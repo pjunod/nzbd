@@ -56,6 +56,8 @@ hyper-util = { version = "0.1", features = ["client", "client-legacy", "http1", 
 http-body-util = "0.1"
 quick-xml = "0.41"
 crc32fast = "1"
+md-5 = "0.10"
+rusqlite = { version = "0.32", features = ["bundled"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 arc-swap = "1"

@@ -8,8 +8,8 @@ roadmaps in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) §16 and
 Legend: ✅ done (implemented, tested, committed) · 🔶 partial · ⬜ not
 started · 👤 operator action (Paul)
 
-**Snapshot (2026-07-17):** 87 tests · 87.3% line coverage · clippy clean ·
-phases 0, 1 and cluster C1 complete · next up: **Phase 2 post-processing**
+**Snapshot (2026-07-17):** 105 tests · clippy clean · phases 0, 1, 2 and
+cluster C1 complete · next up: **C2 PP leases, then Phase 3 API/compat**
 
 | Phase | State | Evidence |
 |---|---|---|
@@ -17,7 +17,8 @@ phases 0, 1 and cluster C1 complete · next up: **Phase 2 post-processing**
 | 1 — Core engine | ✅ complete | `2f45cd5` |
 | C1 — Cluster foundation | ✅ complete | `e4178b2` (design), `0969a79` (impl) |
 | CI & quality gates | ✅ complete (2 decisions open) | `b0b5530`, `0de429b` |
-| 2 — Post-processing (+ C2 PP leases) | ⬜ next | — |
+| 2 — Post-processing | ✅ core complete | this commit |
+| C2 — PP leases + anti-affinity | ⬜ next | — |
 | 3 — Native API + *arr compat shim | ⬜ | — |
 | 4 — Web UI + ecosystem | ⬜ | — |
 | 5 — Beyond parity (+ C3) | ⬜ | — |
@@ -68,7 +69,7 @@ phases 0, 1 and cluster C1 complete · next up: **Phase 2 post-processing**
 - ✅ Any-node API: full API + shim everywhere, transparent proxy to the leader
 - ✅ `[cluster]` config + validation; single-node mode untouched
 - ✅ 5 multi-node e2e tests: single-leader invariant, distributed download via proxied add with budget held, worker-death reclaim (zero re-fetch), leader-death failover with lease adoption, restart persistence
-- ⬜ C2: PP leases (fenced staging dirs, verify-then-rename commit) + download-vs-PP anti-affinity — lands with Phase 2
+- ⬜ C2: PP leases (fenced staging dirs, verify-then-rename commit) + download-vs-PP anti-affinity — **next** (phase 2 core done; PP currently runs leader-only behind an election gate)
 - ⬜ C3: segment-split downloads, weighted scheduling, budget rebalancing
 - 👤 Real-Gluster soak checklist (CLUSTERING.md §11): quorum on, node reboots, volume heal mid-download
 
@@ -82,21 +83,24 @@ phases 0, 1 and cluster C1 complete · next up: **Phase 2 post-processing**
 - 👤 Branch protection on `main` requiring Tests/Lint/Coverage (repo Settings)
 - 👤 Badge rendering decision: badges don't render on a **private** repo README (GitHub proxies images anonymously). Either make the repo public (current setup then works as-is) or ask for the private-repo rework (CI commits relative-path SVGs to `main`)
 
-## Phase 2 — Post-processing ⬜ (next; cluster-native per C2)
+## Phase 2 — Post-processing ✅ core (cluster-native completion lands with C2)
 
-- ⬜ par2 packet parser + **native quick-verify** from download CRCs (no data re-read)
-- ⬜ par2 repair via `par2cmdline-turbo` subprocess behind `ParEngine`
-- ⬜ Delayed-par unpause (`UnpauseParBlocks{count}` engine command, smallest covering set)
-- ⬜ Unpack: unrar/7z subprocess, hardened (argv-only, scrubbed env, timeouts, output caps, staging dir, symlink-escape checks); password retry; `.001` join
+- ✅ par2 packet parser + **native quick-verify** from download CRCs — zero data re-read for intact sets (`nzbd-post/src/par2.rs`, proven against real `par2 create` output)
+- ✅ par2 verify/repair subprocess wrapper (par2cmdline-compatible output parsing: Intact / Repairable / NeedMoreBlocks / Unrepairable)
+- ✅ Delayed-par unpause: `UnpauseParBlocks` engine command, smallest covering set from `.volXX+NN` names; repair loop waits for the fetched blocks
+- ✅ Unpack: unrar/7z subprocess, hardened (argv-only, scrubbed env, timeouts, 256 KiB output caps, kill-on-drop); NZBGet exit-code maps (unrar 11=password, 5=disk; 7z requires "Everything is Ok"); `.zip`/`.7z`/`.rar` multi-volume first-only/`.001`
+- ✅ PP orchestrator: par verify → repair → unpack (⇆ forced-repair retry once) → cleanup → scripts; PostStrategy slots (sequential/balanced/aggressive/rocket); `*PP:done` stamp makes restarts idempotent; 30 s rescan covers leader takeover + lagged events
+- ✅ NZBGet extension-script protocol: `NZBPP_*`/`NZBPR_*` env, `[LEVEL]` stdout log lines, `[NZB] KEY=value` commands (FINALDIR honored), exit codes 92–95, legacy header + v2 `manifest.json` discovery
+- ✅ History: local SQLite index + authoritative append-only JSONL (shared volume in cluster mode per ADR-16; SQLite never on network FS; index rebuilt from JSONL on divergence)
+- ✅ `[post]` config section; daemon wiring single-node **and** cluster (PP runs on the leader, gated live on election state)
+- ✅ 6-test e2e suite against real binaries: intact fast path + script env/FINALDIR, corrupt→repaired bit-identical, unrepairable→PAR_FAILURE, unpack+cleanup, script-error→SCRIPT_FAILURE, event-driven manager + restart-skip
 - ⬜ Direct unpack (`unrar -vp` volume feed during download)
-- ⬜ par-rename / rar-rename
-- ⬜ PP orchestrator state machine incl. unpack↔repair retry loop; PostStrategy levels (sequential/balanced/aggressive/rocket)
-- ⬜ NZBGet extension-script protocol: env vars, `[LEVEL]` stdout, `[NZB] KEY=value`, exit codes 92–95, v2 manifest + legacy headers
-- ⬜ SQLite history (leader-local; JSONL on the shared volume per ADR-16)
+- ⬜ par-rename / rar-rename (obfuscated-name recovery)
+- ⬜ Per-job passwords + password-file retry loop
 - ⬜ Dupe handling (key/score/mode)
 - ⬜ Health-check actions on failure (park/delete per config)
-- ⬜ C2: PP work-lease type + anti-affinity scheduling (a job downloaded on node B repairs on node C)
-- ⬜ Fixture suite: par2 damage matrices, multi-volume/passworded rar, split files
+- ⬜ Fixture suite extras: par2 damage matrices, multi-volume/passworded rar
+- ⬜ C2: PP work-lease type + anti-affinity scheduling (a job downloaded on node B repairs on node C) — replaces the leader-only gate
 
 ## Phase 3 — Native API + compat ⬜
 

@@ -53,6 +53,12 @@ impl SharedLayout {
         self.root.join("nodes")
     }
 
+    /// Authoritative history JSONL directory (ADR-16: append-only JSONL on
+    /// the shared volume; each node's SQLite index stays local).
+    pub fn history_dir(&self) -> PathBuf {
+        self.root.join("history")
+    }
+
     /// Atomic write: unique tmp (per node + counter) + rename.
     pub fn write_json<T: Serialize>(&self, path: &Path, value: &T) -> std::io::Result<()> {
         let n = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);

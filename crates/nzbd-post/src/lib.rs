@@ -1,19 +1,25 @@
-//! Post-processing: trait boundaries (phase 0), implementations in phase 2.
+//! Post-processing (ARCHITECTURE.md §9): the NZBGet-equivalent stage graph
+//! par-verify (native quick path) → repair (with delayed-par fetch) →
+//! unpack (⇆ repair retry) → cleanup → extension scripts.
 //!
-//! The pipeline orchestrator (ARCHITECTURE.md §9) drives these traits through
-//! the NZBGet-equivalent stage graph: par-rename → par-verify/repair →
-//! rar-rename → unpack (⇆ repair retry) → cleanup → move → scripts.
-//!
-//! Design intent baked into the boundaries:
-//! - `ParEngine::quick_verify` stays **native** (we hold per-segment CRC32s
-//!   from download; par2 packet parsing is cheap) while `repair` is
-//!   subprocess `par2cmdline-turbo` first, swappable for a native engine.
-//! - `Extractor` is subprocess `unrar`/`7z` (licensing + crash isolation),
-//!   hardened: argv-only, scrubbed env, timeout, bounded output, staging dir.
-//! - `ScriptRunner` reproduces the NZBGet extension protocol byte-for-byte
+//! Layout:
+//! - [`par2`] — packet parsing + **native quick verification**: we hold
+//!   whole-file CRC32s from download, so an intact set is proven with zero
+//!   data re-reads. GF(2^16) repair math stays in the `par2` subprocess.
+//! - [`tools`] — hardened subprocess runner + `par2`/`unrar`/`7z` wrappers
+//!   (argv-only, scrubbed env, timeouts, bounded output, kill-on-drop).
+//! - [`script`] — the NZBGet extension-script protocol byte-for-byte
 //!   (`NZBPP_*` env, `[NZB] KEY=value` stdout commands, exit codes 92–95).
+//! - [`manager`] — the orchestrator: watches engine events, drives each
+//!   finished job through the stages, records history, stamps jobs so
+//!   restarts never re-process.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
+
+pub mod manager;
+pub mod par2;
+pub mod script;
+pub mod tools;
 
 #[derive(Debug, thiserror::Error)]
 pub enum PostError {
@@ -58,20 +64,6 @@ pub struct DownloadEvidence {
     pub segment_crcs: Vec<(u64, u32, u32)>,
 }
 
-pub trait ParEngine {
-    /// CRC-based verification against the par2 set — no data re-read for
-    /// fully downloaded files. Falls back to `verify_full` on any mismatch.
-    fn quick_verify(
-        &self,
-        par2_file: &Path,
-        evidence: &[DownloadEvidence],
-    ) -> Result<VerifyResult, PostError>;
-
-    fn verify_full(&self, par2_file: &Path) -> Result<VerifyResult, PostError>;
-
-    fn repair(&self, par2_file: &Path) -> Result<RepairResult, PostError>;
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArchiveKind {
     Rar,
@@ -87,16 +79,6 @@ pub struct ExtractOutcome {
     pub password_error: bool,
     /// Out of disk space (unrar exit code 5).
     pub disk_space_error: bool,
-}
-
-pub trait Extractor {
-    fn kind(&self) -> ArchiveKind;
-    fn extract(
-        &self,
-        archive: &Path,
-        dest: &Path,
-        password: Option<&str>,
-    ) -> Result<ExtractOutcome, PostError>;
 }
 
 /// NZBGet extension-script exit codes (post-processing scripts).
@@ -117,20 +99,11 @@ pub enum ScriptKind {
     Command,        // NZBCP_*
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScriptOutcome {
     pub exit_code: i32,
     /// `[NZB] KEY=value` commands emitted by the script.
     pub commands: Vec<(String, String)>,
-}
-
-pub trait ScriptRunner {
-    fn run(
-        &self,
-        kind: ScriptKind,
-        entry: &Path,
-        env: &[(String, String)],
-    ) -> Result<ScriptOutcome, PostError>;
 }
 
 #[cfg(test)]

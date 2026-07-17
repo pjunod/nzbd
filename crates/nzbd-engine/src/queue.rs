@@ -343,6 +343,40 @@ fn job_schedulable(job: &Job, download_paused: bool) -> bool {
     }
 }
 
+/// Parse the recovery-block count from a `*.volXX+NN.par2` filename.
+pub fn vol_par_blocks(filename: &str) -> Option<u32> {
+    let lower = filename.to_ascii_lowercase();
+    let vol = lower.rfind(".vol")?;
+    let rest = &lower[vol + 4..];
+    let plus = rest.find('+')?;
+    let end = rest[plus + 1..]
+        .find(|c: char| !c.is_ascii_digit())
+        .map(|i| plus + 1 + i)
+        .unwrap_or(rest.len());
+    rest[plus + 1..end].parse().ok()
+}
+
+/// Choose the smallest set of paused par files covering `needed` recovery
+/// blocks (NZBGet's delayed-par selection, simplified): prefer the smallest
+/// single file that covers it; otherwise accumulate largest-first.
+pub fn pick_par_files(candidates: &[(FileId, u32)], needed: u32) -> Vec<FileId> {
+    let mut sorted: Vec<_> = candidates.to_vec();
+    sorted.sort_by_key(|(_, blocks)| *blocks);
+    if let Some((id, _)) = sorted.iter().find(|(_, b)| *b >= needed) {
+        return vec![*id];
+    }
+    let mut out = Vec::new();
+    let mut have = 0u32;
+    for (id, blocks) in sorted.iter().rev() {
+        if have >= needed {
+            break;
+        }
+        out.push(*id);
+        have += blocks;
+    }
+    out
+}
+
 /// Health verdict for a finished job: below critical health the download is
 /// beyond repair (would be failed/parked by the health check; phase 2 adds
 /// the par-aware paths).
@@ -514,6 +548,33 @@ mod tests {
             .find(|f| f.id == r.file)
             .unwrap();
         assert_eq!(file.filename, "x.rar");
+    }
+
+    #[test]
+    fn vol_block_parsing_and_selection() {
+        assert_eq!(vol_par_blocks("x.vol00+01.par2"), Some(1));
+        assert_eq!(vol_par_blocks("Show.S01.vol127+64.PAR2"), Some(64));
+        assert_eq!(vol_par_blocks("x.par2"), None);
+        assert_eq!(vol_par_blocks("x.vol7.par2"), None);
+
+        let c = [
+            (FileId(1), 1),
+            (FileId(2), 2),
+            (FileId(3), 8),
+            (FileId(4), 16),
+        ];
+        assert_eq!(
+            pick_par_files(&c, 2),
+            vec![FileId(2)],
+            "smallest single cover"
+        );
+        assert_eq!(pick_par_files(&c, 5), vec![FileId(3)]);
+        assert_eq!(
+            pick_par_files(&c, 20),
+            vec![FileId(4), FileId(3)],
+            "accumulate largest-first"
+        );
+        assert_eq!(pick_par_files(&c, 100).len(), 4, "take everything if short");
     }
 
     #[test]

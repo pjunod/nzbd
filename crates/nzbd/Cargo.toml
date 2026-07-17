@@ -15,7 +15,10 @@ nzbd-engine = { workspace = true }
 nzbd-api = { workspace = true }
 nzbd-compat = { workspace = true }
 nzbd-cluster = { workspace = true }
+nzbd-post = { workspace = true }
+nzbd-state = { workspace = true }
 tokio = { workspace = true }
+tokio-util = { workspace = true }
 axum = { workspace = true }
 clap = { workspace = true }
 tracing = { workspace = true }

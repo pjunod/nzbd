@@ -195,6 +195,20 @@ impl ClusterRuntime {
         self.view.borrow().clone()
     }
 
+    /// A cheap "am I the leader right now?" probe for gating work (e.g. the
+    /// post-processing manager runs only on the queue authority until C2).
+    pub fn leader_gate(&self) -> impl Fn() -> bool + Send + Sync + 'static {
+        let view = self.view.clone();
+        move || view.borrow().is_me
+    }
+
+    /// Where the authoritative history JSONL lives on the shared volume.
+    pub fn history_dir(&self) -> PathBuf {
+        SharedLayout::new(&self.cfg.shared_dir, &self.cfg.node_name)
+            .expect("layout exists")
+            .history_dir()
+    }
+
     /// The full node router: cluster endpoints (answered locally) + the
     /// native API and compat shim (proxied to the leader from non-leaders).
     pub fn router(&self, compat_version: &str) -> Router {

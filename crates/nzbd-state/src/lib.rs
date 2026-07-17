@@ -19,6 +19,8 @@
 //!
 //! **History** in SQLite arrives in phase 2 (the trait is defined below).
 
+pub mod history;
+
 use nzbd_types::{FileId, Job, JobId};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
@@ -397,7 +399,13 @@ pub struct HistoryEntry {
     pub final_dir: Option<String>,
     pub status: String,
     pub size: u64,
+    #[serde(default = "default_health")]
+    pub health: u16,
     pub completed_at_unix: i64,
+}
+
+fn default_health() -> u16 {
+    1000
 }
 
 pub trait HistoryStore {

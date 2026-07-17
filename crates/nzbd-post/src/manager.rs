@@ -1,0 +1,593 @@
+//! The post-processing orchestrator + manager (ARCHITECTURE.md §9).
+//!
+//! The manager watches the engine for finished downloads and drives each
+//! job through the stage graph: par verify (native quick path first) →
+//! repair (with delayed-par fetching) → unpack → cleanup → scripts —
+//! recording the outcome in history and stamping the job so restarts never
+//! re-process. Stage parallelism follows `PostStrategy`.
+
+use crate::script::{discover, ScriptHost};
+use crate::tools::{detect_archives, Extractors, Par2Tool};
+use crate::{par2, DownloadEvidence, PostError, RepairResult, VerifyResult};
+use nzbd_engine::{EngineHandle, Event};
+use nzbd_state::history::HistoryDb;
+use nzbd_state::HistoryEntry;
+use nzbd_types::{Health, Job, JobId, JobStatus, PostStage};
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
+use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
+
+/// Param stamped onto a job once post-processing finished.
+pub const PP_DONE_PARAM: &str = "*PP:done";
+
+#[derive(Debug, Clone)]
+pub struct PostConfig {
+    pub par2_cmd: String,
+    pub unrar_cmd: String,
+    pub sevenzip_cmd: String,
+    pub scripts_dir: Option<PathBuf>,
+    pub unpack: bool,
+    pub cleanup: bool,
+    /// Concurrent PP jobs (PostStrategy: sequential=1, balanced=2,
+    /// aggressive=3, rocket=6).
+    pub slots: usize,
+    pub tool_timeout: Duration,
+    pub script_timeout: Duration,
+    /// How long to wait for delayed par files to download.
+    pub par_fetch_timeout: Duration,
+}
+
+impl Default for PostConfig {
+    fn default() -> Self {
+        PostConfig {
+            par2_cmd: "par2".into(),
+            unrar_cmd: "unrar".into(),
+            sevenzip_cmd: "7z".into(),
+            scripts_dir: None,
+            unpack: true,
+            cleanup: true,
+            slots: 1,
+            tool_timeout: Duration::from_secs(3600),
+            script_timeout: Duration::from_secs(3600),
+            par_fetch_timeout: Duration::from_secs(600),
+        }
+    }
+}
+
+pub fn strategy_slots(name: &str) -> usize {
+    match name {
+        "balanced" => 2,
+        "aggressive" => 3,
+        "rocket" => 6,
+        _ => 1,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PpFinal {
+    Success,
+    ParFailure,
+    UnpackFailure,
+    ScriptFailure,
+}
+
+impl PpFinal {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            PpFinal::Success => "SUCCESS",
+            PpFinal::ParFailure => "PAR_FAILURE",
+            PpFinal::UnpackFailure => "UNPACK_FAILURE",
+            PpFinal::ScriptFailure => "SCRIPT_FAILURE",
+        }
+    }
+}
+
+/// Authority gate: in cluster mode only the node holding queue authority
+/// (the leader) post-processes; everyone else stays parked until the
+/// periodic rescan sees the gate open. `None` = always on (single node).
+/// Cluster C2 replaces this with distributed PP work leases.
+pub type PpGate = Option<Arc<dyn Fn() -> bool + Send + Sync>>;
+
+/// How often the manager rescans the queue for un-processed finished jobs
+/// (covers leadership takeover, lagged event streams, crashed PP attempts
+/// on a prior run — the `*PP:done` stamp keeps it idempotent).
+const RESCAN_INTERVAL: Duration = Duration::from_secs(30);
+
+pub fn spawn_post_manager(
+    engine: EngineHandle,
+    cfg: PostConfig,
+    history: Arc<HistoryDb>,
+    dest_dir: PathBuf,
+    gate: PpGate,
+    cancel: CancellationToken,
+    tracker: &TaskTracker,
+) {
+    let t2 = tracker.clone();
+    tracker.spawn(manager_task(
+        engine, cfg, history, dest_dir, gate, cancel, t2,
+    ));
+}
+
+async fn manager_task(
+    engine: EngineHandle,
+    cfg: PostConfig,
+    history: Arc<HistoryDb>,
+    dest_dir: PathBuf,
+    gate: PpGate,
+    cancel: CancellationToken,
+    tracker: TaskTracker,
+) {
+    let mut rx = engine.subscribe();
+    let mut queued: HashSet<JobId> = HashSet::new();
+    let sem = Arc::new(tokio::sync::Semaphore::new(cfg.slots.max(1)));
+    let open = |g: &PpGate| g.as_ref().map(|f| f()).unwrap_or(true);
+
+    // Startup scan + periodic rescan: finished downloads that were never
+    // post-processed (crash between completion and PP, or authority adopted
+    // from a dead leader mid-way).
+    let mut rescan = tokio::time::interval(RESCAN_INTERVAL);
+    rescan.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => break,
+            _ = rescan.tick() => {
+                if open(&gate) {
+                    scan_queue(&tracker, &engine, &cfg, &history, &dest_dir, &sem, &mut queued).await;
+                }
+            }
+            ev = rx.recv() => match ev {
+                Ok(Event::JobFinished { job, status, name, health }) => match status {
+                    JobStatus::Completed if open(&gate) => {
+                        if let Ok(Some(exported)) = engine.export_job(job).await {
+                            if !pp_done(&exported) && queued.insert(job) {
+                                spawn_job(&tracker, &engine, &cfg, &history, &dest_dir, &sem, job);
+                            }
+                        }
+                    }
+                    JobStatus::Failed if open(&gate) => {
+                        // Below critical health: no PP; record history.
+                        let (category, size) = match engine.export_job(job).await {
+                            Ok(Some(j)) => (j.category.clone(), j.totals.size),
+                            _ => (None, 0),
+                        };
+                        let entry = HistoryEntry {
+                            job,
+                            name,
+                            category,
+                            final_dir: None,
+                            status: "FAILURE/HEALTH".into(),
+                            size,
+                            health,
+                            completed_at_unix: now(),
+                        };
+                        let h = history.clone();
+                        let _ = tokio::task::spawn_blocking(move || h.record(&entry)).await;
+                    }
+                    _ => {}
+                },
+                Ok(_) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                Err(_) => break,
+            },
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn scan_queue(
+    tracker: &TaskTracker,
+    engine: &EngineHandle,
+    cfg: &PostConfig,
+    history: &Arc<HistoryDb>,
+    dest_dir: &Path,
+    sem: &Arc<tokio::sync::Semaphore>,
+    queued: &mut HashSet<JobId>,
+) {
+    for j in engine.snapshot().jobs.iter() {
+        if matches!(j.status, JobStatus::Completed) {
+            if let Ok(Some(job)) = engine.export_job(j.id).await {
+                if !pp_done(&job) && queued.insert(job.id) {
+                    spawn_job(tracker, engine, cfg, history, dest_dir, sem, job.id);
+                }
+            }
+        } else if matches!(j.status, JobStatus::PostQueued | JobStatus::Post { .. })
+            && queued.insert(j.id)
+        {
+            spawn_job(tracker, engine, cfg, history, dest_dir, sem, j.id);
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_job(
+    tracker: &TaskTracker,
+    engine: &EngineHandle,
+    cfg: &PostConfig,
+    history: &Arc<HistoryDb>,
+    dest_dir: &Path,
+    sem: &Arc<tokio::sync::Semaphore>,
+    job: JobId,
+) {
+    let engine = engine.clone();
+    let cfg = cfg.clone();
+    let history = history.clone();
+    let dest = dest_dir.to_path_buf();
+    let sem = sem.clone();
+    tracker.spawn(async move {
+        let Ok(_permit) = sem.acquire().await else {
+            return;
+        };
+        match process_job(&engine, &cfg, &history, &dest, job).await {
+            Ok(outcome) => {
+                tracing::info!(
+                    job = job.0,
+                    outcome = outcome.as_str(),
+                    "post-processing finished"
+                )
+            }
+            Err(e) => tracing::error!(job = job.0, error = %e, "post-processing crashed"),
+        }
+    });
+}
+
+fn pp_done(job: &Job) -> bool {
+    job.params.iter().any(|(k, _)| k == PP_DONE_PARAM)
+}
+
+fn now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// Evidence for quick verification straight from the engine's export.
+fn evidence_of(job: &Job, dir: &Path) -> Vec<DownloadEvidence> {
+    job.files
+        .iter()
+        .map(|f| DownloadEvidence {
+            path: dir.join(&f.filename),
+            crc32: f.crc32,
+            segment_crcs: Vec::new(),
+        })
+        .collect()
+}
+
+async fn set_stage(engine: &EngineHandle, job: JobId, stage: PostStage) {
+    let _ = engine.set_job_status(job, JobStatus::Post { stage }).await;
+}
+
+// ---------------------------------------------------------------------------
+// The stage pipeline for one job
+// ---------------------------------------------------------------------------
+
+pub async fn process_job(
+    engine: &EngineHandle,
+    cfg: &PostConfig,
+    history: &Arc<HistoryDb>,
+    dest_dir: &Path,
+    job_id: JobId,
+) -> Result<PpFinal, PostError> {
+    let _ = engine.set_job_status(job_id, JobStatus::PostQueued).await;
+    let Some(job) = engine
+        .export_job(job_id)
+        .await
+        .map_err(|e| PostError::Subprocess(e.to_string()))?
+    else {
+        return Err(PostError::Subprocess("job vanished".into()));
+    };
+    let dir = dest_dir.join(nzbd_engine::queue::sanitize_name(&job.name));
+
+    // ---- PAR stage ---------------------------------------------------------
+    let par_tool = Par2Tool {
+        cmd: cfg.par2_cmd.clone(),
+        timeout: cfg.tool_timeout,
+    };
+    let mut par_ok = true;
+    let mut par_did_repair = false;
+    if let Some(set) = par2::load_dir(&dir)? {
+        set_stage(engine, job_id, PostStage::ParVerify).await;
+        let quick = par2::quick_verify(&set, &evidence_of(&job, &dir));
+        if quick == VerifyResult::Intact {
+            tracing::info!(job = job_id.0, "par quick-verify: intact (no data re-read)");
+        } else if let Some(main) = set.main_path.clone() {
+            par_ok = repair_loop(engine, cfg, &par_tool, job_id, &main).await?;
+            par_did_repair = par_ok;
+        } else {
+            par_ok = false;
+        }
+    }
+
+    // ---- UNPACK stage ------------------------------------------------------
+    let mut unpack_ok = true;
+    let mut unpacked_any = false;
+    if cfg.unpack {
+        let archives = detect_archives(&dir);
+        if !archives.is_empty() {
+            set_stage(engine, job_id, PostStage::Unpack).await;
+            let ex = Extractors {
+                unrar_cmd: cfg.unrar_cmd.clone(),
+                sevenzip_cmd: cfg.sevenzip_cmd.clone(),
+                timeout: cfg.tool_timeout,
+            };
+            let password = None; // per-job passwords land with the meta plumbing
+            for (archive, kind) in &archives {
+                let mut r = ex.extract(archive, *kind, &dir, password).await?;
+                if !r.success && !par_did_repair && par_ok {
+                    // The unpack↔repair loop: a broken archive that quick
+                    // verification couldn't see; force a repair and retry once.
+                    if let Some(set) = par2::load_dir(&dir)? {
+                        if let Some(main) = set.main_path.clone() {
+                            tracing::warn!(
+                                job = job_id.0,
+                                "unpack failed; forcing par repair + retry"
+                            );
+                            set_stage(engine, job_id, PostStage::ParRepair).await;
+                            if repair_loop(engine, cfg, &par_tool, job_id, &main).await? {
+                                par_did_repair = true;
+                                set_stage(engine, job_id, PostStage::Unpack).await;
+                                r = ex.extract(archive, *kind, &dir, password).await?;
+                            }
+                        }
+                    }
+                }
+                if r.success {
+                    unpacked_any = true;
+                } else {
+                    tracing::warn!(
+                        job = job_id.0,
+                        archive = %archive.display(),
+                        password_error = r.password_error,
+                        "unpack failed"
+                    );
+                    unpack_ok = false;
+                }
+            }
+        }
+    }
+
+    // ---- CLEANUP stage -----------------------------------------------------
+    if cfg.cleanup && par_ok && unpack_ok && unpacked_any {
+        set_stage(engine, job_id, PostStage::Cleanup).await;
+        cleanup_dir(&dir);
+    }
+
+    // ---- SCRIPT stage ------------------------------------------------------
+    let mut script_ok = true;
+    let mut final_dir = dir.to_string_lossy().into_owned();
+    if let Some(scripts_dir) = &cfg.scripts_dir {
+        let scripts = discover(scripts_dir);
+        if !scripts.is_empty() {
+            set_stage(engine, job_id, PostStage::Script).await;
+            let host = ScriptHost {
+                timeout: cfg.script_timeout,
+            };
+            let env = script_env(&job, &dir, par_ok, par_did_repair, unpack_ok, unpacked_any);
+            for script in scripts {
+                match host.run(&script, &dir, &env).await {
+                    Ok(out) => {
+                        for (k, v) in &out.commands {
+                            if k == "FINALDIR" || k == "DIRECTORY" {
+                                final_dir = v.clone();
+                            }
+                        }
+                        match out.exit_code {
+                            crate::script_exit::SUCCESS | crate::script_exit::NONE => {}
+                            crate::script_exit::PAR_CHECK => {
+                                if let Some(set) = par2::load_dir(&dir)? {
+                                    if let Some(main) = set.main_path {
+                                        let _ = repair_loop(engine, cfg, &par_tool, job_id, &main)
+                                            .await;
+                                    }
+                                }
+                            }
+                            _ => script_ok = false,
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!(job = job_id.0, error = %e, "script failed to run");
+                        script_ok = false;
+                    }
+                }
+            }
+        }
+    }
+
+    // ---- finalize ----------------------------------------------------------
+    let outcome = if !par_ok {
+        PpFinal::ParFailure
+    } else if !unpack_ok {
+        PpFinal::UnpackFailure
+    } else if !script_ok {
+        PpFinal::ScriptFailure
+    } else {
+        PpFinal::Success
+    };
+
+    // Stamp + set final status in one import (replaces the job atomically).
+    if let Ok(Some(mut fin)) = engine.export_job(job_id).await {
+        fin.params
+            .push((PP_DONE_PARAM.into(), outcome.as_str().into()));
+        fin.status = if outcome == PpFinal::Success {
+            JobStatus::Completed
+        } else {
+            JobStatus::Failed
+        };
+        let health = Health::calc(&fin.totals).0;
+        let entry = HistoryEntry {
+            job: job_id,
+            name: fin.name.clone(),
+            category: fin.category.clone(),
+            final_dir: Some(final_dir),
+            status: outcome.as_str().into(),
+            size: fin.totals.size,
+            health,
+            completed_at_unix: now(),
+        };
+        // History first, stamp second: a crash in between re-runs PP (the
+        // stages are idempotent) — the reverse would lose the entry forever.
+        let h = history.clone();
+        let _ = tokio::task::spawn_blocking(move || h.record(&entry)).await;
+        let _ = engine.import_job(fin, false, false).await;
+    }
+    Ok(outcome)
+}
+
+/// verify_full → (unpause delayed pars → wait → re-verify)* → repair.
+async fn repair_loop(
+    engine: &EngineHandle,
+    cfg: &PostConfig,
+    par: &Par2Tool,
+    job_id: JobId,
+    main: &Path,
+) -> Result<bool, PostError> {
+    for round in 0..8 {
+        match par.verify_full(main).await? {
+            VerifyResult::Intact => return Ok(true),
+            VerifyResult::Repairable { .. } => {
+                set_stage(engine, job_id, PostStage::ParRepair).await;
+                return Ok(par.repair(main).await? == RepairResult::Repaired);
+            }
+            VerifyResult::NeedMoreBlocks { blocks_needed } => {
+                tracing::info!(
+                    job = job_id.0,
+                    blocks_needed,
+                    round,
+                    "requesting delayed par blocks"
+                );
+                let freed = engine
+                    .unpause_par_blocks(job_id, blocks_needed)
+                    .await
+                    .unwrap_or(0);
+                if freed == 0 {
+                    return Ok(false); // nothing left to fetch
+                }
+                if !wait_par_files(engine, job_id, cfg.par_fetch_timeout).await {
+                    return Ok(false);
+                }
+            }
+            VerifyResult::Unrepairable => return Ok(false),
+        }
+    }
+    Ok(false)
+}
+
+/// Wait until every non-paused par2 file of the job is terminal again
+/// (the freshly unpaused vol files finished downloading).
+async fn wait_par_files(engine: &EngineHandle, job_id: JobId, timeout: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if tokio::time::Instant::now() > deadline {
+            return false;
+        }
+        match engine.export_job(job_id).await {
+            Ok(Some(job)) => {
+                let pending = job
+                    .files
+                    .iter()
+                    .any(|f| f.is_par2 && !f.paused && !f.is_terminal());
+                if !pending {
+                    // Give writers a beat to finalize renames.
+                    let all_finalized = job
+                        .files
+                        .iter()
+                        .filter(|f| f.is_par2 && !f.paused && f.has_any_done())
+                        .all(|f| f.finalized);
+                    if all_finalized {
+                        return true;
+                    }
+                }
+            }
+            _ => return false,
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+fn cleanup_dir(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for e in entries.flatten() {
+        let name = e.file_name().to_string_lossy().to_lowercase();
+        let junk = name.ends_with(".par2")
+            || name.ends_with(".rar")
+            || name.ends_with(".zip")
+            || name.ends_with(".7z")
+            || name.ends_with(".sfv")
+            || name
+                .split('.')
+                .next_back()
+                .map(|e| e.chars().all(|c| c.is_ascii_digit()) && e.len() == 3)
+                .unwrap_or(false);
+        if junk {
+            let _ = std::fs::remove_file(e.path());
+        }
+    }
+}
+
+/// The NZBGet-compatible script environment (the adoption-critical subset).
+fn script_env(
+    job: &Job,
+    dir: &Path,
+    par_ok: bool,
+    par_repaired: bool,
+    unpack_ok: bool,
+    unpacked_any: bool,
+) -> Vec<(String, String)> {
+    let par_status = if !par_ok {
+        "4" // repair failed
+    } else if par_repaired {
+        "2" // repaired
+    } else {
+        "1" // checked, no repair needed (0 = not checked)
+    };
+    let unpack_status = if !unpack_ok {
+        "1" // failed
+    } else if unpacked_any {
+        "2" // unpacked
+    } else {
+        "0" // nothing to unpack
+    };
+    let total = if par_ok && unpack_ok {
+        "SUCCESS"
+    } else {
+        "FAILURE"
+    };
+    let mut env = vec![
+        ("NZBPP_DIRECTORY".into(), dir.to_string_lossy().into_owned()),
+        ("NZBPP_FINALDIR".into(), String::new()),
+        ("NZBPP_NZBNAME".into(), job.name.clone()),
+        ("NZBPP_NZBFILENAME".into(), format!("{}.nzb", job.name)),
+        (
+            "NZBPP_CATEGORY".into(),
+            job.category.clone().unwrap_or_default(),
+        ),
+        ("NZBPP_PARSTATUS".into(), par_status.into()),
+        ("NZBPP_UNPACKSTATUS".into(), unpack_status.into()),
+        ("NZBPP_TOTALSTATUS".into(), total.into()),
+        ("NZBPP_STATUS".into(), format!("{total}/ALL")),
+        (
+            "NZBPP_HEALTH".into(),
+            Health::calc(&job.totals).0.to_string(),
+        ),
+        ("NZBPP_NZBID".into(), job.id.0.to_string()),
+        (
+            "NZBOP_DESTDIR".into(),
+            dir.parent()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+        ),
+        ("NZBOP_VERSION".into(), env!("CARGO_PKG_VERSION").into()),
+    ];
+    for (k, v) in &job.params {
+        if !k.starts_with('*') {
+            env.push((format!("NZBPR_{k}"), v.clone()));
+        }
+    }
+    env
+}

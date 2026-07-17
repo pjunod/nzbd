@@ -6,4 +6,19 @@ license.workspace = true
 
 [dependencies]
 nzbd-types = { workspace = true }
+nzbd-yenc = { workspace = true }
+nzbd-engine = { workspace = true }
+nzbd-state = { workspace = true }
 thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+md-5 = { workspace = true }
+crc32fast = { workspace = true }
+
+[dev-dependencies]
+nzbd-nserv = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }

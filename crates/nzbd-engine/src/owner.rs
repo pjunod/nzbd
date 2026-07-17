@@ -11,8 +11,8 @@
 use crate::events::Event;
 use crate::failover::{AttemptOutcome, Ladder, SegmentAttempt, Verdict};
 use crate::queue::{
-    final_status, next_for_server, recompute_job_totals, sanitize_name, QueueState, SegRef,
-    SelectionCtx,
+    final_status, next_for_server, pick_par_files, recompute_job_totals, sanitize_name,
+    vol_par_blocks, QueueState, SegRef, SelectionCtx,
 };
 use crate::rate::{RateLimiter, SpeedMeter};
 use crate::snapshot::{JobSummary, QueueSnapshot, SharedSnapshot};
@@ -129,6 +129,23 @@ pub(crate) enum QueueCommand {
     RetainJobs {
         keep: Vec<JobId>,
         reply: oneshot::Sender<()>,
+    },
+
+    // -- post-processing hooks (phase 2) ------------------------------------
+    /// Post-processing state transitions (PostQueued / Post{stage} /
+    /// terminal). Only meaningful on jobs whose download already finished.
+    SetJobStatus {
+        job: JobId,
+        status: JobStatus,
+        reply: oneshot::Sender<bool>,
+    },
+    /// Delayed-par download (§3.2): unpause the smallest set of paused
+    /// `*.volXX+NN.par2` files covering `blocks`. Replies with the number
+    /// of recovery blocks now downloading (0 = nothing left to unpause).
+    UnpauseParBlocks {
+        job: JobId,
+        blocks: u32,
+        reply: oneshot::Sender<u32>,
     },
 }
 
@@ -631,6 +648,32 @@ impl Owner {
             QueueCommand::AdoptAuthority { reply } => {
                 self.adopt_authority();
                 let _ = reply.send(());
+            }
+            QueueCommand::SetJobStatus { job, status, reply } => {
+                let ok = match self.state.job_mut(job) {
+                    Some(j) => {
+                        j.status = status;
+                        true
+                    }
+                    None => false,
+                };
+                if ok {
+                    self.dirty = true;
+                    if self.persist
+                        && matches!(
+                            status,
+                            JobStatus::Completed | JobStatus::Failed | JobStatus::Deleted
+                        )
+                    {
+                        self.save_snapshot();
+                    }
+                    self.publish_now();
+                }
+                let _ = reply.send(ok);
+            }
+            QueueCommand::UnpauseParBlocks { job, blocks, reply } => {
+                let unpaused = self.unpause_par_blocks(job, blocks);
+                let _ = reply.send(unpaused);
             }
             QueueCommand::RetainJobs { keep, reply } => {
                 self.persist = false;
@@ -1223,6 +1266,48 @@ impl Owner {
     }
 
     // -- jobs ----------------------------------------------------------------
+
+    /// Delayed-par: unpause the smallest covering set; returns blocks freed.
+    fn unpause_par_blocks(&mut self, job_id: JobId, blocks: u32) -> u32 {
+        let Some(job) = self.state.job_mut(job_id) else {
+            return 0;
+        };
+        let candidates: Vec<(FileId, u32)> = job
+            .files
+            .iter()
+            .filter(|f| f.paused && f.is_par2)
+            .filter_map(|f| vol_par_blocks(&f.filename).map(|b| (f.id, b)))
+            .collect();
+        if candidates.is_empty() {
+            return 0;
+        }
+        let picked = pick_par_files(&candidates, blocks.max(1));
+        let mut freed = 0u32;
+        for (id, b) in &candidates {
+            if picked.contains(id) {
+                if let Some(f) = job.files.iter_mut().find(|f| f.id == *id) {
+                    f.paused = false;
+                    freed += b;
+                }
+            }
+        }
+        if freed > 0 {
+            // The job likely finished its download phase; make it
+            // schedulable again for the par files.
+            if matches!(
+                job.status,
+                JobStatus::Completed | JobStatus::PostQueued | JobStatus::Post { .. }
+            ) {
+                job.status = JobStatus::Queued;
+            }
+            recompute_job_totals(job);
+            tracing::info!(job = job_id.0, freed, "delayed par files unpaused");
+            self.dirty = true;
+            self.bump_epoch();
+            self.publish_now();
+        }
+        freed
+    }
 
     fn delete_job(&mut self, job_id: JobId, delete_files: bool) -> bool {
         let Some(idx) = self.state.jobs.iter().position(|j| j.id == job_id) else {

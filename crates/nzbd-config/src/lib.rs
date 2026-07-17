@@ -26,7 +26,50 @@ pub struct Config {
     #[serde(default)]
     pub api: ApiConfig,
     #[serde(default)]
+    pub post: PostSection,
+    #[serde(default)]
     pub cluster: ClusterConfig,
+}
+
+/// `[post]` — post-processing (ARCHITECTURE.md §9): par verify/repair,
+/// unpack, cleanup, extension scripts.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct PostSection {
+    pub enabled: bool,
+    pub par2_cmd: String,
+    pub unrar_cmd: String,
+    pub sevenzip_cmd: String,
+    /// Directory holding NZBGet-style extension scripts (legacy header or
+    /// v2 `manifest.json`). None = no scripts.
+    pub scripts_dir: Option<PathBuf>,
+    pub unpack: bool,
+    /// Delete archives/par2/sfv after a successful unpack.
+    pub cleanup: bool,
+    /// NZBGet `PostStrategy`: sequential | balanced | aggressive | rocket.
+    pub strategy: String,
+    pub tool_timeout_secs: u64,
+    pub script_timeout_secs: u64,
+    /// How long to wait for delayed par-block downloads during repair.
+    pub par_fetch_timeout_secs: u64,
+}
+
+impl Default for PostSection {
+    fn default() -> Self {
+        PostSection {
+            enabled: true,
+            par2_cmd: "par2".into(),
+            unrar_cmd: "unrar".into(),
+            sevenzip_cmd: "7z".into(),
+            scripts_dir: None,
+            unpack: true,
+            cleanup: true,
+            strategy: "balanced".into(),
+            tool_timeout_secs: 3600,
+            script_timeout_secs: 3600,
+            par_fetch_timeout_secs: 600,
+        }
+    }
 }
 
 /// `[cluster]` — multi-node work distribution (docs/CLUSTERING.md).
@@ -436,6 +479,24 @@ max_download_jobs = 4
         }
         // Disabled cluster needs nothing.
         assert!(Config::from_toml("[cluster]\nenabled = false").is_ok());
+    }
+
+    #[test]
+    fn post_section_parses_with_defaults() {
+        let cfg = Config::from_toml(
+            "[post]\nstrategy = \"rocket\"\nscripts_dir = \"/opt/scripts\"\nunpack = false",
+        )
+        .unwrap();
+        assert!(cfg.post.enabled);
+        assert_eq!(cfg.post.strategy, "rocket");
+        assert!(!cfg.post.unpack);
+        assert!(cfg.post.cleanup);
+        assert_eq!(cfg.post.par2_cmd, "par2");
+        assert_eq!(cfg.post.scripts_dir, Some(PathBuf::from("/opt/scripts")));
+        // Absent section = NZBGet-flavored defaults.
+        let def = Config::from_toml("").unwrap();
+        assert_eq!(def.post.strategy, "balanced");
+        assert_eq!(def.post.tool_timeout_secs, 3600);
     }
 
     #[test]

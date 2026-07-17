@@ -375,6 +375,28 @@ impl EngineHandle {
             .await
     }
 
+    /// Post-processing status transition (PostQueued / Post{stage} / final).
+    pub async fn set_job_status(
+        &self,
+        job: JobId,
+        status: nzbd_types::JobStatus,
+    ) -> Result<bool, EngineError> {
+        self.roundtrip_bool(|reply| QueueCommand::SetJobStatus { job, status, reply })
+            .await
+    }
+
+    /// Delayed-par download: returns recovery blocks now fetching.
+    pub async fn unpause_par_blocks(&self, job: JobId, blocks: u32) -> Result<u32, EngineError> {
+        let (tx, rx) = oneshot::channel();
+        self.send(QueueCommand::UnpauseParBlocks {
+            job,
+            blocks,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| EngineError::Closed)
+    }
+
     /// Lock-free snapshot of the queue (never blocks the engine).
     pub fn snapshot(&self) -> Arc<QueueSnapshot> {
         self.shared.load_full()

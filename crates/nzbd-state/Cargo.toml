@@ -9,8 +9,8 @@ nzbd-types = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
-
-# Phase 2 adds: rusqlite (bundled) behind a dedicated DB thread — history store
+rusqlite = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
