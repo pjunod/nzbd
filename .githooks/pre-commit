@@ -1,0 +1,11 @@
+#!/usr/bin/env sh
+# Fast checks on every commit. Enable once per clone with:
+#   git config core.hooksPath .githooks
+set -e
+
+echo "pre-commit: cargo fmt --all --check"
+if ! cargo fmt --all --check; then
+    echo ""
+    echo "  formatting drift — run 'cargo fmt --all', re-stage, and commit again."
+    exit 1
+fi

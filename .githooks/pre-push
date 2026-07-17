@@ -1,0 +1,11 @@
+#!/usr/bin/env sh
+# The full gate before anything leaves the machine — mirrors CI exactly.
+# Enable once per clone with:
+#   git config core.hooksPath .githooks
+set -e
+
+echo "pre-push: cargo clippy (deny warnings)"
+cargo clippy --workspace --all-targets -- -D warnings
+
+echo "pre-push: cargo test --workspace"
+cargo test --workspace
