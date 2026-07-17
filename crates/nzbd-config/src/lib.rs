@@ -378,12 +378,442 @@ impl Config {
     }
 }
 
-/// Phase 3: map `nzbget.conf` (117 scalar options + `ServerN.*`/`CategoryN.*`/
-/// `TaskN.*` blocks) onto [`Config`], with an import report.
-pub fn import_nzbget_conf(_content: &str) -> Result<Config, ConfigError> {
-    Err(ConfigError::Invalid(
-        "nzbget.conf import lands in phase 3 (see ARCHITECTURE.md §11)".into(),
-    ))
+// ---------------------------------------------------------------------------
+// nzbget.conf importer (ARCHITECTURE.md §11)
+// ---------------------------------------------------------------------------
+
+/// What the importer did with each nzbget.conf option.
+#[derive(Debug, Default)]
+pub struct ImportReport {
+    /// Options mapped onto nzbd config (nzbget key → nzbd setting).
+    pub mapped: Vec<(String, String)>,
+    /// Recognized-but-intentionally-unmapped options (defaults differ or
+    /// the feature is built-in) — safe to ignore.
+    pub skipped: Vec<String>,
+    /// Options nzbd does not know (yet) — review these by hand.
+    pub unknown: Vec<String>,
+    /// Anything suspicious (unparsable values, missing hosts, …).
+    pub warnings: Vec<String>,
+}
+
+/// Map `nzbget.conf` (KEY=value lines with `${Var}` substitution plus
+/// `ServerN.*`/`CategoryN.*` blocks) onto [`Config`] with a full report.
+pub fn import_nzbget_conf(content: &str) -> Result<(Config, ImportReport), ConfigError> {
+    // Pass 1: raw key/value pairs (last one wins, like NZBGet).
+    let mut raw: Vec<(String, String)> = Vec::new();
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some((k, v)) = line.split_once('=') {
+            raw.push((k.trim().to_string(), v.trim().to_string()));
+        }
+    }
+    // ${Var} substitution against earlier keys (NZBGet semantics).
+    let lookup: std::collections::HashMap<String, String> = raw
+        .iter()
+        .map(|(k, v)| (k.to_lowercase(), v.clone()))
+        .collect();
+    let expand_once = |v: &str| -> String {
+        let mut out = String::with_capacity(v.len());
+        let mut rest = v;
+        while let Some(start) = rest.find("${") {
+            out.push_str(&rest[..start]);
+            match rest[start + 2..].find('}') {
+                Some(end) => {
+                    let var = &rest[start + 2..start + 2 + end];
+                    match lookup.get(&var.to_lowercase()) {
+                        Some(val) => out.push_str(val),
+                        None => {
+                            out.push_str("${");
+                            out.push_str(var);
+                            out.push('}');
+                        }
+                    }
+                    rest = &rest[start + 2 + end + 1..];
+                }
+                None => {
+                    out.push_str(&rest[start..]);
+                    rest = "";
+                }
+            }
+        }
+        out.push_str(rest);
+        out
+    };
+    // Nested references (`Category1.DestDir=${DestDir}/movies` where
+    // DestDir itself uses ${MainDir}) expand to a fixpoint, cycle-bounded.
+    let expand = |v: &str| -> String {
+        let mut cur = v.to_string();
+        for _ in 0..10 {
+            let next = expand_once(&cur);
+            if next == cur {
+                break;
+            }
+            cur = next;
+        }
+        cur
+    };
+
+    let mut cfg = Config::default();
+    let mut report = ImportReport::default();
+    let mut servers: std::collections::BTreeMap<u32, ServerConfig> = Default::default();
+    let mut categories: std::collections::BTreeMap<u32, CategoryConfig> = Default::default();
+    let mut control_ip = "127.0.0.1".to_string();
+    let mut control_port = "6789".to_string();
+
+    let yes = |v: &str| v.eq_ignore_ascii_case("yes");
+    for (key, rawv) in &raw {
+        let v = expand(rawv);
+        let lk = key.to_lowercase();
+
+        // ServerN.* / CategoryN.* blocks
+        if let Some(rest) = lk.strip_prefix("server") {
+            if let Some((n, field)) = rest.split_once('.') {
+                if let Ok(n) = n.parse::<u32>() {
+                    let s = servers.entry(n).or_default();
+                    let mapped = match field {
+                        "name" => {
+                            s.name = v.clone();
+                            true
+                        }
+                        "host" => {
+                            s.host = v.clone();
+                            true
+                        }
+                        "port" => {
+                            s.port = v.parse().unwrap_or(119);
+                            true
+                        }
+                        "username" => {
+                            s.username = (!v.is_empty()).then(|| v.clone());
+                            true
+                        }
+                        "password" => {
+                            s.password = (!v.is_empty()).then(|| v.clone());
+                            true
+                        }
+                        "encryption" => {
+                            s.tls = yes(&v);
+                            true
+                        }
+                        "connections" => {
+                            s.connections = v.parse().unwrap_or(4);
+                            true
+                        }
+                        "level" => {
+                            s.tier = v.parse().unwrap_or(0);
+                            true
+                        }
+                        "group" => {
+                            s.group = v.parse().unwrap_or(0);
+                            true
+                        }
+                        "optional" => {
+                            s.fill = yes(&v);
+                            true
+                        }
+                        "retention" => {
+                            s.retention_days = v.parse().unwrap_or(0);
+                            true
+                        }
+                        "active" => {
+                            s.active = yes(&v);
+                            true
+                        }
+                        "certverification" => {
+                            s.cert_verification = match v.to_lowercase().as_str() {
+                                "none" => CertVerification::None,
+                                "minimal" => CertVerification::Minimal,
+                                _ => CertVerification::Strict,
+                            };
+                            true
+                        }
+                        "jointgroup" | "cipher" | "ipversion" | "notes" => {
+                            report.skipped.push(key.clone());
+                            false
+                        }
+                        _ => {
+                            report.unknown.push(key.clone());
+                            false
+                        }
+                    };
+                    if mapped {
+                        report
+                            .mapped
+                            .push((key.clone(), format!("server[{n}].{field}")));
+                    }
+                    continue;
+                }
+            }
+        }
+        if let Some(rest) = lk.strip_prefix("category") {
+            if let Some((n, field)) = rest.split_once('.') {
+                if let Ok(n) = n.parse::<u32>() {
+                    let c = categories.entry(n).or_default();
+                    let mapped = match field {
+                        "name" => {
+                            c.name = v.clone();
+                            true
+                        }
+                        "destdir" => {
+                            c.dest_dir = (!v.is_empty()).then(|| PathBuf::from(&v));
+                            true
+                        }
+                        "unpack" => {
+                            c.unpack = Some(yes(&v));
+                            true
+                        }
+                        "extensions" => {
+                            c.extensions = v
+                                .split(',')
+                                .map(|e| e.trim().to_string())
+                                .filter(|e| !e.is_empty())
+                                .collect();
+                            true
+                        }
+                        "aliases" => {
+                            report.skipped.push(key.clone());
+                            false
+                        }
+                        _ => {
+                            report.unknown.push(key.clone());
+                            false
+                        }
+                    };
+                    if mapped {
+                        report
+                            .mapped
+                            .push((key.clone(), format!("category[{n}].{field}")));
+                    }
+                    continue;
+                }
+            }
+        }
+
+        // Scalar options
+        let mapped_to: Option<String> = match lk.as_str() {
+            "maindir" => {
+                cfg.paths.main_dir = PathBuf::from(&v);
+                Some("paths.main_dir".into())
+            }
+            "destdir" => {
+                cfg.paths.dest_dir = PathBuf::from(&v);
+                Some("paths.dest_dir".into())
+            }
+            "interdir" => {
+                cfg.paths.inter_dir = (!v.is_empty()).then(|| PathBuf::from(&v));
+                Some("paths.inter_dir".into())
+            }
+            "nzbdir" => {
+                cfg.paths.nzb_watch_dir = (!v.is_empty()).then(|| PathBuf::from(&v));
+                Some("paths.nzb_watch_dir".into())
+            }
+            "queuedir" => {
+                cfg.paths.queue_dir = (!v.is_empty()).then(|| PathBuf::from(&v));
+                Some("paths.queue_dir".into())
+            }
+            "tempdir" => {
+                cfg.paths.temp_dir = (!v.is_empty()).then(|| PathBuf::from(&v));
+                Some("paths.temp_dir".into())
+            }
+            "controlip" => {
+                control_ip = if v == "0.0.0.0" || v.is_empty() {
+                    "0.0.0.0".into()
+                } else {
+                    v.clone()
+                };
+                Some("api.bind (ip)".into())
+            }
+            "controlport" => {
+                control_port = v.clone();
+                Some("api.bind (port)".into())
+            }
+            "articleretries" | "retries" => {
+                cfg.queue.article_retries = v.parse().unwrap_or(3);
+                Some("queue.article_retries".into())
+            }
+            "articleinterval" | "retryinterval" => {
+                cfg.queue.retry_interval_secs = v.parse().unwrap_or(10);
+                Some("queue.retry_interval_secs".into())
+            }
+            "articletimeout" => {
+                cfg.queue.article_timeout_secs = v.parse().unwrap_or(60);
+                Some("queue.article_timeout_secs".into())
+            }
+            "articlecache" => {
+                cfg.queue.article_cache_mb = v.parse().unwrap_or(0);
+                Some("queue.article_cache_mb".into())
+            }
+            "directwrite" => {
+                cfg.queue.direct_write = yes(&v);
+                Some("queue.direct_write".into())
+            }
+            "crccheck" => {
+                cfg.queue.crc_check = yes(&v);
+                Some("queue.crc_check".into())
+            }
+            "continuepartial" => {
+                cfg.queue.continue_partial = yes(&v);
+                Some("queue.continue_partial".into())
+            }
+            "propagationdelay" => {
+                cfg.queue.propagation_delay_mins = v.parse().unwrap_or(0);
+                Some("queue.propagation_delay_mins".into())
+            }
+            "diskspace" => {
+                cfg.queue.min_free_disk_mb = v.parse().unwrap_or(250);
+                Some("queue.min_free_disk_mb".into())
+            }
+            "downloadrate" => {
+                let kib: u64 = v.parse().unwrap_or(0);
+                cfg.queue.speed_limit_kib = (kib > 0).then_some(kib);
+                Some("queue.speed_limit_kib".into())
+            }
+            "unrarcmd" => {
+                cfg.post.unrar_cmd = v.clone();
+                Some("post.unrar_cmd".into())
+            }
+            "sevenzipcmd" => {
+                cfg.post.sevenzip_cmd = v.clone();
+                Some("post.sevenzip_cmd".into())
+            }
+            "scriptdir" => {
+                cfg.post.scripts_dir = (!v.is_empty()).then(|| PathBuf::from(&v));
+                Some("post.scripts_dir".into())
+            }
+            "unpack" => {
+                cfg.post.unpack = yes(&v);
+                Some("post.unpack".into())
+            }
+            "unpackcleanupdisk" => {
+                cfg.post.cleanup = yes(&v);
+                Some("post.cleanup".into())
+            }
+            "poststrategy" => {
+                cfg.post.strategy = v.to_lowercase();
+                Some("post.strategy".into())
+            }
+            // Recognized, intentionally unmapped (built-in, obsolete, or a
+            // policy nzbd handles differently).
+            "parcheck"
+            | "parrepair"
+            | "parscan"
+            | "parbuffer"
+            | "parthreads"
+            | "parquick"
+            | "parrename"
+            | "rarrename"
+            | "directunpack"
+            | "healthcheck"
+            | "scriptorder"
+            | "extensions"
+            | "shelloverride"
+            | "eventinterval"
+            | "umask"
+            | "daemonusername"
+            | "lockfile"
+            | "logfile"
+            | "writelog"
+            | "rotatelog"
+            | "errortarget"
+            | "warningtarget"
+            | "infotarget"
+            | "detailtarget"
+            | "debugtarget"
+            | "nzblog"
+            | "crashtrace"
+            | "crashdump"
+            | "timecorrection"
+            | "outputmode"
+            | "curses"
+            | "updatecheck"
+            | "appbin"
+            | "appdir"
+            | "version"
+            | "configfile"
+            | "webdir"
+            | "confighome"
+            | "securecontrol"
+            | "secureport"
+            | "securecert"
+            | "securekey"
+            | "certstore"
+            | "certcheck"
+            | "authorizedip"
+            | "controlusername"
+            | "controlpassword"
+            | "restrictedusername"
+            | "restrictedpassword"
+            | "addusername"
+            | "addpassword"
+            | "formauth"
+            | "urlconnections"
+            | "urlforce"
+            | "urlinterval"
+            | "urltimeout"
+            | "remotetimeout"
+            | "downloadqueue"
+            | "reloadqueue"
+            | "flushqueue"
+            | "dupecheck"
+            | "tempdircleanup"
+            | "keephistory"
+            | "feedhistory"
+            | "skipwrite"
+            | "rawarticle"
+            | "articlereadchunksize"
+            | "monthlyquota"
+            | "quotastartday"
+            | "dailyquota"
+            | "nzbdirinterval"
+            | "nzbdirfilesage"
+            | "dupescope" => {
+                report.skipped.push(key.clone());
+                None
+            }
+            _ => {
+                report.unknown.push(key.clone());
+                None
+            }
+        };
+        if let Some(target) = mapped_to {
+            report.mapped.push((key.clone(), target));
+        }
+    }
+
+    cfg.api.bind = format!("{control_ip}:{control_port}");
+    cfg.servers = servers.into_values().collect();
+    cfg.categories = categories
+        .into_values()
+        .filter(|c| !c.name.is_empty())
+        .collect();
+
+    for (i, s) in cfg.servers.iter().enumerate() {
+        if s.host.is_empty() {
+            report
+                .warnings
+                .push(format!("server #{} has no host — dropped", i + 1));
+        }
+    }
+    cfg.servers.retain(|s| !s.host.is_empty());
+    for s in &mut cfg.servers {
+        if s.connections == 0 {
+            report
+                .warnings
+                .push(format!("server '{}': Connections=0 raised to 1", s.name));
+            s.connections = 1;
+        }
+    }
+
+    cfg.validate()?;
+    Ok((cfg, report))
+}
+
+/// Render a [`Config`] as nzbd.toml text.
+pub fn to_toml(cfg: &Config) -> Result<String, ConfigError> {
+    toml::to_string_pretty(cfg).map_err(|e| ConfigError::Invalid(format!("serialize: {e}")))
 }
 
 #[cfg(test)]
@@ -497,6 +927,157 @@ max_download_jobs = 4
         let def = Config::from_toml("").unwrap();
         assert_eq!(def.post.strategy, "balanced");
         assert_eq!(def.post.tool_timeout_secs, 3600);
+    }
+
+    const NZBGET_CONF: &str = r#"
+# Typical nzbget.conf excerpt
+MainDir=/data/usenet
+DestDir=${MainDir}/dst
+InterDir=${MainDir}/inter
+NzbDir=${MainDir}/nzb
+QueueDir=${MainDir}/queue
+TempDir=${MainDir}/tmp
+ControlIP=0.0.0.0
+ControlPort=6789
+ControlUsername=nzbget
+ControlPassword=tegbzn6789
+
+Server1.Name=main
+Server1.Level=0
+Server1.Host=news.example.com
+Server1.Port=563
+Server1.Username=user1
+Server1.Password=pass1
+Server1.Encryption=yes
+Server1.Connections=30
+Server1.Retention=4500
+Server1.Active=yes
+Server1.CertVerification=strict
+
+Server2.Name=fill
+Server2.Level=1
+Server2.Optional=yes
+Server2.Host=fill.example.com
+Server2.Port=119
+Server2.Encryption=no
+Server2.Connections=8
+Server2.Active=yes
+
+Category1.Name=movies
+Category1.DestDir=${DestDir}/movies
+Category2.Name=tv
+Category2.Unpack=no
+
+ArticleCache=700
+DirectWrite=yes
+CrcCheck=yes
+ContinuePartial=yes
+ArticleRetries=3
+ArticleInterval=10
+ArticleTimeout=60
+DownloadRate=8000
+DiskSpace=250
+PropagationDelay=0
+
+Unpack=yes
+UnpackCleanupDisk=yes
+UnrarCmd=unrar
+SevenZipCmd=7z
+ScriptDir=${MainDir}/scripts
+PostStrategy=aggressive
+ParCheck=auto
+ParRepair=yes
+KeepHistory=30
+FutureOption=whatever
+"#;
+
+    #[test]
+    fn nzbget_conf_import_maps_everything() {
+        let (cfg, report) = import_nzbget_conf(NZBGET_CONF).unwrap();
+
+        // ${Var} substitution + paths
+        assert_eq!(cfg.paths.main_dir, PathBuf::from("/data/usenet"));
+        assert_eq!(cfg.paths.dest_dir, PathBuf::from("/data/usenet/dst"));
+        assert_eq!(
+            cfg.paths.inter_dir,
+            Some(PathBuf::from("/data/usenet/inter"))
+        );
+        assert_eq!(
+            cfg.paths.queue_dir,
+            Some(PathBuf::from("/data/usenet/queue"))
+        );
+        assert_eq!(cfg.api.bind, "0.0.0.0:6789");
+
+        // Servers with NZBGet vocabulary translated (Level→tier,
+        // Optional→fill, Encryption→tls)
+        assert_eq!(cfg.servers.len(), 2);
+        let s1 = &cfg.servers[0];
+        assert_eq!(s1.name, "main");
+        assert_eq!(s1.host, "news.example.com");
+        assert_eq!(s1.port, 563);
+        assert!(s1.tls);
+        assert_eq!(s1.connections, 30);
+        assert_eq!(s1.tier, 0);
+        assert_eq!(s1.retention_days, 4500);
+        assert_eq!(s1.username.as_deref(), Some("user1"));
+        let s2 = &cfg.servers[1];
+        assert_eq!(s2.tier, 1);
+        assert!(s2.fill, "Optional=yes becomes a fill server");
+        assert!(!s2.tls);
+
+        // Categories
+        assert_eq!(cfg.categories.len(), 2);
+        assert_eq!(cfg.categories[0].name, "movies");
+        assert_eq!(
+            cfg.categories[0].dest_dir,
+            Some(PathBuf::from("/data/usenet/dst/movies"))
+        );
+        assert_eq!(cfg.categories[1].unpack, Some(false));
+
+        // Queue + post
+        assert_eq!(cfg.queue.article_cache_mb, 700);
+        assert_eq!(cfg.queue.speed_limit_kib, Some(8000));
+        assert!(cfg.post.unpack);
+        assert_eq!(cfg.post.strategy, "aggressive");
+        assert_eq!(
+            cfg.post.scripts_dir,
+            Some(PathBuf::from("/data/usenet/scripts"))
+        );
+
+        // Report: mapped entries exist; auth options are recognized-skipped;
+        // unknown future options surface for review.
+        assert!(report.mapped.iter().any(|(k, _)| k == "MainDir"));
+        assert!(report
+            .mapped
+            .iter()
+            .any(|(k, t)| k == "Server1.Host" && t == "server[1].host"));
+        assert!(report.skipped.iter().any(|k| k == "ControlPassword"));
+        assert!(report.skipped.iter().any(|k| k == "ParCheck"));
+        assert!(report.unknown.iter().any(|k| k == "FutureOption"));
+        assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+
+        // The imported config round-trips through nzbd.toml.
+        let toml_text = to_toml(&cfg).unwrap();
+        let re = Config::from_toml(&toml_text).unwrap();
+        assert_eq!(re.servers.len(), 2);
+        assert_eq!(re.queue.article_cache_mb, 700);
+    }
+
+    #[test]
+    fn nzbget_conf_import_drops_hostless_servers() {
+        let (cfg, report) = import_nzbget_conf(
+            "MainDir=/x
+Server1.Name=ghost
+Server1.Connections=4
+             Server2.Host=ok.example
+Server2.Connections=0
+",
+        )
+        .unwrap();
+        assert_eq!(cfg.servers.len(), 1);
+        assert_eq!(cfg.servers[0].host, "ok.example");
+        assert_eq!(cfg.servers[0].connections, 1, "zero raised to one");
+        assert_eq!(report.warnings.len(), 2);
     }
 
     #[test]

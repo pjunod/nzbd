@@ -51,8 +51,14 @@ enum Command {
         #[arg(long, default_value = "127.0.0.1:6789")]
         url: String,
     },
-    /// Import an nzbget.conf into nzbd.toml (phase 3).
-    ImportConfig { path: PathBuf },
+    /// Import an nzbget.conf into nzbd.toml with a mapping report.
+    ImportConfig {
+        /// Path to the nzbget.conf to import.
+        path: PathBuf,
+        /// Where to write the converted config.
+        #[arg(short, long, default_value = "nzbd.toml")]
+        out: PathBuf,
+    },
 }
 
 fn main() -> anyhow_lite::Result<()> {
@@ -73,10 +79,28 @@ fn main() -> anyhow_lite::Result<()> {
             priority,
         } => client_add(file, url, name, category, priority),
         Command::Status { url } => client_status(url),
-        Command::ImportConfig { path } => {
+        Command::ImportConfig { path, out } => {
             let content = std::fs::read_to_string(&path)?;
             match nzbd_config::import_nzbget_conf(&content) {
-                Ok(_) => Ok(()),
+                Ok((cfg, report)) => {
+                    let toml_text = nzbd_config::to_toml(&cfg)
+                        .map_err(|e| anyhow_lite::Error::msg(e.to_string()))?;
+                    std::fs::write(&out, toml_text)?;
+                    println!("wrote {}", out.display());
+                    println!(
+                        "mapped {} options, skipped {} (recognized), {} unknown",
+                        report.mapped.len(),
+                        report.skipped.len(),
+                        report.unknown.len()
+                    );
+                    for w in &report.warnings {
+                        println!("warning: {w}");
+                    }
+                    if !report.unknown.is_empty() {
+                        println!("review by hand: {}", report.unknown.join(", "));
+                    }
+                    Ok(())
+                }
                 Err(e) => {
                     eprintln!("{e}");
                     std::process::exit(2);

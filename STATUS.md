@@ -8,9 +8,9 @@ roadmaps in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) §16 and
 Legend: ✅ done (implemented, tested, committed) · 🔶 partial · ⬜ not
 started · 👤 operator action (Paul)
 
-**Snapshot (2026-07-17):** 111 tests · clippy clean · phases 0, 1, 2,
-cluster C1+C2 and the *arr compat core (3a) complete · next up: **rest of
-phase 3** (importer, XML-RPC, SSE/auth/metrics)
+**Snapshot (2026-07-17):** 113 tests · clippy clean · phases 0, 1, 2,
+cluster C1+C2, *arr compat core (3a) and the nzbget.conf importer
+complete · next up: **rest of phase 3** (XML-RPC, SSE/auth/metrics)
 
 | Phase | State | Evidence |
 |---|---|---|
@@ -117,7 +117,7 @@ phase 3** (importer, XML-RPC, SSE/auth/metrics)
 - ⬜ Compat C2: `listfiles`, `listgroups` file details, logs, scan, per-file editqueue actions
 - ⬜ XML-RPC + `system.multicall` + JSON-P + GET-form safe methods; auth tiers
 - ⬜ Golden structural tests vs recorded NZBGet 26.2 responses; nightly live *arr containers
-- ⬜ `nzbget.conf` importer with report
+- ✅ `nzbget.conf` importer: KEY=value + `ServerN.*`/`CategoryN.*` blocks, recursive `${Var}` expansion, NZBGet→nzbd vocabulary (Level→tier, Optional→fill, Encryption→tls), mapped/skipped/unknown/warnings report, hostless-server drop, zero-connection raise; `nzbd import-config <nzbget.conf> -o nzbd.toml` writes the converted file + prints the report; round-trips through the TOML parser
 - ⬜ `rapidyenc-sys` FFI feature (vendored) + differential fuzzing vs scalar decoder
 
 ## Phase 4 — Web UI + ecosystem ⬜
