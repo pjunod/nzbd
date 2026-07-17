@@ -40,6 +40,7 @@ Notably, the fork's own modernization converged on exactly the components a rewr
 6. **Single static binary** per platform (Linux x86-64/aarch64 incl. musl for NAS, macOS, Windows), embedded web UI, no runtime deps beyond optional `unrar`/`par2` executables.
 7. **Modern operability**: structured logs, Prometheus metrics, typed TOML config, OpenAPI-documented native API, SSE event stream.
 8. **A testable architecture**: every subsystem behind a trait; an in-tree mock NNTP server (nzbget's `nserv` equivalent) for end-to-end tests in CI.
+9. **Optional clustering**: multiple nodes sharing a work volume distribute download and post-processing work with automatic leader failover — full design in [`CLUSTERING.md`](CLUSTERING.md) (ADR-13…16). Single-node remains the default and pays nothing for it.
 
 ### Non-goals (initial releases)
 
@@ -144,6 +145,7 @@ A Cargo workspace. Fine-grained crates keep compile times sane, make ownership b
 | `nzbd-api` | Native REST `/api/v1` + SSE events + OpenAPI | axum, tower-http |
 | `nzbd-compat` | nzbget JSON-RPC 1.1 / XML-RPC / JSON-P shim, auth tiers, field-shape fidelity | axum (router merge), quick-xml |
 | `nzbd-config` | TOML config model + validation + `nzbget.conf` importer | toml, serde |
+| `nzbd-cluster` | Clustering (CLUSTERING.md): shared-volume election + node registry, epoch fencing, HTTP work-lease protocol, leader scheduler, worker executor runtime, any-node→leader API proxy | axum, tokio |
 | `nzbd` (bin) | Daemon: wiring, CLI (`nzbd run/import/status`), signals, embedded UI assets | clap, rust-embed |
 | `nzbd-nserv` (dev) | Mock NNTP server for integration tests & benchmarks (nzbget's `nserv` equivalent): scripted articles, injected failures, latency shaping | tokio |
 
@@ -320,6 +322,10 @@ A TypeScript SPA (Svelte 5 + Vite; small bundle, no runtime), built to static as
 | 10 | **Compat scope: *arr-first (7 methods), then breadth; stock webui assets out of scope** | Full 56-method day-one parity (months of shim work before any user value; nzbdav's 1k★ proves targeted API emulation is the adoption cheat code) |
 | 11 | **SSE for events** (WS available via axum if needed) | Polling (nzbget's model — wasteful); WS-only (proxy/reconnect friction for zero benefit here) |
 | 12 | **Extension protocol preserved as-is** | New plugin API first (would orphan the existing script ecosystem — its env/exit-code protocol is crude but proven and language-agnostic) |
+| 13 | **Cluster topology: elected leader + workers, work leased over HTTP; shared volume = data plane + election lease only** (CLUSTERING.md §2.1) | Symmetric peers via FS locks (distributed locking on a network FS — fencing bugs become queue corruption); external etcd/redis (runtime dependency); embedded Raft (consensus machinery to guard a download queue) |
+| 14 | **Work units: whole-job download leases + stage-level PP leases** (CLUSTERING.md §2.2) | PP-only offload (leader still congested); segment-split downloads day one (cross-node fan-in complexity — deferred to C3, protocol doesn't preclude it) |
+| 15 | **HA: automatic election (monotonic staleness observation, write–wait–verify, epoch fencing); every node serves the API and proxies to the leader** (CLUSTERING.md §4) | Workers-idle-when-leader-down (rejected by owner); VIP/keepalived as the only path (now optional); wall-clock lease expiry (home-lab clocks lie) |
+| 16 | **Cluster state: per-job fenced journals + queue snapshot on the shared volume; journal replay = union across lease files; SQLite never on the network FS** (CLUSTERING.md §6.4) | Global journal (can't reclaim jobs independently); FS locks per job (see 13); SQLite/WAL on Gluster (shared-memory WAL doesn't span nodes; known corruption class) |
 
 ## 16. Roadmap
 
@@ -327,10 +333,11 @@ A TypeScript SPA (Svelte 5 + Vite; small bundle, no runtime), built to static as
 |---|---|---|
 | **0. Scaffold** (this session) | Workspace, domain types + health math, NZB parser, scalar incremental yEnc + CRC combine, NNTP codec skeleton, API/shim stubs, CI-ready tests | `cargo test` green; design reviewed |
 | **1. Core engine** | Queue owner, scheduler + failover ladder, pools + pipelining, rustls transport, DirectWrite writer, journal + resume, rate limiter, `nzbd-nserv`, CLI (`nzbd run`, `add`) | Downloads real NZBs from real providers at line rate; kill -9 resume proven; ladder scenario suite green |
-| **2. Post-processing** | PP orchestrator, par quick-verify (native) + repair (subprocess), unpack + direct unpack, script protocol, health gates, dupe handling, SQLite history | Damaged-set fixtures repair correctly; existing NZBGet PP scripts run unmodified |
+| **C1. Cluster foundation** | `nzbd-cluster` per CLUSTERING.md: shared-volume election + registry, epoch-fenced per-job journals, HTTP work-lease protocol, distributed whole-job downloads, any-node API proxy, `[cluster]` config | Multi-node harness green: single-leader invariant, leader-kill failover with lease adoption, worker-kill reclaim with zero re-fetch, single-node parity |
+| **2. Post-processing** | PP orchestrator, par quick-verify (native) + repair (subprocess), unpack + direct unpack, script protocol, health gates, dupe handling, SQLite history; PP stages are cluster-claimable work units (CLUSTERING.md phase C2) | Damaged-set fixtures repair correctly; existing NZBGet PP scripts run unmodified; a job downloaded on one node repairs on another |
 | **3. API + compat** | Native REST/SSE + auth, compat C1→C2, config importer, `rapidyenc-sys` | Sonarr + Radarr run a full grab→import cycle against nzbd in CI; nzbget-migration guide works |
 | **4. Web UI + ecosystem** | SPA (queue/history/config/stats), extension manager, RSS feeds + filter language, compat C3, packaging (static musl, Docker, Homebrew, Windows) | Daily-drivable replacement; linuxserver-style container published |
-| **5. Beyond parity** | Native par2 repair swap-in, io_uring file I/O when tokio stabilizes it, article-level streaming APIs (mount-mode groundwork), per-provider adaptive pipelining | — |
+| **5. Beyond parity** | Native par2 repair swap-in, io_uring file I/O when tokio stabilizes it, article-level streaming APIs (mount-mode groundwork), per-provider adaptive pipelining, cluster C3 (segment-split downloads, weighted scheduling) | — |
 
 Rough sizing honesty: phases 1–3 are each multiple weeks of focused work; nzbget is ~62k LOC of accumulated behavior. The phasing is designed so every phase ends with something independently useful (phase 1 alone = a fast, resumable CLI NZB downloader).
 
@@ -341,6 +348,7 @@ Rough sizing honesty: phases 1–3 are each multiple weeks of focused work; nzbg
 - **par2cmdline-turbo availability** per platform → bundle checksummed binaries in release artifacts, `ParCmd` override like nzbget.
 - **Behavioral unknowns** (deobfuscation heuristics, dupe corner cases) will surface in beta — the C++ source stays the arbiter; port with tests, not vibes.
 - **Scope**: RSS filter language and full config-editing webui are large; deliberately late phases. Streaming-mount demand (nzbdav's traction) may reorder phase 5 — the segment-addressed engine design keeps that door open.
+- **Clustering rests on the shared volume behaving like a consistent POSIX FS.** Gluster must run with quorum (replica 3 or arbiter); a volume that split-brains gives the cluster two truths — no application protocol survives that. Election fencing is practical (epoch + verify-before-commit + union journals), not linearizable consensus; residual zombie-writer windows are analyzed in CLUSTERING.md §6.4. SQLite is never placed on the network FS (ADR-16).
 - Open: adopt `redb` for the journal if fsync patterns disappoint? Expose native API under gRPC too? Windows service story timing? Name the thing properly.
 
 ## Appendix A — behavioral cheat sheet carried from nzbget
