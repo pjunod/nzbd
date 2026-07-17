@@ -1,0 +1,9 @@
+[package]
+name = "nzbd-post"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nzbd-types = { workspace = true }
+thiserror = { workspace = true }

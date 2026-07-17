@@ -1,0 +1,14 @@
+[package]
+name = "nzbd-state"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nzbd-types = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+
+# Phase 1–2 will add:
+#   rusqlite (bundled) behind a dedicated DB thread — history store
+#   snapshot + append-only segment journal for the hot queue path

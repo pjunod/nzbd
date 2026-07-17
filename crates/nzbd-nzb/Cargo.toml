@@ -1,0 +1,11 @@
+[package]
+name = "nzbd-nzb"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+# Pinned: quick-xml has a high breaking-release cadence. We use the event API
+# (not serde-derive) for tolerance of malformed real-world NZBs.
+quick-xml = { workspace = true }
+thiserror = { workspace = true }

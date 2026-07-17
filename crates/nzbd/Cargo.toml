@@ -1,0 +1,21 @@
+[package]
+name = "nzbd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "nzbd"
+path = "src/main.rs"
+
+[dependencies]
+nzbd-types = { workspace = true }
+nzbd-config = { workspace = true }
+nzbd-engine = { workspace = true }
+nzbd-api = { workspace = true }
+nzbd-compat = { workspace = true }
+tokio = { workspace = true }
+axum = { workspace = true }
+clap = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

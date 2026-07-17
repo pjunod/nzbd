@@ -1,0 +1,12 @@
+[package]
+name = "nzbd-compat"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nzbd-types = { workspace = true }
+nzbd-api = { workspace = true }
+axum = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
