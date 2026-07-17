@@ -494,6 +494,16 @@ async fn schedule(s: &Arc<LeaderShared>) {
     let workers = s.live_workers();
     let snap = s.engine.snapshot();
 
+    // Retire: post-processed terminal jobs move out of the queue — their
+    // record of existence is the history store (NZBGet parity). Applies to
+    // jobs PP'd remotely (imported stamped via work/complete) and locally.
+    for j in snap.jobs.iter() {
+        if j.pp_done && matches!(j.status, JobStatus::Completed | JobStatus::Failed) {
+            tracing::info!(job = j.id.0, "retiring finished job to history");
+            let _ = s.engine.remove_job_silent(j.id).await;
+        }
+    }
+
     // Reconcile: a job assigned to a node that is no longer live and holds
     // no lease for it was delegated into the void (node died between
     // assignment and poll, or vanished entirely). Release it.
@@ -583,8 +593,8 @@ async fn schedule(s: &Arc<LeaderShared>) {
             + assigned_pp_backlog(&snap, &w.name, &leased_jobs);
         let free = w.pp_slots.saturating_sub(pp_held);
         if free > 0 {
-            let downloading = leases_by_node.get(&w.name).copied().unwrap_or(0) > 0
-                || w.active_download_jobs > 0;
+            let downloading =
+                leases_by_node.get(&w.name).copied().unwrap_or(0) > 0 || w.active_download_jobs > 0;
             pp_targets.push((w.name.clone(), free, downloading));
         }
     }

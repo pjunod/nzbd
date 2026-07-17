@@ -14,10 +14,12 @@ use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 pub struct HistoryDb {
     conn: Mutex<Connection>,
     jsonl: Option<PathBuf>,
+    last_refresh: Mutex<Option<Instant>>,
 }
 
 impl HistoryDb {
@@ -52,11 +54,18 @@ impl HistoryDb {
                  status TEXT NOT NULL,
                  size INTEGER NOT NULL,
                  health INTEGER NOT NULL DEFAULT 1000,
+                 params TEXT NOT NULL DEFAULT '[]',
                  completed_at INTEGER NOT NULL,
                  UNIQUE(job_id, completed_at)
              );",
         )
         .map_err(|e| StateError::Corrupt(format!("sqlite schema: {e}")))?;
+        // Older index files: add the params column in place (ignore "dup
+        // column" — the JSONL stays authoritative either way).
+        let _ = conn.execute(
+            "ALTER TABLE history ADD COLUMN params TEXT NOT NULL DEFAULT '[]'",
+            [],
+        );
 
         let jsonl = jsonl_dir.map(|d| {
             let file = match tag {
@@ -68,14 +77,23 @@ impl HistoryDb {
         let db = HistoryDb {
             conn: Mutex::new(conn),
             jsonl,
+            last_refresh: Mutex::new(None),
         };
         db.rebuild_from_jsonl()?;
         Ok(db)
     }
 
     /// Pull in rows other nodes appended since open (cluster: call before
-    /// serving history reads).
+    /// serving history reads). Throttled — at most one JSONL re-union per
+    /// 5 s no matter how often clients poll.
     pub fn refresh(&self) -> Result<(), StateError> {
+        {
+            let mut last = self.last_refresh.lock().unwrap();
+            if last.is_some_and(|t| t.elapsed() < Duration::from_secs(5)) {
+                return Ok(());
+            }
+            *last = Some(Instant::now());
+        }
         self.rebuild_from_jsonl()
     }
 
@@ -132,8 +150,8 @@ impl HistoryDb {
         let n = conn
             .execute(
                 "INSERT OR IGNORE INTO history
-                 (job_id, name, category, final_dir, status, size, health, completed_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                 (job_id, name, category, final_dir, status, size, health, params, completed_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                 rusqlite::params![
                     entry.job.0,
                     entry.name,
@@ -142,6 +160,7 @@ impl HistoryDb {
                     entry.status,
                     entry.size as i64,
                     entry.health as i64,
+                    serde_json::to_string(&entry.params).unwrap_or_else(|_| "[]".into()),
                     entry.completed_at_unix,
                 ],
             )
@@ -171,12 +190,13 @@ impl HistoryDb {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn
             .prepare(
-                "SELECT job_id, name, category, final_dir, status, size, health, completed_at
+                "SELECT job_id, name, category, final_dir, status, size, health, params, completed_at
                  FROM history ORDER BY completed_at DESC, id DESC LIMIT ?1",
             )
             .map_err(|e| StateError::Corrupt(e.to_string()))?;
         let rows = stmt
             .query_map([limit as i64], |r| {
+                let params: String = r.get(7)?;
                 Ok(HistoryEntry {
                     job: crate::JobId(r.get::<_, i64>(0)? as u32),
                     name: r.get(1)?,
@@ -185,7 +205,8 @@ impl HistoryDb {
                     status: r.get(4)?,
                     size: r.get::<_, i64>(5)? as u64,
                     health: r.get::<_, i64>(6)? as u16,
-                    completed_at_unix: r.get(7)?,
+                    params: serde_json::from_str(&params).unwrap_or_default(),
+                    completed_at_unix: r.get(8)?,
                 })
             })
             .map_err(|e| StateError::Corrupt(e.to_string()))?;
@@ -218,6 +239,7 @@ mod tests {
             status: "SUCCESS".into(),
             size: 1000,
             health: 1000,
+            params: vec![("drone".into(), "abc123".into())],
             completed_at_unix: at,
         }
     }

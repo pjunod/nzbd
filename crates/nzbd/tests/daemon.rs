@@ -130,27 +130,48 @@ bind = "{api_addr}"
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("add output json");
     assert!(v["id"].as_u64().is_some());
 
-    // Wait for completion via `nzbd status`.
+    // Wait for the finished download on disk (post-processing then retires
+    // the job from the queue into history, so queue counters are transient).
     let start = Instant::now();
+    let payload_path = tmp.path().join("dest/cli demo/payload.bin");
     loop {
         assert!(
             start.elapsed() < Duration::from_secs(30),
             "download did not finish"
         );
+        if std::fs::read(&payload_path)
+            .map(|got| got == data)
+            .unwrap_or(false)
+        {
+            break;
+        }
+        // `nzbd status` keeps answering while we wait (CLI liveness check).
         let out = Command::new(bin)
             .args(["status", "--url", &api_addr])
             .output()
             .unwrap();
-        let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
-        if v["jobs_finished"].as_u64() == Some(1) {
+        assert!(out.status.success());
+        std::thread::sleep(Duration::from_millis(200));
+    }
+
+    // The finished job lands in history with a SUCCESS status.
+    let start = Instant::now();
+    loop {
+        assert!(
+            start.elapsed() < Duration::from_secs(15),
+            "job never reached history"
+        );
+        let (code, body) = http(&api_addr, "GET", "/api/v1/history", b"");
+        assert_eq!(code, 200);
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        if v["entries"]
+            .as_array()
+            .is_some_and(|e| e.iter().any(|h| h["status"] == "SUCCESS"))
+        {
             break;
         }
         std::thread::sleep(Duration::from_millis(200));
     }
-
-    // Bit-identical output on disk (job name derives from the .nzb filename).
-    let got = std::fs::read(tmp.path().join("dest/cli demo/payload.bin")).unwrap();
-    assert_eq!(got, data);
 
     // Compat shim: NZBGet JSON-RPC 1.1 dialect.
     let (code, body) = http(
@@ -202,4 +223,137 @@ bind = "{api_addr}"
 extern "C" {
     #[link_name = "kill"]
     fn libc_kill(pid: i32, sig: i32) -> i32;
+}
+
+fn jsonrpc(addr: &str, body: serde_json::Value) -> serde_json::Value {
+    let (code, text) = http(addr, "POST", "/jsonrpc", body.to_string().as_bytes());
+    assert_eq!(code, 200, "{text}");
+    serde_json::from_str(&text).unwrap()
+}
+
+/// The exact call sequence a Sonarr/Radarr download client makes against
+/// NZBGet: version gate → config (category check) → append(base64) →
+/// listgroups poll → history poll → import from FinalDir.
+#[test]
+fn sonarr_style_flow_over_jsonrpc() {
+    use base64::Engine as _;
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let data = prng_bytes(9, 90_000);
+    let post = build_post("arr episode", &[("episode.mkv", data.clone())], 25_000);
+    let ns = rt.block_on(async { NservBuilder::new().with_post(&post).start().await.unwrap() });
+
+    let tmp = tempfile::tempdir().unwrap();
+    let api_port = free_port();
+    let api_addr = format!("127.0.0.1:{api_port}");
+    let config = format!(
+        r#"
+[paths]
+main_dir = "{main}"
+dest_dir = "{dest}"
+
+[[server]]
+name = "mock"
+host = "127.0.0.1"
+port = {nntp_port}
+tls = false
+connections = 4
+
+[[category]]
+name = "tv"
+
+[api]
+bind = "{api_addr}"
+"#,
+        main = tmp.path().join("main").display(),
+        dest = tmp.path().join("dest").display(),
+        nntp_port = ns.port(),
+    );
+    let cfg_path = tmp.path().join("nzbd.toml");
+    std::fs::write(&cfg_path, config).unwrap();
+
+    let bin = env!("CARGO_BIN_EXE_nzbd");
+    let child = Command::new(bin)
+        .args(["run", "--config"])
+        .arg(&cfg_path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn nzbd");
+    let _child = KillOnDrop(child);
+    wait_healthy(&api_addr, Duration::from_secs(15));
+
+    // 1. Version gate (Sonarr requires >= 12).
+    let v = jsonrpc(&api_addr, serde_json::json!({"method": "version", "id": 1}));
+    let major: u32 = v["result"]
+        .as_str()
+        .unwrap()
+        .split('.')
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(major >= 12);
+
+    // 2. Category exists in config.
+    let v = jsonrpc(&api_addr, serde_json::json!({"method": "config", "id": 2}));
+    assert!(v["result"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|o| o["Name"] == "Category1.Name" && o["Value"] == "tv"));
+
+    // 3. append — Sonarr's exact 9-arg positional form.
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&post.nzb);
+    let v = jsonrpc(
+        &api_addr,
+        serde_json::json!({
+            "method": "append",
+            "params": ["arr episode.nzb", b64, "tv", 0, false, false, "", 0, "SCORE"],
+            "id": 3
+        }),
+    );
+    let nzbid = v["result"].as_i64().unwrap();
+    assert!(nzbid > 0, "append returned {v}");
+
+    // 4. Poll listgroups until the download leaves the queue…
+    let start = Instant::now();
+    loop {
+        assert!(
+            start.elapsed() < Duration::from_secs(45),
+            "job never left the queue"
+        );
+        let v = jsonrpc(
+            &api_addr,
+            serde_json::json!({"method": "listgroups", "id": 4}),
+        );
+        let groups = v["result"].as_array().unwrap();
+        if groups.is_empty() {
+            break;
+        }
+        assert_eq!(groups[0]["NZBID"].as_i64().unwrap(), nzbid);
+        std::thread::sleep(Duration::from_millis(200));
+    }
+
+    // 5. …then find it in history, successful, with the import path.
+    let start = Instant::now();
+    let entry = loop {
+        assert!(
+            start.elapsed() < Duration::from_secs(15),
+            "job never reached history"
+        );
+        let v = jsonrpc(&api_addr, serde_json::json!({"method": "history", "id": 5}));
+        let hist = v["result"].as_array().unwrap().clone();
+        if let Some(e) = hist.iter().find(|e| e["NZBID"].as_i64() == Some(nzbid)) {
+            break e.clone();
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    };
+    assert_eq!(entry["Status"], "SUCCESS/ALL");
+    assert_eq!(entry["Category"], "tv");
+    let final_dir = entry["FinalDir"].as_str().unwrap();
+    assert!(!final_dir.is_empty());
+
+    // 6. Import: the completed file is where history says it is.
+    let got = std::fs::read(std::path::Path::new(final_dir).join("episode.mkv")).unwrap();
+    assert_eq!(got, data);
 }

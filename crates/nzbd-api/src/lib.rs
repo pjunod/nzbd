@@ -8,10 +8,18 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use nzbd_engine::{EngineHandle, JobSummary, QueueSnapshot};
+use nzbd_state::history::HistoryDb;
 use nzbd_types::{JobId, JobStatus};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::sync::Arc;
+
+/// Router state: the engine plus optional stores wired by the daemon.
+#[derive(Clone)]
+pub struct ApiState {
+    pub engine: EngineHandle,
+    pub history: Option<Arc<HistoryDb>>,
+}
 
 #[derive(Debug, Serialize)]
 pub struct StatusDto {
@@ -49,21 +57,21 @@ pub fn status_dto(snap: &QueueSnapshot) -> StatusDto {
     }
 }
 
-async fn get_status(State(engine): State<EngineHandle>) -> Json<StatusDto> {
-    Json(status_dto(&engine.snapshot()))
+async fn get_status(State(st): State<ApiState>) -> Json<StatusDto> {
+    Json(status_dto(&st.engine.snapshot()))
 }
 
 async fn healthz() -> &'static str {
     "ok"
 }
 
-async fn list_jobs(State(engine): State<EngineHandle>) -> Response {
-    let snap = engine.snapshot();
+async fn list_jobs(State(st): State<ApiState>) -> Response {
+    let snap = st.engine.snapshot();
     Json(json!({ "jobs": snap.jobs })).into_response()
 }
 
-async fn get_job(State(engine): State<EngineHandle>, Path(id): Path<u32>) -> Response {
-    let snap = engine.snapshot();
+async fn get_job(State(st): State<ApiState>, Path(id): Path<u32>) -> Response {
+    let snap = st.engine.snapshot();
     match snap.jobs.iter().find(|j| j.id == JobId(id)) {
         Some(job) => Json(job.clone()).into_response(),
         None => not_found(),
@@ -80,7 +88,7 @@ struct AddJobQuery {
 /// `POST /api/v1/jobs` with the raw NZB document as the request body.
 /// (Multipart and `{url}` forms arrive in phase 3.)
 async fn add_job(
-    State(engine): State<EngineHandle>,
+    State(st): State<ApiState>,
     Query(q): Query<AddJobQuery>,
     body: axum::body::Bytes,
 ) -> Response {
@@ -88,7 +96,8 @@ async fn add_job(
         return error(StatusCode::BAD_REQUEST, "empty body; POST the NZB document");
     }
     let name = q.name.unwrap_or_default();
-    match engine
+    match st
+        .engine
         .add_nzb(&name, &body, q.category, q.priority.unwrap_or(0))
         .await
     {
@@ -98,9 +107,10 @@ async fn add_job(
 }
 
 async fn job_action(
-    State(engine): State<EngineHandle>,
+    State(st): State<ApiState>,
     Path((id, action)): Path<(u32, String)>,
 ) -> Response {
+    let engine = &st.engine;
     let job = JobId(id);
     let result = match action.as_str() {
         "pause" => engine.pause_job(job).await,
@@ -121,7 +131,8 @@ async fn job_action(
     }
 }
 
-async fn queue_action(State(engine): State<EngineHandle>, Path(action): Path<String>) -> Response {
+async fn queue_action(State(st): State<ApiState>, Path(action): Path<String>) -> Response {
+    let engine = &st.engine;
     let result = match action.as_str() {
         "pause" => engine.pause_all().await,
         "resume" => engine.resume_all().await,
@@ -138,13 +149,35 @@ struct SpeedLimitBody {
     bytes_per_sec: Option<u64>,
 }
 
-async fn set_speed_limit(
-    State(engine): State<EngineHandle>,
-    Json(body): Json<SpeedLimitBody>,
-) -> Response {
-    match engine.set_speed_limit(body.bytes_per_sec).await {
+async fn set_speed_limit(State(st): State<ApiState>, Json(body): Json<SpeedLimitBody>) -> Response {
+    match st.engine.set_speed_limit(body.bytes_per_sec).await {
         Ok(()) => Json(json!({ "ok": true })).into_response(),
         Err(e) => error(StatusCode::SERVICE_UNAVAILABLE, &e.to_string()),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct HistoryQuery {
+    limit: Option<usize>,
+}
+
+/// `GET /api/v1/history` — completed/failed jobs (NZBGet parity: finished
+/// jobs leave the queue and live here).
+async fn get_history(State(st): State<ApiState>, Query(q): Query<HistoryQuery>) -> Response {
+    let Some(db) = &st.history else {
+        return error(StatusCode::NOT_IMPLEMENTED, "history store not configured");
+    };
+    let db = db.clone();
+    let limit = q.limit.unwrap_or(200).min(10_000);
+    let entries = tokio::task::spawn_blocking(move || {
+        let _ = db.refresh(); // pick up other nodes' appends (throttled)
+        db.list(limit)
+    })
+    .await;
+    match entries {
+        Ok(Ok(entries)) => Json(json!({ "entries": entries })).into_response(),
+        Ok(Err(e)) => error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+        Err(e) => error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     }
 }
 
@@ -157,6 +190,13 @@ fn error(code: StatusCode, msg: &str) -> Response {
 }
 
 pub fn router(engine: EngineHandle) -> Router {
+    router_with(ApiState {
+        engine,
+        history: None,
+    })
+}
+
+pub fn router_with(state: ApiState) -> Router {
     Router::new()
         .route("/api/v1/status", get(get_status))
         .route("/api/v1/jobs", get(list_jobs).post(add_job))
@@ -164,8 +204,9 @@ pub fn router(engine: EngineHandle) -> Router {
         .route("/api/v1/jobs/{id}/actions/{action}", post(job_action))
         .route("/api/v1/queue/actions/{action}", post(queue_action))
         .route("/api/v1/queue/speed-limit", put(set_speed_limit))
+        .route("/api/v1/history", get(get_history))
         .route("/healthz", get(healthz))
-        .with_state(engine)
+        .with_state(state)
 }
 
 /// Re-exported so the daemon can hand the same snapshot to the compat shim.

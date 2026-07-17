@@ -391,26 +391,28 @@ async fn manager_event_driven_and_restart_safe() {
         .await
         .unwrap();
 
-    // Wait for the stamp to land.
+    // The manager processes the job, records history, then retires it out
+    // of the queue (NZBGet parity: finished jobs live in history).
     let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
     loop {
-        let job = engine.export_job(JobId(6)).await.unwrap().unwrap();
-        if job.params.iter().any(|(k, _)| k == PP_DONE_PARAM) {
+        let gone = engine.export_job(JobId(6)).await.unwrap().is_none();
+        if gone && hist.list(10).unwrap().len() == 1 {
             break;
         }
         assert!(
             tokio::time::Instant::now() < deadline,
-            "manager never processed the job"
+            "manager never processed + retired the job"
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    assert_eq!(hist.list(10).unwrap().len(), 1);
+    assert_eq!(hist.list(10).unwrap()[0].status, "SUCCESS");
 
     cancel.cancel();
     tracker.close();
     tracker.wait().await;
 
-    // Second manager start: the startup scan must skip the stamped job.
+    // Second manager start: nothing left to process (the job was retired);
+    // history stays at exactly one entry.
     let cancel2 = CancellationToken::new();
     let tracker2 = TaskTracker::new();
     spawn_post_manager(
@@ -426,7 +428,7 @@ async fn manager_event_driven_and_restart_safe() {
     assert_eq!(
         hist.list(10).unwrap().len(),
         1,
-        "restart must not re-process a stamped job"
+        "restart must not re-process a finished job"
     );
     cancel2.cancel();
     tracker2.close();

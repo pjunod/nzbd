@@ -74,6 +74,7 @@ pub struct ClusterRuntime {
     view: watch::Receiver<LeaderView>,
     leader_shared: Arc<LeaderShared>,
     client: ClusterClient,
+    pp: Option<PpSetup>,
     cancel: CancellationToken,
     tracker: TaskTracker,
 }
@@ -160,6 +161,8 @@ impl ClusterRuntime {
             cancel.clone(),
             &tracker,
         );
+        let history = pp.as_ref().map(|s| s.history.clone());
+        let _ = &history; // (kept alongside pp in the runtime below)
 
         // Leader-local PP manager (C2): processes only jobs the scheduler
         // assigned to THIS node, and only while it holds authority. Health-
@@ -231,6 +234,7 @@ impl ClusterRuntime {
             view,
             leader_shared,
             client,
+            pp,
             cancel,
             tracker,
         })
@@ -260,23 +264,29 @@ impl ClusterRuntime {
 
     /// The full node router: cluster endpoints (answered locally) + the
     /// native API and compat shim (proxied to the leader from non-leaders).
-    pub fn router(&self, compat_version: &str) -> Router {
+    pub fn router(&self, compat_version: &str, options: Vec<(String, String)>) -> Router {
+        let history = self.pp.as_ref().map(|s| s.history.clone());
         let compat_state = nzbd_compat::CompatState {
             config: Arc::new(nzbd_compat::CompatConfig {
                 version: compat_version.to_string(),
             }),
             engine: self.engine.clone(),
+            history: history.clone(),
+            options: Arc::new(options),
         };
-        let proxied = nzbd_api::router(self.engine.clone())
-            .merge(nzbd_compat::router(compat_state))
-            .layer(middleware::from_fn_with_state(
-                ProxyState {
-                    node: self.cfg.node_name.clone(),
-                    view: self.view.clone(),
-                    client: self.client.clone(),
-                },
-                proxy_to_leader,
-            ));
+        let proxied = nzbd_api::router_with(nzbd_api::ApiState {
+            engine: self.engine.clone(),
+            history,
+        })
+        .merge(nzbd_compat::router(compat_state))
+        .layer(middleware::from_fn_with_state(
+            ProxyState {
+                node: self.cfg.node_name.clone(),
+                view: self.view.clone(),
+                client: self.client.clone(),
+            },
+            proxy_to_leader,
+        ));
 
         let info = ClusterInfoState {
             node: self.cfg.node_name.clone(),

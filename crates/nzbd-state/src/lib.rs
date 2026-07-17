@@ -401,6 +401,9 @@ pub struct HistoryEntry {
     pub size: u64,
     #[serde(default = "default_health")]
     pub health: u16,
+    /// Job parameters at completion (drone ids, script settings, …).
+    #[serde(default)]
+    pub params: Vec<(String, String)>,
     pub completed_at_unix: i64,
 }
 

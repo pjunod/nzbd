@@ -7,6 +7,8 @@ license.workspace = true
 [dependencies]
 nzbd-types = { workspace = true }
 nzbd-engine = { workspace = true }
+nzbd-state = { workspace = true }
+tokio = { workspace = true }
 axum = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

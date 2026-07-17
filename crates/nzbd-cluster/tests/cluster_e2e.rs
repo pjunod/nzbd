@@ -41,7 +41,8 @@ struct NodeOpts {
     download: bool,
     max_download_jobs: u32,
     /// PP executor (C2). Slots default to 1 when enabled.
-    post_process: bool,}
+    post_process: bool,
+}
 
 struct Node {
     #[allow(dead_code)] // debugging aid
@@ -115,7 +116,7 @@ async fn start_node(
     .await
     .expect("cluster start");
 
-    let app = runtime.router("26.2");
+    let app = runtime.router("26.2", vec![]);
     let serve_cancel = CancellationToken::new();
     let sc = serve_cancel.clone();
     let serve_task = tokio::spawn(async move {
@@ -204,8 +205,8 @@ async fn three_nodes_elect_exactly_one_leader() {
         priority: p,
         download: true,
         max_download_jobs: 1,
-            post_process: false,
-        };
+        post_process: false,
+    };
     let a = start_node(tmp.path(), "a", opts(0), ns.port(), 4).await;
     let b = start_node(tmp.path(), "b", opts(1), ns.port(), 4).await;
     let c = start_node(tmp.path(), "c", opts(2), ns.port(), 4).await;
@@ -553,8 +554,8 @@ async fn single_node_cluster_restart_keeps_the_queue() {
         priority: 0,
         download: true,
         max_download_jobs: 2,
-            post_process: false,
-        };
+        post_process: false,
+    };
     let a = start_node(tmp.path(), "solo", opts(), ns.port(), 4).await;
     wait_for("self-election", 15, || {
         get_json(&a.url, "/api/v1/cluster")["is_leader"].as_bool() == Some(true)
@@ -604,7 +605,15 @@ async fn pp_runs_on_idle_node_via_anti_affinity() {
     let payload = prng_bytes(77, 90_000);
     std::fs::write(src.path().join("payload.bin"), &payload).unwrap();
     let ok = std::process::Command::new("par2")
-        .args(["create", "-q", "-q", "-s8192", "-c4", "set.par2", "payload.bin"])
+        .args([
+            "create",
+            "-q",
+            "-q",
+            "-s8192",
+            "-c4",
+            "set.par2",
+            "payload.bin",
+        ])
         .current_dir(src.path())
         .status()
         .expect("par2 binary required (apt-get install par2)")
@@ -676,16 +685,27 @@ async fn pp_runs_on_idle_node_via_anti_affinity() {
     })
     .await;
 
-    let (code, body) = http(&a.url, "POST", "/api/v1/jobs?name=pardl", post.nzb.as_bytes());
+    let (code, body) = http(
+        &a.url,
+        "POST",
+        "/api/v1/jobs?name=pardl",
+        post.nzb.as_bytes(),
+    );
     assert_eq!(code, 201, "add failed: {body}");
 
     // Download completes on a (c can't download); PP is assigned to c,
-    // executes there, and the stamped job comes back completed. Node a has
-    // NO PP manager (post_process=false), so the stamp appearing at all
-    // proves remote execution; the history file below proves it was c.
-    wait_for("pp done (remotely)", 45, || {
-        let j = &get_json(&a.url, "/api/v1/jobs")["jobs"][0];
-        j["pp_done"].as_bool() == Some(true) && j["status"] == "completed"
+    // executes there, and the stamped job comes back and is RETIRED to
+    // history by the leader sweep. Node a has NO PP manager
+    // (post_process=false), so history appearing at all proves remote
+    // execution; the per-node file below proves it was c.
+    wait_for("pp done remotely + retired to history", 45, || {
+        let empty = get_json(&a.url, "/api/v1/jobs")["jobs"]
+            .as_array()
+            .is_some_and(|j| j.is_empty());
+        let hist =
+            std::fs::read_to_string(tmp.path().join(".nzbd-cluster/history/history.c.jsonl"))
+                .unwrap_or_default();
+        empty && hist.contains("\"SUCCESS\"")
     })
     .await;
 
@@ -703,10 +723,8 @@ async fn pp_runs_on_idle_node_via_anti_affinity() {
     assert!(residue.is_empty(), "staging residue: {residue:?}");
 
     // History JSONL appended by node c on the shared volume.
-    let hist = std::fs::read_to_string(
-        tmp.path().join(".nzbd-cluster/history/history.c.jsonl"),
-    )
-    .expect("node c must have appended shared history");
+    let hist = std::fs::read_to_string(tmp.path().join(".nzbd-cluster/history/history.c.jsonl"))
+        .expect("node c must have appended shared history");
     assert!(hist.contains("\"SUCCESS\""), "history: {hist}");
     assert!(hist.contains("\"pardl\""), "history: {hist}");
 

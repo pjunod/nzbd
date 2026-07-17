@@ -110,6 +110,77 @@ fn post_config(cfg: &nzbd_config::Config, slots: usize) -> nzbd_post::manager::P
     }
 }
 
+/// NZBGet-style option projection for the compat shim's `config` method
+/// (*arr clients read categories and paths from here).
+fn compat_options(cfg: &nzbd_config::Config, bind: &str) -> Vec<(String, String)> {
+    let port = bind.rsplit(':').next().unwrap_or("6789").to_string();
+    let mut o = vec![
+        ("Version".into(), cfg.api.compat_version.clone()),
+        ("ControlPort".into(), port),
+        ("ControlIP".into(), "0.0.0.0".into()),
+        (
+            "MainDir".into(),
+            nzbd_config::expand_home(&cfg.paths.main_dir)
+                .to_string_lossy()
+                .into_owned(),
+        ),
+        (
+            "DestDir".into(),
+            cfg.dest_dir().to_string_lossy().into_owned(),
+        ),
+        (
+            "InterDir".into(),
+            cfg.paths
+                .inter_dir
+                .as_ref()
+                .map(|p| nzbd_config::expand_home(p).to_string_lossy().into_owned())
+                .unwrap_or_default(),
+        ),
+        (
+            "NzbDir".into(),
+            cfg.paths
+                .nzb_watch_dir
+                .as_ref()
+                .map(|p| nzbd_config::expand_home(p).to_string_lossy().into_owned())
+                .unwrap_or_default(),
+        ),
+        (
+            "ScriptDir".into(),
+            cfg.post
+                .scripts_dir
+                .as_ref()
+                .map(|p| nzbd_config::expand_home(p).to_string_lossy().into_owned())
+                .unwrap_or_default(),
+        ),
+        (
+            "Unpack".into(),
+            if cfg.post.unpack { "yes" } else { "no" }.into(),
+        ),
+        ("PostStrategy".into(), cfg.post.strategy.clone()),
+    ];
+    for (i, c) in cfg.categories.iter().enumerate() {
+        let n = i + 1;
+        o.push((format!("Category{n}.Name"), c.name.clone()));
+        o.push((
+            format!("Category{n}.DestDir"),
+            c.dest_dir
+                .as_ref()
+                .map(|p| nzbd_config::expand_home(p).to_string_lossy().into_owned())
+                .unwrap_or_default(),
+        ));
+        o.push((
+            format!("Category{n}.Unpack"),
+            if c.unpack.unwrap_or(cfg.post.unpack) {
+                "yes"
+            } else {
+                "no"
+            }
+            .into(),
+        ));
+    }
+    o
+}
+
 /// Open the history store: SQLite index in a node-local dir, authoritative
 /// JSONL wherever `jsonl_dir` points (shared volume in cluster mode).
 fn open_history(
@@ -184,14 +255,16 @@ fn run(config: Option<PathBuf>, bind: Option<String>) -> anyhow_lite::Result<()>
         // scripts), watching the engine's finish events.
         let pp_cancel = tokio_util::sync::CancellationToken::new();
         let pp_tracker = tokio_util::task::TaskTracker::new();
+        let mut history = None;
         if cfg.post.enabled {
             let state_dir = cfg.state_dir();
-            let history = open_history(&state_dir, &state_dir.join("history"), None)?;
+            let db = open_history(&state_dir, &state_dir.join("history"), None)?;
+            history = Some(db.clone());
             let slots = nzbd_post::manager::strategy_slots(&cfg.post.strategy);
             nzbd_post::manager::spawn_post_manager(
                 engine.clone(),
                 post_config(&cfg, slots),
-                history,
+                db,
                 cfg.dest_dir(),
                 None, // single node: always the authority
                 pp_cancel.clone(),
@@ -205,8 +278,14 @@ fn run(config: Option<PathBuf>, bind: Option<String>) -> anyhow_lite::Result<()>
                 version: cfg.api.compat_version.clone(),
             }),
             engine: engine.clone(),
+            history: history.clone(),
+            options: Arc::new(compat_options(&cfg, &bind)),
         };
-        let app = nzbd_api::router(engine.clone()).merge(nzbd_compat::router(compat_state));
+        let app = nzbd_api::router_with(nzbd_api::ApiState {
+            engine: engine.clone(),
+            history,
+        })
+        .merge(nzbd_compat::router(compat_state));
 
         let listener = tokio::net::TcpListener::bind(&bind).await?;
         tracing::info!(%bind, "nzbd listening (phase 2: engine + post-processing)");
@@ -292,7 +371,7 @@ async fn run_cluster(
     .await
     .map_err(|e| anyhow_lite::Error::msg(e.to_string()))?;
 
-    let app = runtime.router(&cfg.api.compat_version);
+    let app = runtime.router(&cfg.api.compat_version, compat_options(&cfg, &bind));
     let listener = tokio::net::TcpListener::bind(&bind).await?;
     tracing::info!(
         %bind,

@@ -162,28 +162,44 @@ async fn manager_task(
                     JobStatus::Completed if claim(&gate, job) => {
                         if let Ok(Some(exported)) = engine.export_job(job).await {
                             if !pp_done(&exported) && queued.insert(job) {
-                                spawn_job(&tracker, &engine, &cfg, &history, &dest_dir, &sem, job);
+                                spawn_job(
+                                    &tracker,
+                                    &engine,
+                                    &cfg,
+                                    &history,
+                                    &dest_dir,
+                                    &sem,
+                                    job,
+                                    gate.is_none(),
+                                );
                             }
                         }
                     }
                     JobStatus::Failed if claim(&gate, job) => {
-                        // Below critical health: no PP; record history.
-                        let (category, size) = match engine.export_job(job).await {
-                            Ok(Some(j)) => (j.category.clone(), j.totals.size),
-                            _ => (None, 0),
-                        };
+                        // Below critical health: no PP; record history and
+                        // stamp so the retire sweep moves the job out.
+                        let exported = engine.export_job(job).await.ok().flatten();
+                        if exported.as_ref().is_some_and(pp_done) {
+                            continue; // already handled (rescan overlap)
+                        }
                         let entry = HistoryEntry {
                             job,
                             name,
-                            category,
+                            category: exported.as_ref().and_then(|j| j.category.clone()),
                             final_dir: None,
                             status: "FAILURE/HEALTH".into(),
-                            size,
+                            size: exported.as_ref().map(|j| j.totals.size).unwrap_or(0),
                             health,
+                            params: exported.as_ref().map(user_params).unwrap_or_default(),
                             completed_at_unix: now(),
                         };
                         let h = history.clone();
                         let _ = tokio::task::spawn_blocking(move || h.record(&entry)).await;
+                        if let Some(mut fin) = exported {
+                            fin.params
+                                .push((PP_DONE_PARAM.into(), "FAILURE/HEALTH".into()));
+                            let _ = engine.import_job(fin, false, false).await;
+                        }
                     }
                     _ => {}
                 },
@@ -208,13 +224,33 @@ async fn scan_queue(
 ) {
     let claim = |job: JobId| gate.as_ref().map(|f| f(job)).unwrap_or(true);
     for j in engine.snapshot().jobs.iter() {
+        // NZBGet parity: finished-and-processed jobs live in history, not
+        // the queue. Single-node the manager IS the authority; in cluster
+        // mode the leader sweep retires (the gate stays out of hygiene).
+        if gate.is_none()
+            && j.pp_done
+            && matches!(j.status, JobStatus::Completed | JobStatus::Failed)
+        {
+            let _ = engine.remove_job_silent(j.id).await;
+            queued.remove(&j.id);
+            continue;
+        }
         let needs_pp = !j.pp_done
             && matches!(
                 j.status,
                 JobStatus::Completed | JobStatus::PostQueued | JobStatus::Post { .. }
             );
         if needs_pp && claim(j.id) && queued.insert(j.id) {
-            spawn_job(tracker, engine, cfg, history, dest_dir, sem, j.id);
+            spawn_job(
+                tracker,
+                engine,
+                cfg,
+                history,
+                dest_dir,
+                sem,
+                j.id,
+                gate.is_none(),
+            );
         }
     }
 }
@@ -228,6 +264,7 @@ fn spawn_job(
     dest_dir: &Path,
     sem: &Arc<tokio::sync::Semaphore>,
     job: JobId,
+    retire_local: bool,
 ) {
     let engine = engine.clone();
     let cfg = cfg.clone();
@@ -244,7 +281,12 @@ fn spawn_job(
                     job = job.0,
                     outcome = outcome.as_str(),
                     "post-processing finished"
-                )
+                );
+                if retire_local {
+                    // NZBGet parity: the finished job's record IS the
+                    // history entry — move it out of the queue now.
+                    let _ = engine.remove_job_silent(job).await;
+                }
             }
             Err(e) => tracing::error!(job = job.0, error = %e, "post-processing crashed"),
         }
@@ -253,6 +295,15 @@ fn spawn_job(
 
 fn pp_done(job: &Job) -> bool {
     job.params.iter().any(|(k, _)| k == PP_DONE_PARAM)
+}
+
+/// Parameters exposed in history: everything except `*`-internal ones.
+fn user_params(job: &Job) -> Vec<(String, String)> {
+    job.params
+        .iter()
+        .filter(|(k, _)| !k.starts_with('*'))
+        .cloned()
+        .collect()
 }
 
 fn now() -> i64 {
@@ -454,7 +505,9 @@ pub async fn process_job_ctx(
     };
 
     if !(ctx.commit_ok)() {
-        return Err(PostError::Subprocess("pp lease lost before finalize".into()));
+        return Err(PostError::Subprocess(
+            "pp lease lost before finalize".into(),
+        ));
     }
     // Stamp + set final status in one import (replaces the job atomically).
     if let Ok(Some(mut fin)) = engine.export_job(job_id).await {
@@ -474,6 +527,7 @@ pub async fn process_job_ctx(
             status: outcome.as_str().into(),
             size: fin.totals.size,
             health,
+            params: user_params(&fin),
             completed_at_unix: now(),
         };
         // History first, stamp second: a crash in between re-runs PP (the
@@ -563,10 +617,7 @@ fn remove_stale_staging(dir: &Path, own: &Path) {
     };
     for e in entries.flatten() {
         let p = e.path();
-        if p.is_dir()
-            && p != own
-            && e.file_name().to_string_lossy().starts_with(".pp.")
-        {
+        if p.is_dir() && p != own && e.file_name().to_string_lossy().starts_with(".pp.") {
             tracing::info!(dir = %p.display(), "removing superseded pp staging dir");
             let _ = std::fs::remove_dir_all(&p);
         }

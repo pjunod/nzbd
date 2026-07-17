@@ -1,22 +1,27 @@
-//! NZBGet compatibility shim.
+//! NZBGet compatibility shim (ARCHITECTURE.md §10.2).
 //!
 //! Speaks NZBGet's JSON-RPC 1.1 dialect on `/jsonrpc`: no `"jsonrpc":"2.0"`
 //! member, positional params, `{"version":"1.1","id":…,"result":…}` envelope.
-//! XML-RPC (`/xmlrpc`), JSON-P (`/jsonprpc`), GET-form safe methods, the
-//! three auth tiers and the full C1 method table (`append`, `listgroups`,
-//! `history`, `config`, `editqueue`) are phase 3 (ARCHITECTURE.md §10.2).
-//! Phase 1 answers `version`, `status` and a minimal `listgroups` with live
-//! engine data so a client pointed at the daemon gets well-shaped answers.
+//! Phase 3 C1 — the Sonarr/Radarr certification surface — is served:
+//! `version`, `status`, `listgroups`, `append` (v13+ and legacy positional
+//! forms), `history`, `editqueue` (3- and 4-arg forms), `config`/
+//! `loadconfig`, `rate`, `pausedownload`/`resumedownload`.
+//! XML-RPC (`/xmlrpc`), JSON-P, GET-form safe methods and the auth tiers
+//! are the remaining phase-3 items.
 //!
 //! Field-shape rules (do not "fix" them — clients parse by name):
 //! - 64-bit sizes are split into `…Lo` / `…Hi` / `…MB` triplets.
 //! - Deprecated aliases (`FirstID`, `LastID`, …) are preserved.
+//! - History `Status` is `"TOTAL/DETAIL"` (`SUCCESS/ALL`, `FAILURE/PAR`, …).
 
 use axum::extract::State;
 use axum::routing::post;
 use axum::{Json, Router};
+use base64::Engine as _;
 use nzbd_engine::{EngineHandle, JobSummary};
-use nzbd_types::JobStatus;
+use nzbd_state::history::HistoryDb;
+use nzbd_state::HistoryEntry;
+use nzbd_types::{JobId, JobStatus};
 use serde_json::{json, Value};
 use std::sync::Arc;
 
@@ -38,6 +43,21 @@ impl Default for CompatConfig {
 pub struct CompatState {
     pub config: Arc<CompatConfig>,
     pub engine: EngineHandle,
+    /// History store (None until the daemon wires it — e.g. bare tests).
+    pub history: Option<Arc<HistoryDb>>,
+    /// `config` method projection: NZBGet-style option (Name, Value) pairs.
+    pub options: Arc<Vec<(String, String)>>,
+}
+
+impl CompatState {
+    pub fn new(config: CompatConfig, engine: EngineHandle) -> CompatState {
+        CompatState {
+            config: Arc::new(config),
+            engine,
+            history: None,
+            options: Arc::new(Vec::new()),
+        }
+    }
 }
 
 /// Split a u64 into NZBGet's `(Lo, Hi, MB)` wire triplet.
@@ -57,114 +77,463 @@ pub fn envelope(id: Value, result: Result<Value, (i64, &str)>) -> Value {
     }
 }
 
-/// NZBGet queue status string for a job (the full vocabulary lands with
-/// the phase-3 shim: PP_QUEUED, LOADING_PARS, …).
+/// NZBGet queue status string for a job.
 fn group_status(j: &JobSummary) -> &'static str {
     match j.status {
         JobStatus::Queued => "QUEUED",
         JobStatus::Downloading => "DOWNLOADING",
         JobStatus::Paused => "PAUSED",
         JobStatus::Fetching => "FETCHING",
-        JobStatus::PostQueued | JobStatus::Post { .. } => "PP_QUEUED",
+        JobStatus::PostQueued => "PP_QUEUED",
+        JobStatus::Post { stage } => match stage {
+            nzbd_types::PostStage::ParRename | nzbd_types::PostStage::RarRename => "RENAMING",
+            nzbd_types::PostStage::ParVerify => "VERIFYING_SOURCES",
+            nzbd_types::PostStage::ParRepair => "REPAIRING",
+            nzbd_types::PostStage::Unpack => "UNPACKING",
+            nzbd_types::PostStage::Cleanup | nzbd_types::PostStage::Move => "MOVING",
+            nzbd_types::PostStage::PostUnpackRename => "RENAMING",
+            nzbd_types::PostStage::Script => "EXECUTING_SCRIPT",
+        },
         JobStatus::Completed => "SUCCESS",
         JobStatus::Failed => "FAILURE",
         JobStatus::Deleted => "DELETED",
     }
 }
 
-pub fn dispatch(
+/// Native history status → NZBGet `"TOTAL/DETAIL"` wire form.
+fn history_status(native: &str) -> &str {
+    match native {
+        "SUCCESS" => "SUCCESS/ALL",
+        "PAR_FAILURE" => "FAILURE/PAR",
+        "UNPACK_FAILURE" => "FAILURE/UNPACK",
+        "SCRIPT_FAILURE" => "WARNING/SCRIPT",
+        other => other, // already TOTAL/DETAIL shaped ("FAILURE/HEALTH", "DELETED/MANUAL")
+    }
+}
+
+fn history_json(e: &HistoryEntry) -> Value {
+    let (flo, fhi, fmb) = split64(e.size);
+    let status = history_status(&e.status);
+    let total = status.split('/').next().unwrap_or("SUCCESS");
+    let params: Vec<Value> = e
+        .params
+        .iter()
+        .map(|(k, v)| json!({ "Name": k, "Value": v }))
+        .collect();
+    json!({
+        "NZBID": e.job.0,
+        "ID": e.job.0, // deprecated alias
+        "Kind": "NZB",
+        "Name": e.name,
+        "NZBName": e.name,
+        "NZBNicename": e.name, // deprecated alias
+        "RemoteName": format!("{}.nzb", e.name),
+        "Status": status,
+        "TotalStatus": total,
+        "Category": e.category.clone().unwrap_or_default(),
+        "FileSizeLo": flo,
+        "FileSizeHi": fhi,
+        "FileSizeMB": fmb,
+        "DestDir": e.final_dir.clone().unwrap_or_default(),
+        "FinalDir": e.final_dir.clone().unwrap_or_default(),
+        "HistoryTime": e.completed_at_unix,
+        "Health": e.health,
+        "CriticalHealth": 1000,
+        "ParStatus": match status {
+            "FAILURE/PAR" => "FAILURE",
+            "SUCCESS/ALL" => "SUCCESS",
+            _ => "NONE",
+        },
+        "UnpackStatus": match status {
+            "FAILURE/UNPACK" => "FAILURE",
+            "SUCCESS/ALL" => "SUCCESS",
+            _ => "NONE",
+        },
+        "MoveStatus": "SUCCESS",
+        "ScriptStatus": if status == "WARNING/SCRIPT" { "FAILURE" } else { "NONE" },
+        "DeleteStatus": if total == "DELETED" { "MANUAL" } else { "NONE" },
+        "MarkStatus": "NONE",
+        "UrlStatus": "NONE",
+        "Parameters": params,
+        "ScriptStatuses": [],
+        "ServerStats": [],
+        "Deleted": total == "DELETED", // deprecated alias
+        "DownloadedSizeLo": flo,
+        "DownloadedSizeHi": fhi,
+        "DownloadedSizeMB": fmb,
+        "DownloadTimeSec": 0,
+        "PostTotalTimeSec": 0,
+        "ParTimeSec": 0,
+        "RepairTimeSec": 0,
+        "UnpackTimeSec": 0,
+        "DupeKey": "",
+        "DupeScore": 0,
+        "DupeMode": "SCORE",
+        "RetryData": false,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// param helpers (positional JSON-RPC arrays, NZBGet-tolerant coercions)
+// ---------------------------------------------------------------------------
+
+fn p_str(params: &Value, i: usize) -> String {
+    params
+        .get(i)
+        .map(|v| match v {
+            Value::String(s) => s.clone(),
+            other => other.to_string().trim_matches('"').to_string(),
+        })
+        .unwrap_or_default()
+}
+
+fn p_i64(params: &Value, i: usize) -> i64 {
+    match params.get(i) {
+        Some(Value::Number(n)) => n.as_i64().unwrap_or(0),
+        Some(Value::String(s)) => s.parse().unwrap_or(0),
+        Some(Value::Bool(b)) => *b as i64,
+        _ => 0,
+    }
+}
+
+fn p_bool(params: &Value, i: usize) -> bool {
+    match params.get(i) {
+        Some(Value::Bool(b)) => *b,
+        Some(Value::Number(n)) => n.as_i64().unwrap_or(0) != 0,
+        Some(Value::String(s)) => s.eq_ignore_ascii_case("true") || s == "1",
+        _ => false,
+    }
+}
+
+fn p_ids(params: &Value, i: usize) -> Vec<JobId> {
+    match params.get(i) {
+        Some(Value::Array(a)) => a
+            .iter()
+            .filter_map(|v| v.as_i64().map(|n| JobId(n as u32)))
+            .collect(),
+        Some(Value::Number(n)) => n.as_i64().map(|n| JobId(n as u32)).into_iter().collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Decode append content: base64-encoded NZB (the documented form) or raw
+/// XML (tolerated). `None` if it is neither.
+fn decode_nzb(content: &str) -> Option<Vec<u8>> {
+    let trimmed = content.trim();
+    if trimmed.contains("<nzb") || trimmed.starts_with("<?xml") {
+        return Some(trimmed.as_bytes().to_vec());
+    }
+    let cleaned: String = trimmed.chars().filter(|c| !c.is_whitespace()).collect();
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(&cleaned)
+        .ok()?;
+    let head = String::from_utf8_lossy(&decoded[..decoded.len().min(4096)]).to_lowercase();
+    head.contains("<nzb").then_some(decoded)
+}
+
+// ---------------------------------------------------------------------------
+// dispatch
+// ---------------------------------------------------------------------------
+
+pub async fn dispatch(
     state: &CompatState,
     method: &str,
-    _params: &Value,
+    params: &Value,
 ) -> Result<Value, (i64, &'static str)> {
     match method {
         "version" => Ok(Value::String(state.config.version.clone())),
-        "status" => {
-            let snap = state.engine.snapshot();
-            let (rlo, rhi, rmb) = split64(snap.remaining_bytes);
-            let (dlo, dhi, dmb) = split64(snap.session_downloaded_bytes);
-            let uptime = (nowish() - snap.up_since_unix).max(0);
-            Ok(json!({
+        "status" => Ok(status_json(state)),
+        "listgroups" => Ok(listgroups_json(state)),
+        "append" => append(state, params).await,
+        "history" => history(state).await,
+        "editqueue" => editqueue(state, params).await,
+        "config" | "loadconfig" => {
+            let opts: Vec<Value> = state
+                .options
+                .iter()
+                .map(|(k, v)| json!({ "Name": k, "Value": v }))
+                .collect();
+            Ok(Value::Array(opts))
+        }
+        "rate" => {
+            let kib = p_i64(params, 0).max(0) as u64;
+            let limit = if kib == 0 { None } else { Some(kib * 1024) };
+            match state.engine.set_speed_limit(limit).await {
+                Ok(()) => Ok(Value::Bool(true)),
+                Err(_) => Ok(Value::Bool(false)),
+            }
+        }
+        "pausedownload" | "pausedownload2" => {
+            Ok(Value::Bool(state.engine.pause_all().await.is_ok()))
+        }
+        "resumedownload" | "resumedownload2" => {
+            Ok(Value::Bool(state.engine.resume_all().await.is_ok()))
+        }
+        "writelog" => Ok(Value::Bool(true)),
+        _ => Err((1, "Invalid procedure")),
+    }
+}
+
+fn status_json(state: &CompatState) -> Value {
+    let snap = state.engine.snapshot();
+    let (rlo, rhi, rmb) = split64(snap.remaining_bytes);
+    let (dlo, dhi, dmb) = split64(snap.session_downloaded_bytes);
+    let uptime = (nowish() - snap.up_since_unix).max(0);
+    let post_jobs = snap
+        .jobs
+        .iter()
+        .filter(|j| matches!(j.status, JobStatus::PostQueued | JobStatus::Post { .. }))
+        .count() as u32;
+    json!({
+        "RemainingSizeLo": rlo,
+        "RemainingSizeHi": rhi,
+        "RemainingSizeMB": rmb,
+        "DownloadedSizeLo": dlo,
+        "DownloadedSizeHi": dhi,
+        "DownloadedSizeMB": dmb,
+        "DownloadRate": snap.download_rate_bps.min(u32::MAX as u64) as u32,
+        "AverageDownloadRate": 0,
+        "DownloadLimit": snap.speed_limit_bps.unwrap_or(0).min(u32::MAX as u64) as u32,
+        "DownloadPaused": snap.download_paused,
+        "Download2Paused": snap.download_paused, // deprecated alias
+        "PostPaused": false,
+        "ScanPaused": false,
+        "ServerStandBy": snap.download_rate_bps == 0,
+        "UpTimeSec": uptime,
+        "DownloadTimeSec": uptime,
+        "ThreadCount": 1,
+        "PostJobCount": post_jobs,
+        "UrlCount": 0,
+        "QuotaReached": false,
+        "NewsServers": [],
+    })
+}
+
+fn listgroups_json(state: &CompatState) -> Value {
+    let snap = state.engine.snapshot();
+    let groups: Vec<Value> = snap
+        .jobs
+        .iter()
+        .filter(|j| {
+            !matches!(
+                j.status,
+                JobStatus::Completed | JobStatus::Failed | JobStatus::Deleted
+            )
+        })
+        .map(|j| {
+            let (flo, fhi, fmb) = split64(j.size_bytes);
+            let remaining = j.remaining_bytes;
+            let (rlo, rhi, rmb) = split64(remaining);
+            let (dlo, dhi, dmb) = split64(j.downloaded_bytes);
+            json!({
+                "NZBID": j.id,
+                "FirstID": j.id, // deprecated alias
+                "LastID": j.id,  // deprecated alias
+                "NZBName": j.name,
+                "NZBNicename": j.name, // deprecated alias
+                "Kind": "NZB",
+                "Status": group_status(j),
+                "Category": j.category.clone().unwrap_or_default(),
+                "Priority": j.priority,
+                "FileSizeLo": flo,
+                "FileSizeHi": fhi,
+                "FileSizeMB": fmb,
                 "RemainingSizeLo": rlo,
                 "RemainingSizeHi": rhi,
                 "RemainingSizeMB": rmb,
                 "DownloadedSizeLo": dlo,
                 "DownloadedSizeHi": dhi,
                 "DownloadedSizeMB": dmb,
-                "DownloadRate": snap.download_rate_bps.min(u32::MAX as u64) as u32,
-                "AverageDownloadRate": 0,
-                "DownloadLimit": snap.speed_limit_bps.unwrap_or(0).min(u32::MAX as u64) as u32,
-                "DownloadPaused": snap.download_paused,
-                "Download2Paused": snap.download_paused, // deprecated alias
-                "PostPaused": false,
-                "ScanPaused": false,
-                "ServerStandBy": snap.download_rate_bps == 0,
-                "UpTimeSec": uptime,
-                "DownloadTimeSec": uptime,
-                "ThreadCount": 1,
-                "PostJobCount": 0,
-                "UrlCount": 0,
-                "QuotaReached": false,
-                "NewsServers": [],
-            }))
+                "PausedSizeLo": 0, "PausedSizeHi": 0, "PausedSizeMB": 0,
+                "FileCount": j.files_total,
+                "RemainingFileCount": j.files_total - j.files_done,
+                "RemainingParCount": 0,
+                "Health": j.health,
+                "CriticalHealth": j.critical_health,
+                "DupeKey": "",
+                "DupeScore": 0,
+                "DupeMode": "SCORE",
+                "Parameters": [],
+                "ScriptStatuses": [],
+                "ServerStats": [],
+                "PostInfoText": "NONE",
+                "PostStageProgress": 0,
+                "PostTotalTimeSec": 0,
+                "PostStageTimeSec": 0,
+            })
+        })
+        .collect();
+    Value::Array(groups)
+}
+
+/// `append` — v13+ form `(NZBFilename, Content, Category, Priority,
+/// AddToTop, AddPaused, DupeKey, DupeScore, DupeMode, [PPParameters])` and
+/// the legacy pre-13 form `(NZBFilename, Category, Priority, AddToTop,
+/// Content)`. Returns the NZBID, or 0 on failure (NZBGet's convention).
+async fn append(state: &CompatState, params: &Value) -> Result<Value, (i64, &'static str)> {
+    let filename = p_str(params, 0);
+    // Which positional form? v13+ carries content at [1]; legacy at [4].
+    let (content, category, priority, add_paused) = match decode_nzb(&p_str(params, 1)) {
+        Some(c) => (
+            Some(c),
+            p_str(params, 2),
+            p_i64(params, 3) as i32,
+            p_bool(params, 5),
+        ),
+        None => (
+            decode_nzb(&p_str(params, 4)),
+            p_str(params, 1),
+            p_i64(params, 2) as i32,
+            false,
+        ),
+    };
+    let Some(content) = content else {
+        tracing::warn!(%filename, "append: content is neither base64 NZB nor XML (URL jobs land later)");
+        return Ok(json!(0));
+    };
+    let category = (!category.is_empty()).then_some(category);
+    match state
+        .engine
+        .add_nzb(&filename, &content, category, priority)
+        .await
+    {
+        Ok(id) => {
+            if add_paused {
+                let _ = state.engine.pause_job(id).await;
+            }
+            Ok(json!(id.0))
         }
-        "listgroups" => {
-            let snap = state.engine.snapshot();
-            let groups: Vec<Value> = snap
-                .jobs
-                .iter()
-                .filter(|j| {
-                    !matches!(
-                        j.status,
-                        JobStatus::Completed | JobStatus::Failed | JobStatus::Deleted
-                    )
+        Err(e) => {
+            tracing::warn!(%filename, error = %e, "append failed");
+            Ok(json!(0))
+        }
+    }
+}
+
+async fn history(state: &CompatState) -> Result<Value, (i64, &'static str)> {
+    let Some(db) = &state.history else {
+        return Ok(Value::Array(vec![]));
+    };
+    let db = db.clone();
+    let entries = tokio::task::spawn_blocking(move || {
+        let _ = db.refresh();
+        db.list(1000)
+    })
+    .await;
+    match entries {
+        Ok(Ok(entries)) => Ok(Value::Array(entries.iter().map(history_json).collect())),
+        _ => Err((2, "history store error")),
+    }
+}
+
+/// `editqueue` — v16+ `(Command, Param, IDs)` and v13 `(Command, Offset,
+/// Param, IDs)`; both accepted by arity. Returns bool like NZBGet.
+async fn editqueue(state: &CompatState, params: &Value) -> Result<Value, (i64, &'static str)> {
+    let command = p_str(params, 0);
+    // 4-arg legacy form has a numeric Offset at [1] and IDs at [3].
+    let legacy = params.get(3).is_some() && params.get(1).map(|v| v.is_number()).unwrap_or(false);
+    let (text, ids) = if legacy {
+        (p_str(params, 2), p_ids(params, 3))
+    } else {
+        (p_str(params, 1), p_ids(params, 2))
+    };
+    if ids.is_empty() {
+        return Ok(Value::Bool(false));
+    }
+
+    let mut ok = true;
+    for id in ids {
+        let done = match command.as_str() {
+            "GroupPause" => state.engine.pause_job(id).await.unwrap_or(false),
+            "GroupResume" => state.engine.resume_job(id).await.unwrap_or(false),
+            "GroupDelete" | "GroupParkDelete" | "GroupTrashDelete" => {
+                delete_to_history(state, id, false).await
+            }
+            "GroupFinalDelete" => state.engine.delete_job(id, true).await.unwrap_or(false),
+            "GroupSetPriority" => {
+                let prio: i32 = text.parse().unwrap_or(0);
+                state.engine.set_priority(id, prio).await.unwrap_or(false)
+            }
+            "GroupSetCategory" => {
+                edit_job(state, id, |j| {
+                    j.category = (!text.is_empty()).then(|| text.clone());
                 })
-                .map(|j| {
-                    let (flo, fhi, fmb) = split64(j.size_bytes);
-                    let remaining = j.remaining_bytes;
-                    let (rlo, rhi, rmb) = split64(remaining);
-                    let (dlo, dhi, dmb) = split64(j.downloaded_bytes);
-                    json!({
-                        "NZBID": j.id,
-                        "FirstID": j.id, // deprecated alias
-                        "LastID": j.id,  // deprecated alias
-                        "NZBName": j.name,
-                        "NZBNicename": j.name, // deprecated alias
-                        "Kind": "NZB",
-                        "Status": group_status(j),
-                        "Category": j.category.clone().unwrap_or_default(),
-                        "Priority": j.priority,
-                        "FileSizeLo": flo,
-                        "FileSizeHi": fhi,
-                        "FileSizeMB": fmb,
-                        "RemainingSizeLo": rlo,
-                        "RemainingSizeHi": rhi,
-                        "RemainingSizeMB": rmb,
-                        "DownloadedSizeLo": dlo,
-                        "DownloadedSizeHi": dhi,
-                        "DownloadedSizeMB": dmb,
-                        "PausedSizeLo": 0, "PausedSizeHi": 0, "PausedSizeMB": 0,
-                        "FileCount": j.files_total,
-                        "RemainingFileCount": j.files_total - j.files_done,
-                        "RemainingParCount": 0,
-                        "Health": j.health,
-                        "CriticalHealth": j.critical_health,
-                        "DupeKey": "",
-                        "DupeScore": 0,
-                        "DupeMode": "SCORE",
-                        "Parameters": [],
-                        "ScriptStatuses": [],
-                        "ServerStats": [],
-                        "PostInfoText": "NONE",
-                        "PostStageProgress": 0,
-                        "PostTotalTimeSec": 0,
-                        "PostStageTimeSec": 0,
+                .await
+            }
+            "GroupSetParameter" => match text.split_once('=') {
+                Some((k, v)) => {
+                    let (k, v) = (k.to_string(), v.to_string());
+                    edit_job(state, id, move |j| {
+                        if let Some(p) = j.params.iter_mut().find(|(pk, _)| *pk == k) {
+                            p.1 = v.clone();
+                        } else {
+                            j.params.push((k.clone(), v.clone()));
+                        }
                     })
-                })
-                .collect();
-            Ok(Value::Array(groups))
+                    .await
+                }
+                None => false,
+            },
+            "HistoryDelete" | "HistoryFinalDelete" => match &state.history {
+                Some(db) => {
+                    let db = db.clone();
+                    tokio::task::spawn_blocking(move || db.delete(id).unwrap_or(false))
+                        .await
+                        .unwrap_or(false)
+                }
+                None => false,
+            },
+            other => {
+                tracing::debug!(command = other, "editqueue: unsupported command");
+                false
+            }
+        };
+        ok &= done;
+    }
+    Ok(Value::Bool(ok))
+}
+
+/// Delete a queue job the NZBGet way: it becomes a history entry.
+async fn delete_to_history(state: &CompatState, id: JobId, with_files: bool) -> bool {
+    let exported = state.engine.export_job(id).await.ok().flatten();
+    let deleted = state
+        .engine
+        .delete_job(id, with_files)
+        .await
+        .unwrap_or(false);
+    if deleted {
+        if let (Some(db), Some(job)) = (&state.history, exported) {
+            let entry = HistoryEntry {
+                job: id,
+                name: job.name.clone(),
+                category: job.category.clone(),
+                final_dir: None,
+                status: "DELETED/MANUAL".into(),
+                size: job.totals.size,
+                health: nzbd_types::Health::calc(&job.totals).0,
+                params: job
+                    .params
+                    .iter()
+                    .filter(|(k, _)| !k.starts_with('*'))
+                    .cloned()
+                    .collect(),
+                completed_at_unix: nowish(),
+            };
+            let db = db.clone();
+            let _ = tokio::task::spawn_blocking(move || db.record(&entry)).await;
         }
-        _ => Err((1, "Invalid procedure")),
+    }
+    deleted
+}
+
+/// Export → mutate → import (atomic job replacement).
+async fn edit_job<F: FnOnce(&mut nzbd_types::Job)>(state: &CompatState, id: JobId, f: F) -> bool {
+    match state.engine.export_job(id).await {
+        Ok(Some(mut job)) => {
+            f(&mut job);
+            state.engine.import_job(job, false, false).await.is_ok()
+        }
+        _ => false,
     }
 }
 
@@ -186,7 +555,7 @@ async fn jsonrpc(State(state): State<CompatState>, body: String) -> Json<Value> 
         .and_then(Value::as_str)
         .unwrap_or_default();
     let params = req.get("params").cloned().unwrap_or(Value::Array(vec![]));
-    Json(envelope(id, dispatch(&state, method, &params)))
+    Json(envelope(id, dispatch(&state, method, &params).await))
 }
 
 pub fn router(state: CompatState) -> Router {
@@ -210,9 +579,15 @@ mod tests {
         ))
         .await
         .unwrap();
+        let history = HistoryDb::open(&tmp.path().join("history.sqlite"), None).unwrap();
         CompatState {
             config: Arc::new(CompatConfig::default()),
             engine,
+            history: Some(Arc::new(history)),
+            options: Arc::new(vec![
+                ("ControlPort".into(), "6789".into()),
+                ("Category1.Name".into(), "tv".into()),
+            ]),
         }
     }
 
@@ -237,7 +612,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let state = test_state(&tmp).await;
 
-        let result = dispatch(&state, "version", &Value::Null).unwrap();
+        let result = dispatch(&state, "version", &Value::Null).await.unwrap();
         assert_eq!(result, Value::String("26.2".into()));
         let env = envelope(json!(7), Ok(result));
         assert_eq!(env["version"], "1.1"); // JSON-RPC 1.1 dialect, not 2.0
@@ -245,7 +620,7 @@ mod tests {
         assert_eq!(env["result"], "26.2");
         assert!(env.get("jsonrpc").is_none());
 
-        let status = dispatch(&state, "status", &Value::Null).unwrap();
+        let status = dispatch(&state, "status", &Value::Null).await.unwrap();
         for key in [
             "RemainingSizeLo",
             "RemainingSizeHi",
@@ -255,6 +630,7 @@ mod tests {
             "Download2Paused",
             "ServerStandBy",
             "UpTimeSec",
+            "PostJobCount",
         ] {
             assert!(status.get(key).is_some(), "missing {key}");
         }
@@ -271,7 +647,7 @@ mod tests {
             .await
             .unwrap();
 
-        let groups = dispatch(&state, "listgroups", &Value::Null).unwrap();
+        let groups = dispatch(&state, "listgroups", &Value::Null).await.unwrap();
         let g = &groups[0];
         assert_eq!(g["NZBID"], id.0);
         assert_eq!(g["FirstID"], id.0, "deprecated alias preserved");
@@ -283,8 +659,197 @@ mod tests {
         assert_eq!(g["Health"], 1000);
 
         // status remaining reflects the queued article bytes
-        let status = dispatch(&state, "status", &Value::Null).unwrap();
+        let status = dispatch(&state, "status", &Value::Null).await.unwrap();
         assert_eq!(status["RemainingSizeLo"], 4_194_304u32);
+        state.engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn append_v13_form_like_sonarr() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state(&tmp).await;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(NZB);
+        // Sonarr: [filename, content, category, priority, addToTop,
+        //          addPaused, dupeKey, dupeScore, dupeMode]
+        let params = json!([
+            "My.Show.S01E01.nzb",
+            b64,
+            "tv",
+            0,
+            false,
+            true,
+            "",
+            0,
+            "SCORE"
+        ]);
+        let id = dispatch(&state, "append", &params).await.unwrap();
+        assert!(id.as_i64().unwrap() > 0, "append must return the NZBID");
+
+        let groups = dispatch(&state, "listgroups", &Value::Null).await.unwrap();
+        assert_eq!(groups[0]["NZBName"], "My.Show.S01E01"); // .nzb stripped
+        assert_eq!(groups[0]["Category"], "tv");
+        assert_eq!(groups[0]["Status"], "PAUSED", "AddPaused honored");
+
+        // Legacy pre-13 positional form: content at [4].
+        let params = json!(["Old.Client.nzb", "movies", 0, false, NZB]);
+        let id2 = dispatch(&state, "append", &params).await.unwrap();
+        assert!(id2.as_i64().unwrap() > id.as_i64().unwrap());
+
+        // Garbage content → 0, never an error (NZBGet convention).
+        let params = json!(["x.nzb", "not-an-nzb", "", 0, false, false, "", 0, "SCORE"]);
+        assert_eq!(dispatch(&state, "append", &params).await.unwrap(), json!(0));
+        state.engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn editqueue_pause_resume_delete_and_history() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state(&tmp).await;
+        let id = state
+            .engine
+            .add_nzb("editme", NZB.as_bytes(), None, 0)
+            .await
+            .unwrap();
+
+        // v16+ 3-arg form.
+        let r = dispatch(&state, "editqueue", &json!(["GroupPause", "", [id.0]]))
+            .await
+            .unwrap();
+        assert_eq!(r, json!(true));
+        let groups = dispatch(&state, "listgroups", &Value::Null).await.unwrap();
+        assert_eq!(groups[0]["Status"], "PAUSED");
+
+        // v13 4-arg form (offset ignored for non-move commands).
+        let r = dispatch(&state, "editqueue", &json!(["GroupResume", 0, "", [id.0]]))
+            .await
+            .unwrap();
+        assert_eq!(r, json!(true));
+
+        // Set a parameter then a category, verify via export.
+        let r = dispatch(
+            &state,
+            "editqueue",
+            &json!(["GroupSetParameter", "drone=abc123", [id.0]]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(r, json!(true));
+        let r = dispatch(
+            &state,
+            "editqueue",
+            &json!(["GroupSetCategory", "tv", [id.0]]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(r, json!(true));
+        let job = state.engine.export_job(id).await.unwrap().unwrap();
+        assert!(job
+            .params
+            .iter()
+            .any(|(k, v)| k == "drone" && v == "abc123"));
+        assert_eq!(job.category.as_deref(), Some("tv"));
+
+        // GroupDelete: gone from the queue, present in history as DELETED.
+        let r = dispatch(&state, "editqueue", &json!(["GroupDelete", "", [id.0]]))
+            .await
+            .unwrap();
+        assert_eq!(r, json!(true));
+        let hist = dispatch(&state, "history", &json!([false])).await.unwrap();
+        assert_eq!(hist[0]["NZBID"], id.0);
+        assert_eq!(hist[0]["Status"], "DELETED/MANUAL");
+        assert_eq!(hist[0]["Name"], "editme");
+        let p = hist[0]["Parameters"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["Name"] == "drone")
+            .expect("drone param surfaces in history");
+        assert_eq!(p["Value"], "abc123");
+
+        // HistoryDelete clears it.
+        let r = dispatch(&state, "editqueue", &json!(["HistoryDelete", "", [id.0]]))
+            .await
+            .unwrap();
+        assert_eq!(r, json!(true));
+        let hist = dispatch(&state, "history", &json!([false])).await.unwrap();
+        assert!(hist.as_array().unwrap().is_empty());
+        state.engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn history_status_mapping_and_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state(&tmp).await;
+        let db = state.history.as_ref().unwrap();
+        for (native, _wire) in [
+            ("SUCCESS", "SUCCESS/ALL"),
+            ("PAR_FAILURE", "FAILURE/PAR"),
+            ("SCRIPT_FAILURE", "WARNING/SCRIPT"),
+            ("FAILURE/HEALTH", "FAILURE/HEALTH"),
+        ] {
+            db.record(&HistoryEntry {
+                job: JobId(native.len() as u32), // distinct ids
+                name: native.into(),
+                category: None,
+                final_dir: Some("/dest/x".into()),
+                status: native.into(),
+                size: 5 << 32, // exercise the Hi word
+                health: 1000,
+                params: vec![],
+                completed_at_unix: 100 + native.len() as i64,
+            })
+            .unwrap();
+        }
+        let hist = dispatch(&state, "history", &json!([false])).await.unwrap();
+        for h in hist.as_array().unwrap() {
+            let name = h["Name"].as_str().unwrap();
+            let expected = match name {
+                "SUCCESS" => "SUCCESS/ALL",
+                "PAR_FAILURE" => "FAILURE/PAR",
+                "SCRIPT_FAILURE" => "WARNING/SCRIPT",
+                other => other,
+            };
+            assert_eq!(h["Status"], expected, "{name}");
+            assert_eq!(h["FileSizeHi"], 5);
+            assert_eq!(h["FinalDir"], "/dest/x");
+        }
+
+        let cfg = dispatch(&state, "config", &Value::Null).await.unwrap();
+        assert!(cfg
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|o| o["Name"] == "Category1.Name" && o["Value"] == "tv"));
+        state.engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn rate_and_pause_family() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state(&tmp).await;
+        assert_eq!(
+            dispatch(&state, "rate", &json!([2048])).await.unwrap(),
+            json!(true)
+        );
+        assert_eq!(
+            state.engine.snapshot().speed_limit_bps,
+            Some(2048 * 1024),
+            "rate is KiB/s"
+        );
+        assert_eq!(
+            dispatch(&state, "rate", &json!([0])).await.unwrap(),
+            json!(true)
+        );
+        assert_eq!(state.engine.snapshot().speed_limit_bps, None);
+
+        dispatch(&state, "pausedownload", &Value::Null)
+            .await
+            .unwrap();
+        assert!(state.engine.snapshot().download_paused);
+        dispatch(&state, "resumedownload", &Value::Null)
+            .await
+            .unwrap();
+        assert!(!state.engine.snapshot().download_paused);
         state.engine.shutdown().await;
     }
 
@@ -293,7 +858,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let state = test_state(&tmp).await;
         assert_eq!(
-            dispatch(&state, "nope", &Value::Null),
+            dispatch(&state, "nope", &Value::Null).await,
             Err((1, "Invalid procedure"))
         );
         state.engine.shutdown().await;

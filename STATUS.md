@@ -8,8 +8,9 @@ roadmaps in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) §16 and
 Legend: ✅ done (implemented, tested, committed) · 🔶 partial · ⬜ not
 started · 👤 operator action (Paul)
 
-**Snapshot (2026-07-17):** 106 tests · clippy clean · phases 0, 1, 2 and
-cluster C1+C2 complete · next up: **Phase 3 native API + *arr compat**
+**Snapshot (2026-07-17):** 111 tests · clippy clean · phases 0, 1, 2,
+cluster C1+C2 and the *arr compat core (3a) complete · next up: **rest of
+phase 3** (importer, XML-RPC, SSE/auth/metrics)
 
 | Phase | State | Evidence |
 |---|---|---|
@@ -18,8 +19,9 @@ cluster C1+C2 complete · next up: **Phase 3 native API + *arr compat**
 | C1 — Cluster foundation | ✅ complete | `e4178b2` (design), `0969a79` (impl) |
 | CI & quality gates | ✅ complete (2 decisions open) | `b0b5530`, `0de429b` |
 | 2 — Post-processing | ✅ core complete | `1fdad15` |
-| C2 — PP leases + anti-affinity | ✅ complete | this commit |
-| 3 — Native API + *arr compat shim | ⬜ | — |
+| C2 — PP leases + anti-affinity | ✅ complete | `9f402d8` |
+| 3a — *arr compat core (append/history/editqueue) | ✅ complete | this commit |
+| 3b — importer, XML-RPC, SSE, auth, metrics | ⬜ next | — |
 | 4 — Web UI + ecosystem | ⬜ | — |
 | 5 — Beyond parity (+ C3) | ⬜ | — |
 
@@ -104,14 +106,18 @@ cluster C1+C2 complete · next up: **Phase 3 native API + *arr compat**
 - ✅ C2: PP work-lease type + anti-affinity scheduling (a job downloaded on node B post-processes on node C) — see the cluster section
 - ⬜ C2 fixture extras: kill-mid-PP reclaim e2e (reclaim machinery itself is exercised by the download-lease tests)
 
-## Phase 3 — Native API + compat ⬜
+## Phase 3 — Native API + compat 🔶 (3a done)
 
+- ✅ Compat C1 — the Sonarr/Radarr certification surface: `append` (v13+ 9-arg form AND legacy 5-arg positional form; base64 or raw XML; AddPaused honored; returns NZBID or 0), `history` (full NZBGet field shape: `TOTAL/DETAIL` statuses, Lo/Hi/MB triplets, Parameters, FinalDir/DestDir, Par/Unpack/Script statuses, deprecated aliases), `editqueue` (3-arg v16+ AND 4-arg v13 forms: Group Pause/Resume/Delete/FinalDelete/SetPriority/SetCategory/SetParameter, HistoryDelete; GroupDelete records a `DELETED/MANUAL` history entry), `config`/`loadconfig` (option projection incl. `CategoryN.*`), `rate`, `pausedownload`/`resumedownload`
+- ✅ Queue→history lifecycle (NZBGet parity): post-processed jobs retire out of the queue — immediately after local PP, via the leader sweep in cluster mode; health-failed jobs stamped + retired the same way
+- ✅ Native `GET /api/v1/history` (limit param; cluster-aware via throttled JSONL union refresh)
+- ✅ Post-stage queue status vocabulary in `listgroups` (VERIFYING_SOURCES / REPAIRING / UNPACKING / EXECUTING_SCRIPT / …)
+- ✅ e2e: `sonarr_style_flow_over_jsonrpc` against the real daemon binary — version gate → config category check → base64 append → listgroups poll to empty → history shows SUCCESS/ALL + FinalDir → file imported bit-identical
 - ⬜ Native REST completion: SSE events, servers/config/logs endpoints, Prometheus `/metrics`, bearer-token auth + roles, OpenAPI
-- ⬜ Compat C1 in full: `append` (all arg forms), `history`, `config`, `editqueue` action set — the Sonarr/Radarr certification surface
-- ⬜ Compat C2: `listfiles`, pause/resume family, `rate`, logs, scan, config RPCs
+- ⬜ Compat C2: `listfiles`, `listgroups` file details, logs, scan, per-file editqueue actions
 - ⬜ XML-RPC + `system.multicall` + JSON-P + GET-form safe methods; auth tiers
 - ⬜ Golden structural tests vs recorded NZBGet 26.2 responses; nightly live *arr containers
-- ⬜ `nzbget.conf` importer with report; shim config projection
+- ⬜ `nzbget.conf` importer with report
 - ⬜ `rapidyenc-sys` FFI feature (vendored) + differential fuzzing vs scalar decoder
 
 ## Phase 4 — Web UI + ecosystem ⬜
