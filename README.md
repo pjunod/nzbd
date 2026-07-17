@@ -5,6 +5,8 @@
 [![Coverage](https://raw.githubusercontent.com/pjunod/nzbd/badges/coverage.svg)](https://github.com/pjunod/nzbd/actions/workflows/coverage.yml)
 [![Test count](https://raw.githubusercontent.com/pjunod/nzbd/badges/tests.svg)](https://github.com/pjunod/nzbd/actions/workflows/ci.yml)
 
+**➜ [Project status — what's done, what's next](STATUS.md)**
+
 A ground-up Rust reimplementation of the [NZBGet](https://nzbget.com) Usenet
 downloader — modern architecture, same soul: tiny footprint, line-rate
 throughput, direct-to-disk writing, and drop-in compatibility with the

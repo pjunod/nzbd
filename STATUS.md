@@ -1,0 +1,129 @@
+# nzbd — Project Status
+
+The explicit ledger of what this project intends to do and whether it is
+done. **Update this file in every feature commit.** Derived from the
+roadmaps in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) §16 and
+[`docs/CLUSTERING.md`](docs/CLUSTERING.md) §13.
+
+Legend: ✅ done (implemented, tested, committed) · 🔶 partial · ⬜ not
+started · 👤 operator action (Paul)
+
+**Snapshot (2026-07-17):** 87 tests · 87.3% line coverage · clippy clean ·
+phases 0, 1 and cluster C1 complete · next up: **Phase 2 post-processing**
+
+| Phase | State | Evidence |
+|---|---|---|
+| 0 — Scaffold | ✅ complete | `10eed82` |
+| 1 — Core engine | ✅ complete | `2f45cd5` |
+| C1 — Cluster foundation | ✅ complete | `e4178b2` (design), `0969a79` (impl) |
+| CI & quality gates | ✅ complete (2 decisions open) | `b0b5530`, `0de429b` |
+| 2 — Post-processing (+ C2 PP leases) | ⬜ next | — |
+| 3 — Native API + *arr compat shim | ⬜ | — |
+| 4 — Web UI + ecosystem | ⬜ | — |
+| 5 — Beyond parity (+ C3) | ⬜ | — |
+
+---
+
+## Phase 0 — Scaffold ✅
+
+- ✅ Cargo workspace (13 crates), edition 2021, MSRV 1.85
+- ✅ Domain model + NZBGet's exact health formulas (`nzbd-types`)
+- ✅ Streaming NZB parser: entities, DOCTYPE, unordered/dup segments (`nzbd-nzb`)
+- ✅ Incremental chunk-boundary-safe yEnc decoder + CRC32 + `crc32_combine` (`nzbd-yenc`)
+- ✅ NNTP codec: responses, command injection guards, multiline reader (`nzbd-nntp`)
+- ✅ Server failover ladder as a pure, scenario-tested function (`nzbd-engine`)
+
+## Phase 1 — Core engine ✅
+
+- ✅ Single-owner queue task: mpsc commands, arc-swap snapshots, broadcast events
+- ✅ Scheduler wired to the ladder: tiers, groups, fill servers, per-server retention pre-fail, per-server retry reset, force priority, PropagationDelay
+- ✅ Per-server connection pools, connect-on-demand, 5 s idle retirement
+- ✅ NNTP pipelining (per-server depth), terminator-aware bounded yEnc consumption
+- ✅ rustls transport: TLS with Strict/Minimal/None cert levels, AUTHINFO
+- ✅ DirectWrite writers: sparse preallocate, positional writes, gap zero-fill, atomic rename, combined whole-file CRCs
+- ✅ Delayed-par pausing (`*.volNNN+MM.par2` queued paused)
+- ✅ Health-gated completion (Completed vs Failed below critical health)
+- ✅ Token-bucket rate limiter (debt model) + 30×1 s speed meter
+- ✅ Crash safety: append-only journal + atomic snapshots + unclean marker; kill -9 resume proven in e2e (no re-fetch of journaled segments)
+- ✅ `nzbd-nserv` mock NNTP server: generated posts, 430/CRC/disconnect/latency injection, hit + concurrency gauges
+- ✅ Native API subset: status, jobs add/list/detail, job + queue actions, speed limit
+- ✅ Compat shim: `version`, `status`, `listgroups` in NZBGet's JSON-RPC 1.1 dialect with Lo/Hi/MB triplets
+- ✅ CLI `run` / `add` / `status`; whole-daemon test (real binary, real CLI, SIGINT)
+- ⬜ COMPRESS DEFLATE (RFC 8054)
+- ⬜ RAM article cache (`ArticleCache`, default-off in NZBGet too)
+- ⬜ Quotas + per-server volume counters
+- ⬜ URL jobs (`AddUrl` / fetch)
+- ⬜ Min-free-disk-space check
+- ⬜ Filename deobfuscation beyond the quoted-subject heuristic; direct rename
+- 👤 Real-provider smoke test (point `nzbd run` at an actual news server) — never yet done
+
+## Cluster — C1 foundation ✅ (design ADR-13…16 accepted)
+
+- ✅ Leader election on the shared volume: monotonic staleness observation, write–wait–verify, priority stagger (observing), epoch fencing via verify-before-commit snapshot guard
+- ✅ Node registry (presence, capabilities, load; seq-progression liveness)
+- ✅ Per-job fenced journals with union replay (`jobs/<id>/journal.<node>`) — overlap-safe reclaim without locks
+- ✅ Work-lease protocol: poll/heartbeat/complete, TTL reclaim, **adoption** of running leases across leader failover
+- ✅ Whole-job download distribution; engine worker mode (import/export, delegation, mirror overlay, crash-only demotion)
+- ✅ Cluster-wide provider connection-budget partitioning (non-download nodes pinned to zero)
+- ✅ Any-node API: full API + shim everywhere, transparent proxy to the leader
+- ✅ `[cluster]` config + validation; single-node mode untouched
+- ✅ 5 multi-node e2e tests: single-leader invariant, distributed download via proxied add with budget held, worker-death reclaim (zero re-fetch), leader-death failover with lease adoption, restart persistence
+- ⬜ C2: PP leases (fenced staging dirs, verify-then-rename commit) + download-vs-PP anti-affinity — lands with Phase 2
+- ⬜ C3: segment-split downloads, weighted scheduling, budget rebalancing
+- 👤 Real-Gluster soak checklist (CLUSTERING.md §11): quorum on, node reboots, volume heal mid-download
+
+## CI & quality gates ✅
+
+- ✅ Workflows: **Tests** (full suite + MSRV 1.85), **Lint** (fmt + clippy -D warnings), **Coverage** (cargo-llvm-cov → self-hosted badges → `badges` branch + lcov/HTML artifact)
+- ✅ Git hooks (`.githooks/`): pre-commit fmt, pre-push clippy + tests — `git config core.hooksPath .githooks`
+- ✅ rustfmt enforced workspace-wide; clippy zero warnings; MSRV verified
+- ✅ First Coverage run on GitHub succeeded (it published the `badges` branch)
+- ✅ 87 tests / 87.3% line coverage (local measurement matching CI methodology)
+- 👤 Branch protection on `main` requiring Tests/Lint/Coverage (repo Settings)
+- 👤 Badge rendering decision: badges don't render on a **private** repo README (GitHub proxies images anonymously). Either make the repo public (current setup then works as-is) or ask for the private-repo rework (CI commits relative-path SVGs to `main`)
+
+## Phase 2 — Post-processing ⬜ (next; cluster-native per C2)
+
+- ⬜ par2 packet parser + **native quick-verify** from download CRCs (no data re-read)
+- ⬜ par2 repair via `par2cmdline-turbo` subprocess behind `ParEngine`
+- ⬜ Delayed-par unpause (`UnpauseParBlocks{count}` engine command, smallest covering set)
+- ⬜ Unpack: unrar/7z subprocess, hardened (argv-only, scrubbed env, timeouts, output caps, staging dir, symlink-escape checks); password retry; `.001` join
+- ⬜ Direct unpack (`unrar -vp` volume feed during download)
+- ⬜ par-rename / rar-rename
+- ⬜ PP orchestrator state machine incl. unpack↔repair retry loop; PostStrategy levels (sequential/balanced/aggressive/rocket)
+- ⬜ NZBGet extension-script protocol: env vars, `[LEVEL]` stdout, `[NZB] KEY=value`, exit codes 92–95, v2 manifest + legacy headers
+- ⬜ SQLite history (leader-local; JSONL on the shared volume per ADR-16)
+- ⬜ Dupe handling (key/score/mode)
+- ⬜ Health-check actions on failure (park/delete per config)
+- ⬜ C2: PP work-lease type + anti-affinity scheduling (a job downloaded on node B repairs on node C)
+- ⬜ Fixture suite: par2 damage matrices, multi-volume/passworded rar, split files
+
+## Phase 3 — Native API + compat ⬜
+
+- ⬜ Native REST completion: SSE events, servers/config/logs endpoints, Prometheus `/metrics`, bearer-token auth + roles, OpenAPI
+- ⬜ Compat C1 in full: `append` (all arg forms), `history`, `config`, `editqueue` action set — the Sonarr/Radarr certification surface
+- ⬜ Compat C2: `listfiles`, pause/resume family, `rate`, logs, scan, config RPCs
+- ⬜ XML-RPC + `system.multicall` + JSON-P + GET-form safe methods; auth tiers
+- ⬜ Golden structural tests vs recorded NZBGet 26.2 responses; nightly live *arr containers
+- ⬜ `nzbget.conf` importer with report; shim config projection
+- ⬜ `rapidyenc-sys` FFI feature (vendored) + differential fuzzing vs scalar decoder
+
+## Phase 4 — Web UI + ecosystem ⬜
+
+- ⬜ Svelte SPA (queue/history/config/stats), SSE-driven, embedded via rust-embed
+- ⬜ Extension manager UI; RSS feeds + filter language
+- ⬜ Compat C3 (server volumes, sysinfo, testserver, …)
+- ⬜ Packaging: static musl builds, Docker, Homebrew, Windows
+
+## Phase 5 — Beyond parity ⬜
+
+- ⬜ Native Rust par2 repair swap-in · io_uring file I/O · article-streaming/mount groundwork · per-provider adaptive pipelining · cluster C3
+
+## Operator checklist 👤
+
+- ✅ Push `main` (done — CI ran; `badges` branch is CI-owned, never push it: `git branch -D badges && git fetch --prune`)
+- ⬜ Enable hooks on your clone: `git config core.hooksPath .githooks`
+- ⬜ Branch protection for `main`
+- ⬜ Repo visibility / badge-rendering decision (see CI section)
+- ⬜ Real-provider download smoke test
+- ⬜ Real-Gluster cluster soak (CLUSTERING.md §11)
