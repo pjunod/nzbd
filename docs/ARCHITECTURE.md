@@ -1,0 +1,353 @@
+# nzbd — Architecture Design
+
+**A ground-up Rust reimplementation of the NZBGet Usenet downloader.**
+
+| | |
+|---|---|
+| Status | Draft for review (v0.1) |
+| Date | 2026-07-17 |
+| Working name | `nzbd` ("NZB daemon" — placeholder; trivially renameable, check crates.io/GitHub availability before publishing) |
+| Reference | nzbget v26.2/26.3 (nzbgetcom fork), source analyzed at commit of 2026-07 |
+
+---
+
+## 1. Context and motivation
+
+NZBGet is a binary Usenet downloader with a 20+ year lineage: a C++17 daemon (revived and actively maintained by the nzbgetcom fork since 2023, currently v26.2) known for a tiny footprint and best-in-class throughput (~1.4–1.8 GB/s measured, vs ~0.9 GB/s for a maximally patched SABnzbd). It is the workhorse behind countless Sonarr/Radarr/Prowlarr setups.
+
+The codebase, however, carries its age:
+
+- **Blocking I/O with one OS thread per in-flight article** (`ArticleDownloader : Thread`), plus a thread per HTTP connection in a hand-rolled web server. Concurrency is capped at `2 + Σ MaxConnections`.
+- **One coarse global mutex** (`DownloadQueue::m_lockMutex`) serializes essentially all queue mutation across every subsystem.
+- **Global mutable singletons** (`g_Options`, `g_QueueCoordinator`, `g_WorkState`, …) wired in `main`, coordinated via an ad-hoc Observer pattern; cooperative busy-wait throttling (`Sleep(10ms)` loops against a shared speed meter).
+- **Hand-rolled everything**: HTTP server, XML-RPC/JSON-RPC serialization (4,200-line `XmlRpc.cpp`), versioned line-oriented text persistence (`DiskState.cpp`, 2,616 lines), a from-scratch config parser.
+- A jQuery + Bootstrap 2.3 web UI with no build system (server-side JS file concatenation as the "bundler").
+- C++ memory-safety exposure in a daemon that parses hostile inputs from the network (articles, NZBs, RSS feeds, archives).
+
+Notably, the fork's own modernization converged on exactly the components a rewrite would choose — SIMD yEnc via **rapidyenc** (v26.1), **par2cmdline-turbo** statically linked (v24.4+), OpenSSL-only TLS, `std::filesystem` — which validates the component strategy below.
+
+**What must be preserved** (the product's soul): the lightweight/high-throughput ethos, direct-to-disk writing, unpack-during-download, crash-safe resume, and — critically — the ecosystem: Sonarr/Radarr integration and the post-processing script protocol.
+
+## 2. Goals and non-goals
+
+### Goals
+
+1. **Throughput ≥ nzbget** on the same hardware (target: saturate 10 Gbit with headroom; decode is not the bottleneck — rapidyenc does >4.5 GB/s/core).
+2. **Memory safety and fearless concurrency**: no data races by construction; hostile-input parsing in safe Rust.
+3. **Drop-in for the *arr ecosystem**: an nzbget-compatible JSON-RPC/XML-RPC shim, byte-shape-faithful for the methods clients actually call.
+4. **Post-processing script compatibility**: existing NZBGet extensions run unmodified (same env-var protocol, exit codes, `[NZB]` commands).
+5. **Crash-safe resume**: kill -9 at any moment loses at most a few seconds of progress.
+6. **Single static binary** per platform (Linux x86-64/aarch64 incl. musl for NAS, macOS, Windows), embedded web UI, no runtime deps beyond optional `unrar`/`par2` executables.
+7. **Modern operability**: structured logs, Prometheus metrics, typed TOML config, OpenAPI-documented native API, SSE event stream.
+8. **A testable architecture**: every subsystem behind a trait; an in-tree mock NNTP server (nzbget's `nserv` equivalent) for end-to-end tests in CI.
+
+### Non-goals (initial releases)
+
+- Usenet **posting** (nzbget doesn't do it either).
+- The legacy **BinRPC** binary protocol and `nzbget -C` remote-CLI modes (native CLI talks REST instead).
+- Serving the **stock nzbget web UI assets** unmodified (we build our own UI; the shim targets programmatic clients, not `webui/`).
+- Importing nzbget's on-disk **DiskState queue files** (we import `nzbget.conf` and accept re-queuing in-flight downloads at migration time).
+- GnuTLS, pre-TLS-1.2 protocols, Windows XP-era targets.
+- Streaming-mount/WebDAV modes (the altmount/nzbdav direction) — noted as a future direction the architecture should not preclude, not a v1 feature.
+
+## 3. The reference: how nzbget v26 actually works
+
+Condensed from source analysis; this is the behavioral contract the rewrite preserves (or deliberately breaks, with rationale).
+
+### 3.1 Structure
+
+| Subsystem | LOC (cpp+h) | Core files |
+|---|---|---|
+| queue (model, coordinator, persistence, dupes, history) | 13,114 | QueueCoordinator, DiskState, DownloadInfo, DupeCoordinator |
+| remote (RPC, web server) | 8,288 | XmlRpc (4,200), WebServer, RemoteServer |
+| postprocess | 8,555 | PrePostProcessor, ParChecker, UnpackController, DirectUnpack |
+| nntp (download engine) | 4,301 | ArticleDownloader, ArticleWriter, ServerPool, Decoder, StatMeter |
+| extension | 4,091 | ExtensionManager, ScriptController protocols |
+| main / util / connect / feed / frontend | ~22,000 | Options (152 option names), Scheduler, Connection/TlsSocket, FeedFilter |
+
+External components: **rapidyenc** (SIMD yEnc decode), **par2cmdline-turbo** (linked as C++ lib, driven via `Par2Repairer`), **Boost.Json**, libxml2 (SAX NZB parse), OpenSSL, external `unrar`/`7z` binaries.
+
+### 3.2 Semantics that must be reproduced exactly
+
+These encode two decades of Usenet-reality hardening. They are the spec; file references point into the C++ source for the port.
+
+**Server failover ladder** (`ArticleDownloader::Run`, `ServerPool`): servers have config `Level` (normalized to contiguous tiers 0..N), `Group` (same-level servers treated as interchangeable — failing one skips the whole group), and `Optional` (fill servers whose blockage never stalls progress). Per attempt: connect/transfer errors → retry same server indefinitely (server blocked for `RetryInterval`=10 s); NNTP 4xx "no such article" or CRC error → mark server failed for this article, move on; other failures → decrement retries (`ArticleRetries`=3) then mark failed. All servers at a tier exhausted → next tier. All tiers exhausted → article failed. Per-server `Retention` (days) pre-fails old articles. Connections are pooled, held idle 5 s, selected randomly among free candidates at a tier.
+
+**Health model** (`DownloadInfo.cpp`): per-mille values. `Health = (size − parSize − (failed − parFailed)) × 1000 / (size − parSize)`, clamped to 999 if any non-par bytes failed. `CriticalHealth = (size − 2·goodParSize) × 1000 / (size − goodParSize)` (0 when par ≥ half; 850 as estimation fallback). Health < critical → par-check is pointless → fail/delete/park per `HealthCheck` option.
+
+**Delayed par download**: on NZB add, extra `.volNNN+MM.par2` files are queued **paused**. When repair needs blocks, the smallest set of paused par files covering the needed block count is unpaused with force priority (three widening name-match passes; block counts parsed from `volXX+NN` filenames), and the checker waits for their arrival to continue.
+
+**Disk strategy**: `DirectWrite=yes` default — preallocate the output file sparse (POSIX `truncate`), seek-write each decoded segment at `yEnc begin−1`; gaps zero-filled at assembly. Optional RAM `ArticleCache` (default off) with background flush at 90% budget. Per-segment temp files only as fallback. Final commit = atomic rename. Per-segment CRC32s are stored and combined (`crc32_combine`) into whole-file CRCs — these power par2 **quick verification** without re-reading data.
+
+**Post-processing state machine** (`PrePostProcessor`): not a fixed sequence — a status-flag-driven loop: par-rename → par-check/repair → rar-rename → (unpack | cleanup | move | post-unpack-rename | scripts), with unpack success re-triggering par-rename on extracted files, and unpack failure re-triggering par-repair (`RequestParCheck`, force repair, second unpack attempt). Parallelism strategies: `sequential` (1 job), `balanced`, `aggressive` (3 jobs, 1 par), `rocket` (6 jobs, 2 par). Direct unpack streams `unrar x -vp` volume-by-volume during download via stdin feed, aborts on any failed article, and its results are used only if no archive remains unprocessed.
+
+**Script protocol** (`ScriptController`): spawn via fork/exec with env-var interface — `NZBOP_*` (all options), `NZBPO_*` (extension's own options), `NZBPR_*` (NZB params), `NZBPP_*`/`NZBNP_*`/`NZBNA_*`/`NZBSP_*`/`NZBFP_*`/`NZBCP_*` per script type. Stdout lines `[INFO]`/`[WARNING]`/`[ERROR]`/`[DETAIL]`/`[DEBUG]`; command channel via `[NZB] KEY=value` lines. Exit codes (post-processing): **93**=success, **94**=error, **95**=skip, **92**=request par-check. Extension metadata: v2 `manifest.json` or legacy `### NZBGET ... SCRIPT ###` comment headers.
+
+**RPC surface** (`XmlRpc.cpp`): 56 method names over XML-RPC (`/xmlrpc`), JSON-RPC 1.1-flavored (`/jsonrpc`), and JSON-P (`/jsonprpc`); GET allowed only for "safe" read methods; `system.multicall` on XML-RPC. 64-bit sizes serialized as `*Lo`/`*Hi`/`*MB` triplets. `editqueue` takes ~50 string action names. Auth: HTTP Basic, URL-embedded `user:pass` path segment, or `X-Auth-Token` cookie; three tiers (Control / Restricted / Add-only); infamous defaults `nzbget`/`tegbzn6789`.
+
+**What Sonarr/Radarr actually call** (verified in live Sonarr source, `NzbgetProxy.cs`): exactly seven methods — `version` (gates: ≥12 required, ≥16 for modern append), `append` (v16 form, returns int NZBID; tracked via a `drone`=hex-id PP-parameter, priorities −100…900), `status`, `listgroups`, `history`, `config`, `editqueue` (only `GroupSetParameter`, `GroupFinalDelete`, `HistoryDelete`, `HistoryRedownload`). JSON-RPC over POST to `/jsonrpc`, HTTP Basic. **This is the adoption-critical surface.**
+
+### 3.3 Defaults worth keeping (users' mental model)
+
+`ArticleRetries=3` · `RetryInterval=10s` · `ArticleTimeout=60s` · `DirectWrite=yes` · `ArticleCache=0` · `WriteBuffer=0` · speed window 30×1 s · connection idle hold 5 s · `UrlConnections=4` · `CrcCheck=yes` · `ContinuePartial=yes` · `PropagationDelay=0` · `DiskSpace=250MB` min-free · `ParQuick=yes` · `PostStrategy=sequential` · control port 6789.
+
+## 4. Design principles
+
+1. **Async task-per-connection, not thread-per-article.** One tokio task owns each NNTP connection's protocol state; article work is dispatched to connections, not connections to articles. Scales to hundreds of connections in one process at near-zero idle cost.
+2. **Single-writer state, message passing.** The engine's queue state has exactly one owner task ("actors without a framework": plain tokio tasks + `mpsc` commands + `oneshot` replies + `watch`/broadcast events, per the canonical Ryhl pattern). No global mutex; readers get cheap immutable snapshots via `arc-swap`.
+3. **The hot path is a pipeline, not a lock party.** bytes → TLS → decoder (in-place, SIMD) → disk writer are connected by ownership transfer of buffers, with backpressure via bounded channels.
+4. **Every boundary is a trait.** `NntpTransport`, `ParEngine`, `Extractor`, `ScriptRunner`, `Clock` — swappable for tests, subprocess-vs-FFI-vs-native swappable in production.
+5. **Compat is quarantined.** All bug-for-bug nzbget emulation lives in one crate (`nzbd-compat`) that adapts the native API. The core never learns what a `SizeLo` is.
+6. **Crash-only design.** Every state mutation is either recoverable from the journal or explicitly ephemeral. Clean shutdown is just a fast crash with a flush.
+7. **Cancellation-safe by construction**: `CancellationToken` trees + `TaskTracker`; every subprocess has a timeout, an output cap, and a kill-on-drop guard.
+
+## 5. System overview
+
+```
+                                ┌────────────────────────────────────────────────┐
+                                │                  nzbd daemon                   │
+  Sonarr/Radarr ── /jsonrpc ──▶ │ ┌──────────┐   commands (mpsc)  ┌────────────┐ │
+  curl/UI ──────── /api/v1 ───▶ │ │ nzbd-api │ ──────────────────▶│            │ │
+  Web UI ───────── /  (SPA) ──▶ │ │  (axum)  │ ◀────────────────  │   engine   │ │
+  scripts/watch dir ──────────▶ │ └──────────┘  snapshots (arc-   │ (queue own-│ │
+                                │      │        swap) + events    │  er task)  │ │
+                                │      ▼ SSE/WS  (broadcast)      └─────┬──────┘ │
+                                │                                       │ per-   │
+                                │ ┌───────────┐  ┌────────────┐         │ server │
+                                │ │ state     │  │ post-proc  │   ┌─────▼──────┐ │
+                                │ │ journal + │◀─│ orchestr.  │◀──│ conn pools │ │
+                                │ │ SQLite    │  │ par/unpack/│   │ (tasks per │ │
+                                │ │ history   │  │ scripts    │   │ connection)│ │
+                                │ └───────────┘  └─────┬──────┘   └─────┬──────┘ │
+                                │                      ▼                ▼        │
+                                │              subprocesses      decoder→writer  │
+                                │              (par2, unrar, 7z, (yEnc, CRC,     │
+                                │               extensions)       DirectWrite)   │
+                                └────────────────────────────────────────────────┘
+```
+
+Data flow for one segment: engine leases `(segment, tier)` to a server pool → an idle connection task issues `BODY <msgid>` (optionally pipelined) → response bytes stream through the incremental yEnc decoder (in-place, dot-unstuffing aware) → decoded chunks with `(file, offset)` go to that file's disk-writer → writer seek-writes (or caches) → segment completion event → engine updates counts/health, journal appends, broadcast notifies API subscribers. Article failures walk the failover ladder inside the engine's lease bookkeeping — identical semantics to §3.2, different mechanics.
+
+## 6. Crate map
+
+A Cargo workspace. Fine-grained crates keep compile times sane, make ownership boundaries physical, and let the parser/decoder be reused (or fuzzed) standalone.
+
+| Crate | Purpose | Key deps |
+|---|---|---|
+| `nzbd-types` | Domain model: IDs, jobs/files/segments, server defs, statuses, health math, per-mille types. No I/O. | serde |
+| `nzbd-nzb` | Streaming NZB parser (+ password/category meta, filename deobfuscation heuristics, content hashing for dupes) | quick-xml |
+| `nzbd-yenc` | Incremental yEnc/UU decoder: scalar reference impl now; `rapidyenc-sys` FFI feature later; CRC32 + combine | crc32fast |
+| `nzbd-nntp` | NNTP protocol: command/response codec, capabilities, AUTHINFO, BODY streaming, dot-unstuffing, COMPRESS DEFLATE (RFC 8054) | tokio, tokio-rustls |
+| `nzbd-engine` | Queue owner task, scheduler (failover ladder), per-server connection pools, pipelining, rate limiter, quotas, disk writers, article cache, crash journal | tokio, arc-swap |
+| `nzbd-post` | Post-processing orchestrator state machine; `ParEngine` + `Extractor` + `ScriptRunner` traits and their subprocess impls; direct unpack | tokio (process) |
+| `nzbd-state` | Persistence: queue snapshot + segment journal, SQLite history, config store | rusqlite (bundled) |
+| `nzbd-api` | Native REST `/api/v1` + SSE events + OpenAPI | axum, tower-http |
+| `nzbd-compat` | nzbget JSON-RPC 1.1 / XML-RPC / JSON-P shim, auth tiers, field-shape fidelity | axum (router merge), quick-xml |
+| `nzbd-config` | TOML config model + validation + `nzbget.conf` importer | toml, serde |
+| `nzbd` (bin) | Daemon: wiring, CLI (`nzbd run/import/status`), signals, embedded UI assets | clap, rust-embed |
+| `nzbd-nserv` (dev) | Mock NNTP server for integration tests & benchmarks (nzbget's `nserv` equivalent): scripted articles, injected failures, latency shaping | tokio |
+
+Dependency policy (2026 survey, verified maintenance status): **tokio** (only runtime; io_uring still unstable/file-only — do not architect around it) · **rustls 0.23 + aws-lc-rs + rustls-platform-verifier** (OS trust stores; per-server cipher/verification config parity) · **axum 0.8** (tokio-team; tower ecosystem) · **quick-xml** (pin — fast-moving; event API, not serde-derive, for malformed-NZB tolerance) · **rusqlite bundled** behind a dedicated DB thread (sled is dead; redb viable but hand-rolled indexes) · **crc32fast** (correct ISO-HDLC polynomial — beware `crc32c`, wrong polynomial for yEnc) · **tracing + metrics** · **sevenz-rust2** (pure-Rust 7z; original sevenz-rust is deleted) · unrar/par2 via **subprocess only**. Hand-roll the JSON-RPC envelope: nzbget's dialect is 1.1-flavored (no `"jsonrpc":"2.0"`, positional params, `{version:"1.1", result}` envelope) and jsonrpsee's strict 2.0 server would fight compat at every turn.
+
+## 7. Domain model (`nzbd-types`)
+
+```rust
+pub struct JobId(u32);      // dense, monotonic; == NZBID in the compat shim
+pub struct FileId(u32);
+pub struct SegmentId { pub file: FileId, pub number: u32 }
+
+pub struct Job {                       // == NzbInfo
+    pub id: JobId,
+    pub kind: JobKind,                 // Nzb | Url
+    pub name: String,
+    pub category: Option<String>,
+    pub priority: i32,                 // -100..=900; >= FORCE (900) ignores pause
+    pub dupe: DupeInfo,                // key, score, mode (Score|All|Force)
+    pub params: Vec<(String, String)>, // PP-parameters (incl. Sonarr's "drone")
+    pub files: Vec<FileEntry>,
+    pub totals: JobTotals,             // sizes/articles: total, success, failed, par…
+    pub status: JobStatus,             // queued/downloading/post{stage}/history{…}
+}
+
+pub struct FileEntry {                 // == FileInfo
+    pub id: FileId,
+    pub subject: String,
+    pub filename: String,              // deobfuscated; confirmed after direct-rename
+    pub is_par2: bool,
+    pub paused: bool,                  // delayed-par mechanism uses this
+    pub segments: Vec<Segment>,
+    pub crc32: Option<u32>,            // combined from segment CRCs
+}
+
+pub struct Segment {                   // == ArticleInfo
+    pub message_id: Box<str>,
+    pub number: u32,
+    pub size: u32,
+    pub state: SegmentState,           // Pending | Leased{server} | Done{crc,offset,len} | Failed
+    pub tried: ServerBitmap,           // failed-server set for the failover ladder
+}
+
+pub struct ServerDef {
+    pub id: ServerId,
+    pub host: String, pub port: u16, pub tls: TlsMode,
+    pub credentials: Option<Credentials>,
+    pub tier: u8,                      // == normalized Level
+    pub group: u8,                     // 0 = none; same tier+group = interchangeable
+    pub fill: bool,                    // == Optional
+    pub max_connections: u16,
+    pub pipeline_depth: u8,            // first-class (see §8.3); default 2
+    pub retention_days: u32,
+    pub cert_verification: CertLevel,  // None | Minimal | Strict
+}
+
+pub struct Health(u16);                // per-mille, 0..=1000; formulas from §3.2 as methods
+```
+
+Everything is `serde`-serializable; the journal and API reuse these types. Compat translation (Lo/Hi splits, status strings like `PP_QUEUED`, `SUCCESS/ALL`) lives exclusively in `nzbd-compat` mappers.
+
+## 8. Download engine (`nzbd-engine`)
+
+### 8.1 Queue owner
+
+One task owns `QueueState` (jobs, files, segments, lease table). Inputs: a bounded `mpsc<Command>` (Add, Edit, Pause, SetRate, …, each with an optional `oneshot` reply), completion/failure events from connection tasks, and a 1 Hz tick (journal flush, health/quota checks, `PropagationDelay` re-evaluation). Outputs: leases pushed to per-server pool queues, a debounced `arc_swap::ArcSwap<QueueSnapshot>` for lock-free API reads, and a `broadcast<Event>` stream (job added/progress/completed, server state, log). This replaces nzbget's global mutex + observer web with one serialization point that never blocks readers.
+
+### 8.2 Scheduling and the failover ladder
+
+Selection preserves §3.2 semantics: highest-priority non-paused job → highest-priority file → next pending segment, with force-priority bypassing pause and quota, `PropagationDelay` filtering young files, and (later phase) direct-rename-first article ordering. The ladder is a pure function — `fn next_action(outcome, segment, servers) -> Lease | Retry{server, after} | Escalate | Fail` — table-driven from the C++ behavior (connect-error vs 430-not-found vs CRC-error vs incomplete), unit-tested against scenario fixtures. Server blocking (10 s), group skip, fill-server semantics, and retention pre-fail are all in this function, not scattered across tasks.
+
+### 8.3 Connection pools and pipelining
+
+Per server: a pool task + up to `max_connections` connection tasks (spawned on demand, retired after 5 s idle, hot/cold distinction so reconnect storms don't hammer providers). Each connection task runs the NNTP state machine: greeting → CAPABILITIES → AUTHINFO → optional COMPRESS DEFLATE → loop { take lease(s), issue `BODY`, stream-decode }. **Pipelining depth is first-class per-server config** — SABnzbd's provider benchmarks show depth 1→2 is the single biggest throughput win, and high-latency links want 10–30; nzbget has none (its thread-per-article model can't). Same-host account dedup: a shared per-endpoint 430-miss cache avoids re-asking a provider that already said "no such article" on another account (idea proven in javi11/nntppool).
+
+### 8.4 Decode and disk
+
+Response bytes are decoded **incrementally in the connection task** (no extra hop): the `nzbd-yenc` streaming decoder handles yEnc header/trailer parse, escape sequences and CRLF/dot-unstuffing across arbitrary chunk boundaries, in-place, with running CRC32. Phase 1 ships a scalar decoder (correct, ~0.5–1 GB/s/core, plenty behind TLS); the `rapidyenc-sys` feature (vendored CC0 sources, `cc` build — the binding doesn't exist in the ecosystem yet, we write it) restores the >4.5 GB/s ceiling and serves as differential-fuzzing oracle for the scalar impl.
+
+Decoded chunks go to a **per-file writer task** (bounded channel = backpressure): DirectWrite default (sparse preallocate via `truncate`, positional writes at `yenc_begin − 1`; on Linux `pwrite` needs no seek serialization), optional RAM article cache with a global budget and 90%-flush policy, temp-file fallback, gap zero-fill + atomic rename at assembly, `fsync` policy configurable (default: dirs on rename, data relaxed). Per-segment CRCs recorded for par2 quick-verify.
+
+### 8.5 Rate, quota, stats
+
+A global token-bucket rate limiter (replacing the C++ sleep-loop): connection tasks `acquire(n)` before each read; changing the limit is instant, fairness is inherent, and per-server buckets compose. Speed metering keeps the 30×1 s ring for UI parity; per-server volume counters (sec/min/hour/day arrays) and daily/monthly quota with `QuotaStartDay` reproduce nzbget's accounting; quota-reached behaves as pause-except-force.
+
+### 8.6 Crash recovery
+
+Two artifacts in `state/`: (1) a **queue snapshot** (all jobs/files/segments sans transient lease state), rewritten atomically (tmp+rename) on structural change, debounced; (2) an **append-only segment journal** (`fileId, segNo, offset, len, crc` records) fsync'd on a short interval — the equivalent of nzbget's per-file `s` files but append-only, compacted into the snapshot opportunistically. Recovery: load snapshot, replay journal, re-lease anything not journaled Done. An `unclean` marker file gates cache-loss handling. History lives in SQLite (WAL) — queryable, unbounded-friendly, and keeps the hot queue path allocation-free.
+
+## 9. Post-processing (`nzbd-post`)
+
+The orchestrator is an explicit state machine — same effective stage graph as §3.2 (par-rename → par-check/repair → rar-rename → unpack ↔ repair retry loop → cleanup → move → post-unpack-rename → scripts), driven by typed stage results instead of status-flag polling. Job admission reproduces the four `PostStrategy` levels. Queue-pause-during-PP options carry over.
+
+**par2 — `ParEngine` trait, subprocess-first.** nzbget links par2cmdline-turbo as a C++ library and drives `Par2Repairer` directly; there is **no stable C API**, so FFI means maintaining a C++ shim — the worst option. SABnzbd's model (shell out to `par2cmdline-turbo`, which publishes per-platform binaries) is battle-tested and crash-isolated; we ship that first, bundling/locating the binary like `UnrarCmd`. The trait boundary is designed for the one thing subprocess can't do: **quick verification** stays native — we already hold per-segment CRC32s and combined file CRCs from download, so "is this file intact?" is a CRC-combine against par2 packet checksums (pure Rust, we parse par2 packets ourselves — packet parsing is simple; GF(2^16) repair math is the hard part we delegate). Delayed-par fetching (§3.2) is an engine command (`UnpauseParBlocks{count}`) issued by the orchestrator. A native-Rust repair engine is a swap-in later (four young 2025–26 pure-Rust par2 projects exist; none yet trustworthy).
+
+**Unpack — subprocess, hardened.** `unrar x -y -p… -o+ <archives> <dir>/` and `7z x …` with nzbget's exit-code maps (unrar 5=disk-space, 11=wrong-password; 7z requires "Everything is Ok"), password-file retry loop, `.001` split joining, cleanup rules, temp-unpack-dir + move-back. Hardening beyond nzbget: argv-only (never shell), non-inherited env, kill-on-drop with timeout, bounded captured output, and unpack into a same-filesystem staging dir with symlink-escape checks (nzbget had a symlink TOCTOU fix as recently as v26.2 — we design it out). Direct unpack ports the `-vp` volume-pause trick: feed `\n` on stdin as each volume completes; abort on first failed article; PP validates coverage before trusting results. 7z can later switch to in-process `sevenz-rust2` behind the same `Extractor` trait.
+
+**Scripts — protocol-compatible.** `ScriptRunner` reproduces the env-var interface, `[LEVEL]` stdout parsing, `[NZB] KEY=value` command channel, exit codes 92–95, per-type prefixes (`NZBPP_`, `NZBNP_`, `NZBNA_`, `NZBSP_`, `NZBFP_`, `NZBCP_`), option export (`NZBOP_*`/`NZBPO_*`), and queue-event filtering with `EventInterval` throttling. Discovery reads both v2 `manifest.json` and legacy `###`-header formats. Result: the existing extension ecosystem (VideoSort, notification scripts, …) runs unmodified. Native additions (webhooks, an SSE event feed for sidecar processes) come later without breaking this.
+
+## 10. API layer
+
+### 10.1 Native API (`nzbd-api`)
+
+`/api/v1` REST + `/api/v1/events` SSE, OpenAPI-documented, JSON in domain-model terms (real 64-bit integers — no Lo/Hi). Sketch:
+
+```
+GET  /api/v1/status                    queue+speed+disk summary
+GET  /api/v1/jobs?state=queued         list (paged)         POST /api/v1/jobs   (multipart NZB | {url})
+GET  /api/v1/jobs/{id}                 detail w/ files      PATCH /api/v1/jobs/{id}  (priority, category, pause…)
+POST /api/v1/jobs/{id}/actions/{a}     retry|park|reprocess|move-top|…
+GET  /api/v1/history?since=…           SQLite-backed        DELETE /api/v1/jobs/{id}?final=true
+GET  /api/v1/servers · POST /api/v1/servers/{id}/test       per-server config + live probe
+GET  /api/v1/config · PUT /api/v1/config                    typed, validated, atomic apply-or-reject
+GET  /api/v1/logs?level=…&job=…        ring buffer + per-job
+GET  /metrics                          Prometheus
+```
+
+SSE events mirror the engine broadcast (progress deltas coalesced to ~4 Hz). Auth: bearer tokens (argon2-hashed at rest) with role scopes replacing the three-tier model; the UI uses a session cookie. TLS via rustls with the same cert options as the compat surface.
+
+### 10.2 Compat shim (`nzbd-compat`)
+
+An axum sub-router mounted at `/jsonrpc`, `/xmlrpc`, `/jsonprpc` (plus GET-style `/{proto}/{method}/{params}` for safe methods), speaking nzbget's JSON-RPC 1.1 dialect (`{"version":"1.1","result":…}`), XML-RPC with `system.multicall`, HTTP Basic + URL-embedded `user:pass` + `X-Auth-Token` cookie, and the Control/Restricted/Add tiers mapped onto native roles. `version` reports a configurable compat string (default `"26.2"` — Sonarr gates on ≥12/≥16 and parses `-testing` suffixes; honesty lives in `sysinfo` and the native API).
+
+Implementation phases:
+
+| Phase | Methods | Unblocks |
+|---|---|---|
+| C1 | `version`, `append` (all three historical arg-order forms, incl. v25.3 `AutoCategory`; returns int NZBID), `status`, `listgroups`, `history`, `config`, `editqueue` {GroupSetParameter, GroupFinalDelete, HistoryDelete, HistoryRedownload, GroupPause/Resume, GroupSetPriority/Category/Name, HistoryReturn/Redownload/RetryFailed} | **Sonarr, Radarr, Prowlarr, Lidarr, Readarr, Mylar** |
+| C2 | `listfiles`, `pause*/resume*` family, `rate`, `scheduleresume`, `writelog`/`log`/`loadlog`, `scan`, `saveconfig`/`loadconfig`/`configtemplates`, `shutdown`/`reload`, remaining `editqueue` actions | nzb360, NZBGet mobile apps, scripts |
+| C3 | `servervolumes`/`resetservervolume`, `editserver`, `testserver*`, `sysinfo`, `systemhealth`, history dup entries, extension RPCs | stat dashboards, full webui-class clients |
+
+Field fidelity is enforced by **golden tests**: recorded responses from a real nzbget 26.2 instance (running against `nzbd-nserv` fixtures) are diffed structurally against shim output — every field name, `*Lo/*Hi/*MB` triplet, deprecated alias (`FirstID`/`LastID`), and status string (`PP_QUEUED`, `SUCCESS/ALL`, `DELETED/DUPE`, …) must match. The shim translates; it never computes.
+
+## 11. Configuration (`nzbd-config`)
+
+Native config is **TOML** (`nzbd.toml`): typed, serde-validated, sectioned (`[paths]`, `[[server]]`, `[[category]]`, `[queue]`, `[post]`, `[security]`, `[[task]]`), env overrides (`NZBD__SERVER_1__HOST`-style), secrets referencable from files. Applied via the native API atomically (validate → swap → notify subsystems through their command channels; no restart for most options — same live-apply set as nzbget or better).
+
+`nzbd import-config /path/nzbget.conf` maps the 117 scalar options + `ServerN.*`/`CategoryN.*`/`TaskN.*` blocks onto the native model with a printed report (imported / renamed / dropped-with-reason). Scheduler tasks (`TaskX.Time/WeekDays/Command/Param`, cron-like with the same commands: pause windows, rate windows, server activation, script runs) become `[[task]]` entries executed by a small scheduler service in the daemon. The shim's `config`/`saveconfig` (phase C2) operate on a **projection**: native options exposed under their nzbget names for clients that edit config remotely, with unmappable writes rejected loudly rather than silently dropped.
+
+## 12. Web UI (phase 4)
+
+A TypeScript SPA (Svelte 5 + Vite; small bundle, no runtime), built to static assets and embedded via `rust-embed` — single-binary deployment preserved. Talks only the native API; SSE-driven (no polling), virtualized queue/history tables (nzbget's `fasttable` lesson: large queues must not freeze the UI), config editor generated from the typed schema the daemon serves, dark/light, i18n-ready (nzbget just shipped 20 languages — parity eventually, structure for it now). Feature parity checklist tracked against §3's webui notes (drag-drop NZB upload, per-server stats charts, feed preview, extension manager UI in later phases).
+
+## 13. Observability and security
+
+**Observability.** `tracing` spans: `job(id)` → `file(id)` → `segment(msgid)/server(id)` — a failed download is diagnosable from one filtered trace. JSON or pretty logs; per-job ring buffers backing the `loadlog` compat call. `metrics` → Prometheus: per-server bytes/connections/article-success-rate/430-rate, decoder throughput, writer queue depth, repair durations, PP stage timings. `/healthz` liveness + a `systemhealth`-style self-check (disk space, cert expiry, server reachability).
+
+**Security.** Memory-safe parsing of all network inputs (`forbid(unsafe_code)` outside `nzbd-yenc`'s FFI feature). rustls everywhere; per-server `CertVerification` None/Minimal/Strict parity (users need Minimal for some providers). No default credentials — first-run generates a token and prints it (the shim can opt into legacy `nzbget`/`tegbzn6789` for migration, off by default, warned loudly). Subprocesses: argv-only, scrubbed env, timeouts, output caps, staging-dir confinement, symlink-escape checks. Config redacts secrets in API reads for restricted roles (parity with `Restricted()` masking). systemd unit ships with `ProtectSystem=strict`, `NoNewPrivileges`, RW only on configured dirs.
+
+## 14. Testing strategy
+
+| Layer | Approach |
+|---|---|
+| Parsers (NZB, yEnc, NNTP, par2 packets) | Unit + property tests (proptest) + fuzzing (cargo-fuzz); yEnc differentially tested against rapidyenc once the FFI lands; NZB corpus cribbed from SABnzbd/nzb-rs edge cases (obfuscated subjects, broken XML, weird encodings) |
+| Failover ladder & scheduler | Table-driven scenario tests: scripted server outcomes → expected lease sequences (the §3.2 semantics as executable spec) |
+| Engine end-to-end | `nzbd-nserv` mock NNTP server: serves generated posts with injected 430s, CRC corruption, stalls, disconnects, per-server latency; asserts assembled files bit-identical + resume-after-kill works (kill -9 mid-download in CI) |
+| Post-processing | Fixture archive sets (par2 damage matrices, multi-volume rar, passworded, split files); asserts stage transitions + repair outcomes with a pinned par2cmdline-turbo |
+| Compat shim | Golden structural diffs vs recorded nzbget 26.2 responses; plus live Sonarr/Radarr containers in a nightly integration workflow pointed at nzbd (the real certification) |
+| Performance | criterion micro-benches (decode, CRC, journal append); throughput harness vs nserv over TLS on loopback with regression tracking; reference target: ≥ nzbget on same box, headroom to 10 Gbit |
+
+## 15. Key decisions (ADR summary)
+
+| # | Decision | Alternatives rejected — why |
+|---|---|---|
+| 1 | **Rust + tokio**, task-per-connection | Go (simpler, but GC + no rapidyenc-class native decode story without cgo); modern C++ (keeps the safety exposure this rewrite exists to remove); thread-per-article port (doesn't scale, can't pipeline) |
+| 2 | **rustls + aws-lc-rs** + platform-verifier | OpenSSL (C, global-state pain); ring (post-maintenance-scare, security-fix-only); native-tls (maintenance mode) |
+| 3 | **Single-owner queue task + arc-swap snapshots** | Global `RwLock` (nzbget's coarse-mutex problem reborn); actor frameworks (kameo/ractor: churn + dependency risk for what channels do fine) |
+| 4 | **yEnc: scalar Rust now, vendored rapidyenc FFI as feature** | Pure-Rust SIMD now (std::simd still nightly-only in 2026; `std::arch` port of 8 years of edge-case hardening is real risk); existing crates (dead, non-incremental, or unaudited AI-generated) |
+| 5 | **par2: subprocess par2cmdline-turbo behind `ParEngine`; native quick-verify from download CRCs** | FFI (no C API; C++ shim maintenance); pure-Rust repair today (4 projects, all <18 months old, none differentially validated); skipping quick-verify (loses nzbget's biggest PP speed win) |
+| 6 | **unrar: subprocess only** | `unrar` crate static-links RARLAB freeware-licensed code (not OSI, GPL-incompatible in the common reading) and forfeits crash isolation against hostile archives — nzbget and SABnzbd both subprocess for good reason |
+| 7 | **State: snapshot + append-only journal for queue; SQLite (rusqlite bundled) for history** | SQLite for hot segment state (write amplification vs journal appends); sled (dead); redb (viable, revisit); nzbget's text DiskState (versioned line-format archaeology — the thing we're escaping) |
+| 8 | **axum + hand-rolled RPC envelope in `nzbd-compat`** | jsonrpsee (strict 2.0 — fights nzbget's 1.1 dialect); actix-web (own runtime layer, less ecosystem); emulating at HTTP-server level like nzbget (hand-rolled HTTP in 2026 — no) |
+| 9 | **Native TOML config + one-shot importer + shim projection** | Adopting `nzbget.conf` as primary store (perpetuates write-back of an ordered flat format; blocks typed validation); no importer (migration cliff) |
+| 10 | **Compat scope: *arr-first (7 methods), then breadth; stock webui assets out of scope** | Full 56-method day-one parity (months of shim work before any user value; nzbdav's 1k★ proves targeted API emulation is the adoption cheat code) |
+| 11 | **SSE for events** (WS available via axum if needed) | Polling (nzbget's model — wasteful); WS-only (proxy/reconnect friction for zero benefit here) |
+| 12 | **Extension protocol preserved as-is** | New plugin API first (would orphan the existing script ecosystem — its env/exit-code protocol is crude but proven and language-agnostic) |
+
+## 16. Roadmap
+
+| Phase | Scope | Exit criteria |
+|---|---|---|
+| **0. Scaffold** (this session) | Workspace, domain types + health math, NZB parser, scalar incremental yEnc + CRC combine, NNTP codec skeleton, API/shim stubs, CI-ready tests | `cargo test` green; design reviewed |
+| **1. Core engine** | Queue owner, scheduler + failover ladder, pools + pipelining, rustls transport, DirectWrite writer, journal + resume, rate limiter, `nzbd-nserv`, CLI (`nzbd run`, `add`) | Downloads real NZBs from real providers at line rate; kill -9 resume proven; ladder scenario suite green |
+| **2. Post-processing** | PP orchestrator, par quick-verify (native) + repair (subprocess), unpack + direct unpack, script protocol, health gates, dupe handling, SQLite history | Damaged-set fixtures repair correctly; existing NZBGet PP scripts run unmodified |
+| **3. API + compat** | Native REST/SSE + auth, compat C1→C2, config importer, `rapidyenc-sys` | Sonarr + Radarr run a full grab→import cycle against nzbd in CI; nzbget-migration guide works |
+| **4. Web UI + ecosystem** | SPA (queue/history/config/stats), extension manager, RSS feeds + filter language, compat C3, packaging (static musl, Docker, Homebrew, Windows) | Daily-drivable replacement; linuxserver-style container published |
+| **5. Beyond parity** | Native par2 repair swap-in, io_uring file I/O when tokio stabilizes it, article-level streaming APIs (mount-mode groundwork), per-provider adaptive pipelining | — |
+
+Rough sizing honesty: phases 1–3 are each multiple weeks of focused work; nzbget is ~62k LOC of accumulated behavior. The phasing is designed so every phase ends with something independently useful (phase 1 alone = a fast, resumable CLI NZB downloader).
+
+## 17. Risks and open questions
+
+- **Compat drift** is the top product risk — mitigated by golden tests + nightly live-*arr CI, and by keeping the shim a pure translator.
+- **rapidyenc build friction** on exotic NAS targets → scalar decoder is always available; feature-gated FFI.
+- **par2cmdline-turbo availability** per platform → bundle checksummed binaries in release artifacts, `ParCmd` override like nzbget.
+- **Behavioral unknowns** (deobfuscation heuristics, dupe corner cases) will surface in beta — the C++ source stays the arbiter; port with tests, not vibes.
+- **Scope**: RSS filter language and full config-editing webui are large; deliberately late phases. Streaming-mount demand (nzbdav's traction) may reorder phase 5 — the segment-addressed engine design keeps that door open.
+- Open: adopt `redb` for the journal if fsync patterns disappoint? Expose native API under gRPC too? Windows service story timing? Name the thing properly.
+
+## Appendix A — behavioral cheat sheet carried from nzbget
+
+Failover: retries=3, retry-interval=10 s, timeout=60 s, idle-hold=5 s, random pick among free same-tier connections, groups fail together, fill servers never stall, retention pre-fails. Health = per-mille formulas §3.2. Speed window 30×1 s. Cache flush at 90%. Downloader cap concept (`2 + Σ connections`) replaced by pool-native limits. PP strategies sequential/balanced/aggressive(3,1)/rocket(6,2). Script exits 92/93/94/95. Priorities −100/−50/0/50/100/900-force. Sonarr `drone` param is sacred. Sizes cross the shim as Lo/Hi/MB triplets. Default port 6789.
+
+*Sources: full source analysis of nzbgetcom/nzbget v26.2/26.3 (July 2026); Sonarr develop-branch NzbgetProxy.cs; SABnzbd performance discussions (#2352, #3366); 2026 crates.io/GitHub ecosystem survey (tokio, rustls, axum, rapidyenc, par2cmdline-turbo, prior-art projects).*
+
+
+
