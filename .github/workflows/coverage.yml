@@ -1,0 +1,62 @@
+name: Coverage
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: write # force-push the badges branch (main pushes only)
+
+jobs:
+  coverage:
+    name: cargo llvm-cov
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+
+      - name: run instrumented test suite
+        run: |
+          cargo llvm-cov --workspace --lcov --output-path lcov.info 2>&1 | tee cov-run.out
+          TESTS=$(grep -oE 'test result: ok\. [0-9]+ passed' cov-run.out | grep -oE '[0-9]+' | awk '{s+=$1} END {print s}')
+          COVERAGE=$(cargo llvm-cov report --json --summary-only \
+            | python3 -c "import json,sys; print(round(json.load(sys.stdin)['data'][0]['totals']['lines']['percent'], 1))")
+          echo "TESTS=$TESTS" >> "$GITHUB_ENV"
+          echo "COVERAGE=$COVERAGE" >> "$GITHUB_ENV"
+          echo "### Coverage: ${COVERAGE}% lines · ${TESTS} tests passed" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: HTML report
+        run: cargo llvm-cov report --html
+
+      - name: generate badges
+        run: python3 scripts/coverage-badges.py --coverage "$COVERAGE" --tests "$TESTS" --out badges-out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: |
+            lcov.info
+            target/llvm-cov/html/
+
+      # Self-hosted badges: single-commit `badges` branch, force-updated on
+      # every main push; README references the raw files.
+      - name: publish badges branch
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          cd badges-out
+          git init -q -b badges
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add .
+          git commit -qm "badges for ${GITHUB_SHA} (${COVERAGE}% lines, ${TESTS} tests)"
+          git push -f "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" badges

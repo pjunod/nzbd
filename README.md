@@ -1,5 +1,10 @@
 # nzbd
 
+[![Tests](https://github.com/pjunod/nzbd/actions/workflows/ci.yml/badge.svg)](https://github.com/pjunod/nzbd/actions/workflows/ci.yml)
+[![Lint](https://github.com/pjunod/nzbd/actions/workflows/lint.yml/badge.svg)](https://github.com/pjunod/nzbd/actions/workflows/lint.yml)
+[![Coverage](https://raw.githubusercontent.com/pjunod/nzbd/badges/coverage.svg)](https://github.com/pjunod/nzbd/actions/workflows/coverage.yml)
+[![Test count](https://raw.githubusercontent.com/pjunod/nzbd/badges/tests.svg)](https://github.com/pjunod/nzbd/actions/workflows/ci.yml)
+
 A ground-up Rust reimplementation of the [NZBGet](https://nzbget.com) Usenet
 downloader — modern architecture, same soul: tiny footprint, line-rate
 throughput, direct-to-disk writing, and drop-in compatibility with the
@@ -80,14 +85,21 @@ fails over automatically. Run Gluster with quorum — see
 
 ## Development
 
-CI (GitHub Actions) gates every push/PR on `cargo fmt --check`, `clippy
--D warnings`, the full test suite (unit + engine e2e + multi-node cluster
-tests + the whole-daemon test) and an MSRV (1.85) check. Run the same
-gates locally via the committed git hooks:
+Three GitHub Actions workflows gate every push/PR — **Tests** (the full
+suite: unit + engine e2e + multi-node cluster tests + the whole-daemon
+test, plus an MSRV 1.85 check), **Lint** (`cargo fmt --check`, `clippy
+-D warnings`), and **Coverage** (`cargo llvm-cov`; publishes the line-%
+and test-count badges above to the `badges` branch and uploads the
+lcov + HTML report as a build artifact). Badges are self-hosted
+(`scripts/coverage-badges.py`) — no external badge service.
+
+Run the same gates locally via the committed git hooks:
 
 ```sh
 git config core.hooksPath .githooks   # once per clone
 # pre-commit: fmt check · pre-push: clippy -D warnings + cargo test
+
+cargo llvm-cov --workspace --open      # local coverage report (optional)
 ```
 
 ## Roadmap
