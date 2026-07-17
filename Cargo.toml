@@ -12,6 +12,7 @@ members = [
     "crates/nzbd-api",
     "crates/nzbd-compat",
     "crates/nzbd",
+    "crates/nzbd-nserv",
 ]
 
 [workspace.package]
@@ -36,10 +37,17 @@ nzbd-config = { path = "crates/nzbd-config" }
 nzbd-api = { path = "crates/nzbd-api" }
 nzbd-compat = { path = "crates/nzbd-compat" }
 
+nzbd-nserv = { path = "crates/nzbd-nserv" }
+
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync", "signal", "fs", "process"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+tokio-rustls = "0.26"
+rustls = "0.23"
+rustls-platform-verifier = "0.6"
+tempfile = "3"
 axum = "0.8"
 quick-xml = "0.41"
 crc32fast = "1"

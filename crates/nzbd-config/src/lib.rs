@@ -161,11 +161,45 @@ impl Default for ApiConfig {
     }
 }
 
+/// Expand a leading `~`/`~/` to `$HOME` (config-file ergonomics).
+pub fn expand_home(p: &std::path::Path) -> PathBuf {
+    let Some(s) = p.to_str() else {
+        return p.to_path_buf();
+    };
+    if s == "~" || s.starts_with("~/") {
+        if let Ok(home) = std::env::var("HOME") {
+            if s == "~" {
+                return PathBuf::from(home);
+            }
+            return PathBuf::from(home).join(&s[2..]);
+        }
+    }
+    p.to_path_buf()
+}
+
 impl Config {
     pub fn from_toml(s: &str) -> Result<Config, ConfigError> {
         let cfg: Config = toml::from_str(s)?;
         cfg.validate()?;
         Ok(cfg)
+    }
+
+    /// Journal + queue snapshots directory (NZBGet `QueueDir` equivalent):
+    /// `paths.queue_dir`, defaulting to `<main_dir>/queue`.
+    pub fn state_dir(&self) -> PathBuf {
+        match &self.paths.queue_dir {
+            Some(d) => expand_home(d),
+            None => expand_home(&self.paths.main_dir).join("queue"),
+        }
+    }
+
+    pub fn dest_dir(&self) -> PathBuf {
+        expand_home(&self.paths.dest_dir)
+    }
+
+    /// Configured speed limit in bytes/sec.
+    pub fn speed_limit_bps(&self) -> Option<u64> {
+        self.queue.speed_limit_kib.map(|k| k * 1024)
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
@@ -281,5 +315,20 @@ bind = "0.0.0.0:6789"
         assert_eq!(q.retry_interval_secs, 10);
         assert_eq!(q.article_timeout_secs, 60);
         assert_eq!(q.min_free_disk_mb, 250);
+    }
+
+    #[test]
+    fn path_helpers() {
+        let cfg = Config::from_toml(SAMPLE).unwrap();
+        assert_eq!(cfg.state_dir(), PathBuf::from("/data/usenet/queue"));
+        assert_eq!(cfg.dest_dir(), PathBuf::from("/data/usenet/complete"));
+        assert_eq!(cfg.speed_limit_bps(), None);
+
+        let home = std::env::var("HOME").unwrap();
+        let def = Config::default();
+        assert_eq!(
+            def.state_dir(),
+            PathBuf::from(&home).join("downloads/queue")
+        );
     }
 }

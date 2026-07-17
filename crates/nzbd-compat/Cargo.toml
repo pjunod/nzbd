@@ -6,7 +6,11 @@ license.workspace = true
 
 [dependencies]
 nzbd-types = { workspace = true }
-nzbd-api = { workspace = true }
+nzbd-engine = { workspace = true }
 axum = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+tempfile = { workspace = true }

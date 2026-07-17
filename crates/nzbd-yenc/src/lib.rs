@@ -67,7 +67,10 @@ pub struct DecodeResult {
 pub enum Status {
     /// Feed more bytes.
     NeedMore,
-    /// `=yend` parsed; the article is done. Call [`YencDecoder::take_result`].
+    /// `=yend` and the article terminator (`.` line) have been consumed.
+    /// Call [`YencDecoder::take_result`]. Bytes past the consumed count
+    /// returned by [`YencDecoder::push`] belong to the next response
+    /// (pipelining) and were NOT consumed.
     Finished,
 }
 
@@ -80,7 +83,8 @@ enum State {
     Body,
     /// Line-start `=y` seen in body: accumulating a control line (`=yend`).
     Control,
-    /// Trailer parsed; swallowing any remaining bytes (terminator etc.).
+    /// Trailer parsed; swallowing trailing lines until the `.` terminator
+    /// line, which ends consumption (pipelining-safe).
     Drain,
 }
 
@@ -133,19 +137,21 @@ impl YencDecoder {
     }
 
     /// Feed a chunk; decoded bytes are appended to `out`.
-    pub fn push(&mut self, buf: &[u8], out: &mut Vec<u8>) -> Result<Status, YencError> {
+    ///
+    /// Returns the status and the number of bytes **consumed** from `buf`.
+    /// On [`Status::Finished`] the article terminator has been consumed and
+    /// any remaining bytes belong to the next response on the connection —
+    /// the caller must not feed them to this decoder again.
+    pub fn push(&mut self, buf: &[u8], out: &mut Vec<u8>) -> Result<(Status, usize), YencError> {
         let hash_from = out.len();
         let mut i = 0usize;
-        while i < buf.len() {
+        while i < buf.len() && !self.finished {
             let b = buf[i];
             i += 1;
             match self.state {
-                State::Pre | State::ExpectPart | State::Control => {
+                State::Pre | State::ExpectPart | State::Control | State::Drain => {
                     if b == b'\n' {
                         self.take_line(out)?;
-                        if self.finished {
-                            break;
-                        }
                     } else {
                         if self.line_buf.len() >= MAX_LINE {
                             return Err(YencError::Malformed("line too long"));
@@ -154,7 +160,6 @@ impl YencDecoder {
                     }
                 }
                 State::Body => self.body_byte(b, out)?,
-                State::Drain => { /* swallow */ }
             }
         }
         let newly = &out[hash_from..];
@@ -162,7 +167,11 @@ impl YencDecoder {
             self.hasher.update(newly);
             self.decoded_len += newly.len() as u64;
         }
-        Ok(if self.finished { Status::Finished } else { Status::NeedMore })
+        Ok(if self.finished {
+            (Status::Finished, i)
+        } else {
+            (Status::NeedMore, i)
+        })
     }
 
     /// Available after [`Status::Finished`].
@@ -222,13 +231,18 @@ impl YencDecoder {
             State::Control => {
                 if line.starts_with(b"=yend") {
                     self.trailer = parse_end(&line)?;
-                    self.finished = true;
                     self.state = State::Drain;
                 } else {
                     return Err(YencError::Malformed("unexpected =y control line in body"));
                 }
             }
-            _ => unreachable!(),
+            State::Drain => {
+                // Swallow trailing junk lines until the article terminator.
+                if line == b"." {
+                    self.finished = true;
+                }
+            }
+            State::Body => unreachable!(),
         }
         Ok(())
     }
@@ -585,12 +599,14 @@ mod tests {
         let mut out = Vec::new();
         let mut finished = false;
         for c in chunks {
-            match dec.push(c, &mut out).unwrap() {
+            let (status, consumed) = dec.push(c, &mut out).unwrap();
+            match status {
                 Status::Finished => {
+                    assert_eq!(consumed, c.len(), "must consume the full final chunk");
                     finished = true;
                     break;
                 }
-                Status::NeedMore => {}
+                Status::NeedMore => assert_eq!(consumed, c.len()),
             }
         }
         assert!(finished, "decoder did not finish");
@@ -651,7 +667,7 @@ mod tests {
         // (encodes to '.') positioned so encoded lines *start* with '.', which
         // then exercises NNTP dot-unstuffing.
         let mut data = vec![0xD6u8, 0xE0, 0xE3, 0x13]; // -> 0x00, 0x0A, 0x0D, '='
-        data.extend(std::iter::repeat(0x04).take(64)); // -> '.' everywhere
+        data.extend(std::iter::repeat_n(0x04, 64)); // -> '.' everywhere
         data.extend_from_slice(&[0xD6, 0x13, 0x13, 0xE3]);
         let art = encode_article(&data, data.len() as u64, None, "dots", 8);
         // sanity: the stuffed article must actually contain a doubled dot
@@ -690,6 +706,35 @@ mod tests {
         let mut out = Vec::new();
         let err = dec.push(&cut, &mut out).unwrap_err();
         assert_eq!(err, YencError::PrematureEnd);
+    }
+
+    #[test]
+    fn stops_consuming_at_terminator() {
+        // Pipelining: bytes of the next response must not be swallowed.
+        let data = prng_bytes(9, 200);
+        let art = encode_article(&data, 200, None, "x", 64);
+        let mut wire = art.clone();
+        wire.extend_from_slice(b"222 0 <next@x> body follows\r\n");
+        let mut dec = YencDecoder::new();
+        let mut out = Vec::new();
+        let (st, consumed) = dec.push(&wire, &mut out).unwrap();
+        assert_eq!(st, Status::Finished);
+        assert_eq!(consumed, art.len(), "must stop exactly after the terminator");
+        assert_eq!(&wire[consumed..], b"222 0 <next@x> body follows\r\n");
+        assert_eq!(out, data);
+        assert_eq!(dec.take_result().unwrap().crc_ok, Some(true));
+    }
+
+    #[test]
+    fn junk_lines_after_yend_are_swallowed() {
+        let data = prng_bytes(11, 100);
+        let mut art = encode_article(&data, 100, None, "x", 64);
+        // Insert a junk line between =yend and the terminator.
+        let term = art.len() - 3;
+        art.splice(term..term, b"some trailing garbage\r\n".iter().copied());
+        let (out, res) = decode_all(&[&art]);
+        assert_eq!(out, data);
+        assert_eq!(res.crc_ok, Some(true));
     }
 
     #[test]

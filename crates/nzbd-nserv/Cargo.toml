@@ -1,0 +1,14 @@
+[package]
+name = "nzbd-nserv"
+description = "Mock NNTP server for nzbd integration tests and benchmarks (NZBGet's nserv equivalent)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+tokio = { workspace = true }
+crc32fast = { workspace = true }
+tracing = { workspace = true }

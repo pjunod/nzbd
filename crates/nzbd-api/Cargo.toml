@@ -6,7 +6,14 @@ license.workspace = true
 
 [dependencies]
 nzbd-types = { workspace = true }
+nzbd-engine = { workspace = true }
 axum = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-arc-swap = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+tower = { version = "0.5", features = ["util"] }
+tempfile = { workspace = true }
+http-body-util = "0.1"

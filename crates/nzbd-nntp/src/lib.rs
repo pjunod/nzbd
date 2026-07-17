@@ -1,9 +1,11 @@
-//! NNTP protocol codec: commands, responses, multiline text reading.
+//! NNTP protocol: codec (commands, responses, multiline reading) and the
+//! async transport ([`transport::NntpConnection`]: tokio + rustls).
 //!
-//! Pure protocol logic, no I/O — the async transport (tokio + rustls,
-//! connection state machine, COMPRESS DEFLATE) layers on top in phase 1.
 //! Body streaming does NOT go through [`MultilineReader`]: article bodies are
 //! fed raw into `nzbd-yenc`, which performs its own dot-unstuffing inline.
+//! COMPRESS DEFLATE (RFC 8054) is a later addition.
+
+pub mod transport;
 
 use std::fmt;
 

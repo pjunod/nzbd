@@ -96,9 +96,38 @@ pub struct FileEntry {
     pub is_par2: bool,
     pub paused: bool,
     pub groups: Vec<String>,
+    /// Post date (unix) from the NZB — drives retention pre-fail and
+    /// `PropagationDelay`.
+    #[serde(default)]
+    pub date: Option<i64>,
     pub segments: Vec<Segment>,
     /// Combined CRC32 of the decoded file, available once all segments are done.
     pub crc32: Option<u32>,
+    /// Output file assembled and atomically renamed into place.
+    #[serde(default)]
+    pub finalized: bool,
+}
+
+impl FileEntry {
+    /// All segments in a terminal state (done or failed).
+    pub fn is_terminal(&self) -> bool {
+        self.segments
+            .iter()
+            .all(|s| matches!(s.state, SegmentState::Done { .. } | SegmentState::Failed))
+    }
+
+    pub fn done_segments(&self) -> usize {
+        self.segments
+            .iter()
+            .filter(|s| matches!(s.state, SegmentState::Done { .. }))
+            .count()
+    }
+
+    pub fn has_any_done(&self) -> bool {
+        self.segments
+            .iter()
+            .any(|s| matches!(s.state, SegmentState::Done { .. }))
+    }
 }
 
 // ---------------------------------------------------------------------------

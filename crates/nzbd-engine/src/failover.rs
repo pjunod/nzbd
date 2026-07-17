@@ -57,12 +57,27 @@ pub enum Verdict {
     Failed,
 }
 
+/// The current serving options for a segment (pull-model view used by the
+/// engine: connection tasks ask "may server X take this segment?").
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Candidates {
+    /// Any of these servers may take the segment now (current tier,
+    /// not failed, not blocked), in configuration order.
+    Servers(Vec<ServerId>),
+    /// Usable servers exist at the current tier but all are temporarily
+    /// blocked (and at least one is non-fill): wait, don't escalate.
+    WaitForBlocked,
+    /// Every tier exhausted: the article is unrecoverable.
+    Exhausted,
+}
+
 /// Per-segment failover bookkeeping.
 #[derive(Debug, Clone)]
 pub struct SegmentAttempt {
     pub tier: u8,
     pub failed: BTreeSet<ServerId>,
     pub retries_left: u8,
+    initial_retries: u8,
 }
 
 impl SegmentAttempt {
@@ -71,6 +86,7 @@ impl SegmentAttempt {
             tier: 0,
             failed: BTreeSet::new(),
             retries_left: retries,
+            initial_retries: retries,
         }
     }
 }
@@ -108,36 +124,74 @@ impl<'a> Ladder<'a> {
         att: &mut SegmentAttempt,
         is_blocked: &dyn Fn(ServerId) -> bool,
     ) -> Selection {
+        match self.current_candidates(att, is_blocked, None) {
+            Candidates::Servers(v) => Selection::Server(v[0]),
+            Candidates::WaitForBlocked => Selection::WaitForBlocked,
+            Candidates::Exhausted => Selection::Exhausted,
+        }
+    }
+
+    /// The set of servers that may serve this segment *now*, escalating
+    /// `att.tier` past exhausted tiers as a side effect.
+    ///
+    /// `article_age_days` enables per-server retention pre-fail: a server
+    /// whose `retention_days` window is shorter than the article's age is
+    /// treated as failed for this segment without a network attempt.
+    pub fn current_candidates(
+        &self,
+        att: &mut SegmentAttempt,
+        is_blocked: &dyn Fn(ServerId) -> bool,
+        article_age_days: Option<u32>,
+    ) -> Candidates {
         loop {
             let candidates: Vec<&ServerDef> = self
                 .servers
                 .iter()
-                .filter(|s| s.active && s.tier == att.tier && !self.is_group_failed(att, s))
+                .filter(|s| {
+                    s.active
+                        && s.tier == att.tier
+                        && !self.is_group_failed(att, s)
+                        && !retention_exceeded(s, article_age_days)
+                })
                 .collect();
 
             if candidates.is_empty() {
                 if att.tier >= self.max_tier {
-                    return Selection::Exhausted;
+                    return Candidates::Exhausted;
                 }
                 att.tier += 1;
                 continue;
             }
 
-            if let Some(s) = candidates.iter().find(|s| !is_blocked(s.id)) {
-                return Selection::Server(s.id);
+            let usable: Vec<ServerId> = candidates
+                .iter()
+                .filter(|s| !is_blocked(s.id))
+                .map(|s| s.id)
+                .collect();
+            if !usable.is_empty() {
+                return Candidates::Servers(usable);
             }
 
             // All candidates blocked. Fill servers must never stall the
             // queue: if every blocked candidate is a fill server, escalate.
             if candidates.iter().all(|s| s.fill) {
                 if att.tier >= self.max_tier {
-                    return Selection::Exhausted;
+                    return Candidates::Exhausted;
                 }
                 att.tier += 1;
                 continue;
             }
-            return Selection::WaitForBlocked;
+            return Candidates::WaitForBlocked;
         }
+    }
+
+    /// True when no server anywhere can ever serve this segment (temporary
+    /// blocks ignored — they expire; failed sets only grow).
+    pub fn is_exhausted(&self, att: &mut SegmentAttempt, article_age_days: Option<u32>) -> bool {
+        matches!(
+            self.current_candidates(att, &|_| false, article_age_days),
+            Candidates::Exhausted
+        )
     }
 
     /// Apply an attempt outcome. On `NextServer`, call `select` again (it
@@ -163,10 +217,20 @@ impl<'a> Ladder<'a> {
                     Verdict::RetrySame { block_server: false }
                 } else {
                     att.failed.insert(server);
+                    // A fresh server gets a fresh retry budget (NZBGet's
+                    // retry loop is per download-attempt on a server).
+                    att.retries_left = att.initial_retries;
                     Verdict::NextServer
                 }
             }
         }
+    }
+}
+
+fn retention_exceeded(s: &ServerDef, article_age_days: Option<u32>) -> bool {
+    match article_age_days {
+        Some(age) => s.retention_days > 0 && age > s.retention_days,
+        None => false,
     }
 }
 
@@ -318,5 +382,62 @@ mod tests {
         let ladder = Ladder::new(&servers);
         let mut att = SegmentAttempt::new(3);
         assert_eq!(ladder.select(&mut att, &NOT_BLOCKED), Selection::Server(ServerId(2)));
+    }
+
+    #[test]
+    fn retries_reset_when_moving_to_a_new_server() {
+        let servers = vec![server(1, 0, 0, false), server(2, 1, 0, false)];
+        let ladder = Ladder::new(&servers);
+        let mut att = SegmentAttempt::new(2);
+
+        ladder.on_outcome(&mut att, ServerId(1), AttemptOutcome::Other);
+        assert_eq!(att.retries_left, 1);
+        assert_eq!(
+            ladder.on_outcome(&mut att, ServerId(1), AttemptOutcome::Other),
+            Verdict::NextServer
+        );
+        assert_eq!(att.retries_left, 2, "fresh server, fresh retry budget");
+    }
+
+    #[test]
+    fn retention_prefails_old_articles_per_server() {
+        let mut s1 = server(1, 0, 0, false);
+        s1.retention_days = 100; // too short for a 200-day-old article
+        let servers = vec![s1, server(2, 1, 0, false)];
+        let ladder = Ladder::new(&servers);
+        let mut att = SegmentAttempt::new(3);
+
+        // Old article: server 1 pre-failed, escalate straight to tier 1.
+        match ladder.current_candidates(&mut att, &NOT_BLOCKED, Some(200)) {
+            Candidates::Servers(v) => assert_eq!(v, vec![ServerId(2)]),
+            other => panic!("expected servers, got {other:?}"),
+        }
+
+        // Young article: server 1 serves.
+        let mut att = SegmentAttempt::new(3);
+        match ladder.current_candidates(&mut att, &NOT_BLOCKED, Some(50)) {
+            Candidates::Servers(v) => assert_eq!(v, vec![ServerId(1)]),
+            other => panic!("expected servers, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn candidates_lists_all_usable_at_tier() {
+        let servers = vec![
+            server(1, 0, 0, false),
+            server(2, 0, 0, false),
+            server(3, 1, 0, false),
+        ];
+        let ladder = Ladder::new(&servers);
+        let mut att = SegmentAttempt::new(3);
+        match ladder.current_candidates(&mut att, &NOT_BLOCKED, None) {
+            Candidates::Servers(v) => assert_eq!(v, vec![ServerId(1), ServerId(2)]),
+            other => panic!("expected servers, got {other:?}"),
+        }
+        assert!(!ladder.is_exhausted(&mut att, None));
+        att.failed.insert(ServerId(1));
+        att.failed.insert(ServerId(2));
+        att.failed.insert(ServerId(3));
+        assert!(ladder.is_exhausted(&mut att, None));
     }
 }
