@@ -8,8 +8,8 @@ roadmaps in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) §16 and
 Legend: ✅ done (implemented, tested, committed) · 🔶 partial · ⬜ not
 started · 👤 operator action (Paul)
 
-**Snapshot (2026-07-17):** 105 tests · clippy clean · phases 0, 1, 2 and
-cluster C1 complete · next up: **C2 PP leases, then Phase 3 API/compat**
+**Snapshot (2026-07-17):** 106 tests · clippy clean · phases 0, 1, 2 and
+cluster C1+C2 complete · next up: **Phase 3 native API + *arr compat**
 
 | Phase | State | Evidence |
 |---|---|---|
@@ -17,8 +17,8 @@ cluster C1 complete · next up: **C2 PP leases, then Phase 3 API/compat**
 | 1 — Core engine | ✅ complete | `2f45cd5` |
 | C1 — Cluster foundation | ✅ complete | `e4178b2` (design), `0969a79` (impl) |
 | CI & quality gates | ✅ complete (2 decisions open) | `b0b5530`, `0de429b` |
-| 2 — Post-processing | ✅ core complete | this commit |
-| C2 — PP leases + anti-affinity | ⬜ next | — |
+| 2 — Post-processing | ✅ core complete | `1fdad15` |
+| C2 — PP leases + anti-affinity | ✅ complete | this commit |
 | 3 — Native API + *arr compat shim | ⬜ | — |
 | 4 — Web UI + ecosystem | ⬜ | — |
 | 5 — Beyond parity (+ C3) | ⬜ | — |
@@ -69,7 +69,8 @@ cluster C1 complete · next up: **C2 PP leases, then Phase 3 API/compat**
 - ✅ Any-node API: full API + shim everywhere, transparent proxy to the leader
 - ✅ `[cluster]` config + validation; single-node mode untouched
 - ✅ 5 multi-node e2e tests: single-leader invariant, distributed download via proxied add with budget held, worker-death reclaim (zero re-fetch), leader-death failover with lease adoption, restart persistence
-- ⬜ C2: PP leases (fenced staging dirs, verify-then-rename commit) + download-vs-PP anti-affinity — **next** (phase 2 core done; PP currently runs leader-only behind an election gate)
+- ✅ C2: PP work leases — `LeaseKind::Post` in the poll/heartbeat/complete protocol; leader **anti-affinity scheduler** (idle PP nodes first, downloading nodes last, capacity-aware incl. in-flight backlog); fenced `.pp.<lease>/` staging with verify-lease-then-rename commit; superseded-staging GC; lease adoption across leader failover for PP too; dead-node delegation reconcile; download-only connection-budget divisor; per-node `history.<node>.jsonl` on the shared volume (cross-client O_APPEND is not trusted), union rebuild into each local SQLite index
+- ✅ C2 e2e: leader downloads a real par2-set job, the idle non-download node quick-verifies it, stamps it, appends shared history, hands it back — bit-identical payload, zero staging residue
 - ⬜ C3: segment-split downloads, weighted scheduling, budget rebalancing
 - 👤 Real-Gluster soak checklist (CLUSTERING.md §11): quorum on, node reboots, volume heal mid-download
 
@@ -100,7 +101,8 @@ cluster C1 complete · next up: **C2 PP leases, then Phase 3 API/compat**
 - ⬜ Dupe handling (key/score/mode)
 - ⬜ Health-check actions on failure (park/delete per config)
 - ⬜ Fixture suite extras: par2 damage matrices, multi-volume/passworded rar
-- ⬜ C2: PP work-lease type + anti-affinity scheduling (a job downloaded on node B repairs on node C) — replaces the leader-only gate
+- ✅ C2: PP work-lease type + anti-affinity scheduling (a job downloaded on node B post-processes on node C) — see the cluster section
+- ⬜ C2 fixture extras: kill-mid-PP reclaim e2e (reclaim machinery itself is exercised by the download-lease tests)
 
 ## Phase 3 — Native API + compat ⬜
 

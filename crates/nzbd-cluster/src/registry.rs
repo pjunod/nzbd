@@ -38,6 +38,7 @@ pub fn spawn_registry(
                 post_process: cfg.post_process,
                 max_download_jobs: cfg.max_download_jobs,
                 active_download_jobs: active,
+                pp_slots: if cfg.post_process { cfg.pp_slots } else { 0 },
                 rate_bps: snap.download_rate_bps,
                 seq,
             };

@@ -1,11 +1,12 @@
 //! Job history (ARCHITECTURE.md §8.6 / ADR-16).
 //!
-//! Two layers: an **append-only JSONL** file on the (possibly shared)
+//! Two layers: **append-only JSONL** files on the (possibly shared)
 //! volume — the crash-safe, mergeable source of truth — and a **local
 //! SQLite index** (rusqlite bundled) rebuilt from the JSONL when empty.
-//! SQLite never lives on a network filesystem (ADR-16): in cluster mode
-//! the JSONL sits on the shared volume, the index on the local disk of
-//! whichever node is the authority.
+//! SQLite never lives on a network filesystem (ADR-16). In cluster mode
+//! every node appends to its OWN `history.<node>.jsonl` (cross-client
+//! O_APPEND interleaving on Gluster is not trustworthy); readers union
+//! all `history*.jsonl` files, deduped by (job, completed_at).
 
 use crate::{HistoryEntry, StateError};
 use rusqlite::Connection;
@@ -24,6 +25,17 @@ impl HistoryDb {
     /// authoritative `history.jsonl` (pass the shared volume in cluster
     /// mode, or the local state dir single-node).
     pub fn open(db_path: &Path, jsonl_dir: Option<&Path>) -> Result<HistoryDb, StateError> {
+        Self::open_tagged(db_path, jsonl_dir, None)
+    }
+
+    /// Cluster form: this node appends to `history.<tag>.jsonl`, so
+    /// concurrent PP executors never share an append fd. Reads union every
+    /// `history*.jsonl` in the directory.
+    pub fn open_tagged(
+        db_path: &Path,
+        jsonl_dir: Option<&Path>,
+        tag: Option<&str>,
+    ) -> Result<HistoryDb, StateError> {
         if let Some(parent) = db_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -46,7 +58,13 @@ impl HistoryDb {
         )
         .map_err(|e| StateError::Corrupt(format!("sqlite schema: {e}")))?;
 
-        let jsonl = jsonl_dir.map(|d| d.join("history.jsonl"));
+        let jsonl = jsonl_dir.map(|d| {
+            let file = match tag {
+                Some(t) => format!("history.{t}.jsonl"),
+                None => "history.jsonl".into(),
+            };
+            d.join(file)
+        });
         let db = HistoryDb {
             conn: Mutex::new(conn),
             jsonl,
@@ -55,28 +73,52 @@ impl HistoryDb {
         Ok(db)
     }
 
+    /// Pull in rows other nodes appended since open (cluster: call before
+    /// serving history reads).
+    pub fn refresh(&self) -> Result<(), StateError> {
+        self.rebuild_from_jsonl()
+    }
+
     /// Import any JSONL rows the index doesn't have (fresh index after a
-    /// leader failover, or a wiped local disk).
+    /// leader failover, a wiped local disk, or another node's appends).
+    /// Unions every `history*.jsonl` in the directory — duplicates are
+    /// dropped by the (job, completed_at) unique index.
     fn rebuild_from_jsonl(&self) -> Result<(), StateError> {
-        let Some(path) = &self.jsonl else {
+        let Some(own) = &self.jsonl else {
             return Ok(());
         };
-        let file = match std::fs::File::open(path) {
-            Ok(f) => f,
+        let Some(dir) = own.parent() else {
+            return Ok(());
+        };
+        let mut files: Vec<PathBuf> = match std::fs::read_dir(dir) {
+            Ok(entries) => entries
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| {
+                    let n = p.file_name().unwrap_or_default().to_string_lossy();
+                    n.starts_with("history") && n.ends_with(".jsonl")
+                })
+                .collect(),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
             Err(e) => return Err(e.into()),
         };
+        files.sort();
         let mut imported = 0usize;
-        for line in BufReader::new(file).split(b'\n') {
-            let line = line?;
-            if line.is_empty() {
+        for path in files {
+            let Ok(file) = std::fs::File::open(&path) else {
                 continue;
-            }
-            let Ok(entry) = serde_json::from_slice::<HistoryEntry>(&line) else {
-                continue; // torn tail / old format
             };
-            if self.insert(&entry, false)? {
-                imported += 1;
+            for line in BufReader::new(file).split(b'\n') {
+                let line = line?;
+                if line.is_empty() {
+                    continue;
+                }
+                let Ok(entry) = serde_json::from_slice::<HistoryEntry>(&line) else {
+                    continue; // torn tail / old format
+                };
+                if self.insert(&entry, false)? {
+                    imported += 1;
+                }
             }
         }
         if imported > 0 {

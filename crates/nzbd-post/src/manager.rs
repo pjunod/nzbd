@@ -20,8 +20,9 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
-/// Param stamped onto a job once post-processing finished.
-pub const PP_DONE_PARAM: &str = "*PP:done";
+/// Param stamped onto a job once post-processing finished (defined in
+/// `nzbd-types` so the engine snapshot and cluster scheduler see it too).
+pub use nzbd_types::PP_DONE_PARAM;
 
 #[derive(Debug, Clone)]
 pub struct PostConfig {
@@ -85,11 +86,30 @@ impl PpFinal {
     }
 }
 
-/// Authority gate: in cluster mode only the node holding queue authority
-/// (the leader) post-processes; everyone else stays parked until the
-/// periodic rescan sees the gate open. `None` = always on (single node).
-/// Cluster C2 replaces this with distributed PP work leases.
-pub type PpGate = Option<Arc<dyn Fn() -> bool + Send + Sync>>;
+/// Per-job claim gate. `None` = process everything (single node). In
+/// cluster mode the closure consults election state + the PP assignment
+/// the leader scheduler made (C2 anti-affinity): a node only processes
+/// jobs assigned to it, and only the leader records health-failures.
+pub type PpGate = Option<Arc<dyn Fn(JobId) -> bool + Send + Sync>>;
+
+/// Fencing context for one PP execution (CLUSTERING.md §6.4): `tag` names
+/// the staging dir (`.pp.<tag>/`) unpack extracts into, and `commit_ok`
+/// is re-checked immediately before every commit rename and before the
+/// final stamp — a lease that was cancelled or reclaimed must not publish.
+#[derive(Clone)]
+pub struct PpCtx {
+    pub tag: String,
+    pub commit_ok: Arc<dyn Fn() -> bool + Send + Sync>,
+}
+
+impl Default for PpCtx {
+    fn default() -> Self {
+        PpCtx {
+            tag: "local".into(),
+            commit_ok: Arc::new(|| true),
+        }
+    }
+}
 
 /// How often the manager rescans the queue for un-processed finished jobs
 /// (covers leadership takeover, lagged event streams, crashed PP attempts
@@ -123,7 +143,7 @@ async fn manager_task(
     let mut rx = engine.subscribe();
     let mut queued: HashSet<JobId> = HashSet::new();
     let sem = Arc::new(tokio::sync::Semaphore::new(cfg.slots.max(1)));
-    let open = |g: &PpGate| g.as_ref().map(|f| f()).unwrap_or(true);
+    let claim = |g: &PpGate, job: JobId| g.as_ref().map(|f| f(job)).unwrap_or(true);
 
     // Startup scan + periodic rescan: finished downloads that were never
     // post-processed (crash between completion and PP, or authority adopted
@@ -135,20 +155,18 @@ async fn manager_task(
         tokio::select! {
             _ = cancel.cancelled() => break,
             _ = rescan.tick() => {
-                if open(&gate) {
-                    scan_queue(&tracker, &engine, &cfg, &history, &dest_dir, &sem, &mut queued).await;
-                }
+                scan_queue(&tracker, &engine, &cfg, &history, &dest_dir, &gate, &sem, &mut queued).await;
             }
             ev = rx.recv() => match ev {
                 Ok(Event::JobFinished { job, status, name, health }) => match status {
-                    JobStatus::Completed if open(&gate) => {
+                    JobStatus::Completed if claim(&gate, job) => {
                         if let Ok(Some(exported)) = engine.export_job(job).await {
                             if !pp_done(&exported) && queued.insert(job) {
                                 spawn_job(&tracker, &engine, &cfg, &history, &dest_dir, &sem, job);
                             }
                         }
                     }
-                    JobStatus::Failed if open(&gate) => {
+                    JobStatus::Failed if claim(&gate, job) => {
                         // Below critical health: no PP; record history.
                         let (category, size) = match engine.export_job(job).await {
                             Ok(Some(j)) => (j.category.clone(), j.totals.size),
@@ -184,19 +202,18 @@ async fn scan_queue(
     cfg: &PostConfig,
     history: &Arc<HistoryDb>,
     dest_dir: &Path,
+    gate: &PpGate,
     sem: &Arc<tokio::sync::Semaphore>,
     queued: &mut HashSet<JobId>,
 ) {
+    let claim = |job: JobId| gate.as_ref().map(|f| f(job)).unwrap_or(true);
     for j in engine.snapshot().jobs.iter() {
-        if matches!(j.status, JobStatus::Completed) {
-            if let Ok(Some(job)) = engine.export_job(j.id).await {
-                if !pp_done(&job) && queued.insert(job.id) {
-                    spawn_job(tracker, engine, cfg, history, dest_dir, sem, job.id);
-                }
-            }
-        } else if matches!(j.status, JobStatus::PostQueued | JobStatus::Post { .. })
-            && queued.insert(j.id)
-        {
+        let needs_pp = !j.pp_done
+            && matches!(
+                j.status,
+                JobStatus::Completed | JobStatus::PostQueued | JobStatus::Post { .. }
+            );
+        if needs_pp && claim(j.id) && queued.insert(j.id) {
             spawn_job(tracker, engine, cfg, history, dest_dir, sem, j.id);
         }
     }
@@ -272,6 +289,19 @@ pub async fn process_job(
     dest_dir: &Path,
     job_id: JobId,
 ) -> Result<PpFinal, PostError> {
+    process_job_ctx(engine, cfg, history, dest_dir, job_id, &PpCtx::default()).await
+}
+
+/// The stage pipeline with explicit fencing (cluster PP leases pass their
+/// lease id as the staging tag and a live lease check as `commit_ok`).
+pub async fn process_job_ctx(
+    engine: &EngineHandle,
+    cfg: &PostConfig,
+    history: &Arc<HistoryDb>,
+    dest_dir: &Path,
+    job_id: JobId,
+    ctx: &PpCtx,
+) -> Result<PpFinal, PostError> {
     let _ = engine.set_job_status(job_id, JobStatus::PostQueued).await;
     let Some(job) = engine
         .export_job(job_id)
@@ -281,6 +311,10 @@ pub async fn process_job(
         return Err(PostError::Subprocess("job vanished".into()));
     };
     let dir = dest_dir.join(nzbd_engine::queue::sanitize_name(&job.name));
+    // Superseded staging dirs (a reclaimed lease's leftovers) are garbage
+    // by definition — this lease is now the only live executor.
+    let staging = dir.join(format!(".pp.{}", ctx.tag));
+    remove_stale_staging(&dir, &staging);
 
     // ---- PAR stage ---------------------------------------------------------
     let par_tool = Par2Tool {
@@ -316,7 +350,11 @@ pub async fn process_job(
             };
             let password = None; // per-job passwords land with the meta plumbing
             for (archive, kind) in &archives {
-                let mut r = ex.extract(archive, *kind, &dir, password).await?;
+                // Extraction is fenced: everything lands in the lease's
+                // staging dir and is renamed into place only on success
+                // with the lease still live (double-unpack can't happen).
+                let _ = std::fs::remove_dir_all(&staging);
+                let mut r = ex.extract(archive, *kind, &staging, password).await?;
                 if !r.success && !par_did_repair && par_ok {
                     // The unpack↔repair loop: a broken archive that quick
                     // verification couldn't see; force a repair and retry once.
@@ -330,12 +368,18 @@ pub async fn process_job(
                             if repair_loop(engine, cfg, &par_tool, job_id, &main).await? {
                                 par_did_repair = true;
                                 set_stage(engine, job_id, PostStage::Unpack).await;
-                                r = ex.extract(archive, *kind, &dir, password).await?;
+                                let _ = std::fs::remove_dir_all(&staging);
+                                r = ex.extract(archive, *kind, &staging, password).await?;
                             }
                         }
                     }
                 }
                 if r.success {
+                    if !(ctx.commit_ok)() {
+                        let _ = std::fs::remove_dir_all(&staging);
+                        return Err(PostError::Subprocess("pp lease lost before commit".into()));
+                    }
+                    commit_staging(&staging, &dir)?;
                     unpacked_any = true;
                 } else {
                     tracing::warn!(
@@ -346,6 +390,7 @@ pub async fn process_job(
                     );
                     unpack_ok = false;
                 }
+                let _ = std::fs::remove_dir_all(&staging);
             }
         }
     }
@@ -408,6 +453,9 @@ pub async fn process_job(
         PpFinal::Success
     };
 
+    if !(ctx.commit_ok)() {
+        return Err(PostError::Subprocess("pp lease lost before finalize".into()));
+    }
     // Stamp + set final status in one import (replaces the job atomically).
     if let Ok(Some(mut fin)) = engine.export_job(job_id).await {
         fin.params
@@ -506,6 +554,37 @@ async fn wait_par_files(engine: &EngineHandle, job_id: JobId, timeout: Duration)
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
+}
+
+/// Remove every `.pp.*` staging dir except this lease's own.
+fn remove_stale_staging(dir: &Path, own: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for e in entries.flatten() {
+        let p = e.path();
+        if p.is_dir()
+            && p != own
+            && e.file_name().to_string_lossy().starts_with(".pp.")
+        {
+            tracing::info!(dir = %p.display(), "removing superseded pp staging dir");
+            let _ = std::fs::remove_dir_all(&p);
+        }
+    }
+}
+
+/// Publish staged extraction output: rename each entry into the job dir,
+/// replacing existing targets (identical content by construction — same
+/// archive, same extractor).
+fn commit_staging(staging: &Path, dir: &Path) -> std::io::Result<()> {
+    for e in std::fs::read_dir(staging)?.flatten() {
+        let target = dir.join(e.file_name());
+        if target.is_dir() {
+            std::fs::remove_dir_all(&target)?;
+        }
+        std::fs::rename(e.path(), &target)?;
+    }
+    Ok(())
 }
 
 fn cleanup_dir(dir: &Path) {

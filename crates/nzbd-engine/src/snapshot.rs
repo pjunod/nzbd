@@ -29,6 +29,8 @@ pub struct JobSummary {
     pub critical_health: u16,
     /// Cluster: node currently executing this job remotely (None = local).
     pub assigned_node: Option<String>,
+    /// Post-processing already finished (the `*PP:done` stamp is present).
+    pub pp_done: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]

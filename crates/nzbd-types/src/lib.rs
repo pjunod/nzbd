@@ -266,6 +266,11 @@ pub enum JobStatus {
     Deleted,
 }
 
+/// Job param stamped by post-processing when it finishes (value = final
+/// PP status). Its presence means "never post-process this job again" —
+/// across restarts, leader failovers and lease reclaims.
+pub const PP_DONE_PARAM: &str = "*PP:done";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Job {
     pub id: JobId,

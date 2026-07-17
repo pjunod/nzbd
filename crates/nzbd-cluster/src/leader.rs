@@ -27,6 +27,7 @@ use tokio_util::task::TaskTracker;
 struct LeaseInfo {
     job: JobId,
     node: String,
+    kind: LeaseKind,
     last_hb: Instant,
 }
 
@@ -77,16 +78,18 @@ impl LeaderShared {
         format!("L{}-{}", self.epoch(), n)
     }
 
-    /// Distinct nodes currently downloading (leases) plus the leader
-    /// itself — the divisor for per-account connection budgets. Counting
-    /// the leader unconditionally is conservative: budgets never exceed
-    /// the account cap, at worst they under-use it while the leader idles.
+    /// Distinct nodes currently downloading (download leases only — PP
+    /// leases open no provider connections) plus the leader itself — the
+    /// divisor for per-account connection budgets. Counting the leader
+    /// unconditionally is conservative: budgets never exceed the account
+    /// cap, at worst they under-use it while the leader idles.
     fn budget_divisor(&self) -> u32 {
         let nodes: HashSet<String> = self
             .leases
             .lock()
             .unwrap()
             .values()
+            .filter(|l| l.kind == LeaseKind::Download)
             .map(|l| l.node.clone())
             .collect();
         1 + nodes.len() as u32
@@ -230,6 +233,7 @@ async fn work_poll(
             LeaseInfo {
                 job: job_id,
                 node: req.node.clone(),
+                kind: LeaseKind::Download,
                 last_hb: Instant::now(),
             },
         );
@@ -240,10 +244,57 @@ async fn work_poll(
         grants.push(Grant {
             lease_id,
             epoch: s.epoch(),
+            kind: LeaseKind::Download,
             job,
             server_budgets: s.budgets_by_name(),
         });
     }
+
+    // PP grants (C2): completed jobs the scheduler assigned to this node
+    // for post-processing, not yet leased, PP not yet done.
+    let mut pp_granted = 0u32;
+    let pp_candidates: Vec<JobId> = snap
+        .jobs
+        .iter()
+        .filter(|j| {
+            matches!(j.status, JobStatus::Completed)
+                && !j.pp_done
+                && j.assigned_node.as_deref() == Some(req.node.as_str())
+        })
+        .map(|j| j.id)
+        .collect();
+    for job_id in pp_candidates {
+        if pp_granted >= req.free_pp_slots {
+            break;
+        }
+        let already = s.leases.lock().unwrap().values().any(|l| l.job == job_id);
+        if already {
+            continue;
+        }
+        let Ok(Some(job)) = s.engine.export_job(job_id).await else {
+            continue;
+        };
+        let lease_id = s.next_lease_id();
+        s.leases.lock().unwrap().insert(
+            lease_id.clone(),
+            LeaseInfo {
+                job: job_id,
+                node: req.node.clone(),
+                kind: LeaseKind::Post,
+                last_hb: Instant::now(),
+            },
+        );
+        tracing::info!(job = job_id.0, node = %req.node, %lease_id, "pp lease granted");
+        pp_granted += 1;
+        grants.push(Grant {
+            lease_id,
+            epoch: s.epoch(),
+            kind: LeaseKind::Post,
+            job,
+            server_budgets: HashMap::new(),
+        });
+    }
+
     if !grants.is_empty() {
         s.apply_local_budgets().await;
     }
@@ -279,26 +330,40 @@ async fn work_heartbeat(
                 Some(_) => cancel.push(lp.lease_id.clone()), // someone else's id?!
                 None => {
                     // Adoption (CLUSTERING.md §6.2): new leader, live worker.
+                    // A running download lease is adoptable while the job is
+                    // non-terminal; a running PP lease while the job is
+                    // Completed with PP still pending.
                     let job = snap.jobs.iter().find(|j| j.id == lp.job);
-                    let adoptable = job.is_some_and(|j| {
-                        !matches!(
+                    let unassigned_or_mine = |j: &nzbd_engine::JobSummary| {
+                        j.assigned_node.is_none()
+                            || j.assigned_node.as_deref() == Some(req.node.as_str())
+                    };
+                    let kind = job.and_then(|j| {
+                        if !unassigned_or_mine(j) || leases.values().any(|l| l.job == lp.job) {
+                            None
+                        } else if matches!(j.status, JobStatus::Completed) && !j.pp_done {
+                            Some(LeaseKind::Post)
+                        } else if !matches!(
                             j.status,
                             JobStatus::Completed | JobStatus::Failed | JobStatus::Deleted
-                        ) && (j.assigned_node.is_none()
-                            || j.assigned_node.as_deref() == Some(req.node.as_str()))
-                            && !leases.values().any(|l| l.job == lp.job)
+                        ) {
+                            Some(LeaseKind::Download)
+                        } else {
+                            None
+                        }
                     });
-                    if adoptable {
+                    if let Some(kind) = kind {
                         leases.insert(
                             lp.lease_id.clone(),
                             LeaseInfo {
                                 job: lp.job,
                                 node: req.node.clone(),
+                                kind,
                                 last_hb: Instant::now(),
                             },
                         );
                         adopted.push(lp.job);
-                        tracing::info!(job = lp.job.0, node = %req.node, lease = %lp.lease_id, "lease adopted");
+                        tracing::info!(job = lp.job.0, node = %req.node, lease = %lp.lease_id, ?kind, "lease adopted");
                     } else {
                         cancel.push(lp.lease_id.clone());
                     }
@@ -429,13 +494,37 @@ async fn schedule(s: &Arc<LeaderShared>) {
     let workers = s.live_workers();
     let snap = s.engine.snapshot();
 
-    let leases_by_node: HashMap<String, u32> = {
-        let leases = s.leases.lock().unwrap();
-        let mut m = HashMap::new();
-        for l in leases.values() {
-            *m.entry(l.node.clone()).or_insert(0) += 1;
+    // Reconcile: a job assigned to a node that is no longer live and holds
+    // no lease for it was delegated into the void (node died between
+    // assignment and poll, or vanished entirely). Release it.
+    {
+        let live: HashSet<&str> = workers.iter().map(|w| w.name.as_str()).collect();
+        let leased: HashSet<JobId> = s.leases.lock().unwrap().values().map(|l| l.job).collect();
+        for j in snap.jobs.iter() {
+            if let Some(node) = j.assigned_node.as_deref() {
+                if node != s.cfg.node_name
+                    && !live.contains(node)
+                    && !leased.contains(&j.id)
+                    && !matches!(j.status, JobStatus::Deleted)
+                {
+                    tracing::warn!(job = j.id.0, %node, "assigned node is gone; releasing delegation");
+                    let _ = s.engine.set_delegated(j.id, None).await;
+                }
+            }
         }
-        m
+    }
+
+    let (leases_by_node, pp_leases_by_node): (HashMap<String, u32>, HashMap<String, u32>) = {
+        let leases = s.leases.lock().unwrap();
+        let mut dl = HashMap::new();
+        let mut pp = HashMap::new();
+        for l in leases.values() {
+            match l.kind {
+                LeaseKind::Download => *dl.entry(l.node.clone()).or_insert(0) += 1,
+                LeaseKind::Post => *pp.entry(l.node.clone()).or_insert(0) += 1,
+            }
+        }
+        (dl, pp)
     };
 
     // Free download slots per worker (our lease count is fresher than the
@@ -482,4 +571,62 @@ async fn schedule(s: &Arc<LeaderShared>) {
         tracing::info!(job = job.id.0, %node, "delegating job");
         let _ = s.engine.set_delegated(job.id, Some(node)).await;
     }
+
+    // ---- PP assignment (C2, CLUSTERING.md §13) ----------------------------
+    // Anti-affinity: a node busy downloading is the LAST choice for par
+    // repair / unpack — prefer idle PP-capable nodes so the same box never
+    // runs both when the cluster has spare hands.
+    let leased_jobs: HashSet<JobId> = s.leases.lock().unwrap().values().map(|l| l.job).collect();
+    let mut pp_targets: Vec<(String, u32, bool)> = Vec::new(); // (node, free_pp, downloading)
+    for w in workers.iter().filter(|w| w.post_process && w.pp_slots > 0) {
+        let pp_held = pp_leases_by_node.get(&w.name).copied().unwrap_or(0)
+            + assigned_pp_backlog(&snap, &w.name, &leased_jobs);
+        let free = w.pp_slots.saturating_sub(pp_held);
+        if free > 0 {
+            let downloading = leases_by_node.get(&w.name).copied().unwrap_or(0) > 0
+                || w.active_download_jobs > 0;
+            pp_targets.push((w.name.clone(), free, downloading));
+        }
+    }
+    if s.cfg.post_process && s.cfg.pp_slots > 0 {
+        let held = assigned_pp_backlog(&snap, &s.cfg.node_name, &leased_jobs);
+        let free = s.cfg.pp_slots.saturating_sub(held);
+        if free > 0 {
+            pp_targets.push((s.cfg.node_name.clone(), free, self_active > 0));
+        }
+    }
+    // Idle nodes first, then most free slots, then name for determinism.
+    pp_targets.sort_by(|a, b| a.2.cmp(&b.2).then(b.1.cmp(&a.1)).then(a.0.cmp(&b.0)));
+
+    for job in snap.jobs.iter() {
+        if !matches!(job.status, JobStatus::Completed) || job.pp_done || job.assigned_node.is_some()
+        {
+            continue;
+        }
+        let Some(slot) = pp_targets.iter_mut().find(|(_, f, _)| *f > 0) else {
+            break;
+        };
+        slot.1 -= 1;
+        let node = slot.0.clone();
+        tracing::info!(job = job.id.0, %node, "assigning post-processing");
+        let _ = s.engine.set_delegated(job.id, Some(node)).await;
+    }
+}
+
+/// Completed-but-unprocessed jobs already assigned to `node` and not yet
+/// leased count against its PP capacity (assignment-to-poll in flight).
+fn assigned_pp_backlog(
+    snap: &nzbd_engine::QueueSnapshot,
+    node: &str,
+    leased: &HashSet<JobId>,
+) -> u32 {
+    snap.jobs
+        .iter()
+        .filter(|j| {
+            matches!(j.status, JobStatus::Completed)
+                && !j.pp_done
+                && !leased.contains(&j.id)
+                && j.assigned_node.as_deref() == Some(node)
+        })
+        .count() as u32
 }

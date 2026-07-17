@@ -53,9 +53,19 @@ pub struct ClusterConfig {
     pub download: bool,
     pub max_download_jobs: u32,
     pub post_process: bool,
+    /// Concurrent PP pipelines this node may run (C2).
+    pub pp_slots: u32,
     pub lease_interval: Duration,
     pub takeover_after: Duration,
     pub worker_ttl: Duration,
+}
+
+/// Post-processing wiring for a cluster node (C2): the PP pipeline config
+/// and the history store (SQLite local, JSONL on the shared volume).
+#[derive(Clone)]
+pub struct PpSetup {
+    pub post: nzbd_post::manager::PostConfig,
+    pub history: std::sync::Arc<nzbd_state::history::HistoryDb>,
 }
 
 pub struct ClusterRuntime {
@@ -78,6 +88,7 @@ impl ClusterRuntime {
         tuning: Tuning,
         dest_dir: PathBuf,
         speed_limit_bps: Option<u64>,
+        pp: Option<PpSetup>,
     ) -> Result<ClusterRuntime, ClusterError> {
         let layout = SharedLayout::new(&cfg.shared_dir, &cfg.node_name)?;
         let cancel = CancellationToken::new();
@@ -101,7 +112,7 @@ impl ClusterRuntime {
         let engine = Engine::spawn(EngineConfig {
             servers: servers.clone(),
             state_dir: layout.state_dir(),
-            dest_dir,
+            dest_dir: dest_dir.clone(),
             tuning,
             speed_limit_bps,
             persist_queue: false, // adopted on taking office
@@ -144,9 +155,46 @@ impl ClusterRuntime {
             view.clone(),
             client.clone(),
             active.clone(),
+            pp.clone(),
+            dest_dir.clone(),
             cancel.clone(),
             &tracker,
         );
+
+        // Leader-local PP manager (C2): processes only jobs the scheduler
+        // assigned to THIS node, and only while it holds authority. Health-
+        // failed jobs (no PP) are history-recorded by the leader.
+        if let Some(setup) = &pp {
+            if cfg.post_process && cfg.pp_slots > 0 {
+                let gate: nzbd_post::manager::PpGate = Some(std::sync::Arc::new({
+                    let view = view.clone();
+                    let engine = engine.clone();
+                    let me = cfg.node_name.clone();
+                    move |job_id: nzbd_types::JobId| {
+                        if !view.borrow().is_me {
+                            return false;
+                        }
+                        let snap = engine.snapshot();
+                        match snap.jobs.iter().find(|j| j.id == job_id) {
+                            Some(j) if matches!(j.status, nzbd_types::JobStatus::Failed) => true,
+                            Some(j) => j.assigned_node.as_deref() == Some(me.as_str()),
+                            None => false,
+                        }
+                    }
+                }));
+                let mut post = setup.post.clone();
+                post.slots = cfg.pp_slots.max(1) as usize;
+                nzbd_post::manager::spawn_post_manager(
+                    engine.clone(),
+                    post,
+                    setup.history.clone(),
+                    dest_dir.clone(),
+                    gate,
+                    cancel.clone(),
+                    &tracker,
+                );
+            }
+        }
 
         // Crash-only demotion: on losing leadership, keep only the jobs we
         // still execute as a worker; drop authority state.
@@ -166,7 +214,8 @@ impl ClusterRuntime {
                     }
                     let is_me = view_rx.borrow().is_me;
                     if was_me && !is_me {
-                        let keep: Vec<_> = active.lock().unwrap().values().copied().collect();
+                        let keep: Vec<_> =
+                            active.lock().unwrap().values().map(|st| st.job).collect();
                         tracing::warn!(kept = keep.len(), "demoted: dropping authority state");
                         let _ = engine.retain_jobs(keep).await;
                     }

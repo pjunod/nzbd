@@ -40,7 +40,8 @@ struct NodeOpts {
     priority: u32,
     download: bool,
     max_download_jobs: u32,
-}
+    /// PP executor (C2). Slots default to 1 when enabled.
+    post_process: bool,}
 
 struct Node {
     #[allow(dead_code)] // debugging aid
@@ -71,7 +72,8 @@ async fn start_node(
         priority: opts.priority,
         download: opts.download,
         max_download_jobs: opts.max_download_jobs,
-        post_process: false,
+        post_process: opts.post_process,
+        pp_slots: 1,
         lease_interval: Duration::from_millis(150),
         takeover_after: Duration::from_millis(900),
         worker_ttl: Duration::from_millis(1800),
@@ -83,12 +85,32 @@ async fn start_node(
         idle_hold: Duration::from_secs(1),
         ..Tuning::default()
     };
+    let pp = if opts.post_process {
+        let local = shared.join(format!("local-{name}"));
+        std::fs::create_dir_all(&local).unwrap();
+        let jsonl = shared.join(".nzbd-cluster/history");
+        std::fs::create_dir_all(&jsonl).unwrap();
+        Some(nzbd_cluster::PpSetup {
+            post: nzbd_post::manager::PostConfig::default(),
+            history: std::sync::Arc::new(
+                nzbd_state::history::HistoryDb::open_tagged(
+                    &local.join("history.sqlite"),
+                    Some(&jsonl),
+                    Some(name),
+                )
+                .unwrap(),
+            ),
+        })
+    } else {
+        None
+    };
     let runtime = ClusterRuntime::start(
         cfg,
         vec![server_def(nserv_port, connections)],
         tuning,
         shared.join("complete"),
         None,
+        pp,
     )
     .await
     .expect("cluster start");
@@ -182,7 +204,8 @@ async fn three_nodes_elect_exactly_one_leader() {
         priority: p,
         download: true,
         max_download_jobs: 1,
-    };
+            post_process: false,
+        };
     let a = start_node(tmp.path(), "a", opts(0), ns.port(), 4).await;
     let b = start_node(tmp.path(), "b", opts(1), ns.port(), 4).await;
     let c = start_node(tmp.path(), "c", opts(2), ns.port(), 4).await;
@@ -235,6 +258,7 @@ async fn distributed_download_via_any_node_with_budgets() {
             priority: 0,
             download: false,
             max_download_jobs: 0,
+            post_process: false,
         },
         ns.port(),
         4,
@@ -248,6 +272,7 @@ async fn distributed_download_via_any_node_with_budgets() {
             priority: 9,
             download: true,
             max_download_jobs: 2,
+            post_process: false,
         },
         ns.port(),
         4,
@@ -324,6 +349,7 @@ async fn worker_death_reclaims_and_resumes_elsewhere_without_refetch() {
             priority: 0,
             download: false,
             max_download_jobs: 0,
+            post_process: false,
         },
         ns.port(),
         4,
@@ -337,6 +363,7 @@ async fn worker_death_reclaims_and_resumes_elsewhere_without_refetch() {
             priority: 9,
             download: true,
             max_download_jobs: 2,
+            post_process: false,
         },
         ns.port(),
         4,
@@ -374,6 +401,7 @@ async fn worker_death_reclaims_and_resumes_elsewhere_without_refetch() {
             priority: 9,
             download: true,
             max_download_jobs: 2,
+            post_process: false,
         },
         ns.port(),
         4,
@@ -423,6 +451,7 @@ async fn leader_death_fails_over_and_adopts_the_running_lease() {
             priority: 0,
             download: false,
             max_download_jobs: 0,
+            post_process: false,
         },
         ns.port(),
         4,
@@ -436,6 +465,7 @@ async fn leader_death_fails_over_and_adopts_the_running_lease() {
             priority: 9,
             download: true,
             max_download_jobs: 2,
+            post_process: false,
         },
         ns.port(),
         4,
@@ -449,6 +479,7 @@ async fn leader_death_fails_over_and_adopts_the_running_lease() {
             priority: 4,
             download: false,
             max_download_jobs: 0,
+            post_process: false,
         },
         ns.port(),
         4,
@@ -522,7 +553,8 @@ async fn single_node_cluster_restart_keeps_the_queue() {
         priority: 0,
         download: true,
         max_download_jobs: 2,
-    };
+            post_process: false,
+        };
     let a = start_node(tmp.path(), "solo", opts(), ns.port(), 4).await;
     wait_for("self-election", 15, || {
         get_json(&a.url, "/api/v1/cluster")["is_leader"].as_bool() == Some(true)
@@ -558,4 +590,126 @@ async fn single_node_cluster_restart_keeps_the_queue() {
     })
     .await;
     a2.kill().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn pp_runs_on_idle_node_via_anti_affinity() {
+    // C2: the leader downloads a job with a real par2 set; the scheduler
+    // must hand post-processing to the idle non-download node, which
+    // quick-verifies natively, stamps the job, appends shared-volume
+    // history and returns the finished job to the leader.
+    let tmp = tempfile::tempdir().unwrap();
+
+    let src = tempfile::tempdir().unwrap();
+    let payload = prng_bytes(77, 90_000);
+    std::fs::write(src.path().join("payload.bin"), &payload).unwrap();
+    let ok = std::process::Command::new("par2")
+        .args(["create", "-q", "-q", "-s8192", "-c4", "set.par2", "payload.bin"])
+        .current_dir(src.path())
+        .status()
+        .expect("par2 binary required (apt-get install par2)")
+        .success();
+    assert!(ok, "par2 create failed");
+    let mut files: Vec<(String, Vec<u8>)> = vec![("payload.bin".into(), payload.clone())];
+    let mut pars: Vec<_> = std::fs::read_dir(src.path())
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().map(|e| e == "par2").unwrap_or(false))
+        .collect();
+    pars.sort();
+    for p in pars {
+        files.push((
+            p.file_name().unwrap().to_string_lossy().into_owned(),
+            std::fs::read(&p).unwrap(),
+        ));
+    }
+    let post = build_post(
+        "pardl",
+        &files
+            .iter()
+            .map(|(n, d)| (n.as_str(), d.clone()))
+            .collect::<Vec<_>>(),
+        20_000,
+    );
+    let ns = NservBuilder::new().with_post(&post).start().await.unwrap();
+
+    // a: leader + the only downloader, NOT a PP node.
+    // c: cannot download, PP executor — the anti-affinity target.
+    let a = start_node(
+        tmp.path(),
+        "a",
+        NodeOpts {
+            coordinator: true,
+            priority: 0,
+            download: true,
+            max_download_jobs: 2,
+            post_process: false,
+        },
+        ns.port(),
+        4,
+    )
+    .await;
+    let c = start_node(
+        tmp.path(),
+        "c",
+        NodeOpts {
+            coordinator: false,
+            priority: 9,
+            download: false,
+            max_download_jobs: 0,
+            post_process: true,
+        },
+        ns.port(),
+        4,
+    )
+    .await;
+
+    wait_for("leader elected", 15, || {
+        get_json(&a.url, "/api/v1/cluster")["is_leader"].as_bool() == Some(true)
+    })
+    .await;
+    wait_for("both nodes registered", 15, || {
+        get_json(&a.url, "/api/v1/cluster")["nodes"]
+            .as_array()
+            .is_some_and(|n| n.len() == 2)
+    })
+    .await;
+
+    let (code, body) = http(&a.url, "POST", "/api/v1/jobs?name=pardl", post.nzb.as_bytes());
+    assert_eq!(code, 201, "add failed: {body}");
+
+    // Download completes on a (c can't download); PP is assigned to c,
+    // executes there, and the stamped job comes back completed. Node a has
+    // NO PP manager (post_process=false), so the stamp appearing at all
+    // proves remote execution; the history file below proves it was c.
+    wait_for("pp done (remotely)", 45, || {
+        let j = &get_json(&a.url, "/api/v1/jobs")["jobs"][0];
+        j["pp_done"].as_bool() == Some(true) && j["status"] == "completed"
+    })
+    .await;
+
+    // Payload survived PP bit-identically (no repair was needed).
+    let got = std::fs::read(tmp.path().join("complete/pardl/payload.bin")).unwrap();
+    assert_eq!(got, payload);
+
+    // No staging residue in the job dir.
+    let residue: Vec<String> = std::fs::read_dir(tmp.path().join("complete/pardl"))
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with(".pp."))
+        .collect();
+    assert!(residue.is_empty(), "staging residue: {residue:?}");
+
+    // History JSONL appended by node c on the shared volume.
+    let hist = std::fs::read_to_string(
+        tmp.path().join(".nzbd-cluster/history/history.c.jsonl"),
+    )
+    .expect("node c must have appended shared history");
+    assert!(hist.contains("\"SUCCESS\""), "history: {hist}");
+    assert!(hist.contains("\"pardl\""), "history: {hist}");
+
+    a.kill().await;
+    c.kill().await;
 }

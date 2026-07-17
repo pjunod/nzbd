@@ -115,12 +115,17 @@ fn post_config(cfg: &nzbd_config::Config, slots: usize) -> nzbd_post::manager::P
 fn open_history(
     local_dir: &std::path::Path,
     jsonl_dir: &std::path::Path,
+    node_tag: Option<&str>,
 ) -> anyhow_lite::Result<Arc<nzbd_state::history::HistoryDb>> {
     std::fs::create_dir_all(local_dir)?;
     std::fs::create_dir_all(jsonl_dir)?;
-    nzbd_state::history::HistoryDb::open(&local_dir.join("history.sqlite"), Some(jsonl_dir))
-        .map(Arc::new)
-        .map_err(|e| anyhow_lite::Error::msg(format!("history db: {e}")))
+    nzbd_state::history::HistoryDb::open_tagged(
+        &local_dir.join("history.sqlite"),
+        Some(jsonl_dir),
+        node_tag,
+    )
+    .map(Arc::new)
+    .map_err(|e| anyhow_lite::Error::msg(format!("history db: {e}")))
 }
 
 fn run(config: Option<PathBuf>, bind: Option<String>) -> anyhow_lite::Result<()> {
@@ -181,7 +186,7 @@ fn run(config: Option<PathBuf>, bind: Option<String>) -> anyhow_lite::Result<()>
         let pp_tracker = tokio_util::task::TaskTracker::new();
         if cfg.post.enabled {
             let state_dir = cfg.state_dir();
-            let history = open_history(&state_dir, &state_dir.join("history"))?;
+            let history = open_history(&state_dir, &state_dir.join("history"), None)?;
             let slots = nzbd_post::manager::strategy_slots(&cfg.post.strategy);
             nzbd_post::manager::spawn_post_manager(
                 engine.clone(),
@@ -247,7 +252,7 @@ async fn run_cluster(
 
     let cluster_cfg = nzbd_cluster::ClusterConfig {
         node_name: c.node_name.clone(),
-        shared_dir,
+        shared_dir: shared_dir.clone(),
         advertise_url: c.advertise_url.clone(),
         secret,
         coordinator: c.coordinator,
@@ -255,9 +260,25 @@ async fn run_cluster(
         download: c.download,
         max_download_jobs: c.max_download_jobs,
         post_process: c.post_process,
+        pp_slots: c.pp_slots.max(1),
         lease_interval: Duration::from_secs(c.lease_interval_secs.max(1)),
         takeover_after: Duration::from_secs(c.takeover_after_secs.max(2)),
         worker_ttl: Duration::from_secs(c.worker_ttl_secs.max(3)),
+    };
+
+    // Post-processing wiring (C2): PP runs wherever the leader's
+    // anti-affinity scheduler assigns it — as a work lease on an idle node
+    // when one exists. History: SQLite index stays node-local, the
+    // authoritative JSONL lives on the shared volume.
+    let pp = if cfg.post.enabled && cfg.cluster.post_process {
+        let jsonl_dir = shared_dir.join(".nzbd-cluster/history");
+        let history = open_history(&cfg.state_dir(), &jsonl_dir, Some(&c.node_name))?;
+        Some(nzbd_cluster::PpSetup {
+            post: post_config(&cfg, cfg.cluster.pp_slots.max(1) as usize),
+            history,
+        })
+    } else {
+        None
     };
 
     let runtime = nzbd_cluster::ClusterRuntime::start(
@@ -266,36 +287,17 @@ async fn run_cluster(
         tuning,
         dest_dir,
         cfg.speed_limit_bps(),
+        pp,
     )
     .await
     .map_err(|e| anyhow_lite::Error::msg(e.to_string()))?;
-
-    // Post-processing runs on the queue authority only (the leader) until
-    // C2 distributes PP through work leases. History: SQLite index stays
-    // node-local, the authoritative JSONL lives on the shared volume.
-    let pp_cancel = tokio_util::sync::CancellationToken::new();
-    let pp_tracker = tokio_util::task::TaskTracker::new();
-    if cfg.post.enabled && cfg.cluster.post_process {
-        let history = open_history(&cfg.state_dir(), &runtime.history_dir())?;
-        let slots = cfg.cluster.pp_slots.max(1) as usize;
-        nzbd_post::manager::spawn_post_manager(
-            runtime.engine.clone(),
-            post_config(&cfg, slots),
-            history,
-            cfg.dest_dir(),
-            Some(Arc::new(runtime.leader_gate())),
-            pp_cancel.clone(),
-            &pp_tracker,
-        );
-    }
-    pp_tracker.close();
 
     let app = runtime.router(&cfg.api.compat_version);
     let listener = tokio::net::TcpListener::bind(&bind).await?;
     tracing::info!(
         %bind,
         node = %cfg.cluster.node_name,
-        "nzbd listening (cluster mode: C1 + leader post-processing)"
+        "nzbd listening (cluster mode: C2 distributed post-processing)"
     );
 
     axum::serve(listener, app)
@@ -305,8 +307,6 @@ async fn run_cluster(
         })
         .await?;
 
-    pp_cancel.cancel();
-    pp_tracker.wait().await;
     runtime.shutdown().await;
     Ok(())
 }

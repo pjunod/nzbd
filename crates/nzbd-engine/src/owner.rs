@@ -1415,6 +1415,7 @@ impl Owner {
                     health: health.0,
                     critical_health: critical.0,
                     assigned_node: self.delegated.get(&j.id).cloned(),
+                    pp_done: j.params.iter().any(|(k, _)| k == nzbd_types::PP_DONE_PARAM),
                 };
                 // Delegated jobs progress remotely; overlay heartbeat stats.
                 if let Some(m) = self.mirror.get(&j.id) {
