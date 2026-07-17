@@ -9,6 +9,8 @@ nzbd-types = { workspace = true }
 nzbd-engine = { workspace = true }
 nzbd-state = { workspace = true }
 tokio = { workspace = true }
+tokio-stream = { workspace = true }
+base64 = { workspace = true }
 axum = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

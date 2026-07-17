@@ -260,6 +260,12 @@ pub struct ApiConfig {
     pub compat_version: String,
     /// Opt-in legacy default credentials for migration (off by default).
     pub allow_legacy_default_credentials: bool,
+    /// HTTP Basic auth (NZBGet `ControlUsername`/`ControlPassword`).
+    /// Auth is enforced when a password is set; `/healthz` stays open.
+    pub username: String,
+    pub password: Option<String>,
+    /// Bearer token accepted as an alternative to Basic auth.
+    pub token: Option<String>,
 }
 
 impl Default for ApiConfig {
@@ -268,6 +274,9 @@ impl Default for ApiConfig {
             bind: "127.0.0.1:6789".into(),
             compat_version: "26.2".into(),
             allow_legacy_default_credentials: false,
+            username: "nzbd".into(),
+            password: None,
+            token: None,
         }
     }
 }

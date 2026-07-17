@@ -305,11 +305,18 @@ fn run(config: Option<PathBuf>, bind: Option<String>) -> anyhow_lite::Result<()>
             history: history.clone(),
             options: Arc::new(compat_options(&cfg, &bind)),
         };
-        let app = nzbd_api::router_with(nzbd_api::ApiState {
-            engine: engine.clone(),
-            history,
-        })
-        .merge(nzbd_compat::router(compat_state));
+        let app = nzbd_api::require_auth(
+            nzbd_api::router_with(nzbd_api::ApiState {
+                engine: engine.clone(),
+                history,
+            })
+            .merge(nzbd_compat::router(compat_state)),
+            nzbd_api::AuthConfig {
+                username: cfg.api.username.clone(),
+                password: cfg.api.password.clone(),
+                token: cfg.api.token.clone(),
+            },
+        );
 
         let listener = tokio::net::TcpListener::bind(&bind).await?;
         tracing::info!(%bind, "nzbd listening (phase 2: engine + post-processing)");
@@ -395,7 +402,15 @@ async fn run_cluster(
     .await
     .map_err(|e| anyhow_lite::Error::msg(e.to_string()))?;
 
-    let app = runtime.router(&cfg.api.compat_version, compat_options(&cfg, &bind));
+    let app = runtime.router_with_auth(
+        &cfg.api.compat_version,
+        compat_options(&cfg, &bind),
+        nzbd_api::AuthConfig {
+            username: cfg.api.username.clone(),
+            password: cfg.api.password.clone(),
+            token: cfg.api.token.clone(),
+        },
+    );
     let listener = tokio::net::TcpListener::bind(&bind).await?;
     tracing::info!(
         %bind,

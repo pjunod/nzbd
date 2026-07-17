@@ -265,6 +265,18 @@ impl ClusterRuntime {
     /// The full node router: cluster endpoints (answered locally) + the
     /// native API and compat shim (proxied to the leader from non-leaders).
     pub fn router(&self, compat_version: &str, options: Vec<(String, String)>) -> Router {
+        self.router_with_auth(compat_version, options, Default::default())
+    }
+
+    /// [`ClusterRuntime::router`] with HTTP auth on the API + compat
+    /// surface. Cluster peer endpoints keep their own shared-secret auth
+    /// and are never behind user credentials.
+    pub fn router_with_auth(
+        &self,
+        compat_version: &str,
+        options: Vec<(String, String)>,
+        auth: nzbd_api::AuthConfig,
+    ) -> Router {
         let history = self.pp.as_ref().map(|s| s.history.clone());
         let compat_state = nzbd_compat::CompatState {
             config: Arc::new(nzbd_compat::CompatConfig {
@@ -274,11 +286,14 @@ impl ClusterRuntime {
             history: history.clone(),
             options: Arc::new(options),
         };
-        let proxied = nzbd_api::router_with(nzbd_api::ApiState {
-            engine: self.engine.clone(),
-            history,
-        })
-        .merge(nzbd_compat::router(compat_state))
+        let proxied = nzbd_api::require_auth(
+            nzbd_api::router_with(nzbd_api::ApiState {
+                engine: self.engine.clone(),
+                history,
+            })
+            .merge(nzbd_compat::router(compat_state)),
+            auth,
+        )
         .layer(middleware::from_fn_with_state(
             ProxyState {
                 node: self.cfg.node_name.clone(),

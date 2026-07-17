@@ -1,24 +1,118 @@
-//! Native REST API (`/api/v1`), phase 1: status, job CRUD and queue
-//! controls wired to the engine. SSE events, auth, OpenAPI and the full
-//! surface of ARCHITECTURE.md §10.1 land in phase 3.
+//! Native REST API (`/api/v1`): status, job CRUD, queue controls,
+//! history, SSE events, Prometheus `/metrics` and HTTP auth
+//! (ARCHITECTURE.md §10.1). OpenAPI + roles are the remaining items.
 
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
+use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
+use base64::Engine as _;
 use nzbd_engine::{EngineHandle, JobSummary, QueueSnapshot};
 use nzbd_state::history::HistoryDb;
 use nzbd_types::{JobId, JobStatus};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::sync::Arc;
+use tokio_stream::StreamExt as _;
 
 /// Router state: the engine plus optional stores wired by the daemon.
 #[derive(Clone)]
 pub struct ApiState {
     pub engine: EngineHandle,
     pub history: Option<Arc<HistoryDb>>,
+}
+
+/// HTTP auth requirements (NZBGet `ControlUsername`/`ControlPassword`
+/// parity plus a bearer token). Enforced only when a password or token is
+/// configured; `/healthz` is always open.
+#[derive(Debug, Clone, Default)]
+pub struct AuthConfig {
+    pub username: String,
+    pub password: Option<String>,
+    pub token: Option<String>,
+}
+
+impl AuthConfig {
+    pub fn required(&self) -> bool {
+        self.password.is_some() || self.token.is_some()
+    }
+}
+
+fn constant_time_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    let mut diff = a.len() ^ b.len();
+    for i in 0..a.len().min(b.len()).max(1) {
+        let (x, y) = (
+            a.get(i).copied().unwrap_or(0),
+            b.get(i).copied().unwrap_or(0),
+        );
+        diff |= (x ^ y) as usize;
+    }
+    diff == 0
+}
+
+fn authorized(auth: &AuthConfig, header: Option<&str>) -> bool {
+    if !auth.required() {
+        return true;
+    }
+    let Some(header) = header else { return false };
+    if let Some(token) = header.strip_prefix("Bearer ") {
+        if let Some(want) = &auth.token {
+            return constant_time_eq(token.trim(), want);
+        }
+        return false;
+    }
+    if let Some(b64) = header.strip_prefix("Basic ") {
+        let Some(want_pw) = &auth.password else {
+            return false;
+        };
+        let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(b64.trim()) else {
+            return false;
+        };
+        let decoded = String::from_utf8_lossy(&decoded);
+        let Some((user, pass)) = decoded.split_once(':') else {
+            return false;
+        };
+        return constant_time_eq(user, &auth.username) & constant_time_eq(pass, want_pw);
+    }
+    false
+}
+
+/// Wrap a router with auth enforcement. `/healthz` stays open; everything
+/// else answers 401 (with a Basic challenge, which NZBGet clients expect)
+/// until credentials match.
+pub fn require_auth(router: Router, auth: AuthConfig) -> Router {
+    if !auth.required() {
+        return router;
+    }
+    let auth = Arc::new(auth);
+    router.layer(axum::middleware::from_fn(
+        move |req: axum::extract::Request, next: axum::middleware::Next| {
+            let auth = auth.clone();
+            async move {
+                if req.uri().path() == "/healthz" {
+                    return next.run(req).await;
+                }
+                let header = req
+                    .headers()
+                    .get(axum::http::header::AUTHORIZATION)
+                    .and_then(|v| v.to_str().ok())
+                    .map(|s| s.to_string());
+                if authorized(&auth, header.as_deref()) {
+                    next.run(req).await
+                } else {
+                    (
+                        StatusCode::UNAUTHORIZED,
+                        [(axum::http::header::WWW_AUTHENTICATE, "Basic realm=\"nzbd\"")],
+                        "unauthorized",
+                    )
+                        .into_response()
+                }
+            }
+        },
+    ))
 }
 
 #[derive(Debug, Serialize)]
@@ -156,6 +250,120 @@ async fn set_speed_limit(State(st): State<ApiState>, Json(body): Json<SpeedLimit
     }
 }
 
+/// `GET /api/v1/events` — engine events as SSE (`event:` = variant name,
+/// `data:` = JSON payload). Lagged consumers observe a `lagged` event and
+/// should resync from `/api/v1/status`.
+async fn sse_events(State(st): State<ApiState>) -> Response {
+    let rx = st.engine.subscribe();
+    let stream = tokio_stream::wrappers::BroadcastStream::new(rx).map(|ev| match ev {
+        Ok(ev) => {
+            let (name, data) = event_wire(&ev);
+            Ok::<SseEvent, std::convert::Infallible>(SseEvent::default().event(name).data(data))
+        }
+        Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(n)) => {
+            Ok(SseEvent::default()
+                .event("lagged")
+                .data(json!({ "skipped": n }).to_string()))
+        }
+    });
+    Sse::new(stream)
+        .keep_alive(KeepAlive::default())
+        .into_response()
+}
+
+fn event_wire(ev: &nzbd_engine::Event) -> (&'static str, String) {
+    use nzbd_engine::Event as E;
+    match ev {
+        E::JobAdded { job, name } => ("job_added", json!({"job": job.0, "name": name}).to_string()),
+        E::JobFinished {
+            job,
+            name,
+            status,
+            health,
+        } => (
+            "job_finished",
+            json!({"job": job.0, "name": name, "status": status, "health": health}).to_string(),
+        ),
+        E::JobDeleted { job } => ("job_deleted", json!({"job": job.0}).to_string()),
+        E::FileFinished {
+            job,
+            file,
+            filename,
+            ok,
+        } => (
+            "file_finished",
+            json!({"job": job.0, "file": file.0, "filename": filename, "ok": ok}).to_string(),
+        ),
+        E::SegmentExhausted { job, file, segment } => (
+            "segment_exhausted",
+            json!({"job": job.0, "file": file.0, "segment": segment}).to_string(),
+        ),
+        E::ServerBlocked { server, seconds } => (
+            "server_blocked",
+            json!({"server": server.0, "seconds": seconds}).to_string(),
+        ),
+        other => ("event", json!({"debug": format!("{other:?}")}).to_string()),
+    }
+}
+
+/// `GET /metrics` — Prometheus text exposition from the queue snapshot.
+async fn metrics(State(st): State<ApiState>) -> Response {
+    let snap = st.engine.snapshot();
+    let mut by_status: std::collections::BTreeMap<&'static str, u32> = Default::default();
+    for j in snap.jobs.iter() {
+        let k = match j.status {
+            JobStatus::Queued => "queued",
+            JobStatus::Downloading => "downloading",
+            JobStatus::Paused => "paused",
+            JobStatus::Fetching => "fetching",
+            JobStatus::PostQueued | JobStatus::Post { .. } => "post_processing",
+            JobStatus::Completed => "completed",
+            JobStatus::Failed => "failed",
+            JobStatus::Deleted => "deleted",
+        };
+        *by_status.entry(k).or_insert(0) += 1;
+    }
+    use std::fmt::Write;
+    let mut out = String::with_capacity(1024);
+    let m = &mut out;
+    let _ = writeln!(m, "# TYPE nzbd_download_rate_bytes_per_second gauge");
+    let _ = writeln!(
+        m,
+        "nzbd_download_rate_bytes_per_second {}",
+        snap.download_rate_bps
+    );
+    let _ = writeln!(m, "# TYPE nzbd_remaining_bytes gauge");
+    let _ = writeln!(m, "nzbd_remaining_bytes {}", snap.remaining_bytes);
+    let _ = writeln!(m, "# TYPE nzbd_session_downloaded_bytes counter");
+    let _ = writeln!(
+        m,
+        "nzbd_session_downloaded_bytes {}",
+        snap.session_downloaded_bytes
+    );
+    let _ = writeln!(m, "# TYPE nzbd_download_paused gauge");
+    let _ = writeln!(m, "nzbd_download_paused {}", snap.download_paused as u8);
+    let _ = writeln!(m, "# TYPE nzbd_speed_limit_bytes_per_second gauge");
+    let _ = writeln!(
+        m,
+        "nzbd_speed_limit_bytes_per_second {}",
+        snap.speed_limit_bps.unwrap_or(0)
+    );
+    let _ = writeln!(m, "# TYPE nzbd_jobs gauge");
+    for (k, v) in by_status {
+        let _ = writeln!(m, "nzbd_jobs{{status=\"{k}\"}} {v}");
+    }
+    let _ = writeln!(m, "# TYPE nzbd_up_since_seconds gauge");
+    let _ = writeln!(m, "nzbd_up_since_seconds {}", snap.up_since_unix);
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4",
+        )],
+        out,
+    )
+        .into_response()
+}
+
 #[derive(Debug, Deserialize)]
 struct HistoryQuery {
     limit: Option<usize>,
@@ -205,6 +413,8 @@ pub fn router_with(state: ApiState) -> Router {
         .route("/api/v1/queue/actions/{action}", post(queue_action))
         .route("/api/v1/queue/speed-limit", put(set_speed_limit))
         .route("/api/v1/history", get(get_history))
+        .route("/api/v1/events", get(sse_events))
+        .route("/metrics", get(metrics))
         .route("/healthz", get(healthz))
         .with_state(state)
 }
@@ -350,6 +560,144 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 
+        engine.shutdown().await;
+    }
+
+    #[test]
+    fn auth_matrix() {
+        use base64::Engine as _;
+        let b64 = |s: &str| base64::engine::general_purpose::STANDARD.encode(s);
+
+        // No credentials configured: everything passes.
+        let open = AuthConfig::default();
+        assert!(authorized(&open, None));
+
+        let auth = AuthConfig {
+            username: "paul".into(),
+            password: Some("s3cret".into()),
+            token: Some("tok123".into()),
+        };
+        assert!(!authorized(&auth, None));
+        assert!(!authorized(&auth, Some("Basic definitely-not-b64!")));
+        assert!(authorized(
+            &auth,
+            Some(&format!("Basic {}", b64("paul:s3cret")))
+        ));
+        assert!(!authorized(
+            &auth,
+            Some(&format!("Basic {}", b64("paul:wrong")))
+        ));
+        assert!(!authorized(
+            &auth,
+            Some(&format!("Basic {}", b64("eve:s3cret")))
+        ));
+        assert!(authorized(&auth, Some("Bearer tok123")));
+        assert!(!authorized(&auth, Some("Bearer nope")));
+
+        // Password-only config rejects bearer attempts.
+        let basic_only = AuthConfig {
+            username: "paul".into(),
+            password: Some("pw".into()),
+            token: None,
+        };
+        assert!(!authorized(&basic_only, Some("Bearer pw")));
+        assert!(authorized(
+            &basic_only,
+            Some(&format!("Basic {}", b64("paul:pw")))
+        ));
+    }
+
+    #[tokio::test]
+    async fn auth_layer_guards_routes_but_not_healthz() {
+        use base64::Engine as _;
+        use tower::util::ServiceExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = nzbd_engine::Engine::spawn(nzbd_engine::EngineConfig::single_node(
+            vec![],
+            tmp.path().join("state"),
+            tmp.path().join("dest"),
+            nzbd_engine::Tuning::default(),
+            None,
+        ))
+        .await
+        .unwrap();
+        let app = require_auth(
+            router(engine.clone()),
+            AuthConfig {
+                username: "u".into(),
+                password: Some("p".into()),
+                token: None,
+            },
+        );
+
+        let resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::get("/api/v1/status")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert!(resp.headers().contains_key("www-authenticate"));
+
+        let resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::get("/healthz")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "healthz stays open");
+
+        let creds = base64::engine::general_purpose::STANDARD.encode("u:p");
+        let resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::get("/api/v1/status")
+                    .header("authorization", format!("Basic {creds}"))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn metrics_exposition_shape() {
+        use tower::util::ServiceExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = nzbd_engine::Engine::spawn(nzbd_engine::EngineConfig::single_node(
+            vec![],
+            tmp.path().join("state"),
+            tmp.path().join("dest"),
+            nzbd_engine::Tuning::default(),
+            None,
+        ))
+        .await
+        .unwrap();
+        let app = router(engine.clone());
+        let resp = app
+            .oneshot(
+                axum::http::Request::get("/metrics")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(text.contains("nzbd_download_rate_bytes_per_second"));
+        assert!(text.contains("# TYPE nzbd_jobs gauge"));
+        assert!(text.contains("nzbd_remaining_bytes 0"));
         engine.shutdown().await;
     }
 }

@@ -8,9 +8,9 @@ roadmaps in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) §16 and
 Legend: ✅ done (implemented, tested, committed) · 🔶 partial · ⬜ not
 started · 👤 operator action (Paul)
 
-**Snapshot (2026-07-17):** 113 tests · clippy clean · phases 0, 1, 2,
-cluster C1+C2, *arr compat core (3a) and the nzbget.conf importer
-complete · next up: **rest of phase 3** (XML-RPC, SSE/auth/metrics)
+**Snapshot (2026-07-17):** 116 tests · clippy clean · phases 0, 1, 2,
+cluster C1+C2, *arr compat core, importer, auth/SSE/metrics complete ·
+next up: **XML-RPC, golden tests, phase 4 web UI**
 
 | Phase | State | Evidence |
 |---|---|---|
@@ -113,7 +113,10 @@ complete · next up: **rest of phase 3** (XML-RPC, SSE/auth/metrics)
 - ✅ Native `GET /api/v1/history` (limit param; cluster-aware via throttled JSONL union refresh)
 - ✅ Post-stage queue status vocabulary in `listgroups` (VERIFYING_SOURCES / REPAIRING / UNPACKING / EXECUTING_SCRIPT / …)
 - ✅ e2e: `sonarr_style_flow_over_jsonrpc` against the real daemon binary — version gate → config category check → base64 append → listgroups poll to empty → history shows SUCCESS/ALL + FinalDir → file imported bit-identical
-- ⬜ Native REST completion: SSE events, servers/config/logs endpoints, Prometheus `/metrics`, bearer-token auth + roles, OpenAPI
+- ✅ HTTP auth: Basic (NZBGet `ControlUsername`/`ControlPassword` parity, constant-time compare, `WWW-Authenticate` challenge) + Bearer token; enforced across native API and compat shim when configured; `/healthz` open; cluster peer endpoints keep their own shared-secret auth; importer maps `ControlUsername`/`ControlPassword` (with a warning on NZBGet's well-known default)
+- ✅ `GET /api/v1/events` — engine events as SSE (job added/finished/deleted, file finished, segment exhausted, server blocked; lagged signal)
+- ✅ `GET /metrics` — Prometheus text exposition (rate, remaining, session bytes, paused, speed limit, jobs by status)
+- ⬜ Native REST completion: servers/config/logs endpoints, roles, OpenAPI
 - ⬜ Compat C2: `listfiles`, `listgroups` file details, logs, scan, per-file editqueue actions
 - ⬜ XML-RPC + `system.multicall` + JSON-P + GET-form safe methods; auth tiers
 - ⬜ Golden structural tests vs recorded NZBGet 26.2 responses; nightly live *arr containers
