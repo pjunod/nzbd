@@ -40,13 +40,13 @@ fn test_tuning() -> Tuning {
 }
 
 async fn spawn_engine(dir: &Path, servers: Vec<ServerDef>) -> EngineHandle {
-    Engine::spawn(EngineConfig {
+    Engine::spawn(EngineConfig::single_node(
         servers,
-        state_dir: dir.join("state"),
-        dest_dir: dir.join("dest"),
-        tuning: test_tuning(),
-        speed_limit_bps: None,
-    })
+        dir.join("state"),
+        dir.join("dest"),
+        test_tuning(),
+        None,
+    ))
     .await
     .expect("engine spawn")
 }
@@ -133,8 +133,8 @@ async fn downloads_bit_identical_with_auth_and_pipelining() {
 
     for (name, data) in &files {
         let path = tmp.path().join("dest").join("demo post").join(name);
-        let got = std::fs::read(&path)
-            .unwrap_or_else(|e| panic!("missing {}: {e}", path.display()));
+        let got =
+            std::fs::read(&path).unwrap_or_else(|e| panic!("missing {}: {e}", path.display()));
         assert_eq!(&got, data, "bit-exact: {name}");
         assert!(!tmp
             .path()
@@ -152,7 +152,7 @@ async fn downloads_bit_identical_with_auth_and_pipelining() {
 
     engine.shutdown().await;
     assert!(
-        !tmp.path().join("state").join("unclean").exists(),
+        !tmp.path().join("state").join("unclean.local").exists(),
         "graceful shutdown clears the unclean marker"
     );
 }
@@ -206,7 +206,11 @@ async fn failover_missing_and_corrupt_articles_escalate_tiers() {
 
     // The backup tier served exactly the two bad articles.
     assert_eq!(ns_b.hits(&missing), 1, "missing article from tier 1");
-    assert_eq!(ns_b.hits(&corrupt), 1, "corrupt article re-fetched from tier 1");
+    assert_eq!(
+        ns_b.hits(&corrupt),
+        1,
+        "corrupt article re-fetched from tier 1"
+    );
     assert_eq!(ns_b.total_hits(), 2, "tier 1 must not serve anything else");
     // Tier 0 was asked for the bad ones (and failed them) exactly once each.
     assert_eq!(ns_a.hits(&missing), 1);
@@ -329,15 +333,11 @@ async fn pause_resume_and_delete() {
 // re-fetch journaled segments.
 // ---------------------------------------------------------------------------
 
-fn journaled_segments(journal: &Path) -> Vec<u32> {
-    let Ok(bytes) = std::fs::read(journal) else {
-        return Vec::new();
-    };
-    bytes
-        .split(|&b| b == b'\n')
-        .filter(|l| !l.is_empty())
-        .filter_map(|l| serde_json::from_slice::<serde_json::Value>(l).ok())
-        .filter_map(|v| v["segment_number"].as_u64().map(|n| n as u32))
+fn journaled_segments(state_dir: &Path) -> Vec<u32> {
+    nzbd_state::JobJournals::replay_all(state_dir)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|r| r.segment_number)
         .collect()
 }
 
@@ -346,7 +346,7 @@ fn resume_after_unclean_restart_refetches_nothing_done() {
     let tmp = tempfile::tempdir().unwrap();
     let data = prng_bytes(99, 40 * 4096);
     let post = build_post("resume", &[("big.bin", data.clone())], 4096);
-    let journal = tmp.path().join("state").join("segments.journal");
+    let journal = tmp.path().join("state");
 
     // ---- run 1: first five parts servable, the rest stall ----
     let rt1 = tokio::runtime::Builder::new_multi_thread()
@@ -387,7 +387,7 @@ fn resume_after_unclean_restart_refetches_nothing_done() {
     let done_before = journaled_segments(&journal);
     assert!(done_before.len() >= 3);
     assert!(
-        tmp.path().join("state").join("unclean").exists(),
+        tmp.path().join("state").join("unclean.local").exists(),
         "unclean marker must survive the crash"
     );
 

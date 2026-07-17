@@ -122,6 +122,157 @@ impl FsJournal {
 }
 
 // ---------------------------------------------------------------------------
+// Per-job fenced journals (CLUSTERING.md §6.4 / ADR-16)
+//
+// One journal file per (job, writer-lease): `jobs/<id>/journal.<suffix>`.
+// Replay UNIONS the Done records across every journal file of a job —
+// records are idempotent (immutable article content ⇒ same offset/len/crc),
+// so an expired lease holder appending late is harmless. This is what makes
+// cross-node reclaim safe without any shared-file locking.
+// ---------------------------------------------------------------------------
+
+pub struct JobJournals {
+    jobs_dir: PathBuf,
+    /// Fencing suffix — the work-lease id, or "local" for single-node.
+    suffix: String,
+    open: std::collections::HashMap<u32, File>,
+    dirty: bool,
+}
+
+impl JobJournals {
+    pub fn open(state_dir: &Path, suffix: &str) -> Result<JobJournals, StateError> {
+        let jobs_dir = state_dir.join("jobs");
+        fs::create_dir_all(&jobs_dir)?;
+        Ok(JobJournals {
+            jobs_dir,
+            suffix: sanitize_suffix(suffix),
+            open: Default::default(),
+            dirty: false,
+        })
+    }
+
+    pub fn jobs_dir(&self) -> &Path {
+        &self.jobs_dir
+    }
+
+    fn file_for(&mut self, job: JobId) -> Result<&mut File, StateError> {
+        if !self.open.contains_key(&job.0) {
+            let dir = self.jobs_dir.join(job.0.to_string());
+            fs::create_dir_all(&dir)?;
+            let f = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(dir.join(format!("journal.{}", self.suffix)))?;
+            self.open.insert(job.0, f);
+        }
+        Ok(self.open.get_mut(&job.0).unwrap())
+    }
+
+    pub fn append(&mut self, rec: &JournalRecord) -> Result<(), StateError> {
+        let mut line = serde_json::to_vec(rec)?;
+        line.push(b'\n');
+        self.file_for(rec.job)?.write_all(&line)?;
+        self.dirty = true;
+        Ok(())
+    }
+
+    /// fsync every journal touched since the last sync.
+    pub fn sync(&mut self) -> Result<(), StateError> {
+        if self.dirty {
+            for f in self.open.values() {
+                f.sync_data()?;
+            }
+            self.dirty = false;
+        }
+        Ok(())
+    }
+
+    /// Union replay of ALL journal files (any suffix) for one job.
+    pub fn replay_job(state_dir: &Path, job: JobId) -> Result<Vec<JournalRecord>, StateError> {
+        let dir = state_dir.join("jobs").join(job.0.to_string());
+        replay_dir(&dir)
+    }
+
+    /// Union replay across every job directory.
+    pub fn replay_all(state_dir: &Path) -> Result<Vec<JournalRecord>, StateError> {
+        let jobs_dir = state_dir.join("jobs");
+        let mut out = Vec::new();
+        let entries = match fs::read_dir(&jobs_dir) {
+            Ok(e) => e,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
+            Err(e) => return Err(e.into()),
+        };
+        for entry in entries.flatten() {
+            if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                out.extend(replay_dir(&entry.path())?);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Remove every journal file of a job — call ONLY as the queue
+    /// authority, immediately after a snapshot that folds the job's state,
+    /// and never while the job is delegated (a live foreign writer).
+    pub fn remove_job(&mut self, job: JobId) -> Result<(), StateError> {
+        self.open.remove(&job.0);
+        let dir = self.jobs_dir.join(job.0.to_string());
+        match fs::remove_dir_all(&dir) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e.into()),
+        }
+    }
+}
+
+fn replay_dir(dir: &Path) -> Result<Vec<JournalRecord>, StateError> {
+    let mut out = Vec::new();
+    let entries = match fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
+        Err(e) => return Err(e.into()),
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        if !name.to_string_lossy().starts_with("journal.") {
+            continue;
+        }
+        let file = match File::open(entry.path()) {
+            Ok(f) => f,
+            Err(_) => continue,
+        };
+        for line in BufReader::new(file).split(b'\n') {
+            let line = line?;
+            if line.is_empty() {
+                continue;
+            }
+            match serde_json::from_slice::<JournalRecord>(&line) {
+                Ok(rec) => out.push(rec),
+                Err(_) => break, // torn tail of this file; others still count
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn sanitize_suffix(s: &str) -> String {
+    let cleaned: String = s
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if cleaned.is_empty() {
+        "local".into()
+    } else {
+        cleaned
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Queue snapshot
 // ---------------------------------------------------------------------------
 
@@ -153,10 +304,27 @@ impl SnapshotStore {
 
     /// Atomic write: tmp + fsync + rename + fsync(dir).
     pub fn save(&self, doc: &QueueSnapshotDoc) -> Result<(), StateError> {
+        self.save_guarded(doc, &|| true)
+    }
+
+    /// Atomic write with a fencing guard checked immediately before the
+    /// commit rename (CLUSTERING.md §6.4: a deposed leader must not clobber
+    /// its successor's snapshot). Returns `Corrupt("fenced")` when the
+    /// guard rejects.
+    pub fn save_guarded(
+        &self,
+        doc: &QueueSnapshotDoc,
+        guard: &dyn Fn() -> bool,
+    ) -> Result<(), StateError> {
         let mut f = File::create(&self.tmp)?;
         serde_json::to_writer(&mut f, doc)?;
         f.sync_data()?;
         drop(f);
+        if !guard() {
+            return Err(StateError::Corrupt(
+                "fenced: no longer the authority".into(),
+            ));
+        }
         fs::rename(&self.tmp, &self.path)?;
         if let Ok(d) = File::open(&self.dir) {
             let _ = d.sync_all(); // best-effort directory fsync
@@ -187,9 +355,11 @@ pub struct UncleanMarker {
 }
 
 impl UncleanMarker {
-    pub fn new(dir: &Path) -> UncleanMarker {
+    /// `tag` scopes the marker: in cluster mode every node shares one state
+    /// directory, so each arms its own `unclean.<node>` file.
+    pub fn new(dir: &Path, tag: &str) -> UncleanMarker {
         UncleanMarker {
-            path: dir.join("unclean"),
+            path: dir.join(format!("unclean.{}", sanitize_suffix(tag))),
         }
     }
 
@@ -315,11 +485,68 @@ mod tests {
     }
 
     #[test]
+    fn job_journals_union_across_lease_files() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Two writers (two lease suffixes) journal different segments of
+        // the same job — e.g. a worker died and the job was reclaimed.
+        let mut a = JobJournals::open(dir.path(), "L1-1").unwrap();
+        a.append(&rec(0)).unwrap();
+        a.append(&rec(1)).unwrap();
+        a.sync().unwrap();
+        let mut b = JobJournals::open(dir.path(), "L2-9").unwrap();
+        b.append(&rec(2)).unwrap();
+        b.append(&rec(1)).unwrap(); // duplicate: union is idempotent upstream
+        b.sync().unwrap();
+
+        let recs = JobJournals::replay_job(dir.path(), JobId(1)).unwrap();
+        assert_eq!(recs.len(), 4, "union of both lease files");
+        let segs: std::collections::BTreeSet<u32> = recs.iter().map(|r| r.segment_number).collect();
+        assert_eq!(segs.into_iter().collect::<Vec<_>>(), vec![0, 1, 2]);
+
+        assert_eq!(JobJournals::replay_all(dir.path()).unwrap().len(), 4);
+
+        // Authority folds + removes.
+        a.remove_job(JobId(1)).unwrap();
+        assert!(JobJournals::replay_job(dir.path(), JobId(1))
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn snapshot_guard_fences_the_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SnapshotStore::open(dir.path()).unwrap();
+        store
+            .save(&QueueSnapshotDoc {
+                next_job_id: 1,
+                ..Default::default()
+            })
+            .unwrap();
+
+        let err = store
+            .save_guarded(
+                &QueueSnapshotDoc {
+                    next_job_id: 99,
+                    ..Default::default()
+                },
+                &|| false, // deposed between write and commit
+            )
+            .unwrap_err();
+        assert!(matches!(err, StateError::Corrupt(_)));
+        // The old snapshot survives untouched.
+        assert_eq!(store.load().unwrap().unwrap().next_job_id, 1);
+    }
+
+    #[test]
     fn unclean_marker_lifecycle() {
         let dir = tempfile::tempdir().unwrap();
-        let m = UncleanMarker::new(dir.path());
+        let m = UncleanMarker::new(dir.path(), "local");
         assert!(!m.check_and_arm().unwrap(), "first run is clean");
-        assert!(m.check_and_arm().unwrap(), "second arm without disarm = unclean");
+        assert!(
+            m.check_and_arm().unwrap(),
+            "second arm without disarm = unclean"
+        );
         m.disarm().unwrap();
         assert!(!m.check_and_arm().unwrap(), "after disarm = clean");
         m.disarm().unwrap();

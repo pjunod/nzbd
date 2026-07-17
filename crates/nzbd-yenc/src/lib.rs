@@ -364,11 +364,10 @@ impl YencDecoder {
 // ---------------------------------------------------------------------------
 
 fn kv_fields(line: &[u8]) -> impl Iterator<Item = (&[u8], &[u8])> {
-    line.split(|&b| b == b' ')
-        .filter_map(|tok| {
-            let eq = tok.iter().position(|&b| b == b'=')?;
-            Some((&tok[..eq], &tok[eq + 1..]))
-        })
+    line.split(|&b| b == b' ').filter_map(|tok| {
+        let eq = tok.iter().position(|&b| b == b'=')?;
+        Some((&tok[..eq], &tok[eq + 1..]))
+    })
 }
 
 fn parse_u64(v: &[u8]) -> Option<u64> {
@@ -515,7 +514,9 @@ mod tests {
         let mut x = seed | 1;
         (0..len)
             .map(|_| {
-                x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                x = x
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
                 (x >> 33) as u8
             })
             .collect()
@@ -559,8 +560,10 @@ mod tests {
         let mut art = Vec::new();
         match part {
             Some((p, t, _, _)) => art.extend_from_slice(
-                format!("=ybegin part={p} total={t} line={line_len} size={file_size} name={name}\r\n")
-                    .as_bytes(),
+                format!(
+                    "=ybegin part={p} total={t} line={line_len} size={file_size} name={name}\r\n"
+                )
+                .as_bytes(),
             ),
             None => art.extend_from_slice(
                 format!("=ybegin line={line_len} size={file_size} name={name}\r\n").as_bytes(),
@@ -671,7 +674,10 @@ mod tests {
         data.extend_from_slice(&[0xD6, 0x13, 0x13, 0xE3]);
         let art = encode_article(&data, data.len() as u64, None, "dots", 8);
         // sanity: the stuffed article must actually contain a doubled dot
-        assert!(find_subslice(&art, b"\n..").is_some(), "test article should exercise dot-stuffing");
+        assert!(
+            find_subslice(&art, b"\n..").is_some(),
+            "test article should exercise dot-stuffing"
+        );
         for i in 1..art.len() {
             let (out, res) = decode_all(&[&art[..i], &art[i..]]);
             assert_eq!(out, data, "split at {i}");
@@ -719,7 +725,11 @@ mod tests {
         let mut out = Vec::new();
         let (st, consumed) = dec.push(&wire, &mut out).unwrap();
         assert_eq!(st, Status::Finished);
-        assert_eq!(consumed, art.len(), "must stop exactly after the terminator");
+        assert_eq!(
+            consumed,
+            art.len(),
+            "must stop exactly after the terminator"
+        );
         assert_eq!(&wire[consumed..], b"222 0 <next@x> body follows\r\n");
         assert_eq!(out, data);
         assert_eq!(dec.take_result().unwrap().crc_ok, Some(true));

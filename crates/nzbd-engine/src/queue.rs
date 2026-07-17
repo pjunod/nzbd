@@ -188,10 +188,7 @@ impl QueueState {
                     .filter(|f| !f.paused)
                     .flat_map(|f| &f.segments)
                     .filter(|s| {
-                        matches!(
-                            s.state,
-                            SegmentState::Pending | SegmentState::Leased { .. }
-                        )
+                        matches!(s.state, SegmentState::Pending | SegmentState::Leased { .. })
                     })
                     .map(|s| s.size as u64)
                     .sum::<u64>()
@@ -241,7 +238,11 @@ pub fn sanitize_name(name: &str) -> String {
         })
         .collect();
     let trimmed = cleaned.trim().trim_matches('.').trim();
-    let out = if trimmed.is_empty() { "unnamed" } else { trimmed };
+    let out = if trimmed.is_empty() {
+        "unnamed"
+    } else {
+        trimmed
+    };
     // Keep well under PATH_MAX with room for ".part"/dup suffixes.
     out.chars().take(200).collect()
 }
@@ -254,6 +255,8 @@ pub struct SelectionCtx<'a> {
     pub ladder: &'a Ladder<'a>,
     pub attempts: &'a mut HashMap<SegRef, SegmentAttempt>,
     pub is_blocked: &'a dyn Fn(ServerId) -> bool,
+    /// Jobs executing on another node — invisible to local selection.
+    pub delegated: &'a HashMap<JobId, String>,
     pub article_retries: u8,
     pub now_unix: i64,
     pub propagation_delay_secs: i64,
@@ -280,6 +283,7 @@ pub fn next_for_server(
     let mut order: Vec<&Job> = state
         .jobs
         .iter()
+        .filter(|j| !ctx.delegated.contains_key(&j.id))
         .filter(|j| job_schedulable(j, state.download_paused))
         .collect();
     order.sort_by(|a, b| b.priority.cmp(&a.priority).then(a.id.cmp(&b.id)));
@@ -397,11 +401,7 @@ mod tests {
     #[test]
     fn admission_pauses_extra_pars_and_counts() {
         let mut q = QueueState::default();
-        let parsed = sample_nzb(&[
-            ("data.rar", 3),
-            ("data.par2", 1),
-            ("data.vol00+01.par2", 2),
-        ]);
+        let parsed = sample_nzb(&[("data.rar", 3), ("data.par2", 1), ("data.vol00+01.par2", 2)]);
         let id = q.admit_nzb("job".into(), &parsed, None, 0, true);
         let job = q.job(id).unwrap();
         assert_eq!(job.files.len(), 3);
@@ -424,10 +424,12 @@ mod tests {
         let ladder = Ladder::new(&servers);
         let mut attempts = HashMap::new();
         let not_blocked = |_: ServerId| false;
+        let no_delegation: HashMap<JobId, String> = HashMap::new();
         let mut ctx = SelectionCtx {
             ladder: &ladder,
             attempts: &mut attempts,
             is_blocked: &not_blocked,
+            delegated: &no_delegation,
             article_retries: 3,
             now_unix: 1_800_000_000,
             propagation_delay_secs: 0,
@@ -442,6 +444,7 @@ mod tests {
             ladder: &ladder,
             attempts: &mut attempts,
             is_blocked: &not_blocked,
+            delegated: &no_delegation,
             article_retries: 3,
             now_unix: 1_800_000_000,
             propagation_delay_secs: 0,
@@ -454,6 +457,7 @@ mod tests {
             ladder: &ladder,
             attempts: &mut attempts,
             is_blocked: &not_blocked,
+            delegated: &no_delegation,
             article_retries: 3,
             now_unix: 1_800_000_000,
             propagation_delay_secs: 0,
@@ -476,12 +480,14 @@ mod tests {
         let ladder = Ladder::new(&servers);
         let mut attempts = HashMap::new();
         let not_blocked = |_: ServerId| false;
+        let no_delegation: HashMap<JobId, String> = HashMap::new();
 
         // Tier-1 server gets nothing while tier 0 is viable.
         let mut ctx = SelectionCtx {
             ladder: &ladder,
             attempts: &mut attempts,
             is_blocked: &not_blocked,
+            delegated: &no_delegation,
             article_retries: 3,
             now_unix: 1_800_000_000,
             propagation_delay_secs: 0,
@@ -493,13 +499,20 @@ mod tests {
             ladder: &ladder,
             attempts: &mut attempts,
             is_blocked: &not_blocked,
+            delegated: &no_delegation,
             article_retries: 3,
             now_unix: 1_800_000_000,
             propagation_delay_secs: 0,
         };
         let r = next_for_server(&q, &servers[0], &mut ctx).lease.unwrap();
         assert_eq!(r.job, id);
-        let file = q.job(id).unwrap().files.iter().find(|f| f.id == r.file).unwrap();
+        let file = q
+            .job(id)
+            .unwrap()
+            .files
+            .iter()
+            .find(|f| f.id == r.file)
+            .unwrap();
         assert_eq!(file.filename, "x.rar");
     }
 

@@ -1,27 +1,27 @@
 [package]
-name = "nzbd"
+name = "nzbd-cluster"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
-[[bin]]
-name = "nzbd"
-path = "src/main.rs"
-
 [dependencies]
 nzbd-types = { workspace = true }
-nzbd-config = { workspace = true }
 nzbd-engine = { workspace = true }
+nzbd-state = { workspace = true }
 nzbd-api = { workspace = true }
 nzbd-compat = { workspace = true }
-nzbd-cluster = { workspace = true }
-tokio = { workspace = true }
 axum = { workspace = true }
-clap = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+http-body-util = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
 tracing = { workspace = true }
-tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
 nzbd-nserv = { workspace = true }
 tempfile = { workspace = true }
-serde_json = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }

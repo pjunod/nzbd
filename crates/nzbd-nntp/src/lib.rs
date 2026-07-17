@@ -275,14 +275,23 @@ mod tests {
         assert!(r.is_positive());
         assert!(!r.expects_multiline());
 
-        assert_eq!(Response::parse(b"xx oops"), Err(NntpError::MalformedResponse));
+        assert_eq!(
+            Response::parse(b"xx oops"),
+            Err(NntpError::MalformedResponse)
+        );
         assert_eq!(Response::parse(b"20"), Err(NntpError::MalformedResponse));
     }
 
     #[test]
     fn encodes_commands_and_wraps_msgids() {
-        assert_eq!(Command::Body("abc@def").encode().unwrap(), "BODY <abc@def>\r\n");
-        assert_eq!(Command::Body("<abc@def>").encode().unwrap(), "BODY <abc@def>\r\n");
+        assert_eq!(
+            Command::Body("abc@def").encode().unwrap(),
+            "BODY <abc@def>\r\n"
+        );
+        assert_eq!(
+            Command::Body("<abc@def>").encode().unwrap(),
+            "BODY <abc@def>\r\n"
+        );
         assert_eq!(
             Command::AuthInfoUser("user").encode().unwrap(),
             "AUTHINFO USER user\r\n"
@@ -300,12 +309,18 @@ mod tests {
             Command::Group("alt.bin\r\n").encode(),
             Err(NntpError::IllegalArgument)
         );
-        assert_eq!(Command::Body("<>").encode(), Err(NntpError::IllegalArgument));
+        assert_eq!(
+            Command::Body("<>").encode(),
+            Err(NntpError::IllegalArgument)
+        );
     }
 
     #[test]
     fn display_redacts_password() {
-        assert_eq!(Command::AuthInfoPass("hunter2").to_string(), "AUTHINFO PASS ***");
+        assert_eq!(
+            Command::AuthInfoPass("hunter2").to_string(),
+            "AUTHINFO PASS ***"
+        );
         assert_eq!(Command::Body("a@b").to_string(), "BODY <a@b>");
     }
 

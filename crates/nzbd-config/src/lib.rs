@@ -25,6 +25,74 @@ pub struct Config {
     pub queue: QueueConfig,
     #[serde(default)]
     pub api: ApiConfig,
+    #[serde(default)]
+    pub cluster: ClusterConfig,
+}
+
+/// `[cluster]` — multi-node work distribution (docs/CLUSTERING.md).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct ClusterConfig {
+    pub enabled: bool,
+    /// Unique, stable node name (journal fencing suffix, registry key).
+    pub node_name: String,
+    /// The shared work volume mount (Gluster).
+    pub shared_dir: Option<PathBuf>,
+    /// How peers reach this node's API, e.g. "http://10.0.0.11:6789".
+    pub advertise_url: String,
+    pub secret: Option<String>,
+    pub secret_file: Option<PathBuf>,
+    /// Eligible for leader election.
+    pub coordinator: bool,
+    /// Lower = preferred leader (staggers candidacy).
+    pub priority: u32,
+    pub download: bool,
+    pub max_download_jobs: u32,
+    /// PP executor role (effective from phase 2 / cluster C2).
+    pub post_process: bool,
+    pub pp_slots: u32,
+    pub lease_interval_secs: u64,
+    pub takeover_after_secs: u64,
+    pub worker_ttl_secs: u64,
+}
+
+impl Default for ClusterConfig {
+    fn default() -> Self {
+        ClusterConfig {
+            enabled: false,
+            node_name: String::new(),
+            shared_dir: None,
+            advertise_url: String::new(),
+            secret: None,
+            secret_file: None,
+            coordinator: true,
+            priority: 10,
+            download: true,
+            max_download_jobs: 2,
+            post_process: true,
+            pp_slots: 1,
+            lease_interval_secs: 5,
+            takeover_after_secs: 20,
+            worker_ttl_secs: 30,
+        }
+    }
+}
+
+impl ClusterConfig {
+    /// Resolve the shared secret (inline beats file).
+    pub fn resolve_secret(&self) -> Result<String, ConfigError> {
+        if let Some(s) = &self.secret {
+            return Ok(s.clone());
+        }
+        if let Some(f) = &self.secret_file {
+            return std::fs::read_to_string(expand_home(f))
+                .map(|s| s.trim().to_string())
+                .map_err(|e| ConfigError::Invalid(format!("secret_file: {e}")));
+        }
+        Err(ConfigError::Invalid(
+            "[cluster] requires secret or secret_file".into(),
+        ))
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -205,13 +273,34 @@ impl Config {
     pub fn validate(&self) -> Result<(), ConfigError> {
         for s in &self.servers {
             if s.host.is_empty() {
-                return Err(ConfigError::Invalid(format!("server '{}' has no host", s.name)));
+                return Err(ConfigError::Invalid(format!(
+                    "server '{}' has no host",
+                    s.name
+                )));
             }
             if s.connections == 0 {
                 return Err(ConfigError::Invalid(format!(
                     "server '{}' has zero connections",
                     s.name
                 )));
+            }
+        }
+        if self.cluster.enabled {
+            if self.cluster.node_name.trim().is_empty() {
+                return Err(ConfigError::Invalid("[cluster] requires node_name".into()));
+            }
+            if self.cluster.shared_dir.is_none() {
+                return Err(ConfigError::Invalid("[cluster] requires shared_dir".into()));
+            }
+            if self.cluster.advertise_url.trim().is_empty() {
+                return Err(ConfigError::Invalid(
+                    "[cluster] requires advertise_url".into(),
+                ));
+            }
+            if self.cluster.secret.is_none() && self.cluster.secret_file.is_none() {
+                return Err(ConfigError::Invalid(
+                    "[cluster] requires secret or secret_file".into(),
+                ));
             }
         }
         Ok(())
@@ -315,6 +404,38 @@ bind = "0.0.0.0:6789"
         assert_eq!(q.retry_interval_secs, 10);
         assert_eq!(q.article_timeout_secs, 60);
         assert_eq!(q.min_free_disk_mb, 250);
+    }
+
+    #[test]
+    fn cluster_section_parses_and_validates() {
+        let toml = r#"
+[cluster]
+enabled = true
+node_name = "node-a"
+shared_dir = "/mnt/work"
+advertise_url = "http://10.0.0.11:6789"
+secret = "hunter2"
+priority = 3
+download = true
+max_download_jobs = 4
+"#;
+        let cfg = Config::from_toml(toml).unwrap();
+        assert!(cfg.cluster.enabled);
+        assert_eq!(cfg.cluster.node_name, "node-a");
+        assert_eq!(cfg.cluster.priority, 3);
+        assert_eq!(cfg.cluster.max_download_jobs, 4);
+        assert_eq!(cfg.cluster.lease_interval_secs, 5); // default preserved
+        assert_eq!(cfg.cluster.resolve_secret().unwrap(), "hunter2");
+
+        // Missing requirements are rejected loudly.
+        for broken in [
+            "[cluster]\nenabled = true",
+            "[cluster]\nenabled = true\nnode_name = \"a\"\nshared_dir = \"/x\"\nadvertise_url = \"http://a\"",
+        ] {
+            assert!(Config::from_toml(broken).is_err(), "{broken}");
+        }
+        // Disabled cluster needs nothing.
+        assert!(Config::from_toml("[cluster]\nenabled = false").is_ok());
     }
 
     #[test]

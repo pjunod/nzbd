@@ -41,4 +41,9 @@ pub enum Event {
     SpeedLimitChanged {
         bytes_per_sec: Option<u64>,
     },
+    /// Cluster: job (un)delegated to a node.
+    JobAssigned {
+        job: JobId,
+        node: Option<String>,
+    },
 }

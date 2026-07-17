@@ -21,9 +21,13 @@ use tokio_util::sync::CancellationToken;
 
 pub(crate) struct ConnCtx {
     pub server: ServerDef,
+    /// This task's index within the server's pool — parked while the
+    /// cluster connection budget (CLUSTERING.md §6.3) is below it.
+    pub conn_index: u16,
     pub tls: Option<TlsClientConfig>,
     pub engine_tx: mpsc::Sender<EngineMsg>,
     pub epoch: watch::Receiver<u64>,
+    pub budgets: watch::Receiver<std::collections::HashMap<nzbd_types::ServerId, u16>>,
     pub limiter: Arc<RateLimiter>,
     pub meter: Arc<SpeedMeter>,
     pub cancel: CancellationToken,
@@ -39,6 +43,24 @@ pub(crate) async fn connection_task(mut ctx: ConnCtx) {
     loop {
         if ctx.cancel.is_cancelled() {
             break;
+        }
+        // Cluster connection budget: park (and drop the socket) while this
+        // task's index is beyond the server's current allowance.
+        let allowance = ctx
+            .budgets
+            .borrow_and_update()
+            .get(&ctx.server.id)
+            .copied()
+            .unwrap_or(u16::MAX);
+        if ctx.conn_index >= allowance {
+            if let Some(c) = conn.take() {
+                c.quit().await;
+            }
+            tokio::select! {
+                _ = ctx.cancel.cancelled() => break,
+                r = ctx.budgets.changed() => { if r.is_err() { break } }
+            }
+            continue;
         }
         // Mark the epoch seen *before* asking, so a bump that races the
         // request still wakes us.
@@ -149,11 +171,7 @@ async fn fail_leases(ctx: &ConnCtx, leases: &[Lease], outcome: AttemptOutcome) {
 /// Send BODY for every lease (one write), then read the responses in order.
 /// `Err(())` means the connection died — every unprocessed lease has been
 /// reported back as `ConnectionFailed`.
-async fn run_leases(
-    conn: &mut NntpConnection,
-    leases: &[Lease],
-    ctx: &ConnCtx,
-) -> Result<(), ()> {
+async fn run_leases(conn: &mut NntpConnection, leases: &[Lease], ctx: &ConnCtx) -> Result<(), ()> {
     let cmds: Vec<Command<'_>> = leases
         .iter()
         .map(|l| Command::Body(l.message_id.as_str()))

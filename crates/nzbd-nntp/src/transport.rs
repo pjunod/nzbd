@@ -14,18 +14,14 @@
 
 use crate::{codes, Command, NntpError, Response};
 use nzbd_types::{CertLevel, ServerDef, TlsMode};
-use rustls::client::danger::{
-    HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier,
-};
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{ClientConfig, DigitallySignedStruct, SignatureScheme};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
-use tokio::io::{
-    AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, ReadBuf,
-};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, ReadBuf};
 use tokio::net::TcpStream;
 
 pub type TlsClientConfig = Arc<ClientConfig>;
@@ -146,10 +142,11 @@ impl NntpConnection {
                 let name = ServerName::try_from(server.host.clone())
                     .map_err(|e| TransportError::Tls(format!("invalid server name: {e}")))?;
                 let connector = tokio_rustls::TlsConnector::from(config);
-                let tls_stream = tokio::time::timeout(connect_timeout, connector.connect(name, tcp))
-                    .await
-                    .map_err(|_| TransportError::Timeout("tls handshake"))?
-                    .map_err(|e| TransportError::Tls(e.to_string()))?;
+                let tls_stream =
+                    tokio::time::timeout(connect_timeout, connector.connect(name, tcp))
+                        .await
+                        .map_err(|_| TransportError::Timeout("tls handshake"))?
+                        .map_err(|e| TransportError::Tls(e.to_string()))?;
                 Stream::Tls(Box::new(tls_stream))
             }
         };
@@ -518,15 +515,21 @@ mod tests {
             let mut buf = vec![0u8; 1024];
             // AUTHINFO USER
             let n = sock.read(&mut buf).await.unwrap();
-            assert!(std::str::from_utf8(&buf[..n]).unwrap().starts_with("AUTHINFO USER alice"));
+            assert!(std::str::from_utf8(&buf[..n])
+                .unwrap()
+                .starts_with("AUTHINFO USER alice"));
             sock.write_all(b"381 password required\r\n").await.unwrap();
             // AUTHINFO PASS
             let n = sock.read(&mut buf).await.unwrap();
-            assert!(std::str::from_utf8(&buf[..n]).unwrap().starts_with("AUTHINFO PASS s3cret"));
+            assert!(std::str::from_utf8(&buf[..n])
+                .unwrap()
+                .starts_with("AUTHINFO PASS s3cret"));
             sock.write_all(b"281 welcome\r\n").await.unwrap();
             // BODY -> 430
             let n = sock.read(&mut buf).await.unwrap();
-            assert!(std::str::from_utf8(&buf[..n]).unwrap().starts_with("BODY <x@y>"));
+            assert!(std::str::from_utf8(&buf[..n])
+                .unwrap()
+                .starts_with("BODY <x@y>"));
             sock.write_all(b"430 no such article\r\n").await.unwrap();
         });
 

@@ -116,8 +116,7 @@ async fn writer_task(
                 file_size,
                 combined_crc,
             } => {
-                let result =
-                    finalize(&part_path, &final_path, &mut out, file_size).await;
+                let result = finalize(&part_path, &final_path, &mut out, file_size).await;
                 let msg = match result {
                     Ok(()) => EngineMsg::WriterFinalized {
                         job,
@@ -330,22 +329,24 @@ mod tests {
             "r.bin".into(),
             etx2,
         );
-        h2.tx.send(WriteCmd::Segment {
-            seg_number: 2,
-            offset: 4,
-            data: vec![5, 6, 7, 8],
-            crc: 0,
-            file_size: 8,
-            server: ServerId(1),
-        })
-        .await
-        .unwrap();
-        h2.tx.send(WriteCmd::Finalize {
-            file_size: 8,
-            combined_crc: None,
-        })
-        .await
-        .unwrap();
+        h2.tx
+            .send(WriteCmd::Segment {
+                seg_number: 2,
+                offset: 4,
+                data: vec![5, 6, 7, 8],
+                crc: 0,
+                file_size: 8,
+                server: ServerId(1),
+            })
+            .await
+            .unwrap();
+        h2.tx
+            .send(WriteCmd::Finalize {
+                file_size: 8,
+                combined_crc: None,
+            })
+            .await
+            .unwrap();
         loop {
             match erx2.recv().await.unwrap() {
                 EngineMsg::WriterFinalized { ok, .. } => {

@@ -71,10 +71,16 @@ pub struct JobTotals {
 #[serde(rename_all = "snake_case")]
 pub enum SegmentState {
     Pending,
-    Leased { server: ServerId },
+    Leased {
+        server: ServerId,
+    },
     /// Decoded and written. `offset`/`len` are positions in the output file
     /// (yEnc `begin - 1` / part length); `crc` is the decoded part CRC32.
-    Done { offset: u64, len: u32, crc: u32 },
+    Done {
+        offset: u64,
+        len: u32,
+        crc: u32,
+    },
     Failed,
 }
 
@@ -321,13 +327,19 @@ mod tests {
     #[test]
     fn critical_health_zero_when_par_covers_half() {
         // good par (500) * 2 >= size (1000): repair always feasible
-        assert_eq!(Health::calc_critical(&totals(1000, 500, 0, 0), false), Health(0));
+        assert_eq!(
+            Health::calc_critical(&totals(1000, 500, 0, 0), false),
+            Health(0)
+        );
     }
 
     #[test]
     fn critical_health_formula() {
         // size=1000, goodPar=200 -> (1000-400)*1000/(1000-200) = 750
-        assert_eq!(Health::calc_critical(&totals(1000, 200, 0, 0), false), Health(750));
+        assert_eq!(
+            Health::calc_critical(&totals(1000, 200, 0, 0), false),
+            Health(750)
+        );
         // failed par shrinks goodPar: par=200 with 100 failed -> goodPar=100
         // (1000-200)*1000/(1000-100) = 888
         assert_eq!(
@@ -339,8 +351,14 @@ mod tests {
     #[test]
     fn critical_health_estimation_fallback() {
         // No par at all -> raw = 1000; with estimation allowed -> 850
-        assert_eq!(Health::calc_critical(&totals(1000, 0, 0, 0), true), Health(850));
-        assert_eq!(Health::calc_critical(&totals(1000, 0, 0, 0), false), Health(1000));
+        assert_eq!(
+            Health::calc_critical(&totals(1000, 0, 0, 0), true),
+            Health(850)
+        );
+        assert_eq!(
+            Health::calc_critical(&totals(1000, 0, 0, 0), false),
+            Health(1000)
+        );
     }
 
     #[test]

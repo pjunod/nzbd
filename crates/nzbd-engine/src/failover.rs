@@ -51,7 +51,9 @@ pub enum Verdict {
     Done,
     /// Retry the same server after its block expires. `block_server` asks the
     /// pool to block it (connection-level failures).
-    RetrySame { block_server: bool },
+    RetrySame {
+        block_server: bool,
+    },
     /// This server is failed for this article; ask [`Ladder::select`] again.
     NextServer,
     Failed,
@@ -214,7 +216,9 @@ impl<'a> Ladder<'a> {
             AttemptOutcome::Other => {
                 if att.retries_left > 1 {
                     att.retries_left -= 1;
-                    Verdict::RetrySame { block_server: false }
+                    Verdict::RetrySame {
+                        block_server: false,
+                    }
                 } else {
                     att.failed.insert(server);
                     // A fresh server gets a fresh retry budget (NZBGet's
@@ -267,13 +271,19 @@ mod tests {
         let ladder = Ladder::new(&servers);
         let mut att = SegmentAttempt::new(3);
 
-        assert_eq!(ladder.select(&mut att, &NOT_BLOCKED), Selection::Server(ServerId(1)));
+        assert_eq!(
+            ladder.select(&mut att, &NOT_BLOCKED),
+            Selection::Server(ServerId(1))
+        );
         assert_eq!(
             ladder.on_outcome(&mut att, ServerId(1), AttemptOutcome::ArticleMissing),
             Verdict::NextServer
         );
         // tier 0 exhausted -> tier 1
-        assert_eq!(ladder.select(&mut att, &NOT_BLOCKED), Selection::Server(ServerId(2)));
+        assert_eq!(
+            ladder.select(&mut att, &NOT_BLOCKED),
+            Selection::Server(ServerId(2))
+        );
         assert_eq!(att.tier, 1);
         assert_eq!(
             ladder.on_outcome(&mut att, ServerId(2), AttemptOutcome::ArticleMissing),
@@ -294,10 +304,16 @@ mod tests {
         let ladder = Ladder::new(&servers);
         let mut att = SegmentAttempt::new(3);
 
-        assert_eq!(ladder.select(&mut att, &NOT_BLOCKED), Selection::Server(ServerId(1)));
+        assert_eq!(
+            ladder.select(&mut att, &NOT_BLOCKED),
+            Selection::Server(ServerId(1))
+        );
         ladder.on_outcome(&mut att, ServerId(1), AttemptOutcome::ArticleMissing);
         // server 2 shares the group -> skipped; goes straight to 3
-        assert_eq!(ladder.select(&mut att, &NOT_BLOCKED), Selection::Server(ServerId(3)));
+        assert_eq!(
+            ladder.select(&mut att, &NOT_BLOCKED),
+            Selection::Server(ServerId(3))
+        );
     }
 
     #[test]
@@ -324,18 +340,25 @@ mod tests {
 
         assert_eq!(
             ladder.on_outcome(&mut att, ServerId(1), AttemptOutcome::Other),
-            Verdict::RetrySame { block_server: false }
+            Verdict::RetrySame {
+                block_server: false
+            }
         );
         assert_eq!(
             ladder.on_outcome(&mut att, ServerId(1), AttemptOutcome::Other),
-            Verdict::RetrySame { block_server: false }
+            Verdict::RetrySame {
+                block_server: false
+            }
         );
         // third strike: server failed for this article
         assert_eq!(
             ladder.on_outcome(&mut att, ServerId(1), AttemptOutcome::Other),
             Verdict::NextServer
         );
-        assert_eq!(ladder.select(&mut att, &NOT_BLOCKED), Selection::Server(ServerId(2)));
+        assert_eq!(
+            ladder.select(&mut att, &NOT_BLOCKED),
+            Selection::Server(ServerId(2))
+        );
     }
 
     #[test]
@@ -346,7 +369,10 @@ mod tests {
         let blocked = |id: ServerId| id == ServerId(1);
 
         // fill server blocked -> fall through to next tier instead of waiting
-        assert_eq!(ladder.select(&mut att, &blocked), Selection::Server(ServerId(2)));
+        assert_eq!(
+            ladder.select(&mut att, &blocked),
+            Selection::Server(ServerId(2))
+        );
     }
 
     #[test]
@@ -357,7 +383,10 @@ mod tests {
         let blocked = |id: ServerId| id == ServerId(1);
 
         assert_eq!(ladder.select(&mut att, &blocked), Selection::WaitForBlocked);
-        assert_eq!(att.tier, 0, "must not escalate past a temporarily-blocked main server");
+        assert_eq!(
+            att.tier, 0,
+            "must not escalate past a temporarily-blocked main server"
+        );
     }
 
     #[test]
@@ -371,7 +400,10 @@ mod tests {
             Verdict::NextServer
         );
         assert_eq!(att.retries_left, 3, "CRC errors don't spend retries");
-        assert_eq!(ladder.select(&mut att, &NOT_BLOCKED), Selection::Server(ServerId(2)));
+        assert_eq!(
+            ladder.select(&mut att, &NOT_BLOCKED),
+            Selection::Server(ServerId(2))
+        );
     }
 
     #[test]
@@ -381,7 +413,10 @@ mod tests {
         let servers = vec![s1, server(2, 1, 0, false)];
         let ladder = Ladder::new(&servers);
         let mut att = SegmentAttempt::new(3);
-        assert_eq!(ladder.select(&mut att, &NOT_BLOCKED), Selection::Server(ServerId(2)));
+        assert_eq!(
+            ladder.select(&mut att, &NOT_BLOCKED),
+            Selection::Server(ServerId(2))
+        );
     }
 
     #[test]

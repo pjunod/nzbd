@@ -181,7 +181,10 @@ async fn jsonrpc(State(state): State<CompatState>, body: String) -> Json<Value> 
         Err(_) => return Json(envelope(Value::Null, Err((4, "Parse error")))),
     };
     let id = req.get("id").cloned().unwrap_or(Value::Null);
-    let method = req.get("method").and_then(Value::as_str).unwrap_or_default();
+    let method = req
+        .get("method")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
     let params = req.get("params").cloned().unwrap_or(Value::Array(vec![]));
     Json(envelope(id, dispatch(&state, method, &params)))
 }
@@ -198,13 +201,13 @@ mod tests {
     use nzbd_engine::{Engine, EngineConfig, Tuning};
 
     async fn test_state(tmp: &tempfile::TempDir) -> CompatState {
-        let engine = Engine::spawn(EngineConfig {
-            servers: vec![],
-            state_dir: tmp.path().join("state"),
-            dest_dir: tmp.path().join("dest"),
-            tuning: Tuning::default(),
-            speed_limit_bps: None,
-        })
+        let engine = Engine::spawn(EngineConfig::single_node(
+            vec![],
+            tmp.path().join("state"),
+            tmp.path().join("dest"),
+            Tuning::default(),
+            None,
+        ))
         .await
         .unwrap();
         CompatState {

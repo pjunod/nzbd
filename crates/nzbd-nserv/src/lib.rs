@@ -87,10 +87,12 @@ impl NservBuilder {
         let addr = listener.local_addr()?;
         let hits = Arc::new(Mutex::new(HashMap::new()));
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let concurrency = Arc::new(Concurrency::default());
         let inner = Arc::new(Inner {
             articles: self.articles,
             credentials: self.credentials,
             hits: hits.clone(),
+            concurrency: concurrency.clone(),
         });
         let accept_inner = inner.clone();
         let mut accept_shutdown = shutdown_rx.clone();
@@ -112,6 +114,7 @@ impl NservBuilder {
         Ok(Nserv {
             addr,
             hits,
+            concurrency,
             shutdown: shutdown_tx,
         })
     }
@@ -121,12 +124,38 @@ struct Inner {
     articles: HashMap<String, StoredArticle>,
     credentials: Option<(String, String)>,
     hits: Arc<Mutex<HashMap<String, u32>>>,
+    concurrency: Arc<Concurrency>,
 }
 
 pub struct Nserv {
     addr: SocketAddr,
     hits: Arc<Mutex<HashMap<String, u32>>>,
+    concurrency: Arc<Concurrency>,
     shutdown: watch::Sender<bool>,
+}
+
+/// Live/max concurrent connection gauge (cluster budget assertions).
+#[derive(Default)]
+struct Concurrency {
+    current: std::sync::atomic::AtomicU32,
+    max: std::sync::atomic::AtomicU32,
+}
+
+struct ConnGuard(Arc<Concurrency>);
+impl ConnGuard {
+    fn new(c: Arc<Concurrency>) -> ConnGuard {
+        use std::sync::atomic::Ordering;
+        let now = c.current.fetch_add(1, Ordering::SeqCst) + 1;
+        c.max.fetch_max(now, Ordering::SeqCst);
+        ConnGuard(c)
+    }
+}
+impl Drop for ConnGuard {
+    fn drop(&mut self) {
+        self.0
+            .current
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 impl Nserv {
@@ -147,6 +176,13 @@ impl Nserv {
         self.hits.lock().unwrap().values().sum()
     }
 
+    /// Highest number of simultaneously open client connections seen.
+    pub fn max_concurrent_connections(&self) -> u32 {
+        self.concurrency
+            .max
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     pub fn stop(&self) {
         let _ = self.shutdown.send(true);
     }
@@ -159,6 +195,7 @@ impl Drop for Nserv {
 }
 
 async fn handle_conn(sock: TcpStream, inner: Arc<Inner>, mut shutdown: watch::Receiver<bool>) {
+    let _guard = ConnGuard::new(inner.concurrency.clone());
     sock.set_nodelay(true).ok();
     let mut io = BufReader::new(sock);
     let mut line = String::new();
@@ -202,13 +239,15 @@ async fn handle_conn(sock: TcpStream, inner: Arc<Inner>, mut shutdown: watch::Re
         } else if upper.starts_with("AUTHINFO PASS ") {
             let pass = cmd[14..].trim();
             match &inner.credentials {
-                Some((u, p))
-                    if authed_user.as_deref() == Some(u.as_str()) && pass == p =>
-                {
+                Some((u, p)) if authed_user.as_deref() == Some(u.as_str()) && pass == p => {
                     authed = true;
                     io.get_mut().write_all(b"281 welcome\r\n").await
                 }
-                _ => io.get_mut().write_all(b"481 authentication failed\r\n").await,
+                _ => {
+                    io.get_mut()
+                        .write_all(b"481 authentication failed\r\n")
+                        .await
+                }
             }
         } else if upper.starts_with("BODY") {
             if !authed {
@@ -224,9 +263,7 @@ async fn handle_conn(sock: TcpStream, inner: Arc<Inner>, mut shutdown: watch::Re
             match inner.articles.get(&id) {
                 None => io.get_mut().write_all(b"430 no such article\r\n").await,
                 Some(a) => match a.behavior {
-                    Behavior::NotFound => {
-                        io.get_mut().write_all(b"430 no such article\r\n").await
-                    }
+                    Behavior::NotFound => io.get_mut().write_all(b"430 no such article\r\n").await,
                     Behavior::Serve | Behavior::Delay(_) => {
                         if let Behavior::Delay(d) = a.behavior {
                             tokio::select! {
@@ -333,7 +370,11 @@ pub fn prng_bytes(seed: u64, len: usize) -> Vec<u8> {
 
 /// Build a multi-file post: yEnc articles of `segment_size` decoded bytes
 /// each, plus the NZB describing them.
-pub fn build_post(post_name: &str, files: &[(&str, Vec<u8>)], segment_size: usize) -> GeneratedPost {
+pub fn build_post(
+    post_name: &str,
+    files: &[(&str, Vec<u8>)],
+    segment_size: usize,
+) -> GeneratedPost {
     assert!(segment_size > 0);
     let slug: String = post_name
         .chars()
@@ -493,7 +534,11 @@ mod tests {
         let mut byte = [0u8; 4096];
         loop {
             let n = sock.read(&mut byte).await.unwrap();
-            assert!(n > 0, "peer closed early; got {:?}", String::from_utf8_lossy(&buf));
+            assert!(
+                n > 0,
+                "peer closed early; got {:?}",
+                String::from_utf8_lossy(&buf)
+            );
             buf.extend_from_slice(&byte[..n]);
             if buf.windows(needle.len()).any(|w| w == needle) {
                 return buf;
@@ -578,10 +623,7 @@ mod tests {
             };
             let mut pos = text_end(0); // past =ybegin
             pos = text_end(pos); // past =ypart
-            let end = unstuffed
-                .windows(5)
-                .position(|w| w == b"=yend")
-                .unwrap();
+            let end = unstuffed.windows(5).position(|w| w == b"=yend").unwrap();
             let mut out = Vec::new();
             let mut esc = false;
             for &b in &unstuffed[pos..end] {

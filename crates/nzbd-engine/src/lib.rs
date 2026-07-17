@@ -22,6 +22,7 @@ mod pool;
 mod writer;
 
 pub use events::Event;
+pub use owner::MirrorStats;
 pub use snapshot::{new_shared_snapshot, JobSummary, QueueSnapshot, SharedSnapshot};
 
 use nzbd_nntp::transport::{tls_client_config, TlsClientConfig};
@@ -75,15 +76,46 @@ impl Default for Tuning {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct EngineConfig {
     pub servers: Vec<ServerDef>,
-    /// Journal + snapshots live here.
+    /// Journal + snapshots live here (the shared volume in cluster mode).
     pub state_dir: PathBuf,
     /// Completed jobs are written to `<dest_dir>/<job name>/`.
     pub dest_dir: PathBuf,
     pub tuning: Tuning,
     pub speed_limit_bps: Option<u64>,
+    /// Queue-authority persistence (snapshot save + journal compaction +
+    /// recovery-at-boot). `false` for cluster worker engines: they start
+    /// empty and receive jobs as leases (journals stay on regardless).
+    pub persist_queue: bool,
+    /// Fencing suffix for this engine's per-job journal files — the
+    /// cluster work-lease id, or "local".
+    pub journal_suffix: String,
+    /// Checked immediately before every snapshot commit (CLUSTERING.md
+    /// §6.4): returns false once this node is no longer the authority.
+    pub persist_guard: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
+}
+
+impl EngineConfig {
+    pub fn single_node(
+        servers: Vec<ServerDef>,
+        state_dir: PathBuf,
+        dest_dir: PathBuf,
+        tuning: Tuning,
+        speed_limit_bps: Option<u64>,
+    ) -> EngineConfig {
+        EngineConfig {
+            servers,
+            state_dir,
+            dest_dir,
+            tuning,
+            speed_limit_bps,
+            persist_queue: true,
+            journal_suffix: "local".into(),
+            persist_guard: None,
+        }
+    }
 }
 
 pub struct Engine;
@@ -95,6 +127,8 @@ impl Engine {
         let shared = new_shared_snapshot();
         let (events, _) = broadcast::channel(512);
         let (epoch_tx, epoch_rx) = watch::channel(0u64);
+        let (budget_tx, budget_rx) =
+            watch::channel(std::collections::HashMap::<nzbd_types::ServerId, u16>::new());
         let (engine_tx, engine_rx) = mpsc::channel::<EngineMsg>(1024);
         let meter = Arc::new(SpeedMeter::new());
         let limiter = Arc::new(RateLimiter::new(cfg.speed_limit_bps));
@@ -119,6 +153,10 @@ impl Engine {
             cfg.dest_dir.clone(),
             servers.clone(),
             cfg.tuning.clone(),
+            cfg.persist_queue,
+            &cfg.journal_suffix,
+            cfg.persist_guard.clone(),
+            budget_tx,
             shared.clone(),
             events.clone(),
             epoch_tx,
@@ -136,12 +174,14 @@ impl Engine {
             if !server.active {
                 continue;
             }
-            for _ in 0..server.max_connections.max(1) {
+            for conn_index in 0..server.max_connections.max(1) {
                 tracker.spawn(pool::connection_task(pool::ConnCtx {
                     server: server.clone(),
+                    conn_index,
                     tls: tls_by_server[i].clone(),
                     engine_tx: engine_tx.clone(),
                     epoch: epoch_rx.clone(),
+                    budgets: budget_rx.clone(),
                     limiter: limiter.clone(),
                     meter: meter.clone(),
                     cancel: cancel.clone(),
@@ -253,6 +293,86 @@ impl EngineHandle {
             reply,
         })
         .await
+    }
+
+    // -- cluster operations (used by nzbd-cluster; harmless elsewhere) ------
+
+    /// Insert or replace a job with ids preserved; optionally fold its
+    /// shared per-job journals (cross-node resume).
+    pub async fn import_job(
+        &self,
+        job: nzbd_types::Job,
+        fold_journals: bool,
+        emit_finished: bool,
+    ) -> Result<(), EngineError> {
+        let (tx, rx) = oneshot::channel();
+        self.send(QueueCommand::ImportJob {
+            job: Box::new(job),
+            fold_journals,
+            emit_finished,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| EngineError::Closed)
+    }
+
+    pub async fn export_job(&self, job: JobId) -> Result<Option<nzbd_types::Job>, EngineError> {
+        let (tx, rx) = oneshot::channel();
+        self.send(QueueCommand::ExportJob { job, reply: tx })
+            .await?;
+        rx.await
+            .map(|o| o.map(|b| *b))
+            .map_err(|_| EngineError::Closed)
+    }
+
+    pub async fn remove_job_silent(&self, job: JobId) -> Result<bool, EngineError> {
+        self.roundtrip_bool(|reply| QueueCommand::RemoveJobSilent { job, reply })
+            .await
+    }
+
+    pub async fn set_delegated(
+        &self,
+        job: JobId,
+        node: Option<String>,
+    ) -> Result<bool, EngineError> {
+        self.roundtrip_bool(|reply| QueueCommand::SetDelegated { job, node, reply })
+            .await
+    }
+
+    /// Fire-and-forget remote progress overlay for a delegated job.
+    pub fn mirror_progress(&self, job: JobId, stats: MirrorStats) {
+        let _ = self
+            .cmd_tx
+            .try_send(EngineMsg::Command(QueueCommand::MirrorProgress {
+                job,
+                stats,
+            }));
+    }
+
+    pub async fn fold_job_journals(&self, job: JobId) -> Result<(), EngineError> {
+        self.roundtrip_unit(|reply| QueueCommand::FoldJobJournals { job, reply })
+            .await
+    }
+
+    pub async fn set_server_budgets(
+        &self,
+        budgets: std::collections::HashMap<nzbd_types::ServerId, u16>,
+    ) -> Result<(), EngineError> {
+        self.roundtrip_unit(|reply| QueueCommand::SetServerBudgets { budgets, reply })
+            .await
+    }
+
+    /// Become the queue authority (cluster leader took office).
+    pub async fn adopt_authority(&self) -> Result<(), EngineError> {
+        self.roundtrip_unit(|reply| QueueCommand::AdoptAuthority { reply })
+            .await
+    }
+
+    /// Crash-only demotion: keep only `keep` (leases still executing),
+    /// stop authority persistence.
+    pub async fn retain_jobs(&self, keep: Vec<JobId>) -> Result<(), EngineError> {
+        self.roundtrip_unit(|reply| QueueCommand::RetainJobs { keep, reply })
+            .await
     }
 
     /// Lock-free snapshot of the queue (never blocks the engine).

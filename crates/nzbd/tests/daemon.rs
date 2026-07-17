@@ -13,7 +13,8 @@ use std::time::{Duration, Instant};
 
 fn http(addr: &str, method: &str, path: &str, body: &[u8]) -> (u16, String) {
     let mut sock = TcpStream::connect(addr).expect("connect");
-    sock.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    sock.set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
     let req = format!(
         "{method} {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n",
         body.len()
@@ -164,7 +165,12 @@ bind = "{api_addr}"
     assert_eq!(v["result"], "26.2");
     assert!(v.get("jsonrpc").is_none());
 
-    let (_, body) = http(&api_addr, "POST", "/jsonrpc", br#"{"method":"status","id":4}"#);
+    let (_, body) = http(
+        &api_addr,
+        "POST",
+        "/jsonrpc",
+        br#"{"method":"status","id":4}"#,
+    );
     let v: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert!(v["result"]["RemainingSizeLo"].is_number());
     assert_eq!(v["result"]["RemainingSizeMB"], 0);
@@ -186,7 +192,7 @@ bind = "{api_addr}"
         std::thread::sleep(Duration::from_millis(100));
     }
     assert!(
-        !tmp.path().join("main/queue/unclean").exists(),
+        !tmp.path().join("main/queue/unclean.local").exists(),
         "graceful shutdown must clear the unclean marker"
     );
 

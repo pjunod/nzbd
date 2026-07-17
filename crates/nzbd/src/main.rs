@@ -58,8 +58,7 @@ enum Command {
 fn main() -> anyhow_lite::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
 
@@ -109,26 +108,34 @@ fn run(config: Option<PathBuf>, bind: Option<String>) -> anyhow_lite::Result<()>
         }
     }
     if servers.is_empty() {
-        tracing::warn!("no [[server]] configured — the queue will accept jobs but nothing can download");
+        tracing::warn!(
+            "no [[server]] configured — the queue will accept jobs but nothing can download"
+        );
     }
 
-    let engine_cfg = EngineConfig {
-        servers,
-        state_dir: cfg.state_dir(),
-        dest_dir: cfg.dest_dir(),
-        tuning: Tuning {
-            article_retries: cfg.queue.article_retries,
-            retry_interval: Duration::from_secs(cfg.queue.retry_interval_secs),
-            article_timeout: Duration::from_secs(cfg.queue.article_timeout_secs),
-            propagation_delay: Duration::from_secs(cfg.queue.propagation_delay_mins as u64 * 60),
-            ..Tuning::default()
-        },
-        speed_limit_bps: cfg.speed_limit_bps(),
+    let tuning = Tuning {
+        article_retries: cfg.queue.article_retries,
+        retry_interval: Duration::from_secs(cfg.queue.retry_interval_secs),
+        article_timeout: Duration::from_secs(cfg.queue.article_timeout_secs),
+        propagation_delay: Duration::from_secs(cfg.queue.propagation_delay_mins as u64 * 60),
+        ..Tuning::default()
     };
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
+
+    if cfg.cluster.enabled {
+        return runtime.block_on(run_cluster(cfg, servers, tuning, bind));
+    }
+
+    let engine_cfg = EngineConfig::single_node(
+        servers,
+        cfg.state_dir(),
+        cfg.dest_dir(),
+        tuning,
+        cfg.speed_limit_bps(),
+    );
 
     runtime.block_on(async move {
         let engine = Engine::spawn(engine_cfg)
@@ -156,6 +163,75 @@ fn run(config: Option<PathBuf>, bind: Option<String>) -> anyhow_lite::Result<()>
         engine.shutdown().await;
         Ok(())
     })
+}
+
+/// Cluster mode (docs/CLUSTERING.md): shared-volume state, elected leader,
+/// distributed download work; this node serves the full API either way.
+async fn run_cluster(
+    cfg: nzbd_config::Config,
+    servers: Vec<nzbd_types::ServerDef>,
+    tuning: Tuning,
+    bind: String,
+) -> anyhow_lite::Result<()> {
+    let c = &cfg.cluster;
+    let secret = c
+        .resolve_secret()
+        .map_err(|e| anyhow_lite::Error::msg(e.to_string()))?;
+    let shared_dir =
+        nzbd_config::expand_home(c.shared_dir.as_ref().expect("validated: shared_dir set"));
+    // Job data must be visible to every node: default dest to the shared
+    // volume unless the operator pointed it there (or elsewhere) already.
+    let dest_dir = cfg.dest_dir();
+    if !dest_dir.starts_with(&shared_dir) {
+        tracing::warn!(
+            dest = %dest_dir.display(),
+            shared = %shared_dir.display(),
+            "dest_dir is outside the shared volume; remote post-processing (phase C2) will not see the files"
+        );
+    }
+
+    let cluster_cfg = nzbd_cluster::ClusterConfig {
+        node_name: c.node_name.clone(),
+        shared_dir,
+        advertise_url: c.advertise_url.clone(),
+        secret,
+        coordinator: c.coordinator,
+        priority: c.priority,
+        download: c.download,
+        max_download_jobs: c.max_download_jobs,
+        post_process: c.post_process,
+        lease_interval: Duration::from_secs(c.lease_interval_secs.max(1)),
+        takeover_after: Duration::from_secs(c.takeover_after_secs.max(2)),
+        worker_ttl: Duration::from_secs(c.worker_ttl_secs.max(3)),
+    };
+
+    let runtime = nzbd_cluster::ClusterRuntime::start(
+        cluster_cfg,
+        servers,
+        tuning,
+        dest_dir,
+        cfg.speed_limit_bps(),
+    )
+    .await
+    .map_err(|e| anyhow_lite::Error::msg(e.to_string()))?;
+
+    let app = runtime.router(&cfg.api.compat_version);
+    let listener = tokio::net::TcpListener::bind(&bind).await?;
+    tracing::info!(
+        %bind,
+        node = %cfg.cluster.node_name,
+        "nzbd listening (cluster mode: C1 foundation)"
+    );
+
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async {
+            let _ = tokio::signal::ctrl_c().await;
+            tracing::info!("shutting down");
+        })
+        .await?;
+
+    runtime.shutdown().await;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

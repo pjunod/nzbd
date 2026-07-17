@@ -19,12 +19,10 @@ use crate::snapshot::{JobSummary, QueueSnapshot, SharedSnapshot};
 use crate::writer::{spawn_writer, WriteCmd, WriterHandle};
 use crate::Tuning;
 use nzbd_nzb::ParsedNzb;
-use nzbd_state::{FsJournal, JournalRecord, SnapshotStore, UncleanMarker};
-use nzbd_types::{
-    FileId, Health, JobId, JobStatus, SegmentState, ServerDef, ServerId,
-};
+use nzbd_state::{FsJournal, JobJournals, JournalRecord, SnapshotStore, UncleanMarker};
+use nzbd_types::{FileId, Health, Job, JobId, JobStatus, SegmentState, ServerDef, ServerId};
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio::time::{Duration, Instant, MissedTickBehavior};
@@ -73,6 +71,74 @@ pub(crate) enum QueueCommand {
         bytes_per_sec: Option<u64>,
         reply: oneshot::Sender<()>,
     },
+
+    // -- cluster commands (CLUSTERING.md §7) --------------------------------
+    /// Insert (or replace) a job with its ids preserved — the cluster grant
+    /// / completion path. Optionally folds the job's shared journals
+    /// (cross-node resume).
+    ImportJob {
+        job: Box<Job>,
+        fold_journals: bool,
+        emit_finished: bool,
+        reply: oneshot::Sender<()>,
+    },
+    /// Clone a job's full current state out (for grants and completion
+    /// reports).
+    ExportJob {
+        job: JobId,
+        reply: oneshot::Sender<Option<Box<Job>>>,
+    },
+    /// Remove a job from this engine without touching disk artifacts,
+    /// history or events — the executor-side handoff cleanup.
+    RemoveJobSilent {
+        job: JobId,
+        reply: oneshot::Sender<bool>,
+    },
+    /// Mark a job as executing on another node: the local scheduler skips
+    /// it; summaries carry the assignee.
+    SetDelegated {
+        job: JobId,
+        node: Option<String>,
+        reply: oneshot::Sender<bool>,
+    },
+    /// Overlay remote progress counters onto a delegated job's summary.
+    MirrorProgress {
+        job: JobId,
+        stats: MirrorStats,
+    },
+    /// Union-fold the job's shared journal files into local state (reclaim
+    /// after a worker died, or adoption after taking office).
+    FoldJobJournals {
+        job: JobId,
+        reply: oneshot::Sender<()>,
+    },
+    /// Cap connection concurrency per server (cluster-wide provider
+    /// account budgets). Absent entry = local config limit.
+    SetServerBudgets {
+        budgets: HashMap<ServerId, u16>,
+        reply: oneshot::Sender<()>,
+    },
+    /// Become the queue authority: load the shared snapshot (local jobs
+    /// win on conflict — the executor copy is fresher), fold all journals,
+    /// enable persistence.
+    AdoptAuthority {
+        reply: oneshot::Sender<()>,
+    },
+    /// Crash-only demotion: drop authority persistence and every job not
+    /// in `keep` (the leases this node still executes).
+    RetainJobs {
+        keep: Vec<JobId>,
+        reply: oneshot::Sender<()>,
+    },
+}
+
+/// Remote progress counters mirrored into a delegated job's summary.
+#[derive(Debug, Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
+pub struct MirrorStats {
+    pub done_articles: u32,
+    pub failed_articles: u32,
+    pub downloaded_bytes: u64,
+    pub health: u16,
 }
 
 /// A granted segment lease: everything a connection task needs.
@@ -138,10 +204,19 @@ pub(crate) struct Owner {
     finalize_sent: HashSet<FileId>,
     pending_finalize: Vec<(JobId, FileId)>,
     file_sizes: HashMap<FileId, u64>,
+    /// Jobs executing on another node (job → node name).
+    delegated: HashMap<JobId, String>,
+    mirror: HashMap<JobId, MirrorStats>,
 
-    journal: FsJournal,
+    state_dir: PathBuf,
+    journal: JobJournals,
     snap_store: SnapshotStore,
     marker: UncleanMarker,
+    /// Queue-authority persistence (snapshot save/compact). Worker-mode
+    /// engines run with this off; journals stay on regardless.
+    persist: bool,
+    persist_guard: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
+    budget_tx: watch::Sender<HashMap<ServerId, u16>>,
 
     shared: SharedSnapshot,
     events: broadcast::Sender<Event>,
@@ -164,13 +239,21 @@ pub(crate) struct Owner {
 
 #[allow(clippy::too_many_arguments)]
 impl Owner {
-    /// Synchronous construction incl. crash recovery: load snapshot, replay
-    /// journal, fold, arm the unclean marker.
+    /// Synchronous construction incl. crash recovery. Authority mode
+    /// (`persist = true`): load snapshot, union-replay every per-job
+    /// journal (plus a legacy phase-1 global journal, once), fold. Worker
+    /// mode: start empty — jobs arrive as leases and fold their own
+    /// journals on import.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn recover(
-        state_dir: &std::path::Path,
+        state_dir: &Path,
         dest_dir: PathBuf,
         servers: Arc<Vec<ServerDef>>,
         tuning: Tuning,
+        persist: bool,
+        journal_suffix: &str,
+        persist_guard: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
+        budget_tx: watch::Sender<HashMap<ServerId, u16>>,
         shared: SharedSnapshot,
         events: broadcast::Sender<Event>,
         epoch_tx: watch::Sender<u64>,
@@ -180,39 +263,51 @@ impl Owner {
         tracker: TaskTracker,
         cancel: CancellationToken,
     ) -> Result<Owner, nzbd_state::StateError> {
-        let marker = UncleanMarker::new(state_dir);
+        let marker = UncleanMarker::new(state_dir, journal_suffix);
         let was_unclean = marker.check_and_arm()?;
         let snap_store = SnapshotStore::open(state_dir)?;
-        let journal = FsJournal::open(state_dir)?;
+        let journal = JobJournals::open(state_dir, journal_suffix)?;
 
-        let mut state = match snap_store.load()? {
-            Some(doc) => QueueState::from_doc(doc),
-            None => QueueState::default(),
-        };
-
+        let mut state = QueueState::default();
         let mut file_sizes = HashMap::new();
-        let replayed = journal.replay()?;
-        let replay_count = replayed.len();
-        for rec in replayed {
-            let r = SegRef {
-                job: rec.job,
-                file: rec.file,
-                seg_number: rec.segment_number,
-            };
-            if rec.file_size > 0 {
-                file_sizes.insert(rec.file, rec.file_size);
+        let mut replay_count = 0usize;
+
+        if persist {
+            if let Some(doc) = snap_store.load()? {
+                state = QueueState::from_doc(doc);
             }
-            if let Some(seg) = state.segment_mut(r) {
-                if !matches!(seg.state, SegmentState::Done { .. }) {
-                    seg.state = SegmentState::Done {
-                        offset: rec.offset,
-                        len: rec.len,
-                        crc: rec.crc32,
-                    };
+
+            // Legacy phase-1 global journal: fold once, then retire it.
+            let legacy = FsJournal::open(state_dir)?;
+            let mut replayed = legacy.replay()?;
+            drop(legacy);
+            if !replayed.is_empty() {
+                tracing::info!(records = replayed.len(), "migrating legacy global journal");
+                let _ = std::fs::remove_file(state_dir.join("segments.journal"));
+            }
+            replayed.extend(JobJournals::replay_all(state_dir)?);
+            replay_count = replayed.len();
+            for rec in replayed {
+                let r = SegRef {
+                    job: rec.job,
+                    file: rec.file,
+                    seg_number: rec.segment_number,
+                };
+                if rec.file_size > 0 {
+                    file_sizes.insert(rec.file, rec.file_size);
+                }
+                if let Some(seg) = state.segment_mut(r) {
+                    if !matches!(seg.state, SegmentState::Done { .. }) {
+                        seg.state = SegmentState::Done {
+                            offset: rec.offset,
+                            len: rec.len,
+                            crc: rec.crc32,
+                        };
+                    }
                 }
             }
+            state.recompute_all_totals();
         }
-        state.recompute_all_totals();
 
         if was_unclean || replay_count > 0 {
             tracing::info!(
@@ -234,9 +329,15 @@ impl Owner {
             finalize_sent: HashSet::new(),
             pending_finalize: Vec::new(),
             file_sizes,
+            delegated: HashMap::new(),
+            mirror: HashMap::new(),
+            state_dir: state_dir.to_path_buf(),
             journal,
             snap_store,
             marker,
+            persist,
+            persist_guard,
+            budget_tx,
             shared,
             events,
             epoch_tx,
@@ -345,7 +446,15 @@ impl Owner {
                 seg_number,
                 server,
                 outcome,
-            } => self.on_segment_failed(SegRef { job, file, seg_number }, server, outcome),
+            } => self.on_segment_failed(
+                SegRef {
+                    job,
+                    file,
+                    seg_number,
+                },
+                server,
+                outcome,
+            ),
             EngineMsg::ConnectFailed { server } => self.block_server(server),
             EngineMsg::WriterFinalized {
                 job,
@@ -467,7 +576,247 @@ impl Owner {
                 self.publish_now();
                 let _ = reply.send(());
             }
+            QueueCommand::ImportJob {
+                job,
+                fold_journals,
+                emit_finished,
+                reply,
+            } => {
+                self.import_job(*job, fold_journals, emit_finished);
+                let _ = reply.send(());
+            }
+            QueueCommand::ExportJob { job, reply } => {
+                let _ = reply.send(self.state.job(job).cloned().map(Box::new));
+            }
+            QueueCommand::RemoveJobSilent { job, reply } => {
+                let _ = reply.send(self.remove_job_silent(job));
+            }
+            QueueCommand::SetDelegated { job, node, reply } => {
+                let ok = self.state.job(job).is_some();
+                if ok {
+                    match &node {
+                        Some(n) => {
+                            self.delegated.insert(job, n.clone());
+                        }
+                        None => {
+                            self.delegated.remove(&job);
+                            self.mirror.remove(&job);
+                        }
+                    }
+                    self.emit(Event::JobAssigned {
+                        job,
+                        node: node.clone(),
+                    });
+                    self.bump_epoch();
+                    self.publish_now();
+                }
+                let _ = reply.send(ok);
+            }
+            QueueCommand::MirrorProgress { job, stats } => {
+                if self.delegated.contains_key(&job) {
+                    self.mirror.insert(job, stats);
+                    self.publish_now();
+                }
+            }
+            QueueCommand::FoldJobJournals { job, reply } => {
+                self.fold_job_journals(job);
+                let _ = reply.send(());
+            }
+            QueueCommand::SetServerBudgets { budgets, reply } => {
+                tracing::info!(?budgets, "connection budgets updated");
+                let _ = self.budget_tx.send(budgets);
+                self.bump_epoch();
+                let _ = reply.send(());
+            }
+            QueueCommand::AdoptAuthority { reply } => {
+                self.adopt_authority();
+                let _ = reply.send(());
+            }
+            QueueCommand::RetainJobs { keep, reply } => {
+                self.persist = false;
+                let keep: HashSet<JobId> = keep.into_iter().collect();
+                let drop_ids: Vec<JobId> = self
+                    .state
+                    .jobs
+                    .iter()
+                    .map(|j| j.id)
+                    .filter(|id| !keep.contains(id))
+                    .collect();
+                for id in drop_ids {
+                    self.remove_job_silent(id);
+                }
+                self.delegated.clear();
+                self.mirror.clear();
+                self.publish_now();
+                self.bump_epoch();
+                let _ = reply.send(());
+            }
         }
+    }
+
+    // -- cluster: import / export / delegation / adoption --------------------
+
+    fn import_job(&mut self, mut job: Job, fold_journals: bool, emit_finished: bool) {
+        // Normalize transient state from the wire.
+        for f in &mut job.files {
+            for s in &mut f.segments {
+                if matches!(s.state, SegmentState::Leased { .. }) {
+                    s.state = SegmentState::Pending;
+                }
+            }
+        }
+        if matches!(job.status, JobStatus::Downloading) {
+            job.status = JobStatus::Queued;
+        }
+        let job_id = job.id;
+        let max_file = job.files.iter().map(|f| f.id.0).max().unwrap_or(0);
+        self.state.next_job_id = self.state.next_job_id.max(job_id.0);
+        self.state.next_file_id = self.state.next_file_id.max(max_file);
+
+        // Replace any existing copy (idempotent re-grant / completion).
+        if self.state.job(job_id).is_some() {
+            self.remove_job_silent(job_id);
+        }
+        let terminal = matches!(
+            job.status,
+            JobStatus::Completed | JobStatus::Failed | JobStatus::Deleted
+        );
+        let name = job.name.clone();
+        let status = job.status;
+        let health = Health::calc(&job.totals).0;
+        self.state.jobs.push(job);
+        if let Some(j) = self.state.job_mut(job_id) {
+            recompute_job_totals(j);
+        }
+        self.delegated.remove(&job_id);
+        self.mirror.remove(&job_id);
+
+        if fold_journals {
+            self.fold_job_journals(job_id);
+        }
+        tracing::info!(job = job_id.0, %name, ?status, "job imported");
+        self.dirty = true;
+        if self.persist {
+            self.save_snapshot();
+        }
+        self.publish_now();
+        if terminal && emit_finished {
+            self.emit(Event::JobFinished {
+                job: job_id,
+                name,
+                status,
+                health,
+            });
+        }
+        self.bump_epoch();
+    }
+
+    fn remove_job_silent(&mut self, job_id: JobId) -> bool {
+        let Some(idx) = self.state.jobs.iter().position(|j| j.id == job_id) else {
+            return false;
+        };
+        let job = self.state.jobs.remove(idx);
+        for f in &job.files {
+            self.writers.remove(&f.id);
+            self.file_sizes.remove(&f.id);
+            self.finalize_sent.remove(&f.id);
+        }
+        self.pending_finalize.retain(|(j, _)| *j != job_id);
+        self.attempts.retain(|r, _| r.job != job_id);
+        self.delegated.remove(&job_id);
+        self.mirror.remove(&job_id);
+        self.publish_now();
+        self.bump_epoch();
+        true
+    }
+
+    fn fold_job_journals(&mut self, job_id: JobId) {
+        let recs = match JobJournals::replay_job(&self.state_dir, job_id) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(job = job_id.0, error = %e, "journal fold failed");
+                return;
+            }
+        };
+        let mut touched: HashSet<FileId> = HashSet::new();
+        let mut applied = 0usize;
+        for rec in recs {
+            if rec.job != job_id {
+                continue;
+            }
+            let r = SegRef {
+                job: rec.job,
+                file: rec.file,
+                seg_number: rec.segment_number,
+            };
+            if rec.file_size > 0 {
+                self.file_sizes.insert(rec.file, rec.file_size);
+            }
+            let Some(seg) = self.state.segment_mut(r) else {
+                continue;
+            };
+            if !matches!(seg.state, SegmentState::Done { .. }) {
+                seg.state = SegmentState::Done {
+                    offset: rec.offset,
+                    len: rec.len,
+                    crc: rec.crc32,
+                };
+                self.attempts.remove(&r);
+                touched.insert(rec.file);
+                applied += 1;
+            }
+        }
+        if applied > 0 {
+            tracing::info!(job = job_id.0, applied, "folded journal records");
+            if let Some(j) = self.state.job_mut(job_id) {
+                recompute_job_totals(j);
+            }
+            for file in touched {
+                self.after_file_change(job_id, file);
+            }
+            self.bump_epoch();
+        }
+    }
+
+    fn adopt_authority(&mut self) {
+        self.persist = true;
+        match self.snap_store.load() {
+            Ok(Some(doc)) => {
+                let snapshot_state = QueueState::from_doc(doc);
+                self.state.next_job_id = self.state.next_job_id.max(snapshot_state.next_job_id);
+                self.state.next_file_id = self.state.next_file_id.max(snapshot_state.next_file_id);
+                self.state.download_paused = snapshot_state.download_paused;
+                if self.state.speed_limit_bps.is_none() {
+                    self.state.speed_limit_bps = snapshot_state.speed_limit_bps;
+                    self.limiter.set(snapshot_state.speed_limit_bps);
+                }
+                for job in snapshot_state.jobs {
+                    // Local executor copies are fresher than the late
+                    // leader's snapshot — keep them.
+                    if self.state.job(job.id).is_none() {
+                        self.state.jobs.push(job);
+                    }
+                }
+            }
+            Ok(None) => {}
+            Err(e) => {
+                tracing::error!(error = %e, "authority snapshot unreadable; adopting journals only");
+            }
+        }
+
+        // Fold every job's journals (union across lease files).
+        let ids: Vec<JobId> = self.state.jobs.iter().map(|j| j.id).collect();
+        for id in &ids {
+            self.fold_job_journals(*id);
+        }
+        self.state.recompute_all_totals();
+
+        // Finish anything that completed right before the takeover.
+        self.startup_pass();
+        self.save_snapshot();
+        self.publish_now();
+        self.bump_epoch();
+        tracing::info!(jobs = self.state.jobs.len(), "adopted queue authority");
     }
 
     // -- scheduling ----------------------------------------------------------
@@ -496,6 +845,7 @@ impl Owner {
                 ladder: &ladder,
                 attempts: &mut self.attempts,
                 is_blocked: &is_blocked,
+                delegated: &self.delegated,
                 article_retries: self.tuning.article_retries,
                 now_unix: unix_now(),
                 propagation_delay_secs: self.tuning.propagation_delay.as_secs() as i64,
@@ -509,7 +859,9 @@ impl Owner {
             let Some(r) = lease else { break };
 
             let (message_id, writer) = {
-                let Some(seg) = self.state.segment_mut(r) else { break };
+                let Some(seg) = self.state.segment_mut(r) else {
+                    break;
+                };
                 seg.state = SegmentState::Leased { server: server_id };
                 let msgid = seg.message_id.to_string();
                 (msgid, self.writer_for(r.job, r.file))
@@ -627,7 +979,12 @@ impl Owner {
         if let Some(j) = self.state.job_mut(r.job) {
             recompute_job_totals(j);
         }
-        tracing::debug!(job = r.job.0, file = r.file.0, seg = r.seg_number, "segment exhausted");
+        tracing::debug!(
+            job = r.job.0,
+            file = r.file.0,
+            seg = r.seg_number,
+            "segment exhausted"
+        );
         self.emit(Event::SegmentExhausted {
             job: r.job,
             file: r.file,
@@ -707,7 +1064,12 @@ impl Owner {
             .get(&file)
             .copied()
             .filter(|s| *s > 0)
-            .unwrap_or_else(|| segs.iter().map(|(o, l, _)| o + *l as u64).max().unwrap_or(0));
+            .unwrap_or_else(|| {
+                segs.iter()
+                    .map(|(o, l, _)| o + *l as u64)
+                    .max()
+                    .unwrap_or(0)
+            });
 
         let tx = self.writer_for(job, file);
         match tx.try_send(WriteCmd::Finalize {
@@ -758,6 +1120,9 @@ impl Owner {
     }
 
     fn check_job_complete(&mut self, job_id: JobId) {
+        if self.delegated.contains_key(&job_id) {
+            return; // completes via the executor's report, not locally
+        }
         let Some(job) = self.state.job_mut(job_id) else {
             return;
         };
@@ -768,9 +1133,10 @@ impl Owner {
             return;
         }
         let complete = !job.files.is_empty()
-            && job.files.iter().all(|f| {
-                f.paused || (f.is_terminal() && (!f.has_any_done() || f.finalized))
-            });
+            && job
+                .files
+                .iter()
+                .all(|f| f.paused || (f.is_terminal() && (!f.has_any_done() || f.finalized)));
         if !complete {
             return;
         }
@@ -811,7 +1177,11 @@ impl Owner {
             .insert(server, until)
             .is_none_or(|prev| prev <= Instant::now());
         if newly {
-            tracing::debug!(server = server.0, secs = self.tuning.retry_interval.as_secs(), "server blocked");
+            tracing::debug!(
+                server = server.0,
+                secs = self.tuning.retry_interval.as_secs(),
+                "server blocked"
+            );
             self.emit(Event::ServerBlocked {
                 server,
                 seconds: self.tuning.retry_interval.as_secs(),
@@ -866,6 +1236,11 @@ impl Owner {
         }
         self.pending_finalize.retain(|(j, _)| *j != job_id);
         self.attempts.retain(|r, _| r.job != job_id);
+        self.delegated.remove(&job_id);
+        self.mirror.remove(&job_id);
+        if self.persist {
+            let _ = self.journal.remove_job(job_id);
+        }
         if delete_files {
             let dir = self.dest_dir.join(sanitize_name(&job.name));
             tokio::spawn(async move {
@@ -937,7 +1312,7 @@ impl Owner {
                     })
                     .map(|s| s.size as u64)
                     .sum();
-                JobSummary {
+                let mut summary = JobSummary {
                     id: j.id,
                     name: j.name.clone(),
                     status: j.status,
@@ -954,7 +1329,23 @@ impl Owner {
                     files_done: j.files.iter().filter(|f| f.is_terminal()).count() as u32,
                     health: health.0,
                     critical_health: critical.0,
+                    assigned_node: self.delegated.get(&j.id).cloned(),
+                };
+                // Delegated jobs progress remotely; overlay heartbeat stats.
+                if let Some(m) = self.mirror.get(&j.id) {
+                    summary.done_articles = m.done_articles;
+                    summary.failed_articles = m.failed_articles;
+                    summary.downloaded_bytes = m.downloaded_bytes;
+                    summary.remaining_bytes = summary
+                        .size_bytes
+                        .saturating_sub(m.downloaded_bytes)
+                        .saturating_sub(summary.failed_bytes);
+                    summary.health = m.health;
+                    if m.done_articles > 0 && summary.status == JobStatus::Queued {
+                        summary.status = JobStatus::Downloading;
+                    }
                 }
+                summary
             })
             .collect();
         let snap = QueueSnapshot {
@@ -970,12 +1361,50 @@ impl Owner {
     }
 
     fn save_snapshot(&mut self) {
-        if let Err(e) = self.snap_store.save(&self.state.to_doc()) {
-            tracing::error!(error = %e, "snapshot save failed");
+        if !self.persist {
+            self.dirty = false;
             return;
         }
-        if let Err(e) = self.journal.compact() {
-            tracing::error!(error = %e, "journal compact failed");
+        let doc = self.state.to_doc();
+        let result = match &self.persist_guard {
+            Some(g) => {
+                let g = g.clone();
+                self.snap_store.save_guarded(&doc, &move || g())
+            }
+            None => self.snap_store.save(&doc),
+        };
+        if let Err(e) = result {
+            tracing::error!(error = %e, "snapshot save failed (fenced or io); demoting persistence until re-adopted");
+            if matches!(e, nzbd_state::StateError::Corrupt(_)) {
+                self.persist = false; // deposed: stop writing authority state
+            }
+            return;
+        }
+        // The snapshot now embodies every folded segment: compact journals
+        // of jobs we own outright, plus orphaned job dirs (deleted jobs,
+        // stale zombies). Delegated jobs have live foreign writers — skip.
+        let known: HashSet<JobId> = self.state.jobs.iter().map(|j| j.id).collect();
+        if let Ok(entries) = std::fs::read_dir(self.journal.jobs_dir()) {
+            for entry in entries.flatten() {
+                let Some(id) = entry
+                    .file_name()
+                    .to_string_lossy()
+                    .parse::<u32>()
+                    .ok()
+                    .map(JobId)
+                else {
+                    continue;
+                };
+                // Known & not delegated: folded into the snapshot just
+                // written. Unknown: orphan from a deleted job or a stale
+                // lease. Delegated: live foreign writer — leave alone.
+                let _ = known; // clarity: both known and orphan compact
+                if !self.delegated.contains_key(&id) {
+                    if let Err(e) = self.journal.remove_job(id) {
+                        tracing::debug!(job = id.0, error = %e, "journal compact skip");
+                    }
+                }
+            }
         }
         self.dirty = false;
         self.last_save = Instant::now();

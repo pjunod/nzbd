@@ -27,6 +27,8 @@ pub struct JobSummary {
     /// Per-mille (NZBGet scale: 1000 = 100.0%).
     pub health: u16,
     pub critical_health: u16,
+    /// Cluster: node currently executing this job remotely (None = local).
+    pub assigned_node: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]

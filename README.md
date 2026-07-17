@@ -5,13 +5,16 @@ downloader — modern architecture, same soul: tiny footprint, line-rate
 throughput, direct-to-disk writing, and drop-in compatibility with the
 Sonarr/Radarr ecosystem and NZBGet's post-processing script protocol.
 
-> **Status: Phase 1 (core engine) complete.** The daemon downloads NZBs
-> end-to-end: async queue owner, per-server connection pools with NNTP
-> pipelining, rustls transport, the NZBGet server-failover ladder,
-> DirectWrite disk assembly, crash-safe journal + resume, and a token-bucket
-> rate limiter — all covered by an in-tree mock NNTP server (`nzbd-nserv`)
-> including a kill-and-resume test. Design: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
-> `nzbd` is a working title.
+> **Status: Phase 1 (core engine) + Cluster C1 (foundation) complete.**
+> The daemon downloads NZBs end-to-end — async queue owner, per-server
+> connection pools with NNTP pipelining, rustls transport, the NZBGet
+> server-failover ladder, DirectWrite disk assembly, crash-safe journal +
+> resume, token-bucket rate limiter — and optionally **clusters**: nodes
+> sharing a work volume elect a leader, distribute whole-job downloads,
+> partition provider connection budgets, and fail over automatically
+> (leases survive the failover; nothing already journaled is re-fetched).
+> Design: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) ·
+> [`docs/CLUSTERING.md`](docs/CLUSTERING.md). `nzbd` is a working title.
 
 ## What exists today
 
@@ -28,7 +31,8 @@ Sonarr/Radarr ecosystem and NZBGet's post-processing script protocol.
 | `nzbd-config` | 🔶 TOML config model + path helpers; `nzbget.conf` importer stub (phase 3) |
 | `nzbd-api` | 🔶 `/api/v1`: status, jobs (add/list/detail), job + queue actions, speed limit. SSE/auth/OpenAPI: phase 3 |
 | `nzbd-compat` | 🔶 `/jsonrpc` shim speaking NZBGet's JSON-RPC 1.1 dialect: `version`, `status`, `listgroups` with live data and `*Lo/*Hi/*MB` triplets. Full C1 (`append`, `editqueue`, …): phase 3 |
-| `nzbd` | ✅ Daemon: engine + API + shim; CLI `run` / `add` / `status`; graceful shutdown; whole-daemon integration test |
+| `nzbd-cluster` | ✅ C1: shared-volume leader election (monotonic staleness, write–wait–verify, epoch fencing), node registry, HTTP work-lease protocol with heartbeat/adoption/reclaim, distributed whole-job downloads, cluster-wide connection-budget partitioning, any-node API proxy. Five multi-node e2e tests incl. leader-death failover and worker-death reclaim with zero re-fetch. PP leases: phase C2 |
+| `nzbd` | ✅ Daemon: engine + API + shim; single-node and `[cluster]` modes; CLI `run` / `add` / `status`; graceful shutdown; whole-daemon integration test |
 
 ```sh
 cargo test          # all green (unit + e2e incl. crash-resume)
@@ -53,6 +57,37 @@ nzbd run --config nzbd.toml
 nzbd add show.nzb            # queue an NZB via the API
 nzbd status                  # queue/rate/remaining as JSON
 curl localhost:6789/jsonrpc -d '{"method":"listgroups"}'   # NZBGet-dialect view
+```
+
+### Clustering (per-node additions to `nzbd.toml`)
+
+```toml
+[cluster]
+enabled = true
+node_name = "node-a"                      # unique per node
+shared_dir = "/mnt/work"                  # the Gluster mount (all nodes)
+advertise_url = "http://10.0.0.11:6789"   # how peers reach THIS node
+secret_file = "/etc/nzbd/cluster.secret"  # same secret everywhere
+# coordinator = true    # election-eligible (priority = lower wins)
+# download = true       # takes download-job leases
+# max_download_jobs = 2
+```
+
+Point Sonarr at any node (or a load balancer across all of them): every
+node serves the full API and proxies to the current leader; leadership
+fails over automatically. Run Gluster with quorum — see
+`docs/CLUSTERING.md` for semantics, failure matrix and operational notes.
+
+## Development
+
+CI (GitHub Actions) gates every push/PR on `cargo fmt --check`, `clippy
+-D warnings`, the full test suite (unit + engine e2e + multi-node cluster
+tests + the whole-daemon test) and an MSRV (1.85) check. Run the same
+gates locally via the committed git hooks:
+
+```sh
+git config core.hooksPath .githooks   # once per clone
+# pre-commit: fmt check · pre-push: clippy -D warnings + cargo test
 ```
 
 ## Roadmap

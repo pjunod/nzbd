@@ -113,7 +113,9 @@ pub fn parse(input: &[u8]) -> Result<ParsedNzb, NzbError> {
                     b"file" => {
                         let mut f = ParsedFile::default();
                         for attr in e.attributes().flatten() {
-                            let val = attr.normalized_value(quick_xml::XmlVersion::Implicit1_0).unwrap_or_default();
+                            let val = attr
+                                .normalized_value(quick_xml::XmlVersion::Implicit1_0)
+                                .unwrap_or_default();
                             match attr.key.local_name().as_ref() {
                                 b"subject" => f.subject = val.into_owned(),
                                 b"poster" => f.poster = Some(val.into_owned()),
@@ -131,7 +133,9 @@ pub fn parse(input: &[u8]) -> Result<ParsedNzb, NzbError> {
                             bytes: 0,
                         };
                         for attr in e.attributes().flatten() {
-                            let val = attr.normalized_value(quick_xml::XmlVersion::Implicit1_0).unwrap_or_default();
+                            let val = attr
+                                .normalized_value(quick_xml::XmlVersion::Implicit1_0)
+                                .unwrap_or_default();
                             match attr.key.local_name().as_ref() {
                                 b"bytes" => seg.bytes = val.trim().parse().unwrap_or(0),
                                 b"number" => seg.number = val.trim().parse().unwrap_or(0),
@@ -143,8 +147,11 @@ pub fn parse(input: &[u8]) -> Result<ParsedNzb, NzbError> {
                     }
                     b"meta" => {
                         meta_type = e.attributes().flatten().find_map(|a| {
-                            (a.key.local_name().as_ref() == b"type")
-                                .then(|| a.normalized_value(quick_xml::XmlVersion::Implicit1_0).unwrap_or_default().to_lowercase())
+                            (a.key.local_name().as_ref() == b"type").then(|| {
+                                a.normalized_value(quick_xml::XmlVersion::Implicit1_0)
+                                    .unwrap_or_default()
+                                    .to_lowercase()
+                            })
                         });
                         text_target = Some(TextTarget::Meta);
                     }
@@ -265,7 +272,10 @@ mod tests {
         assert_eq!(nzb.files.len(), 2);
 
         let f = &nzb.files[0];
-        assert_eq!(f.subject, r#"Great & Stuff [1/2] - "archive.part1.rar" yEnc (1/3)"#);
+        assert_eq!(
+            f.subject,
+            r#"Great & Stuff [1/2] - "archive.part1.rar" yEnc (1/3)"#
+        );
         assert_eq!(f.groups, vec!["alt.binaries.test", "alt.binaries.misc"]);
         // segments sorted by number, brackets stripped, entities unescaped
         assert_eq!(

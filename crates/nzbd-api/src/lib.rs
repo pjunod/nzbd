@@ -28,9 +28,8 @@ pub struct StatusDto {
 }
 
 pub fn status_dto(snap: &QueueSnapshot) -> StatusDto {
-    let count = |pred: &dyn Fn(&JobSummary) -> bool| {
-        snap.jobs.iter().filter(|j| pred(j)).count() as u32
-    };
+    let count =
+        |pred: &dyn Fn(&JobSummary) -> bool| snap.jobs.iter().filter(|j| pred(j)).count() as u32;
     StatusDto {
         version: env!("CARGO_PKG_VERSION"),
         up_since_unix: snap.up_since_unix,
@@ -122,10 +121,7 @@ async fn job_action(
     }
 }
 
-async fn queue_action(
-    State(engine): State<EngineHandle>,
-    Path(action): Path<String>,
-) -> Response {
+async fn queue_action(State(engine): State<EngineHandle>, Path(action): Path<String>) -> Response {
     let result = match action.as_str() {
         "pause" => engine.pause_all().await,
         "resume" => engine.resume_all().await,
@@ -185,13 +181,13 @@ mod tests {
     use tower::util::ServiceExt;
 
     async fn test_engine(tmp: &tempfile::TempDir) -> EngineHandle {
-        Engine::spawn(EngineConfig {
-            servers: vec![], // no connections; queue logic only
-            state_dir: tmp.path().join("state"),
-            dest_dir: tmp.path().join("dest"),
-            tuning: Tuning::default(),
-            speed_limit_bps: None,
-        })
+        Engine::spawn(EngineConfig::single_node(
+            vec![], // no connections; queue logic only
+            tmp.path().join("state"),
+            tmp.path().join("dest"),
+            Tuning::default(),
+            None,
+        ))
         .await
         .unwrap()
     }
@@ -260,11 +256,9 @@ mod tests {
             let resp = app
                 .clone()
                 .oneshot(
-                    axum::http::Request::post(format!(
-                        "/api/v1/jobs/{id}/actions/{action}"
-                    ))
-                    .body(axum::body::Body::empty())
-                    .unwrap(),
+                    axum::http::Request::post(format!("/api/v1/jobs/{id}/actions/{action}"))
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
                 )
                 .await
                 .unwrap();

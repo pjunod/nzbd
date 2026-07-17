@@ -30,9 +30,14 @@ pub enum VerifyResult {
     /// All files present and matching — repair not needed.
     Intact,
     /// Repair is possible; `blocks_needed` recovery blocks required.
-    Repairable { blocks_available: u32, blocks_needed: u32 },
+    Repairable {
+        blocks_available: u32,
+        blocks_needed: u32,
+    },
     /// More recovery blocks required than available.
-    NeedMoreBlocks { blocks_needed: u32 },
+    NeedMoreBlocks {
+        blocks_needed: u32,
+    },
     Unrepairable,
 }
 
