@@ -9,6 +9,9 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use base64::Engine as _;
+
+pub mod logbuf;
+pub use logbuf::{LogBuffer, LogBufferLayer};
 use nzbd_engine::{EngineHandle, JobSummary, QueueSnapshot};
 use nzbd_state::history::HistoryDb;
 use nzbd_types::{JobId, JobStatus};
@@ -22,6 +25,7 @@ use tokio_stream::StreamExt as _;
 pub struct ApiState {
     pub engine: EngineHandle,
     pub history: Option<Arc<HistoryDb>>,
+    pub log: Option<Arc<LogBuffer>>,
 }
 
 /// HTTP auth requirements (NZBGet `ControlUsername`/`ControlPassword`
@@ -385,6 +389,25 @@ async fn metrics(State(st): State<ApiState>) -> Response {
 }
 
 #[derive(Debug, Deserialize)]
+struct LogsQuery {
+    after: Option<u64>,
+    limit: Option<usize>,
+}
+
+/// `GET /api/v1/logs` — recent daemon log entries from the in-memory ring.
+async fn get_logs(State(st): State<ApiState>, Query(q): Query<LogsQuery>) -> Response {
+    let Some(buf) = &st.log else {
+        return error(StatusCode::NOT_IMPLEMENTED, "log buffer not configured");
+    };
+    let limit = q.limit.unwrap_or(200).min(2000);
+    let entries = match q.after {
+        Some(after) => buf.since(after, limit),
+        None => buf.tail(limit),
+    };
+    Json(json!({ "entries": entries })).into_response()
+}
+
+#[derive(Debug, Deserialize)]
 struct HistoryQuery {
     limit: Option<usize>,
 }
@@ -409,6 +432,41 @@ async fn get_history(State(st): State<ApiState>, Query(q): Query<HistoryQuery>) 
     }
 }
 
+/// `GET /api/v1/openapi.json` — a compact machine-readable surface
+/// summary (full schema docs are generated in a later pass).
+async fn openapi() -> Response {
+    Json(json!({
+        "openapi": "3.0.3",
+        "info": { "title": "nzbd native API", "version": env!("CARGO_PKG_VERSION") },
+        "paths": {
+            "/api/v1/status": { "get": { "summary": "Queue + rate + guard status" } },
+            "/api/v1/jobs": {
+                "get": { "summary": "List queue jobs" },
+                "post": { "summary": "Add a job (NZB body, or ?url=)",
+                          "parameters": [
+                              {"name": "name", "in": "query"},
+                              {"name": "category", "in": "query"},
+                              {"name": "priority", "in": "query"},
+                              {"name": "url", "in": "query"},
+                              {"name": "paused", "in": "query"},
+                              {"name": "dupe_key", "in": "query"},
+                              {"name": "dupe_score", "in": "query"}
+                          ] }
+            },
+            "/api/v1/jobs/{id}": { "get": { "summary": "Job detail" } },
+            "/api/v1/jobs/{id}/actions/{action}": { "post": { "summary": "pause|resume|delete|delete-files" } },
+            "/api/v1/queue/actions/{action}": { "post": { "summary": "pause|resume" } },
+            "/api/v1/queue/speed-limit": { "put": { "summary": "Set speed limit (bytes_per_sec)" } },
+            "/api/v1/history": { "get": { "summary": "Finished jobs" } },
+            "/api/v1/logs": { "get": { "summary": "Recent daemon log entries" } },
+            "/api/v1/events": { "get": { "summary": "Engine events (SSE)" } },
+            "/metrics": { "get": { "summary": "Prometheus exposition" } },
+            "/healthz": { "get": { "summary": "Liveness" } }
+        }
+    }))
+    .into_response()
+}
+
 fn not_found() -> Response {
     error(StatusCode::NOT_FOUND, "no such job")
 }
@@ -421,6 +479,7 @@ pub fn router(engine: EngineHandle) -> Router {
     router_with(ApiState {
         engine,
         history: None,
+        log: None,
     })
 }
 
@@ -434,7 +493,9 @@ pub fn router_with(state: ApiState) -> Router {
         .route("/api/v1/queue/speed-limit", put(set_speed_limit))
         .route("/api/v1/history", get(get_history))
         .route("/api/v1/events", get(sse_events))
+        .route("/api/v1/logs", get(get_logs))
         .route("/metrics", get(metrics))
+        .route("/api/v1/openapi.json", get(openapi))
         .route("/healthz", get(healthz))
         .with_state(state)
 }

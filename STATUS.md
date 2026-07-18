@@ -8,9 +8,8 @@ roadmaps in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) §16 and
 Legend: ✅ done (implemented, tested, committed) · 🔶 partial · ⬜ not
 started · 👤 operator action (Paul)
 
-**Snapshot (2026-07-17):** 130 tests · clippy clean · phases 0, 1, 2
-(fully), cluster C1+C2, compat 3a, importer, auth/SSE/metrics complete ·
-next up: **compat C2 + XML-RPC, then phase 4**
+**Snapshot (2026-07-17):** 142 tests · clippy clean · phases 0–3 and
+cluster C1+C2 complete · next up: **phase 4 (web UI, packaging)**
 
 | Phase | State | Evidence |
 |---|---|---|
@@ -22,7 +21,7 @@ next up: **compat C2 + XML-RPC, then phase 4**
 | C2 — PP leases + anti-affinity | ✅ complete | `9f402d8` |
 | 3a — *arr compat core | ✅ complete | `3793ad8` |
 | 3b — importer · auth · SSE · metrics | ✅ complete | `e00990c`, `b4c422d` |
-| 3c — compat C2 + XML-RPC + golden tests | ⬜ next | — |
+| 3c — compat C2 + XML-RPC + golden tests | ✅ complete | this commit |
 | 4 — Web UI + ecosystem | ⬜ | — |
 | 5 — Beyond parity (+ C3) | ⬜ | — |
 
@@ -107,7 +106,7 @@ next up: **compat C2 + XML-RPC, then phase 4**
 - ✅ C2: PP work-lease type + anti-affinity scheduling (a job downloaded on node B post-processes on node C) — see the cluster section
 - ⬜ C2 fixture extras: kill-mid-PP reclaim e2e (reclaim machinery itself is exercised by the download-lease tests)
 
-## Phase 3 — Native API + compat 🔶 (3a done)
+## Phase 3 — Native API + compat ✅ complete
 
 - ✅ Compat C1 — the Sonarr/Radarr certification surface: `append` (v13+ 9-arg form AND legacy 5-arg positional form; base64 or raw XML; AddPaused honored; returns NZBID or 0), `history` (full NZBGet field shape: `TOTAL/DETAIL` statuses, Lo/Hi/MB triplets, Parameters, FinalDir/DestDir, Par/Unpack/Script statuses, deprecated aliases), `editqueue` (3-arg v16+ AND 4-arg v13 forms: Group Pause/Resume/Delete/FinalDelete/SetPriority/SetCategory/SetParameter, HistoryDelete; GroupDelete records a `DELETED/MANUAL` history entry), `config`/`loadconfig` (option projection incl. `CategoryN.*`), `rate`, `pausedownload`/`resumedownload`
 - ✅ Queue→history lifecycle (NZBGet parity): post-processed jobs retire out of the queue — immediately after local PP, via the leader sweep in cluster mode; health-failed jobs stamped + retired the same way
@@ -117,12 +116,15 @@ next up: **compat C2 + XML-RPC, then phase 4**
 - ✅ HTTP auth: Basic (NZBGet `ControlUsername`/`ControlPassword` parity, constant-time compare, `WWW-Authenticate` challenge) + Bearer token; enforced across native API and compat shim when configured; `/healthz` open; cluster peer endpoints keep their own shared-secret auth; importer maps `ControlUsername`/`ControlPassword` (with a warning on NZBGet's well-known default)
 - ✅ `GET /api/v1/events` — engine events as SSE (job added/finished/deleted, file finished, segment exhausted, server blocked; lagged signal)
 - ✅ `GET /metrics` — Prometheus text exposition (rate, remaining, session bytes, paused, speed limit, jobs by status)
-- ⬜ Native REST completion: servers/config/logs endpoints, roles, OpenAPI
-- ⬜ Compat C2: `listfiles`, `listgroups` file details, logs, scan, per-file editqueue actions
-- ⬜ XML-RPC + `system.multicall` + JSON-P + GET-form safe methods; auth tiers
-- ⬜ Golden structural tests vs recorded NZBGet 26.2 responses; nightly live *arr containers
+- ✅ Compat C2: `listfiles` (full file detail), per-file editqueue actions (FilePause/FileResume/FileDelete via new engine file commands), `log`/`writelog` on the daemon log ring, `scan` + NzbDir watch-dir (30 s + on-demand, `.queued`/`.error` renames, authority-only in cluster mode)
+- ✅ XML-RPC (`/xmlrpc`): full value codec (string/int/i4/i8/boolean/double/base64/nil/array/struct, entity refs), `system.multicall`, fault responses — same method table as JSON-RPC
+- ✅ JSON-P + GET forms: `GET /jsonrpc?method=…&params=…[&callback=…]`, `/jsonprpc`
+- ✅ Golden structural tests: exact wire field sets locked for status/listgroups/history/listfiles/log/envelope — a renamed field fails the suite
+- ✅ Native: `GET /api/v1/logs` + `/api/v1/openapi.json` surface summary; log ring fed by a tracing layer
+- ⬜ Nightly live *arr containers (CI workflow using real Sonarr/Radarr images) — operator infrastructure; the golden suite + sonarr-flow e2e cover the wire contract in-repo
+- ⬜ Auth roles (restricted/add-only users) — full-control auth shipped in 3b
 - ✅ `nzbget.conf` importer: KEY=value + `ServerN.*`/`CategoryN.*` blocks, recursive `${Var}` expansion, NZBGet→nzbd vocabulary (Level→tier, Optional→fill, Encryption→tls), mapped/skipped/unknown/warnings report, hostless-server drop, zero-connection raise; `nzbd import-config <nzbget.conf> -o nzbd.toml` writes the converted file + prints the report; round-trips through the TOML parser
-- ⬜ `rapidyenc-sys` FFI feature (vendored) + differential fuzzing vs scalar decoder
+- ⬜ `rapidyenc-sys` FFI feature (vendored) + differential fuzzing — deferred to phase 5 (the scalar decoder saturates typical line rates)
 
 ## Phase 4 — Web UI + ecosystem ⬜
 

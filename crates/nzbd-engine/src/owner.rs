@@ -64,6 +64,17 @@ pub(crate) enum QueueCommand {
         error: String,
         reply: oneshot::Sender<()>,
     },
+    SetFilePaused {
+        job: JobId,
+        file: FileId,
+        paused: bool,
+        reply: oneshot::Sender<bool>,
+    },
+    DeleteFile {
+        job: JobId,
+        file: FileId,
+        reply: oneshot::Sender<bool>,
+    },
     Pause {
         job: JobId,
         reply: oneshot::Sender<bool>,
@@ -616,6 +627,56 @@ impl Owner {
                     self.bump_epoch();
                 }
                 let _ = reply.send(());
+            }
+            QueueCommand::SetFilePaused {
+                job,
+                file,
+                paused,
+                reply,
+            } => {
+                let ok = match self.state.job_mut(job) {
+                    Some(j) => match j.files.iter_mut().find(|f| f.id == file) {
+                        Some(f) => {
+                            f.paused = paused;
+                            true
+                        }
+                        None => false,
+                    },
+                    None => false,
+                };
+                if ok {
+                    if let Some(j) = self.state.job_mut(job) {
+                        recompute_job_totals(j);
+                    }
+                    self.dirty = true;
+                    self.bump_epoch();
+                    self.publish_now();
+                    self.check_job_complete(job);
+                }
+                let _ = reply.send(ok);
+            }
+            QueueCommand::DeleteFile { job, file, reply } => {
+                let ok = match self.state.job_mut(job) {
+                    Some(j) => {
+                        let before = j.files.len();
+                        j.files.retain(|f| f.id != file);
+                        if j.files.len() != before {
+                            recompute_job_totals(j);
+                            true
+                        } else {
+                            false
+                        }
+                    }
+                    None => false,
+                };
+                if ok {
+                    self.writers.remove(&file);
+                    self.dirty = true;
+                    self.bump_epoch();
+                    self.publish_now();
+                    self.check_job_complete(job);
+                }
+                let _ = reply.send(ok);
             }
             QueueCommand::Pause { job, reply } => {
                 let ok = match self.state.job_mut(job) {

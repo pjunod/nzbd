@@ -277,6 +277,18 @@ impl ClusterRuntime {
         options: Vec<(String, String)>,
         auth: nzbd_api::AuthConfig,
     ) -> Router {
+        self.router_full(compat_version, options, auth, None, None)
+    }
+
+    /// Full router: auth + daemon log ring + watch-dir scan notify.
+    pub fn router_full(
+        &self,
+        compat_version: &str,
+        options: Vec<(String, String)>,
+        auth: nzbd_api::AuthConfig,
+        log: Option<Arc<nzbd_api::LogBuffer>>,
+        scan_notify: Option<Arc<tokio::sync::Notify>>,
+    ) -> Router {
         let history = self.pp.as_ref().map(|s| s.history.clone());
         let compat_state = nzbd_compat::CompatState {
             config: Arc::new(nzbd_compat::CompatConfig {
@@ -285,11 +297,14 @@ impl ClusterRuntime {
             engine: self.engine.clone(),
             history: history.clone(),
             options: Arc::new(options),
+            log: log.clone(),
+            scan_notify,
         };
         let proxied = nzbd_api::require_auth(
             nzbd_api::router_with(nzbd_api::ApiState {
                 engine: self.engine.clone(),
                 history,
+                log,
             })
             .merge(nzbd_compat::router(compat_state)),
             auth,

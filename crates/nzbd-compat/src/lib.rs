@@ -14,6 +14,8 @@
 //! - Deprecated aliases (`FirstID`, `LastID`, …) are preserved.
 //! - History `Status` is `"TOTAL/DETAIL"` (`SUCCESS/ALL`, `FAILURE/PAR`, …).
 
+pub mod xmlrpc;
+
 use axum::extract::State;
 use axum::routing::post;
 use axum::{Json, Router};
@@ -47,6 +49,10 @@ pub struct CompatState {
     pub history: Option<Arc<HistoryDb>>,
     /// `config` method projection: NZBGet-style option (Name, Value) pairs.
     pub options: Arc<Vec<(String, String)>>,
+    /// Daemon log ring (serves `log`, receives `writelog`).
+    pub log: Option<Arc<nzbd_api::LogBuffer>>,
+    /// Wakes the watch-dir scanner (`scan` method).
+    pub scan_notify: Option<Arc<tokio::sync::Notify>>,
 }
 
 impl CompatState {
@@ -56,6 +62,8 @@ impl CompatState {
             engine,
             history: None,
             options: Arc::new(Vec::new()),
+            log: None,
+            scan_notify: None,
         }
     }
 }
@@ -259,6 +267,36 @@ pub async fn dispatch(
                 .collect();
             Ok(Value::Array(opts))
         }
+        "listfiles" => listfiles(state, params).await,
+        "log" => {
+            // log(IDFrom, NumberOfEntries) — IDFrom 0 = the newest N.
+            let id_from = p_i64(params, 0).max(0) as u64;
+            let n = p_i64(params, 1).clamp(1, 2000) as usize;
+            let entries = match &state.log {
+                Some(buf) if id_from > 0 => buf.since(id_from - 1, n),
+                Some(buf) => buf.tail(n),
+                None => Vec::new(),
+            };
+            Ok(Value::Array(
+                entries
+                    .iter()
+                    .map(|r| {
+                        json!({
+                            "ID": r.id,
+                            "Kind": r.kind,
+                            "Time": r.time_unix,
+                            "Text": r.text,
+                        })
+                    })
+                    .collect(),
+            ))
+        }
+        "scan" => {
+            if let Some(n) = &state.scan_notify {
+                n.notify_one();
+            }
+            Ok(Value::Bool(true))
+        }
         "rate" => {
             let kib = p_i64(params, 0).max(0) as u64;
             let limit = if kib == 0 { None } else { Some(kib * 1024) };
@@ -273,7 +311,20 @@ pub async fn dispatch(
         "resumedownload" | "resumedownload2" => {
             Ok(Value::Bool(state.engine.resume_all().await.is_ok()))
         }
-        "writelog" => Ok(Value::Bool(true)),
+        "writelog" => {
+            // writelog(Kind, Text) — scripts and clients inject log lines.
+            if let Some(buf) = &state.log {
+                let kind = match p_str(params, 0).to_uppercase().as_str() {
+                    "ERROR" => "ERROR",
+                    "WARNING" => "WARNING",
+                    "DETAIL" => "DETAIL",
+                    "DEBUG" => "DETAIL",
+                    _ => "INFO",
+                };
+                buf.push(kind, p_str(params, 1));
+            }
+            Ok(Value::Bool(true))
+        }
         _ => Err((1, "Invalid procedure")),
     }
 }
@@ -597,6 +648,34 @@ async fn editqueue(state: &CompatState, params: &Value) -> Result<Value, (i64, &
                 }
                 None => false,
             },
+            "FilePause" | "FileResume" | "FileDelete" => {
+                // IDs here are FILE ids; find the owning job in the queue.
+                let snap = state.engine.snapshot();
+                let mut done = false;
+                'jobs: for j in snap.jobs.iter() {
+                    let Ok(Some(job)) = state.engine.export_job(j.id).await else {
+                        continue;
+                    };
+                    if job.files.iter().any(|f| f.id.0 == id.0) {
+                        let fid = nzbd_types::FileId(id.0);
+                        done = match command.as_str() {
+                            "FilePause" => state
+                                .engine
+                                .set_file_paused(job.id, fid, true)
+                                .await
+                                .unwrap_or(false),
+                            "FileResume" => state
+                                .engine
+                                .set_file_paused(job.id, fid, false)
+                                .await
+                                .unwrap_or(false),
+                            _ => state.engine.delete_file(job.id, fid).await.unwrap_or(false),
+                        };
+                        break 'jobs;
+                    }
+                }
+                done
+            }
             "HistoryDelete" | "HistoryFinalDelete" => match &state.history {
                 Some(db) => {
                     let db = db.clone();
@@ -614,6 +693,55 @@ async fn editqueue(state: &CompatState, params: &Value) -> Result<Value, (i64, &
         ok &= done;
     }
     Ok(Value::Bool(ok))
+}
+
+/// `listfiles(IDFrom, IDTo, NZBID)` — the files of one queued group
+/// (modern clients pass 0,0,NZBID).
+async fn listfiles(state: &CompatState, params: &Value) -> Result<Value, (i64, &'static str)> {
+    let nzbid = if p_i64(params, 2) > 0 {
+        p_i64(params, 2)
+    } else {
+        p_i64(params, 0)
+    };
+    if nzbid <= 0 {
+        return Ok(Value::Array(vec![]));
+    }
+    let Ok(Some(job)) = state.engine.export_job(JobId(nzbid as u32)).await else {
+        return Ok(Value::Array(vec![]));
+    };
+    let files: Vec<Value> = job
+        .files
+        .iter()
+        .map(|f| {
+            let total: u64 = f.segments.iter().map(|s| s.size as u64).sum();
+            let done: u64 = f
+                .segments
+                .iter()
+                .filter(|s| matches!(s.state, nzbd_types::SegmentState::Done { .. }))
+                .map(|s| s.size as u64)
+                .sum();
+            let remaining = total.saturating_sub(done);
+            let (flo, fhi, _) = split64(total);
+            let (rlo, rhi, _) = split64(remaining);
+            json!({
+                "ID": f.id.0,
+                "NZBID": job.id.0,
+                "Filename": f.filename,
+                "Subject": f.subject,
+                "FileSizeLo": flo,
+                "FileSizeHi": fhi,
+                "RemainingSizeLo": rlo,
+                "RemainingSizeHi": rhi,
+                "Paused": f.paused,
+                "PostTime": f.date.unwrap_or(0),
+                "FilenameConfirmed": f.filename_confirmed,
+                "ActiveDownloads": 0,
+                "CompletedArticles": f.done_segments(),
+                "TotalArticles": f.segments.len(),
+            })
+        })
+        .collect();
+    Ok(Value::Array(files))
 }
 
 /// Delete a queue job the NZBGet way: it becomes a history entry.
@@ -669,6 +797,31 @@ fn nowish() -> i64 {
         .unwrap_or(0)
 }
 
+/// GET form: `/jsonrpc/method?param=…` is NZBGet's URL style; we accept
+/// `?method=X&params=[…]` (params = JSON array, URL-encoded).
+async fn jsonrpc_get(
+    State(state): State<CompatState>,
+    axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let method = q.get("method").cloned().unwrap_or_default();
+    let params: Value = q
+        .get("params")
+        .and_then(|p| serde_json::from_str(p).ok())
+        .unwrap_or(Value::Array(vec![]));
+    let result = dispatch(&state, &method, &params).await;
+    let env = envelope(Value::Null, result);
+    match q.get("callback") {
+        // JSON-P: cb({...});
+        Some(cb) if !cb.is_empty() => (
+            [(axum::http::header::CONTENT_TYPE, "application/javascript")],
+            format!("{cb}({env});"),
+        )
+            .into_response(),
+        _ => Json(env).into_response(),
+    }
+}
+
 async fn jsonrpc(State(state): State<CompatState>, body: String) -> Json<Value> {
     let req: Value = match serde_json::from_str(&body) {
         Ok(v) => v,
@@ -685,7 +838,9 @@ async fn jsonrpc(State(state): State<CompatState>, body: String) -> Json<Value> 
 
 pub fn router(state: CompatState) -> Router {
     Router::new()
-        .route("/jsonrpc", post(jsonrpc))
+        .route("/jsonrpc", post(jsonrpc).get(jsonrpc_get))
+        .route("/jsonprpc", post(jsonrpc).get(jsonrpc_get))
+        .route("/xmlrpc", post(xmlrpc::handle))
         .with_state(state)
 }
 
@@ -713,6 +868,8 @@ mod tests {
                 ("ControlPort".into(), "6789".into()),
                 ("Category1.Name".into(), "tv".into()),
             ]),
+            log: Some(nzbd_api::LogBuffer::new(100)),
+            scan_notify: None,
         }
     }
 
@@ -1084,6 +1241,96 @@ mod tests {
             .unwrap()
             .iter()
             .any(|g| g["DupeKey"] == "show-s01e01" && g["DupeScore"] == 150));
+        state.engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn listfiles_and_file_actions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state(&tmp).await;
+        let id = state
+            .engine
+            .add_nzb("filed", NZB.as_bytes(), None, 0)
+            .await
+            .unwrap();
+
+        let files = dispatch(&state, "listfiles", &json!([0, 0, id.0]))
+            .await
+            .unwrap();
+        assert_eq!(files.as_array().unwrap().len(), 1);
+        let fid = files[0]["ID"].as_i64().unwrap();
+        assert_eq!(files[0]["Filename"], "f.bin");
+        assert_eq!(files[0]["Paused"], false);
+        assert_eq!(files[0]["TotalArticles"], 1);
+
+        // FilePause via editqueue (file ids, not group ids).
+        let r = dispatch(&state, "editqueue", &json!(["FilePause", "", [fid]]))
+            .await
+            .unwrap();
+        assert_eq!(r, json!(true));
+        let files = dispatch(&state, "listfiles", &json!([0, 0, id.0]))
+            .await
+            .unwrap();
+        assert_eq!(files[0]["Paused"], true);
+
+        let r = dispatch(&state, "editqueue", &json!(["FileDelete", "", [fid]]))
+            .await
+            .unwrap();
+        assert_eq!(r, json!(true));
+        let files = dispatch(&state, "listfiles", &json!([0, 0, id.0]))
+            .await
+            .unwrap();
+        assert!(files.as_array().unwrap().is_empty());
+        state.engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn log_and_writelog_roundtrip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state(&tmp).await;
+        dispatch(&state, "writelog", &json!(["WARNING", "from a script"]))
+            .await
+            .unwrap();
+        let v = dispatch(&state, "log", &json!([0, 50])).await.unwrap();
+        let last = v.as_array().unwrap().last().unwrap();
+        assert_eq!(last["Kind"], "WARNING");
+        assert_eq!(last["Text"], "from a script");
+        // Paged fetch from an id.
+        let id = last["ID"].as_u64().unwrap();
+        let v = dispatch(&state, "log", &json!([id + 1, 50])).await.unwrap();
+        assert!(v.as_array().unwrap().is_empty());
+        state.engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn xmlrpc_multicall_end_to_end() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state(&tmp).await;
+        // version + an unknown method in one multicall.
+        let calls = json!([
+            { "methodName": "version", "params": [] },
+            { "methodName": "nope", "params": [] }
+        ]);
+        let mut xml = String::from(
+            "<?xml version=\"1.0\"?><methodCall><methodName>system.multicall</methodName><params><param>",
+        );
+        crate::xmlrpc::to_xml(&json!([calls[0].clone(), calls[1].clone()]), &mut xml);
+        xml.push_str("</param></params></methodCall>");
+        let call = crate::xmlrpc::parse_call(&xml).unwrap();
+        assert_eq!(call.name, "system.multicall");
+        // Execute through the same dispatch path the endpoint uses.
+        let list = call.params[0].as_array().unwrap();
+        let mut results = Vec::new();
+        for c in list {
+            let name = c["methodName"].as_str().unwrap();
+            let params = c["params"].clone();
+            match dispatch(&state, name, &params).await {
+                Ok(v) => results.push(json!([v])),
+                Err((code, msg)) => results.push(json!({"faultCode": code, "faultString": msg})),
+            }
+        }
+        assert_eq!(results[0], json!(["26.2"]));
+        assert_eq!(results[1]["faultCode"], 1);
         state.engine.shutdown().await;
     }
 

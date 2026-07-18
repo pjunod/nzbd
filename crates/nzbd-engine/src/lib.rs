@@ -502,6 +502,32 @@ impl EngineHandle {
             .await
     }
 
+    /// Pause or resume one file inside a job (NZBGet FilePause/FileResume).
+    pub async fn set_file_paused(
+        &self,
+        job: JobId,
+        file: nzbd_types::FileId,
+        paused: bool,
+    ) -> Result<bool, EngineError> {
+        self.roundtrip_bool(|reply| QueueCommand::SetFilePaused {
+            job,
+            file,
+            paused,
+            reply,
+        })
+        .await
+    }
+
+    /// Remove one file from a job (NZBGet FileDelete).
+    pub async fn delete_file(
+        &self,
+        job: JobId,
+        file: nzbd_types::FileId,
+    ) -> Result<bool, EngineError> {
+        self.roundtrip_bool(|reply| QueueCommand::DeleteFile { job, file, reply })
+            .await
+    }
+
     /// Delayed-par download: returns recovery blocks now fetching.
     pub async fn unpause_par_blocks(&self, job: JobId, blocks: u32) -> Result<u32, EngineError> {
         let (tx, rx) = oneshot::channel();

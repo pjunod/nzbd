@@ -793,6 +793,7 @@ dependencies = [
  "tokio-stream",
  "tower",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -825,9 +826,11 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "base64",
+ "nzbd-api",
  "nzbd-engine",
  "nzbd-state",
  "nzbd-types",
+ "quick-xml",
  "serde",
  "serde_json",
  "tempfile",

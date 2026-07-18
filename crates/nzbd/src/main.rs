@@ -62,15 +62,22 @@ enum Command {
 }
 
 fn main() -> anyhow_lite::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
+    use tracing_subscriber::layer::SubscriberExt as _;
+    use tracing_subscriber::util::SubscriberInitExt as _;
+    // The daemon log ring backs `GET /api/v1/logs` and the compat `log`
+    // method; the fmt layer keeps stderr behavior unchanged.
+    let logbuf = nzbd_api::LogBuffer::new(1000);
+    tracing_subscriber::registry()
+        .with(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
+        .with(tracing_subscriber::fmt::layer())
+        .with(nzbd_api::LogBufferLayer(logbuf.clone()))
         .init();
 
     let cli = Cli::parse();
     match cli.command {
-        Command::Run { config, bind } => run(config, bind),
+        Command::Run { config, bind } => run(config, bind, logbuf),
         Command::Add {
             file,
             url,
@@ -224,7 +231,63 @@ fn open_history(
     .map_err(|e| anyhow_lite::Error::msg(format!("history db: {e}")))
 }
 
-fn run(config: Option<PathBuf>, bind: Option<String>) -> anyhow_lite::Result<()> {
+/// Watch-dir scanner: `.nzb` files dropped into `NzbDir` are added and
+/// renamed `.queued` (`.error` on a parse failure). Runs every 30 s and on
+/// a `scan` RPC nudge; in cluster mode only the authority scans.
+fn spawn_watch_dir(
+    engine: nzbd_engine::EngineHandle,
+    dir: PathBuf,
+    notify: Arc<tokio::sync::Notify>,
+    is_authority: Arc<dyn Fn() -> bool + Send + Sync>,
+) {
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_secs(30)) => {}
+                _ = notify.notified() => {}
+            }
+            if !is_authority() {
+                continue;
+            }
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for e in entries.flatten() {
+                let p = e.path();
+                let is_nzb = p
+                    .extension()
+                    .map(|x| x.eq_ignore_ascii_case("nzb"))
+                    .unwrap_or(false);
+                if !is_nzb || !p.is_file() {
+                    continue;
+                }
+                let name = p
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                let Ok(content) = std::fs::read(&p) else {
+                    continue;
+                };
+                match engine.add_nzb(&name, &content, None, 0).await {
+                    Ok(id) => {
+                        tracing::info!(job = id.0, file = %p.display(), "watch dir: queued");
+                        let _ = std::fs::rename(&p, p.with_extension("nzb.queued"));
+                    }
+                    Err(err) => {
+                        tracing::warn!(file = %p.display(), error = %err, "watch dir: rejected");
+                        let _ = std::fs::rename(&p, p.with_extension("nzb.error"));
+                    }
+                }
+            }
+        }
+    });
+}
+
+fn run(
+    config: Option<PathBuf>,
+    bind: Option<String>,
+    logbuf: Arc<nzbd_api::LogBuffer>,
+) -> anyhow_lite::Result<()> {
     let cfg = match &config {
         Some(path) => nzbd_config::Config::from_toml(&std::fs::read_to_string(path)?)
             .map_err(|e| anyhow_lite::Error::msg(e.to_string()))?,
@@ -264,7 +327,7 @@ fn run(config: Option<PathBuf>, bind: Option<String>) -> anyhow_lite::Result<()>
         .build()?;
 
     if cfg.cluster.enabled {
-        return runtime.block_on(run_cluster(cfg, servers, tuning, bind));
+        return runtime.block_on(run_cluster(cfg, servers, tuning, bind, logbuf));
     }
 
     let engine_cfg = EngineConfig::single_node(
@@ -302,6 +365,12 @@ fn run(config: Option<PathBuf>, bind: Option<String>) -> anyhow_lite::Result<()>
         }
         pp_tracker.close();
 
+        let scan_notify = Arc::new(tokio::sync::Notify::new());
+        if let Some(watch) = &cfg.paths.nzb_watch_dir {
+            let dir = nzbd_config::expand_home(watch);
+            let _ = std::fs::create_dir_all(&dir);
+            spawn_watch_dir(engine.clone(), dir, scan_notify.clone(), Arc::new(|| true));
+        }
         let compat_state = nzbd_compat::CompatState {
             config: Arc::new(nzbd_compat::CompatConfig {
                 version: cfg.api.compat_version.clone(),
@@ -309,11 +378,14 @@ fn run(config: Option<PathBuf>, bind: Option<String>) -> anyhow_lite::Result<()>
             engine: engine.clone(),
             history: history.clone(),
             options: Arc::new(compat_options(&cfg, &bind)),
+            log: Some(logbuf.clone()),
+            scan_notify: Some(scan_notify),
         };
         let app = nzbd_api::require_auth(
             nzbd_api::router_with(nzbd_api::ApiState {
                 engine: engine.clone(),
                 history,
+                log: Some(logbuf.clone()),
             })
             .merge(nzbd_compat::router(compat_state)),
             nzbd_api::AuthConfig {
@@ -347,6 +419,7 @@ async fn run_cluster(
     servers: Vec<nzbd_types::ServerDef>,
     tuning: Tuning,
     bind: String,
+    logbuf: Arc<nzbd_api::LogBuffer>,
 ) -> anyhow_lite::Result<()> {
     let c = &cfg.cluster;
     let secret = c
@@ -407,7 +480,19 @@ async fn run_cluster(
     .await
     .map_err(|e| anyhow_lite::Error::msg(e.to_string()))?;
 
-    let app = runtime.router_with_auth(
+    let scan_notify = Arc::new(tokio::sync::Notify::new());
+    if let Some(watch) = &cfg.paths.nzb_watch_dir {
+        let dir = nzbd_config::expand_home(watch);
+        let _ = std::fs::create_dir_all(&dir);
+        let view = runtime.leader_gate();
+        spawn_watch_dir(
+            runtime.engine.clone(),
+            dir,
+            scan_notify.clone(),
+            Arc::new(view),
+        );
+    }
+    let app = runtime.router_full(
         &cfg.api.compat_version,
         compat_options(&cfg, &bind),
         nzbd_api::AuthConfig {
@@ -415,6 +500,8 @@ async fn run_cluster(
             password: cfg.api.password.clone(),
             token: cfg.api.token.clone(),
         },
+        Some(logbuf),
+        Some(scan_notify),
     );
     let listener = tokio::net::TcpListener::bind(&bind).await?;
     tracing::info!(
