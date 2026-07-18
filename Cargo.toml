@@ -6,6 +6,7 @@ members = [
     "crates/nzbd-yenc",
     "crates/nzbd-nntp",
     "crates/nzbd-engine",
+    "crates/nzbd-feed",
     "crates/nzbd-post",
     "crates/nzbd-state",
     "crates/nzbd-config",
@@ -32,6 +33,7 @@ nzbd-nzb = { path = "crates/nzbd-nzb" }
 nzbd-yenc = { path = "crates/nzbd-yenc" }
 nzbd-nntp = { path = "crates/nzbd-nntp" }
 nzbd-engine = { path = "crates/nzbd-engine" }
+nzbd-feed = { path = "crates/nzbd-feed" }
 nzbd-post = { path = "crates/nzbd-post" }
 nzbd-state = { path = "crates/nzbd-state" }
 nzbd-config = { path = "crates/nzbd-config" }

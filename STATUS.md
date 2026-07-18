@@ -8,10 +8,10 @@ roadmaps in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) §16 and
 Legend: ✅ done (implemented, tested, committed) · 🔶 partial · ⬜ not
 started · 👤 operator action (Paul)
 
-**Snapshot (2026-07-17):** 145 tests · clippy clean · **phases 0–4
-complete, cluster C1+C2 complete, phase 5 partial** — the NZBGet parity
-surface is done end to end; what remains is beyond-parity performance
-work and operator actions
+**Snapshot (2026-07-17):** 155 tests · clippy clean · **phases 0–4
+complete incl. RSS feeds, cluster C1+C2 complete, phase 5 partial** —
+every NZBGet user-facing surface exists; what remains is beyond-parity
+performance work and operator actions
 
 | Phase | State | Evidence |
 |---|---|---|
@@ -134,8 +134,9 @@ work and operator actions
 - ✅ Compat C3: `servervolumes` (live per-server total/day/month counters), `sysinfo` (OS/arch + tool paths), `testserver` (real NNTP connect + greeting + AUTHINFO through the production transport — proven against nserv in tests)
 - ✅ Packaging: multi-stage `Dockerfile` (tini + par2/unrar/7z, unprivileged user), tag-triggered release workflow (musl static x86_64 + aarch64, macOS aarch64, sha256 sums, ghcr.io Docker push), Homebrew formula with service block
 - ✅ Live *arr smoke workflow (`arr-live.yml`, weekly + manual): boots real Sonarr against nzbd and asserts the NZBGet download-client validation passes
-- ⬜ Extension manager UI · RSS feeds + filter language — the last parity-surface item (NZBGet's RSS engine is its own subsystem); scheduled next
-- ⬜ Windows packaging — engine code is Unix-portable except statvfs; needs a Windows CI leg
+- ✅ RSS feeds + filter language (`nzbd-feed`): per-feed pollers over the URL-job fetcher; RSS 2.0 / Atom / newznab parsing (enclosures, `newznab:attr` size, entity refs, CDATA); NZBGet-style filter language (Accept/Reject/Require + `A:`/`R:`/`Q:`, wildcard title/category/url terms, `size:` windows, `age:`, negation, Accept options category/priority/pause/dupekey/dupescore); guid seen-ledger (90-day retention, shared-volume in cluster mode so failover never re-downloads a backlog); leader-gated polling; `fetchfeeds`/`viewfeed` compat RPCs; `FeedN.*` mapped by the nzbget.conf importer (`%` → newline in filters); e2e: feed poll → filter → URL job queued once, deduped on re-poll
+- ✖ Windows packaging — cut (per Paul, 2026-07-17)
+- ⬜ Extension manager UI — scripts are discovered + run; a management surface remains
 
 ## Phase 5 — Beyond parity 🔶
 
@@ -145,7 +146,7 @@ work and operator actions
 - ⬜ io_uring file I/O — blocked on tokio-uring maturity; DirectWrite already avoids the copy-heavy paths
 - ⬜ Article-streaming / mount-mode groundwork — design work first (ARCHITECTURE.md §15)
 - ⬜ Cluster C3: segment-split downloads, weighted scheduling, budget rebalancing — the lease protocol carries a `kind` field so a `Segment` lease slots in without wire changes
-- ⬜ RSS feeds + filter language + extension-manager UI (phase 4 carry-over) — the last user-facing surface not yet built
+- ✅ RSS feeds + filter language — shipped (see phase 4)
 - ⬜ `rapidyenc-sys` FFI + differential fuzzing — scalar decoder saturates typical line rates today
 
 ## Operator checklist 👤

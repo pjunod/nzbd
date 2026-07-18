@@ -213,6 +213,24 @@ fn compat_options(cfg: &nzbd_config::Config, bind: &str) -> Vec<(String, String)
     o
 }
 
+/// `[[feed]]` config → feed engine definitions.
+fn feed_defs(cfg: &nzbd_config::Config) -> Vec<nzbd_feed::FeedDef> {
+    cfg.feeds
+        .iter()
+        .enumerate()
+        .map(|(i, f)| nzbd_feed::FeedDef {
+            id: i as u32 + 1,
+            name: f.name.clone(),
+            url: f.url.clone(),
+            interval: Duration::from_secs(f.interval_mins.max(1) * 60),
+            filter: f.filter.clone(),
+            category: f.category.clone(),
+            priority: f.priority,
+            pause: f.pause,
+        })
+        .collect()
+}
+
 /// Open the history store: SQLite index in a node-local dir, authoritative
 /// JSONL wherever `jsonl_dir` points (shared volume in cluster mode).
 fn open_history(
@@ -371,6 +389,19 @@ fn run(
             let _ = std::fs::create_dir_all(&dir);
             spawn_watch_dir(engine.clone(), dir, scan_notify.clone(), Arc::new(|| true));
         }
+        let feed_cancel = tokio_util::sync::CancellationToken::new();
+        let feed_tracker = tokio_util::task::TaskTracker::new();
+        let feeds_handle = (!cfg.feeds.is_empty()).then(|| {
+            nzbd_feed::spawn_feeds(
+                engine.clone(),
+                feed_defs(&cfg),
+                cfg.state_dir(),
+                Arc::new(|| true),
+                feed_cancel.clone(),
+                &feed_tracker,
+            )
+        });
+        feed_tracker.close();
         let compat_state = nzbd_compat::CompatState {
             config: Arc::new(nzbd_compat::CompatConfig {
                 version: cfg.api.compat_version.clone(),
@@ -380,6 +411,7 @@ fn run(
             options: Arc::new(compat_options(&cfg, &bind)),
             log: Some(logbuf.clone()),
             scan_notify: Some(scan_notify),
+            feeds: feeds_handle,
         };
         let app = nzbd_api::require_auth(
             nzbd_api::router_with(nzbd_api::ApiState {
@@ -405,6 +437,8 @@ fn run(
             })
             .await?;
 
+        feed_cancel.cancel();
+        feed_tracker.wait().await;
         pp_cancel.cancel();
         pp_tracker.wait().await;
         engine.shutdown().await;
@@ -492,6 +526,21 @@ async fn run_cluster(
             Arc::new(view),
         );
     }
+    let feed_cancel = tokio_util::sync::CancellationToken::new();
+    let feed_tracker = tokio_util::task::TaskTracker::new();
+    let feeds_handle = (!cfg.feeds.is_empty()).then(|| {
+        // Seen-store on the shared volume: a failover must not re-download
+        // a feed's whole backlog.
+        nzbd_feed::spawn_feeds(
+            runtime.engine.clone(),
+            feed_defs(&cfg),
+            shared_dir.join(".nzbd-cluster"),
+            Arc::new(runtime.leader_gate()),
+            feed_cancel.clone(),
+            &feed_tracker,
+        )
+    });
+    feed_tracker.close();
     let app = runtime.router_full(
         &cfg.api.compat_version,
         compat_options(&cfg, &bind),
@@ -502,6 +551,7 @@ async fn run_cluster(
         },
         Some(logbuf),
         Some(scan_notify),
+        feeds_handle,
     );
     let listener = tokio::net::TcpListener::bind(&bind).await?;
     tracing::info!(
@@ -517,6 +567,8 @@ async fn run_cluster(
         })
         .await?;
 
+    feed_cancel.cancel();
+    feed_tracker.wait().await;
     runtime.shutdown().await;
     Ok(())
 }

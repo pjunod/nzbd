@@ -10,6 +10,7 @@ nzbd-engine = { workspace = true }
 nzbd-state = { workspace = true }
 nzbd-api = { workspace = true }
 nzbd-nntp = { workspace = true }
+nzbd-feed = { workspace = true }
 quick-xml = { workspace = true }
 axum = { workspace = true }
 base64 = { workspace = true }

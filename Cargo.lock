@@ -764,6 +764,7 @@ dependencies = [
  "nzbd-compat",
  "nzbd-config",
  "nzbd-engine",
+ "nzbd-feed",
  "nzbd-nserv",
  "nzbd-post",
  "nzbd-state",
@@ -807,6 +808,7 @@ dependencies = [
  "nzbd-api",
  "nzbd-compat",
  "nzbd-engine",
+ "nzbd-feed",
  "nzbd-nserv",
  "nzbd-post",
  "nzbd-state",
@@ -828,6 +830,7 @@ dependencies = [
  "base64",
  "nzbd-api",
  "nzbd-engine",
+ "nzbd-feed",
  "nzbd-nntp",
  "nzbd-nserv",
  "nzbd-state",
@@ -871,6 +874,22 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tokio-rustls",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
+name = "nzbd-feed"
+version = "0.1.0"
+dependencies = [
+ "nzbd-engine",
+ "nzbd-types",
+ "quick-xml",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
  "tokio-util",
  "tracing",
 ]

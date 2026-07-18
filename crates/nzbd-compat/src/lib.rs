@@ -53,6 +53,8 @@ pub struct CompatState {
     pub log: Option<Arc<nzbd_api::LogBuffer>>,
     /// Wakes the watch-dir scanner (`scan` method).
     pub scan_notify: Option<Arc<tokio::sync::Notify>>,
+    /// RSS feed engine (`fetchfeeds`/`viewfeed`).
+    pub feeds: Option<nzbd_feed::FeedsHandle>,
 }
 
 impl CompatState {
@@ -64,6 +66,7 @@ impl CompatState {
             options: Arc::new(Vec::new()),
             log: None,
             scan_notify: None,
+            feeds: None,
         }
     }
 }
@@ -335,6 +338,39 @@ pub async fn dispatch(
                     })
                     .collect(),
             ))
+        }
+        "fetchfeeds" => {
+            if let Some(f) = &state.feeds {
+                f.fetch_now();
+            }
+            Ok(Value::Bool(true))
+        }
+        "viewfeed" => {
+            // viewfeed(ID) — the last poll's items with filter verdicts.
+            let Some(feeds) = &state.feeds else {
+                return Ok(Value::Array(vec![]));
+            };
+            let id = p_i64(params, 0).max(0) as u32;
+            let items: Vec<Value> = feeds
+                .preview(id)
+                .iter()
+                .map(|p| {
+                    let (slo, shi, smb) = split64(p.item.size);
+                    json!({
+                        "Title": p.item.title,
+                        "Filename": format!("{}.nzb", p.item.title),
+                        "URL": p.item.url,
+                        "SizeLo": slo,
+                        "SizeHi": shi,
+                        "SizeMB": smb,
+                        "Category": p.item.category,
+                        "Time": 0,
+                        "Match": if p.accepted { "ACCEPTED" } else { "REJECTED" },
+                        "Status": if p.new { "NEW" } else { "BACKLOG" },
+                    })
+                })
+                .collect();
+            Ok(Value::Array(items))
         }
         "scan" => {
             if let Some(n) = &state.scan_notify {
@@ -975,6 +1011,7 @@ mod tests {
             ]),
             log: Some(nzbd_api::LogBuffer::new(100)),
             scan_notify: None,
+            feeds: None,
         }
     }
 

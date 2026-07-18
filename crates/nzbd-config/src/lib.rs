@@ -21,6 +21,8 @@ pub struct Config {
     pub servers: Vec<ServerConfig>,
     #[serde(default, rename = "category")]
     pub categories: Vec<CategoryConfig>,
+    #[serde(default, rename = "feed")]
+    pub feeds: Vec<FeedConfig>,
     #[serde(default)]
     pub queue: QueueConfig,
     #[serde(default)]
@@ -223,6 +225,34 @@ pub struct CategoryConfig {
     pub extensions: Vec<String>,
 }
 
+/// `[[feed]]` — an RSS/Atom indexer feed with an NZBGet-style filter.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct FeedConfig {
+    pub name: String,
+    pub url: String,
+    pub interval_mins: u64,
+    /// Filter script (Accept/Reject/Require lines); empty = accept all.
+    pub filter: String,
+    pub category: Option<String>,
+    pub priority: i32,
+    pub pause: bool,
+}
+
+impl Default for FeedConfig {
+    fn default() -> Self {
+        FeedConfig {
+            name: String::new(),
+            url: String::new(),
+            interval_mins: 15,
+            filter: String::new(),
+            category: None,
+            priority: 0,
+            pause: false,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct QueueConfig {
@@ -347,6 +377,13 @@ impl Config {
                     "server '{}' has zero connections",
                     s.name
                 )));
+            }
+        }
+        for f in &self.feeds {
+            if f.name.trim().is_empty() || f.url.trim().is_empty() {
+                return Err(ConfigError::Invalid(
+                    "[[feed]] requires name and url".into(),
+                ));
             }
         }
         if self.cluster.enabled {
@@ -481,6 +518,7 @@ pub fn import_nzbget_conf(content: &str) -> Result<(Config, ImportReport), Confi
     let mut report = ImportReport::default();
     let mut servers: std::collections::BTreeMap<u32, ServerConfig> = Default::default();
     let mut categories: std::collections::BTreeMap<u32, CategoryConfig> = Default::default();
+    let mut feeds: std::collections::BTreeMap<u32, FeedConfig> = Default::default();
     let mut control_ip = "127.0.0.1".to_string();
     let mut control_port = "6789".to_string();
 
@@ -564,6 +602,57 @@ pub fn import_nzbget_conf(content: &str) -> Result<(Config, ImportReport), Confi
                         report
                             .mapped
                             .push((key.clone(), format!("server[{n}].{field}")));
+                    }
+                    continue;
+                }
+            }
+        }
+        if let Some(rest) = lk.strip_prefix("feed") {
+            if let Some((n, field)) = rest.split_once('.') {
+                if let Ok(n) = n.parse::<u32>() {
+                    let f = feeds.entry(n).or_default();
+                    let mapped = match field {
+                        "name" => {
+                            f.name = v.clone();
+                            true
+                        }
+                        "url" => {
+                            f.url = v.clone();
+                            true
+                        }
+                        "interval" => {
+                            f.interval_mins = v.parse().unwrap_or(15);
+                            true
+                        }
+                        "filter" => {
+                            f.filter = v.replace('%', "\n");
+                            true
+                        }
+                        "category" => {
+                            f.category = (!v.is_empty()).then(|| v.clone());
+                            true
+                        }
+                        "priority" => {
+                            f.priority = v.parse().unwrap_or(0);
+                            true
+                        }
+                        "pausenzb" => {
+                            f.pause = yes(&v);
+                            true
+                        }
+                        "backlog" | "extensions" => {
+                            report.skipped.push(key.clone());
+                            false
+                        }
+                        _ => {
+                            report.unknown.push(key.clone());
+                            false
+                        }
+                    };
+                    if mapped {
+                        report
+                            .mapped
+                            .push((key.clone(), format!("feed[{n}].{field}")));
                     }
                     continue;
                 }
@@ -821,6 +910,10 @@ pub fn import_nzbget_conf(content: &str) -> Result<(Config, ImportReport), Confi
     cfg.categories = categories
         .into_values()
         .filter(|c| !c.name.is_empty())
+        .collect();
+    cfg.feeds = feeds
+        .into_values()
+        .filter(|f| !f.name.is_empty() && !f.url.is_empty())
         .collect();
 
     for (i, s) in cfg.servers.iter().enumerate() {
@@ -1111,6 +1204,33 @@ Server2.Connections=0
         assert_eq!(cfg.servers[0].host, "ok.example");
         assert_eq!(cfg.servers[0].connections, 1, "zero raised to one");
         assert_eq!(report.warnings.len(), 2);
+    }
+
+    #[test]
+    fn feed_sections_parse_and_import() {
+        let cfg = Config::from_toml(
+            "[[feed]]\nname = \"idx\"\nurl = \"https://idx.example/rss\"\n\
+             interval_mins = 30\nfilter = \"Accept: *1080p*\"\ncategory = \"tv\"",
+        )
+        .unwrap();
+        assert_eq!(cfg.feeds.len(), 1);
+        assert_eq!(cfg.feeds[0].interval_mins, 30);
+        assert_eq!(cfg.feeds[0].category.as_deref(), Some("tv"));
+        // name+url required
+        assert!(Config::from_toml("[[feed]]\nname = \"x\"").is_err());
+
+        // nzbget.conf FeedN.* import (% is NZBGet's newline in filters).
+        let (cfg, report) = import_nzbget_conf(
+            "Feed1.Name=idx\nFeed1.URL=https://idx.example/rss\n\
+             Feed1.Interval=45\nFeed1.Filter=Accept: *1080p* % Reject: *x265*\n\
+             Feed1.Category=tv\nFeed1.PauseNzb=no\nFeed1.Backlog=yes\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.feeds.len(), 1);
+        assert_eq!(cfg.feeds[0].interval_mins, 45);
+        assert!(cfg.feeds[0].filter.contains('\n'), "% becomes newline");
+        assert!(report.mapped.iter().any(|(k, _)| k == "Feed1.URL"));
+        assert!(report.skipped.iter().any(|k| k == "Feed1.Backlog"));
     }
 
     #[test]

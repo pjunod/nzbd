@@ -16,6 +16,7 @@ nzbd-api = { workspace = true }
 nzbd-compat = { workspace = true }
 nzbd-cluster = { workspace = true }
 nzbd-post = { workspace = true }
+nzbd-feed = { workspace = true }
 nzbd-state = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }

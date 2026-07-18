@@ -277,10 +277,11 @@ impl ClusterRuntime {
         options: Vec<(String, String)>,
         auth: nzbd_api::AuthConfig,
     ) -> Router {
-        self.router_full(compat_version, options, auth, None, None)
+        self.router_full(compat_version, options, auth, None, None, None)
     }
 
     /// Full router: auth + daemon log ring + watch-dir scan notify.
+    #[allow(clippy::too_many_arguments)]
     pub fn router_full(
         &self,
         compat_version: &str,
@@ -288,6 +289,7 @@ impl ClusterRuntime {
         auth: nzbd_api::AuthConfig,
         log: Option<Arc<nzbd_api::LogBuffer>>,
         scan_notify: Option<Arc<tokio::sync::Notify>>,
+        feeds: Option<nzbd_feed::FeedsHandle>,
     ) -> Router {
         let history = self.pp.as_ref().map(|s| s.history.clone());
         let compat_state = nzbd_compat::CompatState {
@@ -299,6 +301,7 @@ impl ClusterRuntime {
             options: Arc::new(options),
             log: log.clone(),
             scan_notify,
+            feeds,
         };
         let proxied = nzbd_api::require_auth(
             nzbd_api::router_with(nzbd_api::ApiState {
