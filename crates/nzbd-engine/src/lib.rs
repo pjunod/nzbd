@@ -13,9 +13,11 @@
 
 pub mod events;
 pub mod failover;
+pub mod fetch;
 pub mod queue;
 pub mod rate;
 pub mod snapshot;
+pub mod volumes;
 
 mod owner;
 mod pool;
@@ -60,6 +62,15 @@ pub struct Tuning {
     pub propagation_delay: Duration,
     /// Queue `*.volNNN+MM.par2` files paused (delayed-par download).
     pub pause_extra_pars: bool,
+    /// Pause all downloading when free space on the dest volume drops
+    /// below this (0 = disabled).
+    pub min_free_disk_bytes: u64,
+    /// Daily / monthly download quotas in bytes (0 = unlimited); force-
+    /// priority jobs bypass quota (never the disk guard).
+    pub daily_quota_bytes: u64,
+    pub monthly_quota_bytes: u64,
+    /// Day of month the monthly quota window starts (1–28).
+    pub quota_start_day: u32,
 }
 
 impl Default for Tuning {
@@ -72,6 +83,10 @@ impl Default for Tuning {
             idle_hold: Duration::from_secs(5),
             propagation_delay: Duration::ZERO,
             pause_extra_pars: true,
+            min_free_disk_bytes: 0,
+            daily_quota_bytes: 0,
+            monthly_quota_bytes: 0,
+            quota_start_day: 1,
         }
     }
 }
@@ -203,6 +218,17 @@ impl Engine {
     }
 }
 
+/// Options for [`EngineHandle::add_nzb_opts`].
+#[derive(Debug, Clone, Default)]
+pub struct AddOpts {
+    pub category: Option<String>,
+    pub priority: i32,
+    /// Duplicate-detection metadata (key/score/mode) carried on the job.
+    pub dupe: Option<nzbd_types::DupeInfo>,
+    /// Add in Paused state (NZBGet `AddPaused`).
+    pub paused: bool,
+}
+
 /// Cloneable handle to a running engine.
 #[derive(Clone)]
 pub struct EngineHandle {
@@ -223,6 +249,95 @@ impl EngineHandle {
         category: Option<String>,
         priority: i32,
     ) -> Result<JobId, EngineError> {
+        self.add_nzb_opts(
+            name,
+            content,
+            AddOpts {
+                category,
+                priority,
+                ..AddOpts::default()
+            },
+        )
+        .await
+    }
+
+    /// Add a URL job: registered immediately (status `Fetching`), the NZB
+    /// is fetched in the background, then the job queues like any other.
+    /// A fetch/parse failure fails the job (history: `FAILURE/FETCH`).
+    pub async fn add_url(
+        &self,
+        name: &str,
+        url: &str,
+        opts: AddOpts,
+    ) -> Result<JobId, EngineError> {
+        let name = if name.trim().is_empty() {
+            url.rsplit('/')
+                .next()
+                .unwrap_or("download")
+                .trim_end_matches(".nzb")
+                .to_string()
+        } else {
+            name.trim().trim_end_matches(".nzb").to_string()
+        };
+        let (tx, rx) = oneshot::channel();
+        self.send(QueueCommand::AddUrl {
+            name,
+            url: url.to_string(),
+            category: opts.category,
+            priority: opts.priority,
+            dupe: opts.dupe,
+            paused: opts.paused,
+            reply: tx,
+        })
+        .await?;
+        let id = rx.await.map_err(|_| EngineError::Closed)?;
+
+        let handle = self.clone();
+        let url = url.to_string();
+        self.tracker.spawn(async move {
+            let outcome = match crate::fetch::http_get(&url).await {
+                Ok(bytes) => match nzbd_nzb::parse(&bytes) {
+                    Ok(parsed) => Ok(parsed),
+                    Err(e) => Err(format!("nzb parse: {e}")),
+                },
+                Err(e) => Err(e.to_string()),
+            };
+            match outcome {
+                Ok(parsed) => {
+                    let (tx, rx) = oneshot::channel();
+                    let _ = handle
+                        .send(QueueCommand::CompleteUrlFetch {
+                            job: id,
+                            parsed: Box::new(parsed),
+                            reply: tx,
+                        })
+                        .await;
+                    let _ = rx.await;
+                }
+                Err(error) => {
+                    let (tx, rx) = oneshot::channel();
+                    let _ = handle
+                        .send(QueueCommand::FailUrlFetch {
+                            job: id,
+                            error,
+                            reply: tx,
+                        })
+                        .await;
+                    let _ = rx.await;
+                }
+            }
+        });
+        Ok(id)
+    }
+
+    /// [`EngineHandle::add_nzb`] with the full option set (dupe metadata,
+    /// add-paused).
+    pub async fn add_nzb_opts(
+        &self,
+        name: &str,
+        content: &[u8],
+        opts: AddOpts,
+    ) -> Result<JobId, EngineError> {
         let parsed = nzbd_nzb::parse(content)?;
         let name = name
             .trim()
@@ -241,8 +356,10 @@ impl EngineHandle {
         self.send(QueueCommand::AddParsed {
             name,
             parsed: Box::new(parsed),
-            category,
-            priority,
+            category: opts.category,
+            priority: opts.priority,
+            dupe: opts.dupe,
+            paused: opts.paused,
             reply: tx,
         })
         .await?;

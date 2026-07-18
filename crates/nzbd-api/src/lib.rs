@@ -177,6 +177,11 @@ struct AddJobQuery {
     name: Option<String>,
     category: Option<String>,
     priority: Option<i32>,
+    /// Fetch the NZB from this URL instead of the request body.
+    url: Option<String>,
+    paused: Option<bool>,
+    dupe_key: Option<String>,
+    dupe_score: Option<i32>,
 }
 
 /// `POST /api/v1/jobs` with the raw NZB document as the request body.
@@ -186,15 +191,30 @@ async fn add_job(
     Query(q): Query<AddJobQuery>,
     body: axum::body::Bytes,
 ) -> Response {
-    if body.is_empty() {
-        return error(StatusCode::BAD_REQUEST, "empty body; POST the NZB document");
-    }
     let name = q.name.unwrap_or_default();
-    match st
-        .engine
-        .add_nzb(&name, &body, q.category, q.priority.unwrap_or(0))
-        .await
-    {
+    let opts = nzbd_engine::AddOpts {
+        category: q.category,
+        priority: q.priority.unwrap_or(0),
+        paused: q.paused.unwrap_or(false),
+        dupe: q.dupe_key.map(|key| nzbd_types::DupeInfo {
+            key,
+            score: q.dupe_score.unwrap_or(0),
+            mode: None,
+        }),
+    };
+    if let Some(url) = &q.url {
+        return match st.engine.add_url(&name, url, opts).await {
+            Ok(id) => (StatusCode::CREATED, Json(json!({ "id": id }))).into_response(),
+            Err(e) => error(StatusCode::UNPROCESSABLE_ENTITY, &e.to_string()),
+        };
+    }
+    if body.is_empty() {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "empty body; POST the NZB document (or pass ?url=)",
+        );
+    }
+    match st.engine.add_nzb_opts(&name, &body, opts).await {
         Ok(id) => (StatusCode::CREATED, Json(json!({ "id": id }))).into_response(),
         Err(e) => error(StatusCode::UNPROCESSABLE_ENTITY, &e.to_string()),
     }

@@ -8,9 +8,9 @@ roadmaps in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) §16 and
 Legend: ✅ done (implemented, tested, committed) · 🔶 partial · ⬜ not
 started · 👤 operator action (Paul)
 
-**Snapshot (2026-07-17):** 116 tests · clippy clean · phases 0, 1, 2,
-cluster C1+C2, *arr compat core, importer, auth/SSE/metrics complete ·
-next up: **XML-RPC, golden tests, phase 4 web UI**
+**Snapshot (2026-07-17):** 130 tests · clippy clean · phases 0, 1, 2
+(fully), cluster C1+C2, compat 3a, importer, auth/SSE/metrics complete ·
+next up: **compat C2 + XML-RPC, then phase 4**
 
 | Phase | State | Evidence |
 |---|---|---|
@@ -18,10 +18,11 @@ next up: **XML-RPC, golden tests, phase 4 web UI**
 | 1 — Core engine | ✅ complete | `2f45cd5` |
 | C1 — Cluster foundation | ✅ complete | `e4178b2` (design), `0969a79` (impl) |
 | CI & quality gates | ✅ complete (2 decisions open) | `b0b5530`, `0de429b` |
-| 2 — Post-processing | ✅ core complete | `1fdad15` |
+| 2 — Post-processing | ✅ complete | `1fdad15` + this commit |
 | C2 — PP leases + anti-affinity | ✅ complete | `9f402d8` |
-| 3a — *arr compat core (append/history/editqueue) | ✅ complete | this commit |
-| 3b — importer, XML-RPC, SSE, auth, metrics | ⬜ next | — |
+| 3a — *arr compat core | ✅ complete | `3793ad8` |
+| 3b — importer · auth · SSE · metrics | ✅ complete | `e00990c`, `b4c422d` |
+| 3c — compat C2 + XML-RPC + golden tests | ⬜ next | — |
 | 4 — Web UI + ecosystem | ⬜ | — |
 | 5 — Beyond parity (+ C3) | ⬜ | — |
 
@@ -52,12 +53,12 @@ next up: **XML-RPC, golden tests, phase 4 web UI**
 - ✅ Native API subset: status, jobs add/list/detail, job + queue actions, speed limit
 - ✅ Compat shim: `version`, `status`, `listgroups` in NZBGet's JSON-RPC 1.1 dialect with Lo/Hi/MB triplets
 - ✅ CLI `run` / `add` / `status`; whole-daemon test (real binary, real CLI, SIGINT)
-- ⬜ COMPRESS DEFLATE (RFC 8054)
-- ⬜ RAM article cache (`ArticleCache`, default-off in NZBGet too)
-- ⬜ Quotas + per-server volume counters
-- ⬜ URL jobs (`AddUrl` / fetch)
-- ⬜ Min-free-disk-space check
-- ⬜ Filename deobfuscation beyond the quoted-subject heuristic; direct rename
+- ✅ URL jobs: `AddUrl` via API/append — registered instantly (`Fetching`), NZB fetched over HTTPS (hyper on the NNTP rustls stack, redirects, 64 MiB cap), then queued; fetch failure → `FAILURE/FETCH` in history
+- ✅ Min-free-disk-space guard: statvfs on the dest volume every 10 s; below the floor ALL leasing stops (even force jobs), auto-resumes
+- ✅ Quotas + per-server volume counters: daily/monthly windows (`QuotaStartDay` civil-date periods), per-node `volumes.<node>.json` summed cluster-wide, force-priority bypasses quota, `QuotaReached` live in compat status, counters in snapshots
+- ✅ Filename deobfuscation: par-rename (16k-MD5 match incl. content-detected par2s) + rar-rename (RAR4/RAR5/7z/zip signatures, RAR5 volume numbers) — see Phase 2
+- ⬜ COMPRESS DEFLATE (RFC 8054) — deferred: single-digit % savings on yEnc bodies; scoped for a later pass
+- ✖ RAM article cache — intentionally not applicable: `ArticleCache` exists in NZBGet to reduce fragmentation when DirectWrite is off; nzbd's DirectWrite positional writer is always on, so there is nothing for a cache to fix
 - 👤 Real-provider smoke test (point `nzbd run` at an actual news server) — never yet done
 
 ## Cluster — C1 foundation ✅ (design ADR-13…16 accepted)
@@ -86,7 +87,7 @@ next up: **XML-RPC, golden tests, phase 4 web UI**
 - 👤 Branch protection on `main` requiring Tests/Lint/Coverage (repo Settings)
 - 👤 Badge rendering decision: badges don't render on a **private** repo README (GitHub proxies images anonymously). Either make the repo public (current setup then works as-is) or ask for the private-repo rework (CI commits relative-path SVGs to `main`)
 
-## Phase 2 — Post-processing ✅ core (cluster-native completion lands with C2)
+## Phase 2 — Post-processing ✅ complete
 
 - ✅ par2 packet parser + **native quick-verify** from download CRCs — zero data re-read for intact sets (`nzbd-post/src/par2.rs`, proven against real `par2 create` output)
 - ✅ par2 verify/repair subprocess wrapper (par2cmdline-compatible output parsing: Intact / Repairable / NeedMoreBlocks / Unrepairable)
@@ -97,11 +98,11 @@ next up: **XML-RPC, golden tests, phase 4 web UI**
 - ✅ History: local SQLite index + authoritative append-only JSONL (shared volume in cluster mode per ADR-16; SQLite never on network FS; index rebuilt from JSONL on divergence)
 - ✅ `[post]` config section; daemon wiring single-node **and** cluster (PP runs on the leader, gated live on election state)
 - ✅ 6-test e2e suite against real binaries: intact fast path + script env/FINALDIR, corrupt→repaired bit-identical, unrepairable→PAR_FAILURE, unpack+cleanup, script-error→SCRIPT_FAILURE, event-driven manager + restart-skip
-- ⬜ Direct unpack (`unrar -vp` volume feed during download)
-- ⬜ par-rename / rar-rename (obfuscated-name recovery)
-- ⬜ Per-job passwords + password-file retry loop
-- ⬜ Dupe handling (key/score/mode)
-- ⬜ Health-check actions on failure (park/delete per config)
+- ✅ par-rename / rar-rename: obfuscated posts recover real names before verify/unpack — par2 16k-MD5 catalog (obfuscated `.par2`s found by magic), RAR4/RAR5/7z/zip signatures, RAR5 internal volume numbers, evidence paths remapped so quick-verify still runs; e2e proves obfuscated → renamed → Intact
+- ✅ Per-job unpack passwords (`*Unpack:Password` job parameter, NZBGet convention) — e2e with a passworded archive
+- ✅ Dupe handling (key/score/mode): append carries DupeKey/Score/Mode onto the job; Score/All block against queue + history successes, Force overrides; rejects recorded as `DELETED/DUPE`; real dupe fields in listgroups/history
+- ✅ Health-check actions (`HealthCheck`: none/park/delete) — delete removes the failed download's files; recorded `FAILURE/HEALTH`
+- ⬜ Direct unpack (`unrar -vp` volume feed during download) — deferred (deep coupling with the download pipeline; unpack-after-download covers the outcome)
 - ⬜ Fixture suite extras: par2 damage matrices, multi-volume/passworded rar
 - ✅ C2: PP work-lease type + anti-affinity scheduling (a job downloaded on node B post-processes on node C) — see the cluster section
 - ⬜ C2 fixture extras: kill-mid-PP reclaim e2e (reclaim machinery itself is exercised by the download-lease tests)

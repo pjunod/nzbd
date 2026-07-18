@@ -436,3 +436,69 @@ fn resume_after_unclean_restart_refetches_nothing_done() {
 // tests are filtered out).
 #[allow(dead_code)]
 fn _hold(_: &Nserv, _: &GeneratedPost, _: PathBuf) {}
+
+/// URL job: the NZB is fetched over HTTP (local listener), then the job
+/// queues and downloads normally; a dead URL fails the job.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn url_jobs_fetch_then_download() {
+    use std::io::{Read as _, Write as _};
+    let data = prng_bytes(21, 60_000);
+    let post = build_post("urljob", &[("u.bin", data.clone())], 20_000);
+    let ns = NservBuilder::new().with_post(&post).start().await.unwrap();
+
+    // One-shot HTTP server handing out the NZB.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let http_port = listener.local_addr().unwrap().port();
+    let nzb = post.nzb.clone();
+    std::thread::spawn(move || {
+        let (mut s, _) = listener.accept().unwrap();
+        let mut buf = [0u8; 2048];
+        let _ = s.read(&mut buf);
+        let _ = s.write_all(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{nzb}",
+                nzb.len()
+            )
+            .as_bytes(),
+        );
+    });
+
+    let tmp = tempfile::tempdir().unwrap();
+    let engine = spawn_engine(tmp.path(), vec![server_def(1, ns.port(), 0, 4, 2)]).await;
+    let mut rx = engine.subscribe();
+    let id = engine
+        .add_url(
+            "urljob",
+            &format!("http://127.0.0.1:{http_port}/get.nzb"),
+            nzbd_engine::AddOpts::default(),
+        )
+        .await
+        .unwrap();
+    // Registered instantly in Fetching state.
+    assert!(engine
+        .snapshot()
+        .jobs
+        .iter()
+        .any(|j| j.id == id && matches!(j.status, JobStatus::Fetching)));
+
+    let (status, _) = wait_finished(&mut rx, id, 30).await;
+    assert_eq!(status, JobStatus::Completed);
+    assert_eq!(
+        std::fs::read(tmp.path().join("dest/urljob/u.bin")).unwrap(),
+        data
+    );
+
+    // Dead URL: job fails (history classification is FAILURE/FETCH,
+    // asserted at the PP layer).
+    let dead = engine
+        .add_url(
+            "deadjob",
+            "http://127.0.0.1:1/nope.nzb",
+            nzbd_engine::AddOpts::default(),
+        )
+        .await
+        .unwrap();
+    let (status, _) = wait_finished(&mut rx, dead, 30).await;
+    assert_eq!(status, JobStatus::Failed);
+    engine.shutdown().await;
+}

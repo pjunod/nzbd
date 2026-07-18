@@ -58,6 +58,7 @@ http-body-util = "0.1"
 quick-xml = "0.41"
 crc32fast = "1"
 base64 = "0.22"
+libc = "0.2"
 md-5 = "0.10"
 rusqlite = { version = "0.32", features = ["bundled"] }
 tracing = "0.1"

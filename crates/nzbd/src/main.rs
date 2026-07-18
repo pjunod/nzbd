@@ -127,6 +127,7 @@ fn post_config(cfg: &nzbd_config::Config, slots: usize) -> nzbd_post::manager::P
             .map(|p| nzbd_config::expand_home(p)),
         unpack: cfg.post.unpack,
         cleanup: cfg.post.cleanup,
+        health_action: nzbd_post::manager::HealthAction::parse(&cfg.post.health_action),
         slots,
         tool_timeout: Duration::from_secs(cfg.post.tool_timeout_secs.max(1)),
         script_timeout: Duration::from_secs(cfg.post.script_timeout_secs.max(1)),
@@ -251,6 +252,10 @@ fn run(config: Option<PathBuf>, bind: Option<String>) -> anyhow_lite::Result<()>
         retry_interval: Duration::from_secs(cfg.queue.retry_interval_secs),
         article_timeout: Duration::from_secs(cfg.queue.article_timeout_secs),
         propagation_delay: Duration::from_secs(cfg.queue.propagation_delay_mins as u64 * 60),
+        min_free_disk_bytes: cfg.queue.min_free_disk_mb * 1024 * 1024,
+        daily_quota_bytes: cfg.queue.daily_quota_mb * 1024 * 1024,
+        monthly_quota_bytes: cfg.queue.monthly_quota_mb * 1024 * 1024,
+        quota_start_day: cfg.queue.quota_start_day.clamp(1, 28),
         ..Tuning::default()
     };
 

@@ -850,6 +850,10 @@ name = "nzbd-engine"
 version = "0.1.0"
 dependencies = [
  "arc-swap",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "libc",
  "nzbd-nntp",
  "nzbd-nserv",
  "nzbd-nzb",
@@ -861,6 +865,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-rustls",
  "tokio-util",
  "tracing",
 ]

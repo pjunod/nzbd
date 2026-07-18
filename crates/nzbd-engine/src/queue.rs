@@ -106,7 +106,76 @@ impl QueueState {
         self.next_job_id += 1;
         let job_id = JobId(self.next_job_id);
         let category = category.or_else(|| parsed.meta.category.clone());
+        let files = self.build_files(parsed, pause_extra_pars);
 
+        let mut job = Job {
+            id: job_id,
+            kind: JobKind::Nzb,
+            name,
+            category,
+            priority,
+            dupe: DupeInfo::default(),
+            params: Vec::new(),
+            files,
+            totals: Default::default(),
+            status: JobStatus::Queued,
+        };
+        recompute_job_totals(&mut job);
+        self.jobs.push(job);
+        job_id
+    }
+
+    /// Register a URL job: no files yet, `Fetching` until the NZB arrives
+    /// (then [`QueueState::complete_url_fetch`] fills it in).
+    pub fn admit_url(
+        &mut self,
+        name: String,
+        url: &str,
+        category: Option<String>,
+        priority: i32,
+    ) -> JobId {
+        self.next_job_id += 1;
+        let job_id = JobId(self.next_job_id);
+        self.jobs.push(Job {
+            id: job_id,
+            kind: JobKind::Url,
+            name,
+            category,
+            priority,
+            dupe: DupeInfo::default(),
+            params: vec![("*URL".into(), url.to_string())],
+            files: Vec::new(),
+            totals: Default::default(),
+            status: JobStatus::Fetching,
+        });
+        job_id
+    }
+
+    /// The fetched NZB for a URL job: populate files and queue it.
+    pub fn complete_url_fetch(
+        &mut self,
+        job_id: JobId,
+        parsed: &ParsedNzb,
+        pause_extra_pars: bool,
+    ) -> bool {
+        let files = self.build_files(parsed, pause_extra_pars);
+        let meta_category = parsed.meta.category.clone();
+        let Some(job) = self.job_mut(job_id) else {
+            return false;
+        };
+        if !matches!(job.status, JobStatus::Fetching) {
+            return false;
+        }
+        if job.category.is_none() {
+            job.category = meta_category;
+        }
+        job.files = files;
+        job.status = JobStatus::Queued;
+        recompute_job_totals(job);
+        true
+    }
+
+    fn build_files(&mut self, parsed: &ParsedNzb, pause_extra_pars: bool) -> Vec<FileEntry> {
         let mut files = Vec::with_capacity(parsed.files.len());
         let mut seen_names: HashMap<String, u32> = HashMap::new();
         for pf in &parsed.files {
@@ -146,22 +215,7 @@ impl QueueState {
                 finalized: false,
             });
         }
-
-        let mut job = Job {
-            id: job_id,
-            kind: JobKind::Nzb,
-            name,
-            category,
-            priority,
-            dupe: DupeInfo::default(),
-            params: Vec::new(),
-            files,
-            totals: Default::default(),
-            status: JobStatus::Queued,
-        };
-        recompute_job_totals(&mut job);
-        self.jobs.push(job);
-        job_id
+        files
     }
 
     // -- accounting ----------------------------------------------------------
@@ -260,6 +314,8 @@ pub struct SelectionCtx<'a> {
     pub article_retries: u8,
     pub now_unix: i64,
     pub propagation_delay_secs: i64,
+    /// Quota reached (or another soft hold): only force-priority jobs run.
+    pub soft_hold: bool,
 }
 
 pub struct SelectionResult {
@@ -284,7 +340,7 @@ pub fn next_for_server(
         .jobs
         .iter()
         .filter(|j| !ctx.delegated.contains_key(&j.id))
-        .filter(|j| job_schedulable(j, state.download_paused))
+        .filter(|j| job_schedulable(j, state.download_paused || ctx.soft_hold))
         .collect();
     order.sort_by(|a, b| b.priority.cmp(&a.priority).then(a.id.cmp(&b.id)));
 
@@ -467,6 +523,8 @@ mod tests {
             article_retries: 3,
             now_unix: 1_800_000_000,
             propagation_delay_secs: 0,
+
+            soft_hold: false,
         };
 
         let r = next_for_server(&q, &servers[0], &mut ctx);
@@ -482,6 +540,8 @@ mod tests {
             article_retries: 3,
             now_unix: 1_800_000_000,
             propagation_delay_secs: 0,
+
+            soft_hold: false,
         };
         assert!(next_for_server(&q, &servers[0], &mut ctx).lease.is_none());
 
@@ -495,6 +555,8 @@ mod tests {
             article_retries: 3,
             now_unix: 1_800_000_000,
             propagation_delay_secs: 0,
+
+            soft_hold: false,
         };
         let r = next_for_server(&q, &servers[0], &mut ctx);
         assert_eq!(r.lease.unwrap().job, low, "force ignores global pause");
@@ -525,6 +587,8 @@ mod tests {
             article_retries: 3,
             now_unix: 1_800_000_000,
             propagation_delay_secs: 0,
+
+            soft_hold: false,
         };
         assert!(next_for_server(&q, &servers[1], &mut ctx).lease.is_none());
 
@@ -537,6 +601,8 @@ mod tests {
             article_retries: 3,
             now_unix: 1_800_000_000,
             propagation_delay_secs: 0,
+
+            soft_hold: false,
         };
         let r = next_for_server(&q, &servers[0], &mut ctx).lease.unwrap();
         assert_eq!(r.job, id);

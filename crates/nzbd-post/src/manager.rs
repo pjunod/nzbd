@@ -6,6 +6,7 @@
 //! recording the outcome in history and stamping the job so restarts never
 //! re-process. Stage parallelism follows `PostStrategy`.
 
+use crate::rename::{par_rename, rar_rename};
 use crate::script::{discover, ScriptHost};
 use crate::tools::{detect_archives, Extractors, Par2Tool};
 use crate::{par2, DownloadEvidence, PostError, RepairResult, VerifyResult};
@@ -24,6 +25,27 @@ use tokio_util::task::TaskTracker;
 /// `nzbd-types` so the engine snapshot and cluster scheduler see it too).
 pub use nzbd_types::PP_DONE_PARAM;
 
+/// What to do with a job that failed its health gate (NZBGet
+/// `HealthCheck`): keep the partial files (`None`/`Park` — the history
+/// entry records the failure either way) or delete them from disk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum HealthAction {
+    #[default]
+    None,
+    Park,
+    Delete,
+}
+
+impl HealthAction {
+    pub fn parse(s: &str) -> HealthAction {
+        match s.to_ascii_lowercase().as_str() {
+            "delete" => HealthAction::Delete,
+            "park" | "pause" => HealthAction::Park,
+            _ => HealthAction::None,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct PostConfig {
     pub par2_cmd: String,
@@ -32,6 +54,8 @@ pub struct PostConfig {
     pub scripts_dir: Option<PathBuf>,
     pub unpack: bool,
     pub cleanup: bool,
+    /// Action for health-gated failures (files on disk).
+    pub health_action: HealthAction,
     /// Concurrent PP jobs (PostStrategy: sequential=1, balanced=2,
     /// aggressive=3, rocket=6).
     pub slots: usize,
@@ -50,6 +74,7 @@ impl Default for PostConfig {
             scripts_dir: None,
             unpack: true,
             cleanup: true,
+            health_action: HealthAction::None,
             slots: 1,
             tool_timeout: Duration::from_secs(3600),
             script_timeout: Duration::from_secs(3600),
@@ -182,22 +207,45 @@ async fn manager_task(
                         if exported.as_ref().is_some_and(pp_done) {
                             continue; // already handled (rescan overlap)
                         }
+                        let fetch_failure = exported
+                            .as_ref()
+                            .map(|j| matches!(j.kind, nzbd_types::JobKind::Url) && j.files.is_empty())
+                            .unwrap_or(false);
+                        let fail_status = if fetch_failure {
+                            "FAILURE/FETCH"
+                        } else {
+                            "FAILURE/HEALTH"
+                        };
                         let entry = HistoryEntry {
                             job,
                             name,
                             category: exported.as_ref().and_then(|j| j.category.clone()),
                             final_dir: None,
-                            status: "FAILURE/HEALTH".into(),
+                            status: fail_status.into(),
                             size: exported.as_ref().map(|j| j.totals.size).unwrap_or(0),
                             health,
                             params: exported.as_ref().map(user_params).unwrap_or_default(),
+                            dupe_key: exported
+                                .as_ref()
+                                .map(|j| j.dupe.key.clone())
+                                .unwrap_or_default(),
+                            dupe_score: exported.as_ref().map(|j| j.dupe.score).unwrap_or(0),
                             completed_at_unix: now(),
                         };
                         let h = history.clone();
                         let _ = tokio::task::spawn_blocking(move || h.record(&entry)).await;
                         if let Some(mut fin) = exported {
-                            fin.params
-                                .push((PP_DONE_PARAM.into(), "FAILURE/HEALTH".into()));
+                            if cfg.health_action == HealthAction::Delete {
+                                let dir = dest_dir
+                                    .join(nzbd_engine::queue::sanitize_name(&fin.name));
+                                tracing::warn!(job = job.0, dir = %dir.display(),
+                                    "health check action: deleting failed download");
+                                let _ = tokio::task::spawn_blocking(move || {
+                                    std::fs::remove_dir_all(&dir)
+                                })
+                                .await;
+                            }
+                            fin.params.push((PP_DONE_PARAM.into(), fail_status.into()));
                             let _ = engine.import_job(fin, false, false).await;
                         }
                     }
@@ -313,14 +361,23 @@ fn now() -> i64 {
         .unwrap_or(0)
 }
 
-/// Evidence for quick verification straight from the engine's export.
-fn evidence_of(job: &Job, dir: &Path) -> Vec<DownloadEvidence> {
+/// Evidence for quick verification straight from the engine's export,
+/// with paths remapped through any de-obfuscation renames.
+fn evidence_of(
+    job: &Job,
+    dir: &Path,
+    renames: &std::collections::HashMap<PathBuf, PathBuf>,
+) -> Vec<DownloadEvidence> {
     job.files
         .iter()
-        .map(|f| DownloadEvidence {
-            path: dir.join(&f.filename),
-            crc32: f.crc32,
-            segment_crcs: Vec::new(),
+        .map(|f| {
+            let orig = dir.join(&f.filename);
+            let path = renames.get(&orig).cloned().unwrap_or(orig);
+            DownloadEvidence {
+                path,
+                crc32: f.crc32,
+                segment_crcs: Vec::new(),
+            }
         })
         .collect()
 }
@@ -367,6 +424,18 @@ pub async fn process_job_ctx(
     let staging = dir.join(format!(".pp.{}", ctx.tag));
     remove_stale_staging(&dir, &staging);
 
+    // ---- RENAME stage (par-rename, then rar-rename) ------------------------
+    // Obfuscated posts get their real names back before anything verifies
+    // or unpacks. Whole-file CRCs are content-addressed, so download
+    // evidence just needs its paths remapped.
+    set_stage(engine, job_id, PostStage::ParRename).await;
+    let mut renames = par_rename(&dir);
+    if cfg.unpack {
+        set_stage(engine, job_id, PostStage::RarRename).await;
+        renames.extend(rar_rename(&dir));
+    }
+    let rename_map: std::collections::HashMap<PathBuf, PathBuf> = renames.into_iter().collect();
+
     // ---- PAR stage ---------------------------------------------------------
     let par_tool = Par2Tool {
         cmd: cfg.par2_cmd.clone(),
@@ -376,7 +445,7 @@ pub async fn process_job_ctx(
     let mut par_did_repair = false;
     if let Some(set) = par2::load_dir(&dir)? {
         set_stage(engine, job_id, PostStage::ParVerify).await;
-        let quick = par2::quick_verify(&set, &evidence_of(&job, &dir));
+        let quick = par2::quick_verify(&set, &evidence_of(&job, &dir, &rename_map));
         if quick == VerifyResult::Intact {
             tracing::info!(job = job_id.0, "par quick-verify: intact (no data re-read)");
         } else if let Some(main) = set.main_path.clone() {
@@ -399,7 +468,11 @@ pub async fn process_job_ctx(
                 sevenzip_cmd: cfg.sevenzip_cmd.clone(),
                 timeout: cfg.tool_timeout,
             };
-            let password = None; // per-job passwords land with the meta plumbing
+            let password = job
+                .params
+                .iter()
+                .find(|(k, _)| k == "*Unpack:Password")
+                .map(|(_, v)| v.as_str());
             for (archive, kind) in &archives {
                 // Extraction is fenced: everything lands in the lease's
                 // staging dir and is renamed into place only on success
@@ -528,6 +601,8 @@ pub async fn process_job_ctx(
             size: fin.totals.size,
             health,
             params: user_params(&fin),
+            dupe_key: fin.dupe.key.clone(),
+            dupe_score: fin.dupe.score,
             completed_at_unix: now(),
         };
         // History first, stamp second: a crash in between re-runs PP (the

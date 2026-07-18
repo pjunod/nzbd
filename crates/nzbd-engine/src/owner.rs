@@ -41,7 +41,28 @@ pub(crate) enum QueueCommand {
         parsed: Box<ParsedNzb>,
         category: Option<String>,
         priority: i32,
+        dupe: Option<nzbd_types::DupeInfo>,
+        paused: bool,
         reply: oneshot::Sender<JobId>,
+    },
+    AddUrl {
+        name: String,
+        url: String,
+        category: Option<String>,
+        priority: i32,
+        dupe: Option<nzbd_types::DupeInfo>,
+        paused: bool,
+        reply: oneshot::Sender<JobId>,
+    },
+    CompleteUrlFetch {
+        job: JobId,
+        parsed: Box<ParsedNzb>,
+        reply: oneshot::Sender<bool>,
+    },
+    FailUrlFetch {
+        job: JobId,
+        error: String,
+        reply: oneshot::Sender<()>,
     },
     Pause {
         job: JobId,
@@ -252,6 +273,12 @@ pub(crate) struct Owner {
     up_since_unix: i64,
     dirty: bool,
     last_save: Instant,
+
+    /// Per-server volume counters + quota/disk guards.
+    volumes: crate::volumes::VolumeBook,
+    quota_reached: bool,
+    disk_low: bool,
+    guard_tick: u32,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -369,6 +396,10 @@ impl Owner {
             up_since_unix: unix_now(),
             dirty: false,
             last_save: Instant::now(),
+            volumes: crate::volumes::VolumeBook::load(state_dir, journal_suffix),
+            quota_reached: false,
+            disk_low: false,
+            guard_tick: 0,
         })
     }
 
@@ -398,6 +429,7 @@ impl Owner {
         if let Err(e) = self.journal.sync() {
             tracing::warn!(error = %e, "journal sync at shutdown failed");
         }
+        self.volumes.save_if_dirty();
         self.save_snapshot();
         if let Err(e) = self.marker.disarm() {
             tracing::warn!(error = %e, "could not clear unclean marker");
@@ -455,7 +487,7 @@ impl Owner {
                     len,
                     "segment written"
                 );
-                self.on_segment_written(job, file, seg_number, offset, len, crc, file_size)
+                self.on_segment_written(job, file, seg_number, offset, len, crc, file_size, server)
             }
             EngineMsg::SegmentFailed {
                 job,
@@ -494,6 +526,8 @@ impl Owner {
                 parsed,
                 category,
                 priority,
+                dupe,
+                paused,
                 reply,
             } => {
                 let id = self.state.admit_nzb(
@@ -503,12 +537,85 @@ impl Owner {
                     priority,
                     self.tuning.pause_extra_pars,
                 );
+                if let Some(j) = self.state.job_mut(id) {
+                    if let Some(dupe) = dupe {
+                        j.dupe = dupe;
+                    }
+                    if paused {
+                        j.status = JobStatus::Paused;
+                    }
+                }
                 tracing::info!(job = id.0, %name, "job added");
                 self.save_snapshot(); // adds are durable immediately
                 self.publish_now();
                 self.emit(Event::JobAdded { job: id, name });
                 self.bump_epoch();
                 let _ = reply.send(id);
+            }
+            QueueCommand::AddUrl {
+                name,
+                url,
+                category,
+                priority,
+                dupe,
+                paused,
+                reply,
+            } => {
+                let id = self.state.admit_url(name.clone(), &url, category, priority);
+                if let Some(j) = self.state.job_mut(id) {
+                    if let Some(dupe) = dupe {
+                        j.dupe = dupe;
+                    }
+                    if paused {
+                        j.params.push(("*AddPaused".into(), "yes".into()));
+                    }
+                }
+                tracing::info!(job = id.0, %name, %url, "url job added (fetching)");
+                self.save_snapshot();
+                self.publish_now();
+                self.emit(Event::JobAdded { job: id, name });
+                self.bump_epoch();
+                let _ = reply.send(id);
+            }
+            QueueCommand::CompleteUrlFetch { job, parsed, reply } => {
+                let ok = self
+                    .state
+                    .complete_url_fetch(job, &parsed, self.tuning.pause_extra_pars);
+                if ok {
+                    if let Some(j) = self.state.job_mut(job) {
+                        if let Some(pos) = j.params.iter().position(|(k, _)| k == "*AddPaused") {
+                            j.params.remove(pos);
+                            j.status = JobStatus::Paused;
+                        }
+                    }
+                    tracing::info!(job = job.0, "url fetch complete; queued");
+                    self.save_snapshot();
+                    self.publish_now();
+                    self.bump_epoch();
+                }
+                let _ = reply.send(ok);
+            }
+            QueueCommand::FailUrlFetch { job, error, reply } => {
+                let name = match self.state.job_mut(job) {
+                    Some(j) if matches!(j.status, JobStatus::Fetching) => {
+                        j.status = JobStatus::Failed;
+                        Some(j.name.clone())
+                    }
+                    _ => None,
+                };
+                if let Some(name) = name {
+                    tracing::warn!(job = job.0, %error, "url fetch failed");
+                    self.save_snapshot();
+                    self.publish_now();
+                    self.emit(Event::JobFinished {
+                        job,
+                        name,
+                        status: JobStatus::Failed,
+                        health: 0,
+                    });
+                    self.bump_epoch();
+                }
+                let _ = reply.send(());
             }
             QueueCommand::Pause { job, reply } => {
                 let ok = match self.state.job_mut(job) {
@@ -865,7 +972,7 @@ impl Owner {
     // -- scheduling ----------------------------------------------------------
 
     fn grant_work(&mut self, server_id: ServerId, max: usize) -> Vec<Lease> {
-        if self.is_blocked(server_id) {
+        if self.disk_low || self.is_blocked(server_id) {
             return Vec::new();
         }
         let servers = self.servers.clone();
@@ -892,6 +999,7 @@ impl Owner {
                 article_retries: self.tuning.article_retries,
                 now_unix: unix_now(),
                 propagation_delay_secs: self.tuning.propagation_delay.as_secs() as i64,
+                soft_hold: self.quota_reached,
             };
             let result = next_for_server(&self.state, server, &mut ctx);
             let exhausted = result.exhausted;
@@ -925,6 +1033,7 @@ impl Owner {
 
     // -- outcomes ------------------------------------------------------------
 
+    #[allow(clippy::too_many_arguments)]
     fn on_segment_written(
         &mut self,
         job: JobId,
@@ -934,7 +1043,10 @@ impl Owner {
         len: u32,
         crc: u32,
         file_size: u64,
+        server: ServerId,
     ) {
+        self.volumes
+            .add(server, len as u64, unix_now(), self.tuning.quota_start_day);
         let r = SegRef {
             job,
             file,
@@ -1346,7 +1458,55 @@ impl Owner {
 
     // -- tick / snapshot -----------------------------------------------------
 
+    /// Disk + quota guards, evaluated every 10 s (cluster-aware quota:
+    /// peers' volume files on the shared state dir are summed in).
+    fn update_guards(&mut self) {
+        if self.tuning.min_free_disk_bytes > 0 {
+            let free = crate::volumes::free_space(&self.dest_dir);
+            let was = self.disk_low;
+            self.disk_low = free < self.tuning.min_free_disk_bytes;
+            if self.disk_low != was {
+                if self.disk_low {
+                    tracing::warn!(
+                        free,
+                        floor = self.tuning.min_free_disk_bytes,
+                        "destination volume low on space — downloads held"
+                    );
+                } else {
+                    tracing::info!(free, "disk space recovered — downloads resume");
+                }
+                self.publish_now();
+            }
+        }
+        if self.tuning.daily_quota_bytes > 0 || self.tuning.monthly_quota_bytes > 0 {
+            let (day, month) = self
+                .volumes
+                .cluster_totals(unix_now(), self.tuning.quota_start_day);
+            let was = self.quota_reached;
+            self.quota_reached = (self.tuning.daily_quota_bytes > 0
+                && day >= self.tuning.daily_quota_bytes)
+                || (self.tuning.monthly_quota_bytes > 0
+                    && month >= self.tuning.monthly_quota_bytes);
+            if self.quota_reached != was {
+                tracing::warn!(
+                    day,
+                    month,
+                    reached = self.quota_reached,
+                    "download quota state changed"
+                );
+                self.publish_now();
+            }
+        }
+    }
+
     fn on_tick(&mut self) {
+        self.guard_tick = self.guard_tick.wrapping_add(1);
+        if self.guard_tick.is_multiple_of(10) {
+            self.update_guards();
+        }
+        if self.guard_tick.is_multiple_of(30) {
+            self.volumes.save_if_dirty();
+        }
         let rate = self.meter.tick();
 
         let now = Instant::now();
@@ -1416,6 +1576,8 @@ impl Owner {
                     critical_health: critical.0,
                     assigned_node: self.delegated.get(&j.id).cloned(),
                     pp_done: j.params.iter().any(|(k, _)| k == nzbd_types::PP_DONE_PARAM),
+                    dupe_key: j.dupe.key.clone(),
+                    dupe_score: j.dupe.score,
                 };
                 // Delegated jobs progress remotely; overlay heartbeat stats.
                 if let Some(m) = self.mirror.get(&j.id) {
@@ -1437,6 +1599,25 @@ impl Owner {
         let snap = QueueSnapshot {
             up_since_unix: self.up_since_unix,
             download_paused: self.state.download_paused,
+            quota_reached: self.quota_reached,
+            disk_low: self.disk_low,
+            server_volumes: {
+                let now_day = unix_now().div_euclid(86_400);
+                let mut v: Vec<crate::snapshot::ServerVolume> = self
+                    .volumes
+                    .doc()
+                    .servers
+                    .iter()
+                    .map(|(id, w)| crate::snapshot::ServerVolume {
+                        server: *id,
+                        total_bytes: w.total_bytes,
+                        day_bytes: if w.day_key == now_day { w.day_bytes } else { 0 },
+                        month_bytes: w.month_bytes,
+                    })
+                    .collect();
+                v.sort_by_key(|x| x.server);
+                v
+            },
             speed_limit_bps: self.state.speed_limit_bps,
             download_rate_bps: rate,
             session_downloaded_bytes: self.meter.total(),

@@ -31,12 +31,30 @@ pub struct JobSummary {
     pub assigned_node: Option<String>,
     /// Post-processing already finished (the `*PP:done` stamp is present).
     pub pp_done: bool,
+    /// Duplicate-detection metadata (empty key = no dupe tracking).
+    pub dupe_key: String,
+    pub dupe_score: i32,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ServerVolume {
+    pub server: u32,
+    pub total_bytes: u64,
+    pub day_bytes: u64,
+    pub month_bytes: u64,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct QueueSnapshot {
     pub up_since_unix: i64,
     pub download_paused: bool,
+    /// Daily/monthly quota exhausted (force-priority jobs still run).
+    pub quota_reached: bool,
+    /// Free space on the destination volume is below the floor — all
+    /// downloading is held.
+    pub disk_low: bool,
+    /// Per-server session/day/month volume counters (this node).
+    pub server_volumes: Vec<ServerVolume>,
     pub speed_limit_bps: Option<u64>,
     pub download_rate_bps: u64,
     pub session_downloaded_bytes: u64,

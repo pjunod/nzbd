@@ -435,3 +435,143 @@ async fn manager_event_driven_and_restart_safe() {
     tracker2.wait().await;
     engine.shutdown().await;
 }
+
+/// Fully obfuscated post: the payload arrives with a garbage name; the
+/// rename stage recovers it via the par2 16k-MD5 catalog, evidence paths
+/// remap, and the native quick check still proves the set.
+#[tokio::test]
+async fn obfuscated_names_recovered_then_quick_verified() {
+    let tmp = tempfile::tempdir().unwrap();
+    let engine = spawn_engine(tmp.path()).await;
+    let dir = tmp.path().join("dest/obfus");
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let data: Vec<u8> = (0..45_000u32).map(|i| ((i * 3) % 250) as u8).collect();
+    std::fs::write(dir.join("Real.Name.S01E02.mkv"), &data).unwrap();
+    par2_create(&dir, 4, &["Real.Name.S01E02.mkv"]);
+    // Obfuscate on disk, exactly as an obfuscated post downloads.
+    std::fs::rename(dir.join("Real.Name.S01E02.mkv"), dir.join("d41d8cd9")).unwrap();
+
+    let mut files = vec![file_entry(1, "d41d8cd9", Some(crc(&data)), false)];
+    files.extend(par2_entries(&dir, 2));
+    engine
+        .import_job(completed_job(7, "obfus", files), false, false)
+        .await
+        .unwrap();
+
+    let hist = history(tmp.path());
+    let out = process_job(
+        &engine,
+        &PostConfig::default(),
+        &hist,
+        &tmp.path().join("dest"),
+        JobId(7),
+    )
+    .await
+    .unwrap();
+    assert_eq!(out, PpFinal::Success);
+    assert_eq!(
+        std::fs::read(dir.join("Real.Name.S01E02.mkv")).unwrap(),
+        data,
+        "true name restored, bytes intact"
+    );
+    assert!(!dir.join("d41d8cd9").exists());
+    engine.shutdown().await;
+}
+
+/// Per-job password (`*Unpack:Password` parameter, NZBGet convention)
+/// reaches the extractor.
+#[tokio::test]
+async fn per_job_password_unlocks_archive() {
+    let tmp = tempfile::tempdir().unwrap();
+    let engine = spawn_engine(tmp.path()).await;
+    let dir = tmp.path().join("dest/locked");
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let inner = b"secret contents";
+    std::fs::write(dir.join("file.bin"), inner).unwrap();
+    let ok = std::process::Command::new("7z")
+        .args(["a", "-tzip", "-y", "-phunter2", "locked.zip", "file.bin"])
+        .current_dir(&dir)
+        .status()
+        .unwrap()
+        .success();
+    assert!(ok);
+    std::fs::remove_file(dir.join("file.bin")).unwrap();
+
+    let zip = std::fs::read(dir.join("locked.zip")).unwrap();
+    let files = vec![file_entry(1, "locked.zip", Some(crc(&zip)), false)];
+    let mut job = completed_job(8, "locked", files);
+    job.params
+        .push(("*Unpack:Password".into(), "hunter2".into()));
+    engine.import_job(job, false, false).await.unwrap();
+
+    let hist = history(tmp.path());
+    let out = process_job(
+        &engine,
+        &PostConfig::default(),
+        &hist,
+        &tmp.path().join("dest"),
+        JobId(8),
+    )
+    .await
+    .unwrap();
+    assert_eq!(out, PpFinal::Success);
+    assert_eq!(std::fs::read(dir.join("file.bin")).unwrap(), inner);
+    engine.shutdown().await;
+}
+
+/// HealthAction::Delete removes the failed download's files from disk.
+#[tokio::test]
+async fn health_action_delete_removes_files() {
+    use nzbd_post::manager::HealthAction;
+    let tmp = tempfile::tempdir().unwrap();
+    let engine = spawn_engine(tmp.path()).await;
+    let dir = tmp.path().join("dest/sick");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("partial.bin"), b"broken half-download").unwrap();
+
+    let hist = history(tmp.path());
+    let cancel = CancellationToken::new();
+    let tracker = TaskTracker::new();
+    spawn_post_manager(
+        engine.clone(),
+        PostConfig {
+            health_action: HealthAction::Delete,
+            ..PostConfig::default()
+        },
+        hist.clone(),
+        tmp.path().join("dest"),
+        None,
+        cancel.clone(),
+        &tracker,
+    );
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let files = vec![file_entry(1, "partial.bin", None, false)];
+    let mut job = completed_job(9, "sick", files);
+    job.status = JobStatus::Failed;
+    engine.import_job(job, false, true).await.unwrap();
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let recorded = hist
+            .list(10)
+            .unwrap()
+            .iter()
+            .any(|e| e.status == "FAILURE/HEALTH");
+        if recorded && !dir.exists() {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "health delete never happened (dir exists: {})",
+            dir.exists()
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    cancel.cancel();
+    tracker.close();
+    tracker.wait().await;
+    engine.shutdown().await;
+}

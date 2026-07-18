@@ -404,6 +404,11 @@ pub struct HistoryEntry {
     /// Job parameters at completion (drone ids, script settings, …).
     #[serde(default)]
     pub params: Vec<(String, String)>,
+    /// Duplicate-detection metadata (empty key = none).
+    #[serde(default)]
+    pub dupe_key: String,
+    #[serde(default)]
+    pub dupe_score: i32,
     pub completed_at_unix: i64,
 }
 

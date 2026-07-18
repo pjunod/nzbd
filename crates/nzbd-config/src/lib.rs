@@ -48,6 +48,9 @@ pub struct PostSection {
     pub cleanup: bool,
     /// NZBGet `PostStrategy`: sequential | balanced | aggressive | rocket.
     pub strategy: String,
+    /// What to do with health-gated failures: none | park | delete
+    /// (NZBGet `HealthCheck`).
+    pub health_action: String,
     pub tool_timeout_secs: u64,
     pub script_timeout_secs: u64,
     /// How long to wait for delayed par-block downloads during repair.
@@ -65,6 +68,7 @@ impl Default for PostSection {
             unpack: true,
             cleanup: true,
             strategy: "balanced".into(),
+            health_action: "none".into(),
             tool_timeout_secs: 3600,
             script_timeout_secs: 3600,
             par_fetch_timeout_secs: 600,
@@ -232,6 +236,11 @@ pub struct QueueConfig {
     pub propagation_delay_mins: u32,
     pub min_free_disk_mb: u64,
     pub speed_limit_kib: Option<u64>,
+    /// Daily/monthly download quotas in MB (0 = unlimited); NZBGet
+    /// `DailyQuota` / `MonthlyQuota` / `QuotaStartDay`.
+    pub daily_quota_mb: u64,
+    pub monthly_quota_mb: u64,
+    pub quota_start_day: u32,
 }
 
 impl Default for QueueConfig {
@@ -248,6 +257,9 @@ impl Default for QueueConfig {
             propagation_delay_mins: 0,
             min_free_disk_mb: 250,
             speed_limit_kib: None,
+            daily_quota_mb: 0,
+            monthly_quota_mb: 0,
+            quota_start_day: 1,
         }
     }
 }
@@ -675,6 +687,18 @@ pub fn import_nzbget_conf(content: &str) -> Result<(Config, ImportReport), Confi
                 cfg.queue.min_free_disk_mb = v.parse().unwrap_or(250);
                 Some("queue.min_free_disk_mb".into())
             }
+            "dailyquota" => {
+                cfg.queue.daily_quota_mb = v.parse().unwrap_or(0);
+                Some("queue.daily_quota_mb".into())
+            }
+            "monthlyquota" => {
+                cfg.queue.monthly_quota_mb = v.parse().unwrap_or(0);
+                Some("queue.monthly_quota_mb".into())
+            }
+            "quotastartday" => {
+                cfg.queue.quota_start_day = v.parse().unwrap_or(1);
+                Some("queue.quota_start_day".into())
+            }
             "downloadrate" => {
                 let kib: u64 = v.parse().unwrap_or(0);
                 cfg.queue.speed_limit_kib = (kib > 0).then_some(kib);
@@ -696,6 +720,10 @@ pub fn import_nzbget_conf(content: &str) -> Result<(Config, ImportReport), Confi
                 cfg.post.unpack = yes(&v);
                 Some("post.unpack".into())
             }
+            "healthcheck" => {
+                cfg.post.health_action = v.to_lowercase();
+                Some("post.health_action".into())
+            }
             "unpackcleanupdisk" => {
                 cfg.post.cleanup = yes(&v);
                 Some("post.cleanup".into())
@@ -715,7 +743,6 @@ pub fn import_nzbget_conf(content: &str) -> Result<(Config, ImportReport), Confi
             | "parrename"
             | "rarrename"
             | "directunpack"
-            | "healthcheck"
             | "scriptorder"
             | "extensions"
             | "shelloverride"
@@ -773,9 +800,6 @@ pub fn import_nzbget_conf(content: &str) -> Result<(Config, ImportReport), Confi
             | "skipwrite"
             | "rawarticle"
             | "articlereadchunksize"
-            | "monthlyquota"
-            | "quotastartday"
-            | "dailyquota"
             | "nzbdirinterval"
             | "nzbdirfilesage"
             | "dupescope" => {

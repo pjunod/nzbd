@@ -151,7 +151,11 @@ fn history_json(e: &HistoryEntry) -> Value {
         },
         "MoveStatus": "SUCCESS",
         "ScriptStatus": if status == "WARNING/SCRIPT" { "FAILURE" } else { "NONE" },
-        "DeleteStatus": if total == "DELETED" { "MANUAL" } else { "NONE" },
+        "DeleteStatus": match status {
+            "DELETED/DUPE" => "DUPE",
+            s if s.starts_with("DELETED") => "MANUAL",
+            _ => "NONE",
+        },
         "MarkStatus": "NONE",
         "UrlStatus": "NONE",
         "Parameters": params,
@@ -166,8 +170,8 @@ fn history_json(e: &HistoryEntry) -> Value {
         "ParTimeSec": 0,
         "RepairTimeSec": 0,
         "UnpackTimeSec": 0,
-        "DupeKey": "",
-        "DupeScore": 0,
+        "DupeKey": e.dupe_key,
+        "DupeScore": e.dupe_score,
         "DupeMode": "SCORE",
         "RetryData": false,
     })
@@ -304,7 +308,7 @@ fn status_json(state: &CompatState) -> Value {
         "ThreadCount": 1,
         "PostJobCount": post_jobs,
         "UrlCount": 0,
-        "QuotaReached": false,
+        "QuotaReached": snap.quota_reached,
         "NewsServers": [],
     })
 }
@@ -350,8 +354,8 @@ fn listgroups_json(state: &CompatState) -> Value {
                 "RemainingParCount": 0,
                 "Health": j.health,
                 "CriticalHealth": j.critical_health,
-                "DupeKey": "",
-                "DupeScore": 0,
+                "DupeKey": j.dupe_key,
+                "DupeScore": j.dupe_score,
                 "DupeMode": "SCORE",
                 "Parameters": [],
                 "ScriptStatuses": [],
@@ -373,41 +377,160 @@ fn listgroups_json(state: &CompatState) -> Value {
 async fn append(state: &CompatState, params: &Value) -> Result<Value, (i64, &'static str)> {
     let filename = p_str(params, 0);
     // Which positional form? v13+ carries content at [1]; legacy at [4].
-    let (content, category, priority, add_paused) = match decode_nzb(&p_str(params, 1)) {
+    let (content, category, priority, add_paused, dupe) = match classify_content(&p_str(params, 1))
+    {
         Some(c) => (
             Some(c),
             p_str(params, 2),
             p_i64(params, 3) as i32,
             p_bool(params, 5),
+            parse_dupe(params, 6),
         ),
         None => (
-            decode_nzb(&p_str(params, 4)),
+            classify_content(&p_str(params, 4)),
             p_str(params, 1),
             p_i64(params, 2) as i32,
             false,
+            None,
         ),
     };
     let Some(content) = content else {
-        tracing::warn!(%filename, "append: content is neither base64 NZB nor XML (URL jobs land later)");
+        tracing::warn!(%filename, "append: content is neither base64 NZB, raw XML, nor a URL");
         return Ok(json!(0));
     };
     let category = (!category.is_empty()).then_some(category);
-    match state
-        .engine
-        .add_nzb(&filename, &content, category, priority)
-        .await
-    {
-        Ok(id) => {
-            if add_paused {
-                let _ = state.engine.pause_job(id).await;
-            }
-            Ok(json!(id.0))
-        }
-        Err(e) => {
-            tracing::warn!(%filename, error = %e, "append failed");
-            Ok(json!(0))
+
+    // Duplicate check (NZBGet DupeCheck): a same-key success in history or
+    // a same-key job in the queue blocks the add (mode-dependent).
+    if let Some(d) = &dupe {
+        if is_duplicate(state, d).await {
+            tracing::info!(%filename, key = %d.key, "append rejected: duplicate");
+            record_dupe_reject(state, &filename, d).await;
+            return Ok(json!(0));
         }
     }
+
+    match content {
+        AppendContent::Nzb(bytes) => {
+            let opts = nzbd_engine::AddOpts {
+                category,
+                priority,
+                dupe: dupe.clone(),
+                paused: add_paused,
+            };
+            match state.engine.add_nzb_opts(&filename, &bytes, opts).await {
+                Ok(id) => Ok(json!(id.0)),
+                Err(e) => {
+                    tracing::warn!(%filename, error = %e, "append failed");
+                    Ok(json!(0))
+                }
+            }
+        }
+        AppendContent::Url(url) => {
+            let opts = nzbd_engine::AddOpts {
+                category,
+                priority,
+                dupe: dupe.clone(),
+                paused: add_paused,
+            };
+            match state.engine.add_url(&filename, &url, opts).await {
+                Ok(id) => Ok(json!(id.0)),
+                Err(e) => {
+                    tracing::warn!(%filename, error = %e, "append(url) failed");
+                    Ok(json!(0))
+                }
+            }
+        }
+    }
+}
+
+enum AppendContent {
+    Nzb(Vec<u8>),
+    Url(String),
+}
+
+/// NZBGet accepts base64 NZB content, raw XML, or an HTTP(S) URL in the
+/// content slot.
+fn classify_content(content: &str) -> Option<AppendContent> {
+    let t = content.trim();
+    if t.starts_with("http://") || t.starts_with("https://") {
+        return Some(AppendContent::Url(t.to_string()));
+    }
+    decode_nzb(content).map(AppendContent::Nzb)
+}
+
+fn parse_dupe(params: &Value, first: usize) -> Option<nzbd_types::DupeInfo> {
+    let key = p_str(params, first);
+    if key.is_empty() {
+        return None;
+    }
+    let score = p_i64(params, first + 1) as i32;
+    let mode = match p_str(params, first + 2).to_uppercase().as_str() {
+        "ALL" => nzbd_types::DupeMode::All,
+        "FORCE" => nzbd_types::DupeMode::Force,
+        _ => nzbd_types::DupeMode::Score,
+    };
+    Some(nzbd_types::DupeInfo {
+        key,
+        score,
+        mode: Some(mode),
+    })
+}
+
+/// True when the add must be rejected as a duplicate.
+async fn is_duplicate(state: &CompatState, d: &nzbd_types::DupeInfo) -> bool {
+    if d.mode == Some(nzbd_types::DupeMode::Force) {
+        return false;
+    }
+    // Queue: a live same-key job blocks (Score: only an equal-or-better one).
+    let snap = state.engine.snapshot();
+    let queue_hit = snap.jobs.iter().any(|j| {
+        j.dupe_key == d.key
+            && !matches!(j.status, JobStatus::Failed | JobStatus::Deleted)
+            && (d.mode == Some(nzbd_types::DupeMode::All) || j.dupe_score >= d.score)
+    });
+    if queue_hit {
+        return true;
+    }
+    // History: a same-key SUCCESS blocks (Score: equal-or-better only).
+    let Some(db) = &state.history else {
+        return false;
+    };
+    let db = db.clone();
+    let entries = tokio::task::spawn_blocking(move || {
+        let _ = db.refresh();
+        db.list(1000)
+    })
+    .await;
+    match entries {
+        Ok(Ok(entries)) => entries.iter().any(|e| {
+            e.dupe_key == d.key
+                && e.status.starts_with("SUCCESS")
+                && (d.mode == Some(nzbd_types::DupeMode::All) || e.dupe_score >= d.score)
+        }),
+        _ => false,
+    }
+}
+
+/// The rejected duplicate shows up in history as `DELETED/DUPE` (so *arr
+/// clients see a terminal state instead of a silent swallow).
+async fn record_dupe_reject(state: &CompatState, filename: &str, d: &nzbd_types::DupeInfo) {
+    let Some(db) = &state.history else { return };
+    let entry = HistoryEntry {
+        job: JobId(0),
+        name: filename.trim_end_matches(".nzb").to_string(),
+        category: None,
+        final_dir: None,
+        status: "DELETED/DUPE".into(),
+        size: 0,
+        health: 1000,
+        params: vec![],
+        dupe_key: d.key.clone(),
+        dupe_score: d.score,
+        completed_at_unix: nowish(),
+    };
+    let db = db.clone();
+    let _ = tokio::task::spawn_blocking(move || db.record(&entry)).await;
 }
 
 async fn history(state: &CompatState) -> Result<Value, (i64, &'static str)> {
@@ -517,6 +640,8 @@ async fn delete_to_history(state: &CompatState, id: JobId, with_files: bool) -> 
                     .filter(|(k, _)| !k.starts_with('*'))
                     .cloned()
                     .collect(),
+                dupe_key: job.dupe.key.clone(),
+                dupe_score: job.dupe.score,
                 completed_at_unix: nowish(),
             };
             let db = db.clone();
@@ -796,6 +921,8 @@ mod tests {
                 size: 5 << 32, // exercise the Hi word
                 health: 1000,
                 params: vec![],
+                dupe_key: String::new(),
+                dupe_score: 0,
                 completed_at_unix: 100 + native.len() as i64,
             })
             .unwrap();
@@ -850,6 +977,113 @@ mod tests {
             .await
             .unwrap();
         assert!(!state.engine.snapshot().download_paused);
+        state.engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn dupe_check_blocks_and_force_overrides() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state(&tmp).await;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(NZB);
+
+        // Seed history: a SUCCESS with key "show-s01e01" score 100.
+        state
+            .history
+            .as_ref()
+            .unwrap()
+            .record(&HistoryEntry {
+                job: JobId(90),
+                name: "prior".into(),
+                category: None,
+                final_dir: Some("/dest/prior".into()),
+                status: "SUCCESS".into(),
+                size: 1,
+                health: 1000,
+                params: vec![],
+                dupe_key: "show-s01e01".into(),
+                dupe_score: 100,
+                completed_at_unix: 50,
+            })
+            .unwrap();
+
+        // Same key, lower score, mode SCORE → rejected (returns 0) and a
+        // DELETED/DUPE history row appears.
+        let params = json!([
+            "dup.nzb",
+            b64,
+            "",
+            0,
+            false,
+            false,
+            "show-s01e01",
+            50,
+            "SCORE"
+        ]);
+        assert_eq!(dispatch(&state, "append", &params).await.unwrap(), json!(0));
+        let hist = dispatch(&state, "history", &json!([false])).await.unwrap();
+        assert!(hist
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|h| h["Status"] == "DELETED/DUPE" && h["DeleteStatus"] == "DUPE"));
+
+        // Higher score → accepted.
+        let params = json!([
+            "better.nzb",
+            b64,
+            "",
+            0,
+            false,
+            false,
+            "show-s01e01",
+            150,
+            "SCORE"
+        ]);
+        let id = dispatch(&state, "append", &params).await.unwrap();
+        assert!(id.as_i64().unwrap() > 0, "higher score passes: {id}");
+
+        // Same key again while the better one sits in the QUEUE → rejected.
+        let params = json!([
+            "again.nzb",
+            b64,
+            "",
+            0,
+            false,
+            false,
+            "show-s01e01",
+            150,
+            "SCORE"
+        ]);
+        assert_eq!(dispatch(&state, "append", &params).await.unwrap(), json!(0));
+
+        // FORCE overrides everything.
+        let params = json!([
+            "forced.nzb",
+            b64,
+            "",
+            0,
+            false,
+            false,
+            "show-s01e01",
+            1,
+            "FORCE"
+        ]);
+        assert!(
+            dispatch(&state, "append", &params)
+                .await
+                .unwrap()
+                .as_i64()
+                .unwrap()
+                > 0
+        );
+
+        // Queue groups expose the dupe metadata.
+        let groups = dispatch(&state, "listgroups", &Value::Null).await.unwrap();
+        assert!(groups
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|g| g["DupeKey"] == "show-s01e01" && g["DupeScore"] == 150));
         state.engine.shutdown().await;
     }
 

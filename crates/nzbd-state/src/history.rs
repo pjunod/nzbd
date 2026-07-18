@@ -55,6 +55,8 @@ impl HistoryDb {
                  size INTEGER NOT NULL,
                  health INTEGER NOT NULL DEFAULT 1000,
                  params TEXT NOT NULL DEFAULT '[]',
+                 dupe_key TEXT NOT NULL DEFAULT '',
+                 dupe_score INTEGER NOT NULL DEFAULT 0,
                  completed_at INTEGER NOT NULL,
                  UNIQUE(job_id, completed_at)
              );",
@@ -64,6 +66,14 @@ impl HistoryDb {
         // column" — the JSONL stays authoritative either way).
         let _ = conn.execute(
             "ALTER TABLE history ADD COLUMN params TEXT NOT NULL DEFAULT '[]'",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE history ADD COLUMN dupe_key TEXT NOT NULL DEFAULT ''",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE history ADD COLUMN dupe_score INTEGER NOT NULL DEFAULT 0",
             [],
         );
 
@@ -150,8 +160,9 @@ impl HistoryDb {
         let n = conn
             .execute(
                 "INSERT OR IGNORE INTO history
-                 (job_id, name, category, final_dir, status, size, health, params, completed_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                 (job_id, name, category, final_dir, status, size, health, params,
+                  dupe_key, dupe_score, completed_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                 rusqlite::params![
                     entry.job.0,
                     entry.name,
@@ -161,6 +172,8 @@ impl HistoryDb {
                     entry.size as i64,
                     entry.health as i64,
                     serde_json::to_string(&entry.params).unwrap_or_else(|_| "[]".into()),
+                    entry.dupe_key,
+                    entry.dupe_score,
                     entry.completed_at_unix,
                 ],
             )
@@ -190,7 +203,8 @@ impl HistoryDb {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn
             .prepare(
-                "SELECT job_id, name, category, final_dir, status, size, health, params, completed_at
+                "SELECT job_id, name, category, final_dir, status, size, health, params,
+                        dupe_key, dupe_score, completed_at
                  FROM history ORDER BY completed_at DESC, id DESC LIMIT ?1",
             )
             .map_err(|e| StateError::Corrupt(e.to_string()))?;
@@ -206,7 +220,9 @@ impl HistoryDb {
                     size: r.get::<_, i64>(5)? as u64,
                     health: r.get::<_, i64>(6)? as u16,
                     params: serde_json::from_str(&params).unwrap_or_default(),
-                    completed_at_unix: r.get(8)?,
+                    dupe_key: r.get(8)?,
+                    dupe_score: r.get::<_, i64>(9)? as i32,
+                    completed_at_unix: r.get(10)?,
                 })
             })
             .map_err(|e| StateError::Corrupt(e.to_string()))?;
@@ -240,6 +256,8 @@ mod tests {
             size: 1000,
             health: 1000,
             params: vec![("drone".into(), "abc123".into())],
+            dupe_key: String::new(),
+            dupe_score: 0,
             completed_at_unix: at,
         }
     }

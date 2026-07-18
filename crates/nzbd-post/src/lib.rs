@@ -18,6 +18,7 @@ use std::path::PathBuf;
 
 pub mod manager;
 pub mod par2;
+pub mod rename;
 pub mod script;
 pub mod tools;
 
