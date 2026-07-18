@@ -87,7 +87,7 @@ performance work and operator actions
 - ✅ First Coverage run on GitHub succeeded (it published the `badges` branch)
 - ✅ 87 tests / 87.3% line coverage (local measurement matching CI methodology)
 - 👤 Branch protection on `main` requiring Tests/Lint/Coverage (repo Settings)
-- 👤 Badge rendering decision: badges don't render on a **private** repo README (GitHub proxies images anonymously). Either make the repo public (current setup then works as-is) or ask for the private-repo rework (CI commits relative-path SVGs to `main`)
+- ✅ Badge rendering decision (2026-07-18): **repo goes public** — the badges-branch + raw-URL setup then works as-is, no code changes. Flip: repo Settings → General → Danger Zone → Change visibility
 
 ## Phase 2 — Post-processing ✅ complete
 
@@ -156,6 +156,6 @@ performance work and operator actions
 - ✅ Enable hooks on your clone (done — your pre-push ran the suite)
 - ⬜ Optional: `brew install par2 p7zip` for full local test coverage (without them the tool-backed tests self-skip; CI always runs them)
 - ⬜ Branch protection for `main`
-- ⬜ Repo visibility / badge-rendering decision (see CI section)
+- ⬜ Flip repo to public (decided 2026-07-18; Settings → Danger Zone → Change visibility) — Coverage/Test-count badges render once flipped
 - ⬜ Real-provider download smoke test
 - ⬜ Real-Gluster cluster soak (CLUSTERING.md §11)
