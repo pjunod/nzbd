@@ -216,10 +216,6 @@ mod tests {
     use super::*;
     use std::process::Command;
 
-    fn have_par2() -> bool {
-        Command::new("par2").arg("-V").output().is_ok()
-    }
-
     fn crc(data: &[u8]) -> u32 {
         let mut h = crc32fast::Hasher::new();
         h.update(data);
@@ -235,8 +231,8 @@ mod tests {
 
     #[test]
     fn parse_and_quick_verify_real_par2() {
-        if !have_par2() {
-            panic!("par2 binary required for tests (apt-get install par2)");
+        if !crate::tools::require_tool("par2") {
+            return;
         }
         let tmp = tempfile::tempdir().unwrap();
         let data: Vec<u8> = (0..50_000u32).map(|i| (i * 31 % 251) as u8).collect();

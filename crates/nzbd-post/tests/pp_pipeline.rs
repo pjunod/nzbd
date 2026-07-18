@@ -66,6 +66,27 @@ fn history(dir: &Path) -> Arc<HistoryDb> {
     Arc::new(HistoryDb::open(&dir.join("history.sqlite"), Some(dir)).unwrap())
 }
 
+/// Probe for an external tool; on a miss the calling test self-skips with a
+/// notice. `NZBD_REQUIRE_TOOLS` (set in CI) turns the miss into a loud
+/// failure so CI can never silently lose coverage.
+fn require_tool(tool: &str) -> bool {
+    let found = std::process::Command::new(tool)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok();
+    if found {
+        return true;
+    }
+    if std::env::var_os("NZBD_REQUIRE_TOOLS").is_some() {
+        panic!("`{tool}` is required because NZBD_REQUIRE_TOOLS is set — install it in this environment");
+    }
+    eprintln!(
+        "SKIPPED: `{tool}` not installed — `brew install par2 p7zip` / `apt-get install par2 p7zip-full` for full local coverage"
+    );
+    false
+}
+
 /// par2-create a recovery set for `files` inside `dir`.
 fn par2_create(dir: &Path, blocks: u32, files: &[&str]) {
     let mut args = vec![
@@ -114,6 +135,9 @@ fn par2_entries(dir: &Path, first_id: u32) -> Vec<FileEntry> {
 /// redirects the final dir via `[NZB] FINALDIR=`.
 #[tokio::test]
 async fn intact_quick_path_then_script() {
+    if !require_tool("par2") {
+        return;
+    }
     let tmp = tempfile::tempdir().unwrap();
     let engine = spawn_engine(tmp.path()).await;
     let dir = tmp.path().join("dest/myjob");
@@ -177,6 +201,9 @@ async fn intact_quick_path_then_script() {
 /// and the original bytes come back.
 #[tokio::test]
 async fn corrupt_payload_gets_repaired() {
+    if !require_tool("par2") {
+        return;
+    }
     let tmp = tempfile::tempdir().unwrap();
     let engine = spawn_engine(tmp.path()).await;
     let dir = tmp.path().join("dest/damaged");
@@ -220,6 +247,9 @@ async fn corrupt_payload_gets_repaired() {
 /// PAR_FAILURE, job marked Failed.
 #[tokio::test]
 async fn unrepairable_is_par_failure() {
+    if !require_tool("par2") {
+        return;
+    }
     let tmp = tempfile::tempdir().unwrap();
     let engine = spawn_engine(tmp.path()).await;
     let dir = tmp.path().join("dest/hopeless");
@@ -264,6 +294,9 @@ async fn unrepairable_is_par_failure() {
 /// Archive job: unpack extracts, cleanup removes the archive husks.
 #[tokio::test]
 async fn unpack_then_cleanup() {
+    if !require_tool("7z") {
+        return;
+    }
     let tmp = tempfile::tempdir().unwrap();
     let engine = spawn_engine(tmp.path()).await;
     let dir = tmp.path().join("dest/packed");
@@ -441,6 +474,9 @@ async fn manager_event_driven_and_restart_safe() {
 /// remap, and the native quick check still proves the set.
 #[tokio::test]
 async fn obfuscated_names_recovered_then_quick_verified() {
+    if !require_tool("par2") {
+        return;
+    }
     let tmp = tempfile::tempdir().unwrap();
     let engine = spawn_engine(tmp.path()).await;
     let dir = tmp.path().join("dest/obfus");
@@ -483,6 +519,9 @@ async fn obfuscated_names_recovered_then_quick_verified() {
 /// reaches the extractor.
 #[tokio::test]
 async fn per_job_password_unlocks_archive() {
+    if !require_tool("7z") {
+        return;
+    }
     let tmp = tempfile::tempdir().unwrap();
     let engine = spawn_engine(tmp.path()).await;
     let dir = tmp.path().join("dest/locked");

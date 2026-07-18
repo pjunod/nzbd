@@ -269,6 +269,30 @@ impl Extractors {
     }
 }
 
+/// Test-only probe for an external tool. Returns `false` — and the calling
+/// test self-skips with a notice — when the binary is missing, so a laptop
+/// without `par2`/`7z` still passes the suite. Setting `NZBD_REQUIRE_TOOLS`
+/// (CI does) turns a missing tool into a loud failure instead, so CI can
+/// never silently lose coverage.
+#[cfg(test)]
+pub(crate) fn require_tool(tool: &str) -> bool {
+    let found = std::process::Command::new(tool)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok();
+    if found {
+        return true;
+    }
+    if std::env::var_os("NZBD_REQUIRE_TOOLS").is_some() {
+        panic!("`{tool}` is required because NZBD_REQUIRE_TOOLS is set — install it in this environment");
+    }
+    eprintln!(
+        "SKIPPED: `{tool}` not installed — `brew install par2 p7zip` / `apt-get install par2 p7zip-full` for full local coverage"
+    );
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -322,6 +346,9 @@ mod tests {
 
     #[tokio::test]
     async fn sevenzip_zip_roundtrip_and_wrong_password() {
+        if !require_tool("7z") {
+            return;
+        }
         let tmp = tempfile::tempdir().unwrap();
         let src = tmp.path().join("in");
         std::fs::create_dir(&src).unwrap();

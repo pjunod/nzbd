@@ -7,6 +7,9 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # External-tool tests (par2, 7z) self-skip on machines without the
+  # binaries; in CI a missing tool must be a failure, never a skip.
+  NZBD_REQUIRE_TOOLS: 1
 
 permissions:
   contents: write # force-push the badges branch (main pushes only)
@@ -24,6 +27,8 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-llvm-cov
+      - name: install PP tools (par2, 7z)
+        run: sudo apt-get update && sudo apt-get install -y par2 p7zip-full
 
       - name: run instrumented test suite
         run: |

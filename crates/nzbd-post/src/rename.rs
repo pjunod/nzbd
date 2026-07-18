@@ -266,6 +266,9 @@ mod tests {
 
     #[test]
     fn par_rename_recovers_obfuscated_names() {
+        if !crate::tools::require_tool("par2") {
+            return;
+        }
         let tmp = tempfile::tempdir().unwrap();
         let data: Vec<u8> = (0..50_000u32).map(|i| (i % 251) as u8).collect();
         std::fs::write(tmp.path().join("Great.Movie.2026.mkv"), &data).unwrap();

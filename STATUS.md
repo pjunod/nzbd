@@ -83,6 +83,7 @@ performance work and operator actions
 - ✅ Workflows: **Tests** (full suite + MSRV 1.85), **Lint** (fmt + clippy -D warnings), **Coverage** (cargo-llvm-cov → self-hosted badges → `badges` branch + lcov/HTML artifact)
 - ✅ Git hooks (`.githooks/`): pre-commit fmt, pre-push clippy + tests — `git config core.hooksPath .githooks`
 - ✅ rustfmt enforced workspace-wide; clippy zero warnings; MSRV verified
+- ✅ External-tool tests (par2/7z fixtures) self-skip with a notice on machines without the binaries, so the pre-push hook passes on a stock Mac; CI installs the tools and sets `NZBD_REQUIRE_TOOLS=1` so a skip there is a hard failure — `brew install par2 p7zip` for full local coverage
 - ✅ First Coverage run on GitHub succeeded (it published the `badges` branch)
 - ✅ 87 tests / 87.3% line coverage (local measurement matching CI methodology)
 - 👤 Branch protection on `main` requiring Tests/Lint/Coverage (repo Settings)
@@ -152,7 +153,8 @@ performance work and operator actions
 ## Operator checklist 👤
 
 - ✅ Push `main` (done — CI ran; `badges` branch is CI-owned, never push it: `git branch -D badges && git fetch --prune`)
-- ⬜ Enable hooks on your clone: `git config core.hooksPath .githooks`
+- ✅ Enable hooks on your clone (done — your pre-push ran the suite)
+- ⬜ Optional: `brew install par2 p7zip` for full local test coverage (without them the tool-backed tests self-skip; CI always runs them)
 - ⬜ Branch protection for `main`
 - ⬜ Repo visibility / badge-rendering decision (see CI section)
 - ⬜ Real-provider download smoke test

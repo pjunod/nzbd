@@ -15,6 +15,27 @@ use tokio_util::sync::CancellationToken;
 
 const SECRET: &str = "test-cluster-secret";
 
+/// Probe for an external tool; on a miss the calling test self-skips with a
+/// notice. `NZBD_REQUIRE_TOOLS` (set in CI) turns the miss into a loud
+/// failure so CI can never silently lose coverage.
+fn require_tool(tool: &str) -> bool {
+    let found = std::process::Command::new(tool)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok();
+    if found {
+        return true;
+    }
+    if std::env::var_os("NZBD_REQUIRE_TOOLS").is_some() {
+        panic!("`{tool}` is required because NZBD_REQUIRE_TOOLS is set — install it in this environment");
+    }
+    eprintln!(
+        "SKIPPED: `{tool}` not installed — `brew install par2 p7zip` / `apt-get install par2 p7zip-full` for full local coverage"
+    );
+    false
+}
+
 fn server_def(port: u16, connections: u16) -> ServerDef {
     ServerDef {
         id: ServerId(1),
@@ -599,6 +620,9 @@ async fn pp_runs_on_idle_node_via_anti_affinity() {
     // must hand post-processing to the idle non-download node, which
     // quick-verifies natively, stamps the job, appends shared-volume
     // history and returns the finished job to the leader.
+    if !require_tool("par2") {
+        return;
+    }
     let tmp = tempfile::tempdir().unwrap();
 
     let src = tempfile::tempdir().unwrap();
