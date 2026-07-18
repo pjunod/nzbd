@@ -1562,10 +1562,11 @@ impl Owner {
 
     fn on_tick(&mut self) {
         self.guard_tick = self.guard_tick.wrapping_add(1);
-        if self.guard_tick.is_multiple_of(10) {
+        // NOT `is_multiple_of`: stabilized in 1.87, MSRV is 1.85.
+        if self.guard_tick % 10 == 0 {
             self.update_guards();
         }
-        if self.guard_tick.is_multiple_of(30) {
+        if self.guard_tick % 30 == 0 {
             self.volumes.save_if_dirty();
         }
         let rate = self.meter.tick();
