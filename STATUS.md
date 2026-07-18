@@ -8,8 +8,10 @@ roadmaps in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) §16 and
 Legend: ✅ done (implemented, tested, committed) · 🔶 partial · ⬜ not
 started · 👤 operator action (Paul)
 
-**Snapshot (2026-07-17):** 143 tests · clippy clean · phases 0–4 and
-cluster C1+C2 complete · next up: **phase 5 (beyond parity) + C3**
+**Snapshot (2026-07-17):** 145 tests · clippy clean · **phases 0–4
+complete, cluster C1+C2 complete, phase 5 partial** — the NZBGet parity
+surface is done end to end; what remains is beyond-parity performance
+work and operator actions
 
 | Phase | State | Evidence |
 |---|---|---|
@@ -22,8 +24,8 @@ cluster C1+C2 complete · next up: **phase 5 (beyond parity) + C3**
 | 3a — *arr compat core | ✅ complete | `3793ad8` |
 | 3b — importer · auth · SSE · metrics | ✅ complete | `e00990c`, `b4c422d` |
 | 3c — compat C2 + XML-RPC + golden tests | ✅ complete | `fe6d2be` |
-| 4 — Web UI + ecosystem | ✅ complete | this commit |
-| 5 — Beyond parity (+ C3) | ⬜ | — |
+| 4 — Web UI + ecosystem | ✅ complete | `77b7660` |
+| 5 — Beyond parity (+ C3) | 🔶 adaptive pipelining done; rest scoped | this commit |
 
 ---
 
@@ -135,9 +137,16 @@ cluster C1+C2 complete · next up: **phase 5 (beyond parity) + C3**
 - ⬜ Extension manager UI · RSS feeds + filter language — the last parity-surface item (NZBGet's RSS engine is its own subsystem); scheduled next
 - ⬜ Windows packaging — engine code is Unix-portable except statvfs; needs a Windows CI leg
 
-## Phase 5 — Beyond parity ⬜
+## Phase 5 — Beyond parity 🔶
 
-- ⬜ Native Rust par2 repair swap-in · io_uring file I/O · article-streaming/mount groundwork · per-provider adaptive pipelining · cluster C3
+- ✅ Per-provider adaptive pipelining: AIMD depth controller per connection — climbs one step after sustained clean batches, halves on connection failure; configured `pipeline_depth` is the ceiling, 1 the floor. Weak providers settle low, healthy ones ride the ceiling (exercised by the full e2e suite)
+- ⬜ Native Rust par2 repair swap-in — the GF(2^16) Reed-Solomon engine is a project of its own; the subprocess boundary (`Par2Tool`) was designed for exactly this swap
+- ⬜ COMPRESS DEFLATE (RFC 8054) — carried from phase 1; single-digit % on yEnc bodies
+- ⬜ io_uring file I/O — blocked on tokio-uring maturity; DirectWrite already avoids the copy-heavy paths
+- ⬜ Article-streaming / mount-mode groundwork — design work first (ARCHITECTURE.md §15)
+- ⬜ Cluster C3: segment-split downloads, weighted scheduling, budget rebalancing — the lease protocol carries a `kind` field so a `Segment` lease slots in without wire changes
+- ⬜ RSS feeds + filter language + extension-manager UI (phase 4 carry-over) — the last user-facing surface not yet built
+- ⬜ `rapidyenc-sys` FFI + differential fuzzing — scalar decoder saturates typical line rates today
 
 ## Operator checklist 👤
 

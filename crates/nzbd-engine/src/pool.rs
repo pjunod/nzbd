@@ -36,9 +36,54 @@ pub(crate) struct ConnCtx {
     pub idle_hold: Duration,
 }
 
+/// AIMD pipeline-depth controller (phase 5 "per-provider adaptive
+/// pipelining"): climb by one after a sustained run of clean articles,
+/// halve on any connection-level failure. The configured `pipeline_depth`
+/// is the ceiling; the floor is 1. Providers that can't sustain deep
+/// pipelines (drops, timeouts) settle low; healthy ones ride the ceiling.
+#[derive(Debug)]
+pub(crate) struct AdaptiveDepth {
+    cur: usize,
+    max: usize,
+    ok_run: usize,
+}
+
+impl AdaptiveDepth {
+    pub(crate) fn new(max: usize) -> AdaptiveDepth {
+        let max = max.max(1);
+        AdaptiveDepth {
+            // Start midway: deep enough to be fast out of the gate, shallow
+            // enough that a weak provider halves to sane quickly.
+            cur: max.div_ceil(2),
+            max,
+            ok_run: 0,
+        }
+    }
+
+    pub(crate) fn get(&self) -> usize {
+        self.cur
+    }
+
+    /// `n` articles completed cleanly on the connection.
+    pub(crate) fn on_success(&mut self, n: usize) {
+        self.ok_run += n;
+        // Additive increase after ~4 clean batches at the current depth.
+        if self.cur < self.max && self.ok_run >= self.cur * 4 {
+            self.cur += 1;
+            self.ok_run = 0;
+        }
+    }
+
+    /// Connection-level failure (death, timeout): multiplicative decrease.
+    pub(crate) fn on_error(&mut self) {
+        self.cur = (self.cur / 2).max(1);
+        self.ok_run = 0;
+    }
+}
+
 pub(crate) async fn connection_task(mut ctx: ConnCtx) {
     let mut conn: Option<NntpConnection> = None;
-    let depth = ctx.server.pipeline_depth.max(1) as usize;
+    let mut adaptive = AdaptiveDepth::new(ctx.server.pipeline_depth.max(1) as usize);
 
     loop {
         if ctx.cancel.is_cancelled() {
@@ -71,7 +116,7 @@ pub(crate) async fn connection_task(mut ctx: ConnCtx) {
             .engine_tx
             .send(EngineMsg::WorkRequest {
                 server: ctx.server.id,
-                max: depth,
+                max: adaptive.get(),
                 reply: reply_tx,
             })
             .await
@@ -130,6 +175,25 @@ pub(crate) async fn connection_task(mut ctx: ConnCtx) {
         let c = conn.as_mut().unwrap();
         if run_leases(c, &leases, &ctx).await.is_err() {
             conn = None; // connection is unusable; leases already reported
+            let before = adaptive.get();
+            adaptive.on_error();
+            if adaptive.get() != before {
+                tracing::debug!(
+                    server = %ctx.server.name,
+                    depth = adaptive.get(),
+                    "pipeline depth halved after connection failure"
+                );
+            }
+        } else {
+            let before = adaptive.get();
+            adaptive.on_success(leases.len());
+            if adaptive.get() != before {
+                tracing::debug!(
+                    server = %ctx.server.name,
+                    depth = adaptive.get(),
+                    "pipeline depth raised"
+                );
+            }
         }
     }
 
@@ -301,4 +365,42 @@ async fn stream_body(
         })
         .await;
     Ok(())
+}
+
+#[cfg(test)]
+mod adaptive_tests {
+    use super::AdaptiveDepth;
+
+    #[test]
+    fn climbs_on_sustained_success_and_halves_on_error() {
+        let mut a = AdaptiveDepth::new(8);
+        assert_eq!(a.get(), 4, "starts midway");
+        // Sustained clean batches climb one step at a time to the ceiling.
+        for _ in 0..200 {
+            let d = a.get();
+            a.on_success(d);
+        }
+        assert_eq!(a.get(), 8, "reaches the configured ceiling");
+        a.on_error();
+        assert_eq!(a.get(), 4);
+        a.on_error();
+        a.on_error();
+        assert_eq!(a.get(), 1, "floor is one");
+        // Recovery climbs again.
+        for _ in 0..200 {
+            let d = a.get();
+            a.on_success(d);
+        }
+        assert_eq!(a.get(), 8);
+    }
+
+    #[test]
+    fn depth_one_config_disables_adaptivity() {
+        let mut a = AdaptiveDepth::new(1);
+        assert_eq!(a.get(), 1);
+        a.on_success(100);
+        assert_eq!(a.get(), 1);
+        a.on_error();
+        assert_eq!(a.get(), 1);
+    }
 }
