@@ -163,6 +163,15 @@ async fn healthz() -> &'static str {
     "ok"
 }
 
+/// The embedded web UI (phase 4): one self-contained page, no build step.
+async fn ui_index() -> Response {
+    (
+        [(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        include_str!("../ui/index.html"),
+    )
+        .into_response()
+}
+
 async fn list_jobs(State(st): State<ApiState>) -> Response {
     let snap = st.engine.snapshot();
     Json(json!({ "jobs": snap.jobs })).into_response()
@@ -497,6 +506,7 @@ pub fn router_with(state: ApiState) -> Router {
         .route("/metrics", get(metrics))
         .route("/api/v1/openapi.json", get(openapi))
         .route("/healthz", get(healthz))
+        .route("/", get(ui_index))
         .with_state(state)
 }
 

@@ -1,0 +1,311 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>nzbd</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #f7f7f5; --panel: #ffffff; --ink: #111; --ink2: #555; --muted: #8a8a84;
+    --line: rgba(0,0,0,.09); --accent: #2a78d6; --ok: #0a7d0a; --warn: #b07800; --bad: #b3261e;
+    --track: #e8e8e4;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #101010; --panel: #191919; --ink: #f2f2f2; --ink2: #b9b9b3; --muted: #84847e;
+      --line: rgba(255,255,255,.10); --accent: #4a8fe0; --ok: #3fae3f; --warn: #d8a63a; --bad: #e05a52;
+      --track: #2a2a28;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink);
+         font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  .wrap { max-width: 1060px; margin: 0 auto; padding: 18px 16px 48px; }
+
+  header { display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap; }
+  header h1 { font-size: 20px; margin: 0; letter-spacing: -.01em; }
+  header .ver { color: var(--muted); font-size: 12px; }
+  header .spacer { flex: 1; }
+
+  .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+           gap: 8px; margin: 14px 0; }
+  .stat { background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
+          padding: 10px 12px; }
+  .stat .v { font-size: 19px; font-weight: 650; font-variant-numeric: tabular-nums; }
+  .stat .l { color: var(--ink2); font-size: 11.5px; margin-top: 1px; }
+
+  .badges { display: flex; gap: 6px; flex-wrap: wrap; }
+  .badge { font-size: 11px; font-weight: 600; border: 1px solid var(--line);
+           border-radius: 999px; padding: 2px 9px; color: var(--ink2); }
+  .badge.on-warn { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 50%, transparent); }
+  .badge.on-bad  { color: var(--bad);  border-color: color-mix(in srgb, var(--bad) 50%, transparent); }
+
+  .controls { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin: 6px 0 14px; }
+  button { background: var(--panel); color: var(--ink); border: 1px solid var(--line);
+           border-radius: 7px; padding: 6px 12px; font: inherit; font-size: 13px; cursor: pointer; }
+  button:hover { border-color: var(--accent); }
+  button.small { padding: 2px 9px; font-size: 12px; }
+  input[type=number] { width: 90px; background: var(--panel); color: var(--ink);
+           border: 1px solid var(--line); border-radius: 7px; padding: 6px 8px; font: inherit; }
+  label { color: var(--ink2); font-size: 12.5px; }
+
+  nav.tabs { display: flex; gap: 2px; border-bottom: 1px solid var(--line); margin-top: 6px; }
+  nav.tabs button { border: none; background: none; border-radius: 7px 7px 0 0;
+                    padding: 8px 14px; color: var(--ink2); }
+  nav.tabs button.active { color: var(--ink); font-weight: 650;
+                           box-shadow: inset 0 -2px 0 var(--accent); }
+
+  table { width: 100%; border-collapse: collapse; background: var(--panel);
+          border: 1px solid var(--line); border-radius: 8px; overflow: hidden;
+          margin-top: 12px; font-variant-numeric: tabular-nums; }
+  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--line);
+           vertical-align: middle; }
+  th { color: var(--ink2); font-size: 11.5px; font-weight: 600; text-transform: uppercase;
+       letter-spacing: .04em; }
+  tr:last-child td { border-bottom: none; }
+  td.num, th.num { text-align: right; }
+  td .name { font-weight: 550; word-break: break-word; }
+  td .sub { color: var(--muted); font-size: 12px; }
+
+  .meter { display: flex; align-items: center; gap: 8px; min-width: 140px; }
+  .meter .track { flex: 1; height: 7px; background: var(--track); border-radius: 4px; overflow: hidden; }
+  .meter .fill { height: 100%; background: var(--accent); border-radius: 4px 0 0 4px; }
+  .meter .fill.done { background: var(--ok); border-radius: 4px; }
+  .meter .pct { color: var(--ink2); font-size: 12px; min-width: 38px; text-align: right; }
+
+  .st { font-size: 11.5px; font-weight: 650; }
+  .st.ok { color: var(--ok); } .st.warn { color: var(--warn); }
+  .st.bad { color: var(--bad); } .st.dim { color: var(--muted); }
+
+  #logbox { background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
+            margin-top: 12px; padding: 10px 12px; max-height: 480px; overflow-y: auto;
+            font: 12px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace; }
+  #logbox .lg { white-space: pre-wrap; word-break: break-word; }
+  #logbox .k-ERROR { color: var(--bad); } #logbox .k-WARNING { color: var(--warn); }
+  #logbox .k-INFO { color: var(--ink); } #logbox .k-DETAIL { color: var(--muted); }
+  .empty { color: var(--muted); padding: 22px; text-align: center; }
+  footer { color: var(--muted); font-size: 11.5px; margin-top: 22px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>nzbd</h1>
+    <span class="ver" id="ver"></span>
+    <span class="spacer"></span>
+    <span class="badges" id="badges"></span>
+  </header>
+
+  <div class="stats">
+    <div class="stat"><div class="v" id="s-rate">—</div><div class="l">download rate</div></div>
+    <div class="stat"><div class="v" id="s-remaining">—</div><div class="l">remaining</div></div>
+    <div class="stat"><div class="v" id="s-session">—</div><div class="l">this session</div></div>
+    <div class="stat"><div class="v" id="s-active">—</div><div class="l">active / queued</div></div>
+  </div>
+
+  <div class="controls">
+    <button id="btn-pause">Pause queue</button>
+    <button id="btn-resume">Resume queue</button>
+    <label>Limit <input type="number" id="limit" min="0" step="128" placeholder="KiB/s">
+      <button class="small" id="btn-limit">set</button></label>
+    <span class="spacer" style="flex:1"></span>
+    <label style="font-size:11.5px" id="conn">connecting…</label>
+  </div>
+
+  <nav class="tabs">
+    <button data-tab="queue" class="active">Queue</button>
+    <button data-tab="history">History</button>
+    <button data-tab="logs">Logs</button>
+  </nav>
+
+  <section id="tab-queue">
+    <table>
+      <thead><tr><th>Job</th><th>Status</th><th style="width:220px">Progress</th>
+        <th class="num">Size</th><th class="num">Health</th><th style="width:150px"></th></tr></thead>
+      <tbody id="queue-body"><tr><td colspan="6" class="empty">loading…</td></tr></tbody>
+    </table>
+  </section>
+
+  <section id="tab-history" hidden>
+    <table>
+      <thead><tr><th>Job</th><th>Status</th><th class="num">Size</th>
+        <th>Finished</th><th>Location</th></tr></thead>
+      <tbody id="history-body"><tr><td colspan="5" class="empty">loading…</td></tr></tbody>
+    </table>
+  </section>
+
+  <section id="tab-logs" hidden>
+    <div id="logbox"><div class="empty">loading…</div></div>
+  </section>
+
+  <footer>nzbd — NZBGet-compatible usenet daemon · <a href="/api/v1/openapi.json" style="color:var(--muted)">API</a> · <a href="/metrics" style="color:var(--muted)">metrics</a></footer>
+</div>
+
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+
+function fmtBytes(n) {
+  if (n == null) return "—";
+  const u = ["B", "KiB", "MiB", "GiB", "TiB"];
+  let i = 0, v = Number(n);
+  while (v >= 1024 && i < u.length - 1) { v /= 1024; i++; }
+  return (i === 0 ? v : v.toFixed(v >= 100 ? 0 : 1)) + " " + u[i];
+}
+function fmtRate(bps) { return bps > 0 ? fmtBytes(bps) + "/s" : "0"; }
+function fmtTime(unix) {
+  if (!unix) return "—";
+  return new Date(unix * 1000).toLocaleString();
+}
+function esc(s) {
+  return String(s).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+}
+
+// ---- status -------------------------------------------------------------
+async function refreshStatus() {
+  const r = await fetch("/api/v1/status");
+  if (!r.ok) throw new Error("status " + r.status);
+  const s = await r.json();
+  $("ver").textContent = "v" + s.version;
+  $("s-rate").textContent = fmtRate(s.download_rate_bps);
+  $("s-remaining").textContent = fmtBytes(s.remaining_bytes);
+  $("s-session").textContent = fmtBytes(s.session_downloaded_bytes);
+  $("s-active").textContent = s.jobs_downloading + " / " + s.jobs_queued;
+  const badges = [];
+  if (s.download_paused) badges.push('<span class="badge on-warn">paused</span>');
+  if (s.speed_limit_bps) badges.push('<span class="badge">limit ' + fmtRate(s.speed_limit_bps) + "</span>");
+  $("badges").innerHTML = badges.join("");
+  if (s.speed_limit_bps && !$("limit").matches(":focus"))
+    $("limit").value = Math.round(s.speed_limit_bps / 1024);
+}
+
+// ---- queue --------------------------------------------------------------
+const STATUS_CLASS = {
+  downloading: "ok", queued: "dim", paused: "warn", fetching: "dim",
+  completed: "ok", failed: "bad", post_queued: "warn"
+};
+function statusName(st) {
+  return typeof st === "string" ? st : ("post: " + (st.post ? st.post.stage : "…"));
+}
+async function refreshQueue() {
+  const r = await fetch("/api/v1/jobs");
+  const { jobs } = await r.json();
+  const body = $("queue-body");
+  if (!jobs.length) {
+    body.innerHTML = '<tr><td colspan="6" class="empty">queue is empty</td></tr>';
+    return;
+  }
+  body.innerHTML = jobs.map(j => {
+    const total = j.size_bytes || 0;
+    const done = Math.min(j.downloaded_bytes || 0, total);
+    const pct = total ? Math.floor(done * 100 / total) : 0;
+    const st = statusName(j.status);
+    const cls = STATUS_CLASS[st] || "dim";
+    const paused = st === "paused";
+    return `<tr>
+      <td><div class="name">${esc(j.name)}</div>
+          <div class="sub">#${j.id}${j.category ? " · " + esc(j.category) : ""}${j.assigned_node ? " · on " + esc(j.assigned_node) : ""}</div></td>
+      <td><span class="st ${cls}">${esc(st).toUpperCase()}</span></td>
+      <td><div class="meter"><div class="track"><div class="fill${pct >= 100 ? " done" : ""}" style="width:${pct}%"></div></div><span class="pct">${pct}%</span></div></td>
+      <td class="num">${fmtBytes(total)}</td>
+      <td class="num">${(j.health / 10).toFixed(1)}%</td>
+      <td>
+        <button class="small" onclick="jobAction(${j.id}, '${paused ? "resume" : "pause"}')">${paused ? "resume" : "pause"}</button>
+        <button class="small" onclick="if(confirm('Delete ${esc(j.name).replace(/'/g, "\\'")}?')) jobAction(${j.id}, 'delete')">delete</button>
+      </td>
+    </tr>`;
+  }).join("");
+}
+async function jobAction(id, action) {
+  await fetch(`/api/v1/jobs/${id}/actions/${action}`, { method: "POST" });
+  refreshAll();
+}
+
+// ---- history ------------------------------------------------------------
+function histClass(status) {
+  if (status.startsWith("SUCCESS")) return "ok";
+  if (status.startsWith("WARNING")) return "warn";
+  if (status.startsWith("DELETED")) return "dim";
+  return "bad";
+}
+async function refreshHistory() {
+  const r = await fetch("/api/v1/history?limit=200");
+  if (r.status === 501) {
+    $("history-body").innerHTML = '<tr><td colspan="5" class="empty">history store not configured</td></tr>';
+    return;
+  }
+  const { entries } = await r.json();
+  const body = $("history-body");
+  if (!entries.length) {
+    body.innerHTML = '<tr><td colspan="5" class="empty">no finished jobs yet</td></tr>';
+    return;
+  }
+  body.innerHTML = entries.map(e => `<tr>
+    <td><div class="name">${esc(e.name)}</div><div class="sub">#${e.job}${e.category ? " · " + esc(e.category) : ""}</div></td>
+    <td><span class="st ${histClass(e.status)}">${esc(e.status)}</span></td>
+    <td class="num">${fmtBytes(e.size)}</td>
+    <td>${fmtTime(e.completed_at_unix)}</td>
+    <td class="sub">${esc(e.final_dir || "")}</td>
+  </tr>`).join("");
+}
+
+// ---- logs ---------------------------------------------------------------
+async function refreshLogs() {
+  const r = await fetch("/api/v1/logs?limit=300");
+  if (r.status === 501) {
+    $("logbox").innerHTML = '<div class="empty">log buffer not configured</div>';
+    return;
+  }
+  const { entries } = await r.json();
+  const box = $("logbox");
+  const stick = box.scrollTop + box.clientHeight >= box.scrollHeight - 8;
+  box.innerHTML = entries.map(e =>
+    `<div class="lg k-${e.kind}">${new Date(e.time_unix * 1000).toLocaleTimeString()}  ${e.kind.padEnd(7)} ${esc(e.text)}</div>`
+  ).join("") || '<div class="empty">no log entries</div>';
+  if (stick) box.scrollTop = box.scrollHeight;
+}
+
+// ---- controls -----------------------------------------------------------
+$("btn-pause").onclick = async () => { await fetch("/api/v1/queue/actions/pause", { method: "POST" }); refreshAll(); };
+$("btn-resume").onclick = async () => { await fetch("/api/v1/queue/actions/resume", { method: "POST" }); refreshAll(); };
+$("btn-limit").onclick = async () => {
+  const kib = parseInt($("limit").value || "0", 10);
+  await fetch("/api/v1/queue/speed-limit", {
+    method: "PUT", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ bytes_per_sec: kib > 0 ? kib * 1024 : null })
+  });
+  refreshAll();
+};
+
+// ---- tabs ---------------------------------------------------------------
+let activeTab = "queue";
+document.querySelectorAll("nav.tabs button").forEach(b => b.onclick = () => {
+  activeTab = b.dataset.tab;
+  document.querySelectorAll("nav.tabs button").forEach(x => x.classList.toggle("active", x === b));
+  for (const t of ["queue", "history", "logs"]) $("tab-" + t).hidden = t !== activeTab;
+  refreshAll();
+});
+
+// ---- refresh loop: SSE-driven with poll fallback ------------------------
+function refreshAll() {
+  refreshStatus().catch(() => {});
+  if (activeTab === "queue") refreshQueue().catch(() => {});
+  if (activeTab === "history") refreshHistory().catch(() => {});
+  if (activeTab === "logs") refreshLogs().catch(() => {});
+}
+let debounce = null;
+function nudge() { clearTimeout(debounce); debounce = setTimeout(refreshAll, 150); }
+function connectSse() {
+  const es = new EventSource("/api/v1/events");
+  es.onopen = () => { $("conn").textContent = "live"; };
+  es.onerror = () => { $("conn").textContent = "reconnecting…"; };
+  for (const ev of ["job_added", "job_finished", "job_deleted", "file_finished", "lagged"])
+    es.addEventListener(ev, nudge);
+}
+connectSse();
+setInterval(refreshAll, 5000);
+refreshAll();
+</script>
+</body>
+</html>

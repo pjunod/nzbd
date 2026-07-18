@@ -268,6 +268,51 @@ pub async fn dispatch(
             Ok(Value::Array(opts))
         }
         "listfiles" => listfiles(state, params).await,
+        "servervolumes" => {
+            // Simplified from NZBGet's slot arrays: totals + current day and
+            // month windows per server, from the live volume counters.
+            let snap = state.engine.snapshot();
+            Ok(Value::Array(
+                snap.server_volumes
+                    .iter()
+                    .map(|v| {
+                        let (tlo, thi, tmb) = split64(v.total_bytes);
+                        let (dlo, dhi, dmb) = split64(v.day_bytes);
+                        let (mlo, mhi, mmb) = split64(v.month_bytes);
+                        json!({
+                            "ServerID": v.server,
+                            "TotalSizeLo": tlo, "TotalSizeHi": thi, "TotalSizeMB": tmb,
+                            "DaySizeLo": dlo, "DaySizeHi": dhi, "DaySizeMB": dmb,
+                            "MonthSizeLo": mlo, "MonthSizeHi": mhi, "MonthSizeMB": mmb,
+                        })
+                    })
+                    .collect(),
+            ))
+        }
+        "sysinfo" => {
+            let tool = |cmd: &str| {
+                let path = std::env::var_os("PATH")
+                    .and_then(|paths| {
+                        std::env::split_paths(&paths)
+                            .map(|d| d.join(cmd))
+                            .find(|p| p.is_file())
+                    })
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                json!({ "Name": cmd, "Path": path, "Version": "" })
+            };
+            Ok(json!({
+                "OS": { "Name": std::env::consts::OS, "Version": std::env::consts::ARCH },
+                "CPU": { "Model": "", "Arch": std::env::consts::ARCH },
+                "Network": { "PublicIP": "", "PrivateIP": "" },
+                "Tools": [tool("par2"), tool("unrar"), tool("7z")],
+                "Libraries": [
+                    { "Name": "rustls", "Version": "" },
+                    { "Name": "tokio", "Version": "" }
+                ],
+            }))
+        }
+        "testserver" => testserver(params).await,
         "log" => {
             // log(IDFrom, NumberOfEntries) — IDFrom 0 = the newest N.
             let id_from = p_i64(params, 0).max(0) as u64;
@@ -693,6 +738,66 @@ async fn editqueue(state: &CompatState, params: &Value) -> Result<Value, (i64, &
         ok &= done;
     }
     Ok(Value::Bool(ok))
+}
+
+/// `testserver(Host, Port, Username, Password, Encryption, Cipher,
+/// Timeout)` — live connect + greeting + optional AUTHINFO against a news
+/// server; returns the greeting text or the error string (NZBGet shape).
+async fn testserver(params: &Value) -> Result<Value, (i64, &'static str)> {
+    let host = p_str(params, 0);
+    if host.is_empty() {
+        return Ok(Value::String("no host given".into()));
+    }
+    let port = p_i64(params, 1).clamp(1, 65535) as u16;
+    let user = p_str(params, 2);
+    let pass = p_str(params, 3);
+    let tls = p_bool(params, 4);
+    let timeout = std::time::Duration::from_secs(p_i64(params, 6).clamp(2, 60) as u64);
+
+    let def = nzbd_types::ServerDef {
+        id: nzbd_types::ServerId(0),
+        name: "testserver".into(),
+        host,
+        port,
+        tls: if tls {
+            nzbd_types::TlsMode::Tls
+        } else {
+            nzbd_types::TlsMode::None
+        },
+        username: None,
+        password: None,
+        active: true,
+        tier: 0,
+        group: 0,
+        fill: false,
+        max_connections: 1,
+        pipeline_depth: 1,
+        retention_days: 0,
+        cert_verification: nzbd_types::CertLevel::Strict,
+    };
+    let tls_cfg = if tls {
+        match nzbd_nntp::transport::tls_client_config(nzbd_types::CertLevel::Strict) {
+            Ok(c) => Some(c),
+            Err(e) => return Ok(Value::String(format!("TLS setup failed: {e}"))),
+        }
+    } else {
+        None
+    };
+    match nzbd_nntp::transport::NntpConnection::connect(&def, tls_cfg, timeout, timeout).await {
+        Ok((mut conn, greeting)) => {
+            if !user.is_empty() {
+                if let Err(e) = conn.authenticate(&user, &pass).await {
+                    return Ok(Value::String(format!("connected, but login failed: {e}")));
+                }
+            }
+            conn.quit().await;
+            Ok(Value::String(format!(
+                "Connection to {}:{} established: {}",
+                def.host, def.port, greeting.text
+            )))
+        }
+        Err(e) => Ok(Value::String(format!("Connection failed: {e}"))),
+    }
 }
 
 /// `listfiles(IDFrom, IDTo, NZBID)` — the files of one queued group
@@ -1331,6 +1436,53 @@ mod tests {
         }
         assert_eq!(results[0], json!(["26.2"]));
         assert_eq!(results[1]["faultCode"], 1);
+        state.engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn c3_sysinfo_servervolumes_testserver() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state(&tmp).await;
+
+        let v = dispatch(&state, "sysinfo", &Value::Null).await.unwrap();
+        assert_eq!(v["OS"]["Name"], std::env::consts::OS);
+        assert!(v["Tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t["Name"] == "par2"));
+
+        let v = dispatch(&state, "servervolumes", &Value::Null)
+            .await
+            .unwrap();
+        assert!(v.is_array());
+
+        // testserver against a live nserv: greeting + no auth.
+        let post = nzbd_nserv::build_post("t", &[("a.bin", vec![1, 2, 3])], 3);
+        let ns = nzbd_nserv::NservBuilder::new()
+            .with_post(&post)
+            .start()
+            .await
+            .unwrap();
+        let v = dispatch(
+            &state,
+            "testserver",
+            &json!(["127.0.0.1", ns.port(), "", "", false, "", 5]),
+        )
+        .await
+        .unwrap();
+        let text = v.as_str().unwrap();
+        assert!(text.contains("established"), "{text}");
+
+        // Dead port → failure text, not an RPC error.
+        let v = dispatch(
+            &state,
+            "testserver",
+            &json!(["127.0.0.1", 1, "", "", false, "", 2]),
+        )
+        .await
+        .unwrap();
+        assert!(v.as_str().unwrap().contains("failed"), "{v}");
         state.engine.shutdown().await;
     }
 

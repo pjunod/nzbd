@@ -1,0 +1,58 @@
+# Live *arr smoke: boots nzbd + a real Sonarr container and verifies the
+# download-client test handshake (version + config category check).
+# Manual trigger — network-heavy; the golden suite + sonarr-flow e2e cover
+# the wire contract on every push.
+name: Arr Live Smoke
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 6 * * 1" # weekly, Monday 06:17 UTC
+jobs:
+  sonarr-handshake:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build nzbd
+        run: cargo build --release -p nzbd
+      - name: Boot nzbd
+        run: |
+          cat > nzbd.toml <<CFG
+          [paths]
+          main_dir = "$PWD/work"
+          dest_dir = "$PWD/work/complete"
+          [[category]]
+          name = "tv"
+          [api]
+          bind = "0.0.0.0:6789"
+          CFG
+          ./target/release/nzbd run --config nzbd.toml &
+          for i in $(seq 1 50); do curl -fs http://127.0.0.1:6789/healthz && break; sleep 0.2; done
+      - name: Boot Sonarr
+        run: |
+          docker run -d --name sonarr --network host \
+            -e SONARR__AUTH__METHOD=External linuxserver/sonarr:latest
+          for i in $(seq 1 120); do
+            curl -fs http://127.0.0.1:8989/ping && break; sleep 2; done
+      - name: Handshake via Sonarr API
+        run: |
+          APIKEY=$(docker exec sonarr sh -c 'until [ -f /config/config.xml ]; do sleep 1; done; \
+            sed -n "s:.*<ApiKey>\(.*\)</ApiKey>.*:\1:p" /config/config.xml')
+          # Ask Sonarr to test an NZBGet download client pointed at nzbd.
+          curl -fs -X POST "http://127.0.0.1:8989/api/v3/downloadclient/test" \
+            -H "X-Api-Key: $APIKEY" -H "Content-Type: application/json" \
+            -d '{"enable":true,"protocol":"usenet","priority":1,"name":"nzbd",
+                 "implementation":"Nzbget","configContract":"NzbgetSettings",
+                 "fields":[{"name":"host","value":"127.0.0.1"},
+                           {"name":"port","value":6789},
+                           {"name":"useSsl","value":false},
+                           {"name":"username","value":""},
+                           {"name":"password","value":""},
+                           {"name":"tvCategory","value":"tv"},
+                           {"name":"recentTvPriority","value":0},
+                           {"name":"olderTvPriority","value":0},
+                           {"name":"addPaused","value":false}]}' \
+            | tee result.json
+          # An empty validation array = Sonarr accepted nzbd as NZBGet.
+          test "$(cat result.json)" = "[]" || (echo "validation failures"; exit 1)

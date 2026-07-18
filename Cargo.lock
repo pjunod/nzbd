@@ -828,6 +828,8 @@ dependencies = [
  "base64",
  "nzbd-api",
  "nzbd-engine",
+ "nzbd-nntp",
+ "nzbd-nserv",
  "nzbd-state",
  "nzbd-types",
  "quick-xml",

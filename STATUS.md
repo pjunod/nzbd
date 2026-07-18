@@ -8,8 +8,8 @@ roadmaps in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) §16 and
 Legend: ✅ done (implemented, tested, committed) · 🔶 partial · ⬜ not
 started · 👤 operator action (Paul)
 
-**Snapshot (2026-07-17):** 142 tests · clippy clean · phases 0–3 and
-cluster C1+C2 complete · next up: **phase 4 (web UI, packaging)**
+**Snapshot (2026-07-17):** 143 tests · clippy clean · phases 0–4 and
+cluster C1+C2 complete · next up: **phase 5 (beyond parity) + C3**
 
 | Phase | State | Evidence |
 |---|---|---|
@@ -21,8 +21,8 @@ cluster C1+C2 complete · next up: **phase 4 (web UI, packaging)**
 | C2 — PP leases + anti-affinity | ✅ complete | `9f402d8` |
 | 3a — *arr compat core | ✅ complete | `3793ad8` |
 | 3b — importer · auth · SSE · metrics | ✅ complete | `e00990c`, `b4c422d` |
-| 3c — compat C2 + XML-RPC + golden tests | ✅ complete | this commit |
-| 4 — Web UI + ecosystem | ⬜ | — |
+| 3c — compat C2 + XML-RPC + golden tests | ✅ complete | `fe6d2be` |
+| 4 — Web UI + ecosystem | ✅ complete | this commit |
 | 5 — Beyond parity (+ C3) | ⬜ | — |
 
 ---
@@ -126,12 +126,14 @@ cluster C1+C2 complete · next up: **phase 4 (web UI, packaging)**
 - ✅ `nzbget.conf` importer: KEY=value + `ServerN.*`/`CategoryN.*` blocks, recursive `${Var}` expansion, NZBGet→nzbd vocabulary (Level→tier, Optional→fill, Encryption→tls), mapped/skipped/unknown/warnings report, hostless-server drop, zero-connection raise; `nzbd import-config <nzbget.conf> -o nzbd.toml` writes the converted file + prints the report; round-trips through the TOML parser
 - ⬜ `rapidyenc-sys` FFI feature (vendored) + differential fuzzing — deferred to phase 5 (the scalar decoder saturates typical line rates)
 
-## Phase 4 — Web UI + ecosystem ⬜
+## Phase 4 — Web UI + ecosystem ✅ complete
 
-- ⬜ Svelte SPA (queue/history/config/stats), SSE-driven, embedded via rust-embed
-- ⬜ Extension manager UI; RSS feeds + filter language
-- ⬜ Compat C3 (server volumes, sysinfo, testserver, …)
-- ⬜ Packaging: static musl builds, Docker, Homebrew, Windows
+- ✅ Embedded web UI at `/`: one self-contained page compiled into the binary (`include_str!` — zero build toolchain, an explicit simplification from the Svelte plan). Queue with live progress/actions, history, log tail, pause/resume/speed-limit controls, quota/paused badges, SSE-driven refresh with poll fallback, dark/light
+- ✅ Compat C3: `servervolumes` (live per-server total/day/month counters), `sysinfo` (OS/arch + tool paths), `testserver` (real NNTP connect + greeting + AUTHINFO through the production transport — proven against nserv in tests)
+- ✅ Packaging: multi-stage `Dockerfile` (tini + par2/unrar/7z, unprivileged user), tag-triggered release workflow (musl static x86_64 + aarch64, macOS aarch64, sha256 sums, ghcr.io Docker push), Homebrew formula with service block
+- ✅ Live *arr smoke workflow (`arr-live.yml`, weekly + manual): boots real Sonarr against nzbd and asserts the NZBGet download-client validation passes
+- ⬜ Extension manager UI · RSS feeds + filter language — the last parity-surface item (NZBGet's RSS engine is its own subsystem); scheduled next
+- ⬜ Windows packaging — engine code is Unix-portable except statvfs; needs a Windows CI leg
 
 ## Phase 5 — Beyond parity ⬜
 
