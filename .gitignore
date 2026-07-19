@@ -6,3 +6,5 @@
 /cov-run.out
 /badges-out/
 /_to_delete/
+/dev/data/
+/dev/nzbd.toml

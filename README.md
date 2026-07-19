@@ -120,6 +120,10 @@ Tests that exercise external tools (`par2`, `7z`) self-skip with a notice
 when the binary is missing; CI installs them and sets
 `NZBD_REQUIRE_TOOLS=1` so a skip there is a failure.
 
+To hack on the *container* rather than the engine, [`dev/`](dev/) has a
+compose file that builds the image locally from the Dockerfile
+(`cd dev && docker compose up --build`) — see [`dev/README.md`](dev/README.md).
+
 ## License
 
 MIT OR Apache-2.0. Written from scratch against a behavioral spec

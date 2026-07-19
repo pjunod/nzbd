@@ -1,0 +1,26 @@
+# Dev config for dev/docker-compose.yml. Copy to nzbd.toml (gitignored).
+#
+# No auth, debug-friendly defaults, everything under the ./data bind
+# mount so you can watch files land from the host.
+
+[paths]
+main_dir = "/data"
+dest_dir = "/data/complete"
+nzb_watch_dir = "/data/nzb"     # drop .nzb files into dev/data/nzb/
+
+# Point at a real provider to exercise downloads end-to-end:
+[[server]]
+name = "dev"
+host = "news.example.com"
+port = 563
+tls = true
+username = "CHANGE-ME"
+password = "CHANGE-ME"
+connections = 4                 # keep dev gentle on your account
+
+[[category]]
+name = "tv"
+
+[api]
+bind = "0.0.0.0:6789"           # container-internal; published on localhost
+# no password: dev container, published only on localhost

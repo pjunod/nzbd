@@ -1,0 +1,12 @@
+# Keep the Docker build context small — without this, target/ (gigabytes
+# of build artifacts) and .git get shipped to the daemon on every build.
+target
+target-*
+.git
+.githooks
+dev/data
+dev/nzbd.toml
+badges-out
+lcov.info
+cov-run.out
+*.nzb

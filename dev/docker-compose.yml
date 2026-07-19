@@ -1,0 +1,42 @@
+# Dev compose — builds the image LOCALLY from the repo's Dockerfile and
+# runs it with a throwaway data dir. For testing the container itself;
+# the faster inner loop for engine work is plain `cargo run -p nzbd`.
+#
+#   cd dev
+#   cp nzbd.toml.example nzbd.toml    # edit if you want a real provider
+#   docker compose up --build         # build + run (foreground, logs)
+#
+# Rebuild-on-change (Compose v2.22+): `docker compose watch` rebuilds the
+# image whenever crate sources or the Dockerfile change.
+
+services:
+  nzbd:
+    build:
+      context: ..                # repo root (the Dockerfile lives there)
+      dockerfile: Dockerfile
+    image: nzbd:dev
+    container_name: nzbd-dev
+    ports:
+      - "6789:6789"
+    volumes:
+      - ./data:/data             # throwaway downloads/state, easy to inspect
+      - ./nzbd.toml:/etc/nzbd/nzbd.toml:ro
+    environment:
+      - TZ=Etc/UTC
+      - RUST_LOG=debug           # dev default; drop to info if too chatty
+    healthcheck:
+      test: ["CMD", "nzbd", "status", "--url", "127.0.0.1:6789"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    develop:
+      watch:
+        - action: rebuild
+          path: ../crates
+        - action: rebuild
+          path: ../Cargo.toml
+        - action: rebuild
+          path: ../Cargo.lock
+        - action: rebuild
+          path: ../Dockerfile
