@@ -119,6 +119,11 @@
     font: 11.5px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
     background: var(--panel); color: var(--ink); border: 1px solid var(--line);
     border-radius: 8px; padding: 10px; }
+  #setup-cx { margin-top: 8px; font-size: 11.5px; color: var(--muted); line-height: 1.55; }
+  #setup-cx pre { margin: 4px 0 8px; padding: 7px 9px; overflow-x: auto; user-select: all;
+    font: 11px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    background: var(--panel); border: 1px solid var(--line); border-radius: 6px;
+    color: var(--ink); white-space: pre; }
   /* phones */
   @media (max-width: 640px) {
     .wrap { padding: 12px 10px 34px; }
@@ -196,6 +201,7 @@
           <button type="button" id="su-download">Download</button>
         </div>
         <textarea id="setup-toml-text" readonly spellcheck="false"></textarea>
+        <div id="setup-cx" hidden></div>
       </div>
     </form>
   </section>
@@ -444,6 +450,32 @@ async function checkSetup() {
     $("setup-toml").hidden = false;
     $("setup-toml-hint").textContent = hint || "";
     $("setup-toml-text").value = toml;
+    // "Where do I even put this?" — when we're inside a container, the
+    // config path shown is a *container* path; explain how to reach its
+    // host side. (s.container comes from GET /api/v1/setup.)
+    if (s.container) {
+      const dir = s.config_path.replace(/\/[^/]*$/, "") || "/";
+      // Docker's default hostname is the container's own ID, so commands
+      // templated with it work verbatim on the host.
+      const cid = s.container_id || "<container-name>";
+      $("setup-cx").hidden = false;
+      $("setup-cx").innerHTML =
+        "<b>Where does it go?</b> <code>" + esc(s.config_path) + "</code> is the path " +
+        "<i>inside this container</i>. Save the file to the <b>host</b> directory mounted " +
+        "there — on the machine running the container:" +
+        "<pre>docker container inspect -f '{{range .Mounts}}{{if eq .Destination \"" + esc(dir) +
+        "\"}}{{.Source}}{{end}}{{end}}' " + esc(cid) + "</pre>" +
+        "prints that host directory; put <code>nzbd.toml</code> in it, then " +
+        "<code>docker restart " + esc(cid) + "</code>. " +
+        "(If the ID isn't recognized, find the name with <code>docker ps</code>; with " +
+        "compose, the <code>volumes:</code> line of your compose file is the same answer. " +
+        "A <i>permission denied</i> save usually means the host directory is owned by " +
+        "root — <code>chown -R 1000:1000</code> it and Save works.) " +
+        "If inspect prints nothing, no volume is mounted — add one (see docs/DEPLOY.md), " +
+        "or copy the file straight in (works until the container is re-created):" +
+        "<pre>docker cp nzbd.toml " + esc(cid) + ":" + esc(s.config_path) +
+        " && docker restart " + esc(cid) + "</pre>";
+    }
   };
   $("su-copy").onclick = async () => {
     const ta = $("setup-toml-text");

@@ -662,10 +662,37 @@ async fn get_setup(State(st): State<ApiState>) -> Response {
             "setup_mode": !s.applied.load(std::sync::atomic::Ordering::Relaxed),
             "config_path": s.config_path.display().to_string(),
             "writable": s.writable,
+            // Lets the UI explain that config_path is a *container* path
+            // and how to find its host side (docker inspect / docker cp).
+            "container": in_container(),
+            // Docker sets the container's hostname to its own ID, so the
+            // UI can print `docker container inspect <id>` commands that
+            // work verbatim on the host — no guessing the container name.
+            "container_id": hostname(),
         }))
         .into_response(),
         None => Json(json!({ "setup_mode": false })).into_response(),
     }
+}
+
+/// Best-effort "are we in a container?" — advisory, for setup-UI wording
+/// only. Covers docker (/.dockerenv), podman (/run/.containerenv) and
+/// kubernetes (service env / cgroup paths).
+fn in_container() -> bool {
+    std::path::Path::new("/.dockerenv").exists()
+        || std::path::Path::new("/run/.containerenv").exists()
+        || std::env::var_os("KUBERNETES_SERVICE_HOST").is_some()
+        || std::fs::read_to_string("/proc/1/cgroup")
+            .map(|s| s.contains("docker") || s.contains("kubepods") || s.contains("containerd"))
+            .unwrap_or(false)
+}
+
+fn hostname() -> Option<String> {
+    std::fs::read_to_string("/proc/sys/kernel/hostname")
+        .or_else(|_| std::fs::read_to_string("/etc/hostname"))
+        .map(|s| s.trim().to_string())
+        .ok()
+        .filter(|s| !s.is_empty())
 }
 
 async fn post_setup(State(st): State<ApiState>, Json(req): Json<SetupReq>) -> Response {

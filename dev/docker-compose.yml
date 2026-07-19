@@ -3,7 +3,10 @@
 # the faster inner loop for engine work is plain `cargo run -p nzbd`.
 #
 #   cd dev
-#   mkdir -p config data
+#   mkdir -p config data              # BEFORE up: if compose creates these
+#                                     # bind-mount dirs for you they're owned
+#                                     # by root, and the setup UI can't write
+#                                     # config/nzbd.toml (chown -R $USER fixes)
 #   docker compose up --build         # build + run (foreground, logs)
 #   # → http://localhost:6789/ serves the first-run setup UI, which
 #   #   writes config/nzbd.toml and restarts the daemon with it.

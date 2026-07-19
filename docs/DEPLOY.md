@@ -59,6 +59,42 @@ Where the wizard's write actually lands, by deployment shape:
   path; nzbd refuses to start with a message explaining the fix. Mount
   the directory instead.
 
+**"Where do I put the copied config?"** The path the setup page shows
+(`/etc/nzbd/nzbd.toml`) is the path *inside the container*. The file
+belongs on the **host side** of the volume mounted there — find it on
+the machine running the container (the setup page prints this command
+with your actual container ID filled in):
+
+```sh
+docker container inspect -f \
+  '{{range .Mounts}}{{if eq .Destination "/etc/nzbd"}}{{.Source}}{{end}}{{end}}' nzbd
+# → e.g. /opt/nzbd/config  →  save it as /opt/nzbd/config/nzbd.toml
+docker restart nzbd
+```
+
+Use `docker container inspect` (not bare `docker inspect`): if an
+*image* shares the name, bare inspect matches it and fails with
+`map has no entry for key "Mounts"`. Wrong name? `docker ps` lists the
+real one (compose names containers `<project>-<service>-1` unless
+`container_name` is set) — or just read the `volumes:` line in your
+compose file, which is the same answer.
+
+If that prints nothing, no volume is mounted: either recreate the
+container with one (recommended, see above), or copy the file straight
+into the container — this survives restarts but not re-creation:
+
+```sh
+docker cp nzbd.toml nzbd:/etc/nzbd/nzbd.toml && docker restart nzbd
+```
+
+On Kubernetes with a ConfigMap, the config lives in the ConfigMap
+itself: `kubectl create configmap nzbd-config --from-file=nzbd.toml
+--dry-run=client -o yaml | kubectl apply -f -`, then restart the pod.
+And if the wizard's save failed with *permission denied* on a mounted
+volume, the mount exists but the host directory isn't writable by the
+container user — `sudo chown -R 1000:1000 <host dir>` and the wizard's
+own Save works.
+
 Or fully declarative, config-first:
 
 ```sh
