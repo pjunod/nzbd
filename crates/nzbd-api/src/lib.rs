@@ -56,6 +56,9 @@ pub struct SetupHandle {
     /// The currently-running configuration — what the settings editor
     /// shows (masked) and merges masked secrets from on save.
     pub current: std::sync::Mutex<nzbd_config::Config>,
+    /// Sections saved to disk but not yet applied — the UI's "restart
+    /// required" banner. Cleared by a restart (fresh handle).
+    pub pending_restart: std::sync::Mutex<std::collections::BTreeSet<&'static str>>,
 }
 
 impl SetupHandle {
@@ -70,6 +73,7 @@ impl SetupHandle {
             applied: std::sync::atomic::AtomicBool::new(false),
             writable,
             current: std::sync::Mutex::new(nzbd_config::Config::default()),
+            pending_restart: std::sync::Mutex::new(Default::default()),
         }
     }
 
@@ -88,6 +92,7 @@ impl SetupHandle {
             applied: std::sync::atomic::AtomicBool::new(false),
             writable,
             current: std::sync::Mutex::new(current),
+            pending_restart: std::sync::Mutex::new(Default::default()),
         }
     }
 }
@@ -843,21 +848,31 @@ async fn get_config(State(st): State<ApiState>) -> Response {
         let cur = h.current.lock().unwrap();
         nzbd_config::mask_secrets(&cur)
     };
+    let pending: Vec<&str> = h.pending_restart.lock().unwrap().iter().copied().collect();
     match nzbd_config::to_toml(&masked) {
         Ok(toml) => Json(json!({
             "path": h.config_path.as_ref().map(|p| p.display().to_string()),
             "writable": h.writable,
             "toml": toml,
+            "config": masked,
             "mask": nzbd_config::SECRET_MASK,
+            "pending_restart": pending,
         }))
         .into_response(),
         Err(e) => error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     }
 }
 
-/// PUT raw TOML: validate strictly, restore masked secrets from the
-/// running config, write the file, hot-reload the daemon.
-async fn put_config(State(st): State<ApiState>, body: String) -> Response {
+/// PUT the config (JSON from the settings form, or raw TOML from the
+/// advanced editor): validate strictly, restore masked secrets, write
+/// the file, live-apply what a running daemon can absorb (speed limit),
+/// and report which sections need a restart. Does NOT restart by itself
+/// — that's `POST /api/v1/restart`.
+async fn put_config(
+    State(st): State<ApiState>,
+    headers: axum::http::HeaderMap,
+    body: String,
+) -> Response {
     let Some(h) = &st.setup else {
         return error(StatusCode::NOT_FOUND, "no config handle");
     };
@@ -867,14 +882,25 @@ async fn put_config(State(st): State<ApiState>, body: String) -> Response {
             "daemon is running without --config; there is no file to edit",
         );
     };
-    let mut new_cfg = match nzbd_config::Config::from_toml(&body) {
-        Ok(c) => c,
-        Err(e) => return error(StatusCode::UNPROCESSABLE_ENTITY, &e.to_string()),
+    let is_json = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|ct| ct.contains("json"))
+        || body.trim_start().starts_with('{');
+    let mut new_cfg = if is_json {
+        match serde_json::from_str::<nzbd_config::Config>(&body) {
+            Ok(c) => c,
+            Err(e) => return error(StatusCode::UNPROCESSABLE_ENTITY, &e.to_string()),
+        }
+    } else {
+        match nzbd_config::Config::from_toml(&body) {
+            Ok(c) => c,
+            Err(e) => return error(StatusCode::UNPROCESSABLE_ENTITY, &e.to_string()),
+        }
     };
-    {
-        let cur = h.current.lock().unwrap();
-        nzbd_config::merge_masked_secrets(&mut new_cfg, &cur);
-    }
+    let old_cfg = { h.current.lock().unwrap().clone() };
+    nzbd_config::merge_masked_secrets(&mut new_cfg, &old_cfg);
+    let (live, restart) = nzbd_config::diff_sections(&old_cfg, &new_cfg);
     let toml_text = match nzbd_config::to_toml(&new_cfg) {
         Ok(t) => t,
         Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
@@ -896,11 +922,41 @@ async fn put_config(State(st): State<ApiState>, body: String) -> Response {
             ),
         );
     }
+    // Live-apply what the engine can absorb without a restart.
+    if live.contains(&"speed limit") {
+        let bps = new_cfg.queue.speed_limit_kib.map(|k| k * 1024);
+        let _ = st.engine.set_speed_limit(bps).await;
+    }
     *h.current.lock().unwrap() = new_cfg;
-    tracing::info!(path = %cfg_path.display(), "settings saved; reloading");
+    let pending: Vec<&str> = {
+        let mut p = h.pending_restart.lock().unwrap();
+        p.extend(restart.iter().copied());
+        p.iter().copied().collect()
+    };
+    tracing::info!(
+        path = %cfg_path.display(),
+        live = live.join(","),
+        pending = pending.join(","),
+        "settings saved"
+    );
+    Json(json!({
+        "ok": true,
+        "applied_live": live,
+        "restart_required": pending,
+    }))
+    .into_response()
+}
+
+/// Restart the daemon: tear down and re-run with the config on disk.
+/// The listener bounces for a moment; the UI polls /healthz.
+async fn post_restart(State(st): State<ApiState>) -> Response {
+    let Some(h) = &st.setup else {
+        return error(StatusCode::NOT_FOUND, "no config handle");
+    };
+    tracing::info!("restart requested from the settings UI");
     h.applied.store(true, std::sync::atomic::Ordering::Relaxed);
     h.reload.notify_one();
-    Json(json!({ "ok": true, "reloading": true })).into_response()
+    Json(json!({ "ok": true, "restarting": true })).into_response()
 }
 
 pub fn router_with(state: ApiState) -> Router {
@@ -918,6 +974,7 @@ pub fn router_with(state: ApiState) -> Router {
         .route("/api/v1/openapi.json", get(openapi))
         .route("/api/v1/setup", get(get_setup).post(post_setup))
         .route("/api/v1/config", get(get_config).put(put_config))
+        .route("/api/v1/restart", post(post_restart))
         .route("/healthz", get(healthz))
         .route("/", get(ui_index))
         .route("/manifest.webmanifest", get(pwa_manifest))

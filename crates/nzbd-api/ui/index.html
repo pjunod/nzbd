@@ -122,17 +122,50 @@
   .acts .mv { font-size: 11px; padding: 2px 6px; }
   .acts .del:hover { border-color: var(--bad); color: var(--bad); }
 
-  #tab-settings textarea { width: 100%; height: 460px; box-sizing: border-box; resize: vertical;
-    margin-top: 12px; font: 12.5px/1.55 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-    background: var(--panel); color: var(--ink); border: 1px solid var(--line);
-    border-radius: 8px; padding: 12px; tab-size: 2; }
   .cfg-meta { color: var(--muted); font-size: 12px; margin-top: 12px; line-height: 1.5; }
   .cfg-meta code { color: var(--ink2); }
+  #cfg-form { margin-top: 4px; }
+  .cfg-card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+    padding: 14px 16px 10px; margin-top: 12px; }
+  .cfg-card > h3 { margin: 0 0 2px; font-size: 13.5px; }
+  .cfg-card > .desc { color: var(--muted); font-size: 11.5px; margin: 0 0 10px; }
+  .cfg-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr));
+    gap: 10px 14px; margin-bottom: 8px; }
+  .cfg-grid label { display: flex; flex-direction: column; gap: 3px;
+    font-size: 11.5px; color: var(--muted); min-width: 0; }
+  .cfg-grid label.wide { grid-column: span 2; }
+  .cfg-grid input[type=text], .cfg-grid input[type=password], .cfg-grid input[type=number],
+  .cfg-grid select { width: 100%; box-sizing: border-box; background: var(--bg);
+    color: var(--ink); border: 1px solid var(--line); border-radius: 6px;
+    padding: 6px 8px; font: inherit; font-size: 13px; }
+  .cfg-grid .chk { flex-direction: row; align-items: center; gap: 6px; padding-top: 17px;
+    color: var(--ink2); }
+  .cfg-grid .chk input { accent-color: var(--accent); }
+  .cfg-sub { border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px 4px;
+    margin-bottom: 10px; background: color-mix(in srgb, var(--bg) 50%, var(--panel)); }
+  .cfg-sub .sub-head { display: flex; align-items: center; margin-bottom: 8px; }
+  .cfg-sub .sub-head b { font-size: 12.5px; }
+  .cfg-sub .sub-head button { margin-left: auto; }
+  .cfg-add { margin: 2px 0 8px; }
+  #restart-banner { display: flex; align-items: center; gap: 12px; margin-top: 12px;
+    padding: 9px 12px; border-radius: 8px; font-size: 12.5px; font-weight: 550;
+    color: var(--warn); background: color-mix(in srgb, var(--warn) 10%, transparent);
+    border: 1px solid color-mix(in srgb, var(--warn) 35%, transparent); }
+  #restart-banner span { flex: 1; }
+  #restart-banner button { font-weight: 600; border-color: color-mix(in srgb, var(--warn) 50%, transparent); }
   .cfg-bar { display: flex; gap: 8px; align-items: center; margin-top: 10px; flex-wrap: wrap; }
+  .cfg-bar.sticky { position: sticky; bottom: 0; background: var(--bg); padding: 10px 0;
+    border-top: 1px solid var(--line); margin-top: 14px; }
   .cfg-bar #cfg-save { font-weight: 600; }
   #cfg-msg { font-size: 12.5px; color: var(--muted); }
   #cfg-msg.err { color: var(--bad); white-space: pre-wrap; }
   #cfg-msg.ok { color: var(--ok); }
+  #cfg-advanced { margin-top: 14px; }
+  #cfg-advanced summary { color: var(--muted); font-size: 12px; cursor: pointer; }
+  #cfg-advanced textarea { width: 100%; height: 320px; box-sizing: border-box; resize: vertical;
+    margin-top: 8px; font: 12px/1.55 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    background: var(--panel); color: var(--ink); border: 1px solid var(--line);
+    border-radius: 8px; padding: 12px; tab-size: 2; }
   #logbox { background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
             margin-top: 12px; padding: 10px 12px; max-height: 480px; overflow-y: auto;
             font: 12px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace; }
@@ -306,12 +339,23 @@
   </section>
 
   <section id="tab-settings" hidden>
+    <div id="restart-banner" hidden>
+      <span id="restart-msg"></span>
+      <button id="btn-restart">Restart nzbd</button>
+    </div>
     <div id="cfg-meta" class="cfg-meta"></div>
-    <textarea id="cfg-text" spellcheck="false" disabled></textarea>
-    <div class="cfg-bar">
-      <button id="cfg-save" disabled>Save &amp; restart</button>
-      <button id="cfg-reload" class="small">Discard changes</button>
-      <button id="cfg-download" class="small">Download</button>
+    <form id="cfg-form" onsubmit="return false"></form>
+    <details id="cfg-advanced">
+      <summary>Advanced: edit the raw nzbd.toml (feeds &amp; cluster live here)</summary>
+      <textarea id="adv-toml" spellcheck="false"></textarea>
+      <div class="cfg-bar">
+        <button id="adv-save" class="small">Save TOML</button>
+        <button id="adv-download" class="small">Download</button>
+      </div>
+    </details>
+    <div class="cfg-bar sticky">
+      <button id="cfg-save" disabled>Save changes</button>
+      <button id="cfg-discard" class="small">Discard</button>
       <span id="cfg-msg"></span>
     </div>
   </section>
@@ -547,76 +591,288 @@ function refreshAll() {
   if (activeTab === "settings") loadSettings().catch(() => {});
 }
 
-// ---- settings: the live nzbd.toml, secrets masked, save = hot reload ----
-let cfgLoaded = false, cfgDirty = false;
+// ---- settings: a real form over nzbd.toml -------------------------------
+// GET /api/v1/config gives the full config as JSON (secrets masked).
+// The form edits a working copy; Save PUTs the whole object back —
+// the daemon applies what it can live and reports what needs a restart.
+let cfgModel = null, cfgInfo = null, cfgDirty = false, cfgLoaded = false;
+
+const SEL = (opts) => opts;  // readability
+const SETTINGS_SECTIONS = [
+  { key: "paths", title: "Paths", desc: "Where downloads and state live on disk.", fields: [
+    ["paths.main_dir", "working dir (downloads + state)", "text"],
+    ["paths.dest_dir", "completed downloads", "text"],
+    ["paths.inter_dir", "intermediate dir (optional)", "text?"],
+    ["paths.nzb_watch_dir", "watch dir for dropped .nzb (optional)", "text?"],
+  ]},
+  { key: "servers", title: "News servers", desc: "Tier 0 is tried first; higher tiers are backups. Fill servers only see missing articles.", array: true },
+  { key: "queue", title: "Speed & queue", desc: "Speed limit applies immediately on save; the rest needs a restart.", fields: [
+    ["queue.speed_limit_kib", "speed limit (KiB/s, empty = unlimited)", "num?"],
+    ["queue.article_retries", "article retries", "num"],
+    ["queue.retry_interval_secs", "retry interval (s)", "num"],
+    ["queue.article_timeout_secs", "article timeout (s)", "num"],
+    ["queue.propagation_delay_mins", "propagation delay (min)", "num"],
+    ["queue.min_free_disk_mb", "min free disk (MB)", "num"],
+    ["queue.daily_quota_mb", "daily quota (MB, 0 = off)", "num"],
+    ["queue.monthly_quota_mb", "monthly quota (MB, 0 = off)", "num"],
+    ["queue.quota_start_day", "quota start day", "num"],
+    ["queue.direct_write", "direct write", "check"],
+    ["queue.crc_check", "CRC check", "check"],
+    ["queue.continue_partial", "resume partials on restart", "check"],
+  ]},
+  { key: "api", title: "Web UI & API", desc: "Changing bind, auth or TLS restarts the listener — you may need to sign in again or change the URL.", fields: [
+    ["api.bind", "listen address", "text"],
+    ["api.username", "username", "text"],
+    ["api.password", "password (empty = keep current)", "secret"],
+    ["api.tls", "serve HTTPS (self-signed if no cert set)", "check"],
+    ["api.tls_cert", "TLS cert path (optional)", "text?"],
+    ["api.tls_key", "TLS key path (optional)", "text?"],
+    ["api.tls_sans", "extra cert names (comma-separated)", "list"],
+  ]},
+  { key: "post", title: "Post-processing", desc: "Par verify/repair, unpack, cleanup and scripts.", fields: [
+    ["post.unpack", "unpack archives", "check"],
+    ["post.cleanup", "delete archives after unpack", "check"],
+    ["post.deobfuscate_final", "deobfuscate file names", "check"],
+    ["post.strategy", "strategy", "select", SEL(["sequential", "balanced", "aggressive", "rocket"])],
+    ["post.health_action", "unrepairable downloads (also aborts early)", "select", SEL(["none", "park", "delete"])],
+    ["post.scripts_dir", "extension scripts dir (optional)", "text?"],
+    ["post.par2_cmd", "par2 command", "text"],
+    ["post.unrar_cmd", "unrar command", "text"],
+    ["post.sevenzip_cmd", "7z command", "text"],
+    ["post.tool_timeout_secs", "tool timeout (s)", "num"],
+    ["post.script_timeout_secs", "script timeout (s)", "num"],
+  ]},
+  { key: "categories", title: "Categories", desc: "Per-category destination and unpack overrides (what the *arrs select).", array: true },
+];
+
+const getPath = (obj, path) => path.split(".").reduce((o, k) => (o ? o[k] : undefined), obj);
+const setPath = (obj, path, v) => {
+  const ks = path.split("."); const last = ks.pop();
+  ks.reduce((o, k) => o[k], obj)[last] = v;
+};
+
+function fieldControl(path, label, type, opts) {
+  const id = "f-" + path.replace(/\./g, "-");
+  const v = getPath(cfgModel, path);
+  if (type === "check")
+    return `<label class="chk"><input type="checkbox" id="${id}" data-path="${path}" data-type="check" ${v ? "checked" : ""}> ${esc(label)}</label>`;
+  if (type === "select") {
+    const os = opts.map(o => `<option value="${esc(o)}" ${o === v ? "selected" : ""}>${esc(o)}</option>`).join("");
+    return `<label>${esc(label)}<select id="${id}" data-path="${path}" data-type="select">${os}</select></label>`;
+  }
+  if (type === "secret") {
+    const has = v != null;
+    return `<label>${esc(label)}<input type="password" id="${id}" data-path="${path}" data-type="secret" autocomplete="new-password" placeholder="${has ? "(unchanged)" : "(none set)"}"></label>`;
+  }
+  const numeric = type.startsWith("num");
+  const val = v == null ? "" : (type === "list" ? v.join(", ") : String(v));
+  return `<label>${esc(label)}<input type="${numeric ? "number" : "text"}" id="${id}" data-path="${path}" data-type="${type}" value="${esc(val)}"></label>`;
+}
+
+function serverCard(sIdx) {
+  const p = (f) => `server.${sIdx}.${f}`;
+  return `<div class="cfg-sub" data-server="${sIdx}">
+    <div class="sub-head"><b>Server ${sIdx + 1}</b>
+      <button type="button" class="small" onclick="removeServer(${sIdx})">remove</button></div>
+    <div class="cfg-grid">
+      ${fieldControl(p("name"), "name", "text")}
+      ${fieldControl(p("host"), "host", "text")}
+      ${fieldControl(p("port"), "port", "num")}
+      ${fieldControl(p("tls"), "TLS", "check")}
+      ${fieldControl(p("username"), "username", "text?")}
+      ${fieldControl(p("password"), "password (empty = keep)", "secret")}
+      ${fieldControl(p("connections"), "connections", "num")}
+      ${fieldControl(p("cert_verification"), "cert verification", "select", ["strict", "minimal", "none"])}
+      ${fieldControl(p("active"), "active", "check")}
+      ${fieldControl(p("tier"), "tier (0 = main)", "num")}
+      ${fieldControl(p("fill"), "fill server", "check")}
+      ${fieldControl(p("retention_days"), "retention days (0 = ∞)", "num")}
+    </div>
+  </div>`;
+}
+
+function categoryCard(cIdx) {
+  const p = (f) => `category.${cIdx}.${f}`;
+  return `<div class="cfg-sub" data-category="${cIdx}">
+    <div class="sub-head"><b>${esc(cfgModel.category[cIdx].name || "Category " + (cIdx + 1))}</b>
+      <button type="button" class="small" onclick="removeCategory(${cIdx})">remove</button></div>
+    <div class="cfg-grid">
+      ${fieldControl(p("name"), "name", "text")}
+      ${fieldControl(p("dest_dir"), "destination (optional)", "text?")}
+      ${fieldControl(p("unpack"), "unpack override", "select3")}
+    </div>
+  </div>`;
+}
+
+function renderSettingsForm() {
+  const form = $("cfg-form");
+  form.innerHTML = SETTINGS_SECTIONS.map(sec => {
+    let body;
+    if (sec.key === "servers") {
+      body = cfgModel.server.map((_, i) => serverCard(i)).join("") +
+        `<button type="button" class="small cfg-add" onclick="addServer()">+ add server</button>`;
+    } else if (sec.key === "categories") {
+      body = cfgModel.category.map((_, i) => categoryCard(i)).join("") +
+        `<button type="button" class="small cfg-add" onclick="addCategory()">+ add category</button>`;
+    } else {
+      body = `<div class="cfg-grid">` +
+        sec.fields.map(([p, l, t, o]) => fieldControl(p, l, t, o)).join("") + `</div>`;
+    }
+    return `<div class="cfg-card"><h3>${esc(sec.title)}</h3><p class="desc">${esc(sec.desc)}</p>${body}</div>`;
+  }).join("");
+  // Tri-state (inherit/yes/no) selects render as placeholders first;
+  // swap them for real <select>s.
+  form.querySelectorAll('input[data-type="select3"]').forEach(inp => {
+    const path = inp.dataset.path;
+    const v = getPath(cfgModel, path);
+    const sel = document.createElement("select");
+    sel.dataset.path = path; sel.dataset.type = "select3";
+    for (const [val, lab] of [["", "inherit"], ["true", "yes"], ["false", "no"]]) {
+      const o = document.createElement("option");
+      o.value = val; o.textContent = lab;
+      o.selected = (v == null ? "" : String(v)) === val;
+      sel.appendChild(o);
+    }
+    inp.replaceWith(sel);
+  });
+  form.oninput = () => { cfgDirty = true; $("cfg-save").disabled = !cfgInfo.writable; };
+}
+
+function collectSettingsForm() {
+  const out = JSON.parse(JSON.stringify(cfgModel)); // keep unedited sections (feeds, cluster) intact
+  for (const el of $("cfg-form").querySelectorAll("[data-path]")) {
+    const path = el.dataset.path, t = el.dataset.type;
+    if (t === "check") setPath(out, path, el.checked);
+    else if (t === "select") setPath(out, path, el.value);
+    else if (t === "select3") setPath(out, path, el.value === "" ? null : el.value === "true");
+    else if (t === "secret") {
+      if (el.value !== "") setPath(out, path, el.value); // typed = replace; empty = keep model value (mask/null)
+    } else if (t === "list") {
+      setPath(out, path, el.value.split(",").map(x => x.trim()).filter(Boolean));
+    } else if (t === "num" || t === "num?") {
+      const v = el.value.trim();
+      if (v === "" && t === "num?") setPath(out, path, null);
+      else setPath(out, path, Number(v) || 0);
+    } else { // text / text?
+      const v = el.value.trim();
+      setPath(out, path, v === "" && t === "text?" ? null : v);
+    }
+  }
+  return out;
+}
+
+function addServer() {
+  cfgModel = collectSettingsForm();
+  cfgModel.server.push({ name: "", host: "", port: 563, tls: true, username: null,
+    password: null, active: true, tier: 0, group: 0, fill: false, connections: 8,
+    pipeline_depth: 2, retention_days: 0, cert_verification: "strict" });
+  renderSettingsForm(); cfgDirty = true; $("cfg-save").disabled = !cfgInfo.writable;
+}
+function removeServer(i) {
+  cfgModel = collectSettingsForm(); cfgModel.server.splice(i, 1);
+  renderSettingsForm(); cfgDirty = true; $("cfg-save").disabled = !cfgInfo.writable;
+}
+function addCategory() {
+  cfgModel = collectSettingsForm();
+  cfgModel.category.push({ name: "", dest_dir: null, unpack: null, extensions: [] });
+  renderSettingsForm(); cfgDirty = true; $("cfg-save").disabled = !cfgInfo.writable;
+}
+function removeCategory(i) {
+  cfgModel = collectSettingsForm(); cfgModel.category.splice(i, 1);
+  renderSettingsForm(); cfgDirty = true; $("cfg-save").disabled = !cfgInfo.writable;
+}
+
+function showRestartBanner(sections) {
+  const b = $("restart-banner");
+  if (!sections || !sections.length) { b.hidden = true; return; }
+  $("restart-msg").textContent =
+    "Saved changes to " + sections.join(", ") + " take effect after a restart.";
+  b.hidden = false;
+}
+
 async function loadSettings(force) {
-  if (cfgLoaded && !force) return;           // don't clobber edits on refresh
+  if (cfgLoaded && !force) return;   // never clobber an open edit on refresh ticks
   const r = await fetch("/api/v1/config");
-  const msg = $("cfg-msg");
   if (!r.ok) {
     $("cfg-meta").textContent = r.status === 401
       ? "authentication required" : "settings unavailable (" + r.status + ")";
     return;
   }
   const c = await r.json();
-  cfgLoaded = true; cfgDirty = false;
-  $("cfg-text").value = c.toml;
-  const editable = !!c.path && c.writable;
-  $("cfg-text").disabled = !editable;
-  $("cfg-save").disabled = !editable;
+  cfgInfo = c; cfgModel = c.config; cfgLoaded = true; cfgDirty = false;
+  $("adv-toml").value = c.toml;
+  renderSettingsForm();
+  $("cfg-save").disabled = true;
+  showRestartBanner(c.pending_restart);
   $("cfg-meta").innerHTML = c.path
-    ? (editable
-        ? "Editing <code>" + esc(c.path) + "</code> — saving validates, writes the file and restarts the daemon. " +
-          "Passwords show as <code>" + esc(c.mask) + "</code> and are kept unless you type a new one."
-        : "<code>" + esc(c.path) + "</code> isn't writable from the daemon — edit the file by hand and restart. " +
-          "This view is read-only (secrets masked).")
-    : "Running without <code>--config</code>: these are the effective defaults, read-only. " +
-      "Start with <code>nzbd run --config nzbd.toml</code> to make settings editable.";
-  msg.textContent = ""; msg.className = "";
+    ? (c.writable
+        ? "Backed by <code>" + esc(c.path) + "</code> — passwords stay stored; type a new one only to change it."
+        : "<code>" + esc(c.path) + "</code> isn't writable from the daemon — settings are read-only here; edit the file by hand and restart.")
+    : "Running without <code>--config</code>: effective defaults, read-only. Start with <code>nzbd run --config nzbd.toml</code> to make settings editable.";
+  if (!c.writable || !c.path) {
+    $("cfg-form").querySelectorAll("input,select,button").forEach(el => { el.disabled = true; });
+  }
+  $("cfg-msg").textContent = ""; $("cfg-msg").className = "";
 }
-$("cfg-text").oninput = () => { cfgDirty = true; };
-$("cfg-reload").onclick = () => loadSettings(true);
-$("cfg-download").onclick = () => {
-  const a = document.createElement("a");
-  a.href = URL.createObjectURL(new Blob([$("cfg-text").value], { type: "text/plain" }));
-  a.download = "nzbd.toml";
-  a.click();
-  URL.revokeObjectURL(a.href);
-};
-$("cfg-save").onclick = async () => {
+
+async function saveSettings(body, contentType) {
   const msg = $("cfg-msg");
-  msg.className = ""; msg.textContent = "validating…";
+  msg.className = ""; msg.textContent = "saving…";
   let r;
   try {
-    r = await fetch("/api/v1/config", { method: "PUT", body: $("cfg-text").value });
-  } catch (e) { msg.className = "err"; msg.textContent = String(e); return; }
+    r = await fetch("/api/v1/config", { method: "PUT",
+      headers: { "content-type": contentType }, body });
+  } catch (e) { msg.className = "err"; msg.textContent = String(e); return null; }
   if (!r.ok) {
     const e = await r.json().catch(() => ({}));
-    msg.className = "err";
-    msg.textContent = e.error || ("save failed: " + r.status);
-    return;
+    msg.className = "err"; msg.textContent = e.error || ("save failed: " + r.status);
+    return null;
   }
-  msg.className = "ok"; msg.textContent = "saved — restarting daemon…";
-  cfgLoaded = false;
+  return r.json();
+}
+
+$("cfg-save").onclick = async () => {
+  const res = await saveSettings(JSON.stringify(collectSettingsForm()), "application/json");
+  if (!res) return;
+  const msg = $("cfg-msg");
+  msg.className = "ok";
+  msg.textContent = res.applied_live.length
+    ? "saved — applied immediately: " + res.applied_live.join(", ")
+    : "saved";
+  showRestartBanner(res.restart_required);
+  cfgDirty = false; $("cfg-save").disabled = true;
+  await loadSettings(true);
+  if (res.applied_live.length) refreshAll();
+};
+$("cfg-discard").onclick = () => loadSettings(true);
+$("adv-save").onclick = async () => {
+  const res = await saveSettings($("adv-toml").value, "text/plain");
+  if (!res) return;
+  $("cfg-msg").className = "ok"; $("cfg-msg").textContent = "TOML saved";
+  showRestartBanner(res.restart_required);
+  await loadSettings(true);
+};
+$("adv-download").onclick = () => {
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(new Blob([$("adv-toml").value], { type: "text/plain" }));
+  a.download = "nzbd.toml"; a.click(); URL.revokeObjectURL(a.href);
+};
+$("btn-restart").onclick = async () => {
+  const msg = $("cfg-msg");
+  msg.className = ""; msg.textContent = "restarting…";
+  $("btn-restart").disabled = true;
+  try { await fetch("/api/v1/restart", { method: "POST" }); } catch { /* listener bouncing */ }
   for (let i = 0; i < 60; i++) {
     await new Promise(res => setTimeout(res, 500));
-    try {
-      const h = await fetch("/healthz");
-      if (h.ok && i > 1) break;              // listener bounced and returned
-    } catch { /* restarting */ }
+    try { const h = await fetch("/healthz"); if (h.ok && i > 1) break; } catch { /* down */ }
   }
-  msg.textContent = "daemon restarted with the new configuration";
+  $("btn-restart").disabled = false;
+  msg.className = "ok"; msg.textContent = "restarted";
+  cfgLoaded = false;
+  await loadSettings(true);
   refreshAll();
 };
-let debounce = null;
-function nudge() { clearTimeout(debounce); debounce = setTimeout(refreshAll, 150); }
-function connectSse() {
-  const es = new EventSource("/api/v1/events");
-  es.onopen = () => { $("conn").textContent = "live"; };
-  es.onerror = () => { $("conn").textContent = "reconnecting…"; };
-  for (const ev of ["job_added", "job_finished", "job_deleted", "file_finished", "lagged"])
-    es.addEventListener(ev, nudge);
-}
+
 // ---- first-run setup ----------------------------------------------------
 async function checkSetup() {
   let s;

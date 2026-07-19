@@ -57,6 +57,18 @@ consider **secure**, which gives three tiers:
    to install on devices; the best option when you have a domain or a
    tailnet.
 
+## Settings
+
+The **Settings** tab edits the running configuration as a normal form:
+paths, news servers (add/remove), speed & queue, web UI & API,
+post-processing, and categories. Passwords stay stored — type a new one
+only to change it. Saving applies what a running daemon can absorb
+immediately (the speed limit today); anything else flags a **restart
+required** banner listing the affected sections, with a *Restart nzbd*
+button that bounces the daemon in place (downloads resume from the
+journal). Feeds and cluster settings live in the collapsible raw-TOML
+editor at the bottom, which edits the same file.
+
 ## Connecting Sonarr / Radarr / Lidarr
 
 Add a download client of type **NZBGet** (not SABnzbd):

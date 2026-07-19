@@ -266,11 +266,11 @@ fn strip_chunking(body: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Settings tab round-trip: GET the masked config, edit a value, PUT it
-/// back; the daemon validates, restores masked secrets, writes the file
-/// and hot-reloads — with auth still working on the original password.
+/// Settings round-trip with the new contract: a speed-limit change
+/// applies LIVE (no restart); other sections mark restart-required;
+/// POST /api/v1/restart bounces the daemon; secrets survive throughout.
 #[test]
-fn settings_edit_reloads_daemon_and_keeps_secrets() {
+fn settings_live_apply_restart_flow_keeps_secrets() {
     let tmp = tempfile::tempdir().unwrap();
     let port = free_port();
     let addr = format!("127.0.0.1:{port}");
@@ -300,54 +300,103 @@ fn settings_edit_reloads_daemon_and_keeps_secrets() {
     wait_healthy(&addr, Duration::from_secs(15));
 
     let auth = Some("nzbd:pw1");
-    // Unauthenticated config access is refused.
-    let (code, _) = try_http(&addr, "GET", "/api/v1/config", b"", None).unwrap();
-    assert_eq!(code, 401);
-
-    let (code, body) = try_http(&addr, "GET", "/api/v1/config", b"", auth).unwrap();
-    assert_eq!(code, 200);
     let json = |s: &str| -> serde_json::Value {
         let (a, b) = (s.find('{').unwrap(), s.rfind('}').unwrap());
         serde_json::from_str(&s[a..=b]).unwrap()
     };
+
+    // Config requires auth; GET returns masked structured config.
+    let (code, _) = try_http(&addr, "GET", "/api/v1/config", b"", None).unwrap();
+    assert_eq!(code, 401);
+    let (code, body) = try_http(&addr, "GET", "/api/v1/config", b"", auth).unwrap();
+    assert_eq!(code, 200);
     let c = json(&body);
-    let toml = c["toml"].as_str().unwrap();
-    assert!(c["writable"].as_bool().unwrap());
-    assert!(toml.contains("***unchanged***"), "secrets masked");
-    assert!(!toml.contains("srv-secret"), "server password never shown");
-    assert!(!toml.contains("pw1"), "api password never shown");
+    assert_eq!(c["config"]["server"][0]["password"], "***unchanged***");
+    assert!(!body.contains("srv-secret"));
+    assert_eq!(c["pending_restart"].as_array().unwrap().len(), 0);
+    let (code, body) = try_http(&addr, "GET", "/api/v1/status", b"", auth).unwrap();
+    assert_eq!(code, 200);
+    let up_before = json(&body)["up_since_unix"].as_i64().unwrap();
 
-    // Edit: add a speed limit, keep the masked secrets untouched.
-    let edited = toml.replace("[queue]", "[queue]\nspeed_limit_kib = 512");
-    let edited = if edited.contains("speed_limit_kib") {
-        edited
-    } else {
-        format!("{toml}\n[queue]\nspeed_limit_kib = 512\n")
-    };
-    let (code, body) = try_http(&addr, "PUT", "/api/v1/config", edited.as_bytes(), auth).unwrap();
+    // 1) Speed limit via JSON PUT: applied live, no restart required.
+    let mut cfg_json = c["config"].clone();
+    cfg_json["queue"]["speed_limit_kib"] = serde_json::json!(512);
+    let (code, body) = try_http(
+        &addr,
+        "PUT",
+        "/api/v1/config",
+        cfg_json.to_string().as_bytes(),
+        auth,
+    )
+    .unwrap();
     assert_eq!(code, 200, "{body}");
+    let res = json(&body);
+    assert_eq!(res["applied_live"][0], "speed limit");
+    assert_eq!(res["restart_required"].as_array().unwrap().len(), 0);
+    let (_, body) = try_http(&addr, "GET", "/api/v1/status", b"", auth).unwrap();
+    let st = json(&body);
+    assert_eq!(st["speed_limit_bps"].as_u64(), Some(512 * 1024), "live");
+    assert_eq!(
+        st["up_since_unix"].as_i64().unwrap(),
+        up_before,
+        "no bounce"
+    );
 
-    // Invalid TOML is rejected with 422 before anything is written.
-    let (code, _) = try_http(&addr, "PUT", "/api/v1/config", b"not = valid = toml", auth)
-        .unwrap_or((422, String::new()));
-    assert!(code == 422 || code == 0, "bad toml must not be accepted");
+    // 2) A post-processing change: saved, flagged restart-required.
+    cfg_json["post"]["unpack"] = serde_json::json!(false);
+    let (code, body) = try_http(
+        &addr,
+        "PUT",
+        "/api/v1/config",
+        cfg_json.to_string().as_bytes(),
+        auth,
+    )
+    .unwrap();
+    assert_eq!(code, 200, "{body}");
+    let res = json(&body);
+    assert!(res["restart_required"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|v| v == "post-processing"));
+    // Banner state survives a fresh GET.
+    let (_, body) = try_http(&addr, "GET", "/api/v1/config", b"", auth).unwrap();
+    assert!(json(&body)["pending_restart"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|v| v == "post-processing"));
 
-    // Daemon bounces; the new limit is live and the OLD password still works.
+    // Garbage JSON is rejected.
+    let (code, _) = try_http(&addr, "PUT", "/api/v1/config", b"{\"nope\": 1}", auth).unwrap();
+    assert_eq!(code, 422);
+
+    // 3) Restart button: daemon bounces, pending clears, auth persists.
+    let (code, _) = try_http(&addr, "POST", "/api/v1/restart", b"", auth).unwrap();
+    assert_eq!(code, 200);
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
-        assert!(Instant::now() < deadline, "daemon did not reload");
+        assert!(Instant::now() < deadline, "daemon did not restart");
         if let Some((200, body)) = try_http(&addr, "GET", "/api/v1/status", b"", auth) {
             let st = json(&body);
-            if st["speed_limit_bps"].as_u64() == Some(512 * 1024) {
-                break;
+            if st["up_since_unix"].as_i64().unwrap() > up_before
+                || st["speed_limit_bps"].as_u64() == Some(512 * 1024)
+            {
+                // restarted (or at least reloaded state); confirm pending cleared
+                if let Some((200, cb)) = try_http(&addr, "GET", "/api/v1/config", b"", auth) {
+                    if json(&cb)["pending_restart"].as_array().unwrap().is_empty() {
+                        break;
+                    }
+                }
             }
         }
         std::thread::sleep(Duration::from_millis(250));
     }
 
-    // The file on disk carries the REAL secrets, not the mask.
+    // Real secrets on disk, never the mask; the unpack edit persisted.
     let on_disk = std::fs::read_to_string(&cfg_path).unwrap();
     assert!(on_disk.contains("srv-secret"));
+    assert!(on_disk.contains("unpack = false"));
     assert!(on_disk.contains("speed_limit_kib = 512"));
     assert!(!on_disk.contains("***unchanged***"));
 }

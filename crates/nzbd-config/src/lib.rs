@@ -12,7 +12,7 @@ pub enum ConfigError {
     Invalid(String),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     #[serde(default)]
@@ -35,7 +35,7 @@ pub struct Config {
 
 /// `[post]` — post-processing (ARCHITECTURE.md §9): par verify/repair,
 /// unpack, cleanup, extension scripts.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields, default)]
 pub struct PostSection {
     pub enabled: bool,
@@ -83,7 +83,7 @@ impl Default for PostSection {
 }
 
 /// `[cluster]` — multi-node work distribution (docs/CLUSTERING.md).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields, default)]
 pub struct ClusterConfig {
     pub enabled: bool,
@@ -148,7 +148,7 @@ impl ClusterConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields, default)]
 pub struct Paths {
     pub main_dir: PathBuf,
@@ -172,7 +172,7 @@ impl Default for Paths {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields, default)]
 pub struct ServerConfig {
     pub name: String,
@@ -220,7 +220,7 @@ pub enum CertVerification {
     Strict,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 #[serde(deny_unknown_fields, default)]
 pub struct CategoryConfig {
     pub name: String,
@@ -230,7 +230,7 @@ pub struct CategoryConfig {
 }
 
 /// `[[feed]]` — an RSS/Atom indexer feed with an NZBGet-style filter.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields, default)]
 pub struct FeedConfig {
     pub name: String,
@@ -257,7 +257,7 @@ impl Default for FeedConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields, default)]
 pub struct QueueConfig {
     pub article_retries: u8,
@@ -298,7 +298,7 @@ impl Default for QueueConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields, default)]
 pub struct ApiConfig {
     pub bind: String,
@@ -1295,6 +1295,47 @@ Server2.Connections=0
 // ---------------------------------------------------------------------------
 // Settings-editor support: masked secrets round-trip
 // ---------------------------------------------------------------------------
+
+/// Compare two configs section by section for the settings UI:
+/// returns (live_appliable, restart_required) section names. Only the
+/// global speed limit can be applied to a running daemon today; any
+/// other change needs a restart.
+pub fn diff_sections(old: &Config, new: &Config) -> (Vec<&'static str>, Vec<&'static str>) {
+    let mut live = Vec::new();
+    let mut restart = Vec::new();
+    if old.paths != new.paths {
+        restart.push("paths");
+    }
+    if old.servers != new.servers {
+        restart.push("servers");
+    }
+    if old.categories != new.categories {
+        restart.push("categories");
+    }
+    if old.feeds != new.feeds {
+        restart.push("feeds");
+    }
+    if old.queue.speed_limit_kib != new.queue.speed_limit_kib {
+        live.push("speed limit");
+    }
+    let mut oq = old.queue.clone();
+    let mut nq = new.queue.clone();
+    oq.speed_limit_kib = None;
+    nq.speed_limit_kib = None;
+    if oq != nq {
+        restart.push("queue");
+    }
+    if old.api != new.api {
+        restart.push("api");
+    }
+    if old.post != new.post {
+        restart.push("post-processing");
+    }
+    if old.cluster != new.cluster {
+        restart.push("cluster");
+    }
+    (live, restart)
+}
 
 /// Placeholder the settings UI shows instead of stored secrets. A saved
 /// config carrying this exact value keeps the existing secret.
