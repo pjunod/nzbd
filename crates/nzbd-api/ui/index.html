@@ -69,6 +69,10 @@
            border: 1px solid var(--line); border-radius: 7px; padding: 6px 8px; font: inherit; }
   label { color: var(--ink2); font-size: 12.5px; }
 
+  #conn.conn { font-size: 11.5px; font-weight: 550; }
+  #conn.ok { color: var(--ok); }
+  #conn.warn { color: var(--warn); }
+  #conn.dim { color: var(--muted); }
   nav.tabs { display: flex; gap: 2px; border-bottom: 1px solid var(--line); margin-top: 6px; }
   nav.tabs button { border: none; background: none; border-radius: 7px 7px 0 0;
                     padding: 8px 14px; color: var(--ink2); }
@@ -321,7 +325,7 @@
       <button class="small" id="btn-limit">set</button></label>
     <span class="spacer" style="flex:1"></span>
     <button class="small" id="theme" title="theme: follows your system, dark otherwise">auto</button>
-    <label style="font-size:11.5px" id="conn">connecting…</label>
+    <label class="conn dim" id="conn" title="Establishing the live event stream to the daemon.">○ connecting…</label>
   </div>
 
   <nav class="tabs">
@@ -658,6 +662,33 @@ function refreshAll() {
   if (activeTab === "history") refreshHistory().catch(() => {});
   if (activeTab === "logs") refreshLogs().catch(() => {});
   if (activeTab === "settings") loadSettings().catch(() => {});
+}
+let debounce = null;
+function nudge() { clearTimeout(debounce); debounce = setTimeout(refreshAll, 150); }
+
+// Connection indicator: what the page's data feed is doing right now.
+function connState(mode) {
+  const el = $("conn");
+  if (mode === "live") {
+    el.className = "conn ok";
+    el.textContent = "● live updates";
+    el.title = "Connected to the daemon's event stream — changes appear the moment they happen.";
+  } else if (mode === "poll") {
+    el.className = "conn warn";
+    el.textContent = "◌ polling — reconnecting…";
+    el.title = "Lost the daemon's event stream; refreshing every 5 s while reconnecting. Data may lag a few seconds.";
+  } else {
+    el.className = "conn dim";
+    el.textContent = "○ connecting…";
+    el.title = "Establishing the live event stream to the daemon.";
+  }
+}
+function connectSse() {
+  const es = new EventSource("/api/v1/events");
+  es.onopen = () => connState("live");
+  es.onerror = () => connState("poll"); // EventSource retries by itself
+  for (const ev of ["job_added", "job_finished", "job_deleted", "file_finished", "lagged"])
+    es.addEventListener(ev, nudge);
 }
 
 // ---- settings: a real form over nzbd.toml -------------------------------
