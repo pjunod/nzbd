@@ -48,6 +48,9 @@ pub struct PostSection {
     pub unpack: bool,
     /// Delete archives/par2/sfv after a successful unpack.
     pub cleanup: bool,
+    /// Rename still-obfuscated files to the job name after unpack
+    /// (SABnzbd-style; fully obfuscated season packs get `<job> - NN`).
+    pub deobfuscate_final: bool,
     /// NZBGet `PostStrategy`: sequential | balanced | aggressive | rocket.
     pub strategy: String,
     /// What to do with health-gated failures: none | park | delete
@@ -69,6 +72,7 @@ impl Default for PostSection {
             scripts_dir: None,
             unpack: true,
             cleanup: true,
+            deobfuscate_final: true,
             strategy: "balanced".into(),
             health_action: "none".into(),
             tool_timeout_secs: 3600,
@@ -891,6 +895,9 @@ pub fn import_nzbget_conf(content: &str) -> Result<(Config, ImportReport), Confi
             | "articlereadchunksize"
             | "nzbdirinterval"
             | "nzbdirfilesage"
+            // DirectRename's during-download variant is covered by the PP
+            // rename stage (par/rar rename are always-on in nzbd).
+            | "directrename"
             | "dupescope" => {
                 report.skipped.push(key.clone());
                 None

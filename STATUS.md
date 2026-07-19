@@ -8,7 +8,7 @@ roadmaps in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) §16 and
 Legend: ✅ done (implemented, tested, committed) · 🔶 partial · ⬜ not
 started · 👤 operator action (Paul)
 
-**Snapshot (2026-07-17):** 155 tests · clippy clean · **phases 0–4
+**Snapshot (2026-07-18):** 165 tests · clippy clean · **phases 0–4
 complete incl. RSS feeds, cluster C1+C2 complete, phase 5 partial** —
 every NZBGet user-facing surface exists; what remains is beyond-parity
 performance work and operator actions
@@ -101,6 +101,7 @@ performance work and operator actions
 - ✅ `[post]` config section; daemon wiring single-node **and** cluster (PP runs on the leader, gated live on election state)
 - ✅ 6-test e2e suite against real binaries: intact fast path + script env/FINALDIR, corrupt→repaired bit-identical, unrepairable→PAR_FAILURE, unpack+cleanup, script-error→SCRIPT_FAILURE, event-driven manager + restart-skip
 - ✅ par-rename / rar-rename: obfuscated posts recover real names before verify/unpack — par2 16k-MD5 catalog (obfuscated `.par2`s found by magic), RAR4/RAR5/7z/zip signatures, RAR5 internal volume numbers, evidence paths remapped so quick-verify still runs; e2e proves obfuscated → renamed → Intact
+- ✅ Final-name deobfuscation (`post.deobfuscate_final`, default on): after unpack, whatever still carries a meaningless name gets the job name — SABnzbd's dominant-file rule (biggest ≥ 3× next) with its heuristics ported, plus **season packs** (which SABnzbd skips): several similar-sized videos, all hex/uuid-grade obfuscated → stable `<job> - NN` numbering, logged as heuristic. par2-set names are evidence-protected (never overridden); companions (`.srt`, `-sample`) follow their media file; per-daemon e2e through the real binary
 - ✅ Per-job unpack passwords (`*Unpack:Password` job parameter, NZBGet convention) — e2e with a passworded archive
 - ✅ Dupe handling (key/score/mode): append carries DupeKey/Score/Mode onto the job; Score/All block against queue + history successes, Force overrides; rejects recorded as `DELETED/DUPE`; real dupe fields in listgroups/history
 - ✅ Health-check actions (`HealthCheck`: none/park/delete) — delete removes the failed download's files; recorded `FAILURE/HEALTH`

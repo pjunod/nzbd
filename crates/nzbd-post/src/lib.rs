@@ -13,9 +13,13 @@
 //! - [`manager`] — the orchestrator: watches engine events, drives each
 //!   finished job through the stages, records history, stamps jobs so
 //!   restarts never re-process.
+//! - [`rename`] — evidence-based obfuscation recovery (par2 16k-hashes,
+//!   archive signatures); [`deobfuscate`] — the final heuristic pass
+//!   (job-name rename, season-pack numbering) for what evidence missed.
 
 use std::path::PathBuf;
 
+pub mod deobfuscate;
 pub mod manager;
 pub mod par2;
 pub mod rename;

@@ -315,6 +315,19 @@ Revisit later: segment-split downloads (C3); weighted/affinity scheduling
 (CPU class, per-node link speed); observed-latency-based provider budget
 rebalancing; WAN-separated nodes.
 
+**Filesystem portability.** Nothing here is Gluster-specific. The
+protocol needs exactly: atomic same-directory rename, create-exclusive
+(`O_EXCL`), and bounded cross-client visibility lag — and it deliberately
+avoids everything network filesystems get wrong (no byte-range locks, no
+cross-client `O_APPEND`, fencing tokens re-checked at commit so stale
+reads can't double-apply work). That holds on NFSv4, CephFS, Lustre,
+GPFS, JuiceFS and similar; Gluster is the reference deployment and one
+of the *weaker* targets, so anything stronger is strictly easier. What
+cannot work is a non-filesystem store (raw object storage has no atomic
+rename); supporting that would mean an alternative lease-store backend
+(etcd/redis) behind the same lease/fencing protocol — a seam, not a
+rewrite.
+
 ## 13. Phasing
 
 | Phase | Scope | Exit criteria |

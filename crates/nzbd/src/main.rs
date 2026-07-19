@@ -134,6 +134,7 @@ fn post_config(cfg: &nzbd_config::Config, slots: usize) -> nzbd_post::manager::P
             .map(|p| nzbd_config::expand_home(p)),
         unpack: cfg.post.unpack,
         cleanup: cfg.post.cleanup,
+        deobfuscate_final: cfg.post.deobfuscate_final,
         health_action: nzbd_post::manager::HealthAction::parse(&cfg.post.health_action),
         slots,
         tool_timeout: Duration::from_secs(cfg.post.tool_timeout_secs.max(1)),

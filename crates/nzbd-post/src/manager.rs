@@ -54,6 +54,9 @@ pub struct PostConfig {
     pub scripts_dir: Option<PathBuf>,
     pub unpack: bool,
     pub cleanup: bool,
+    /// Rename still-obfuscated files to the job name after unpack
+    /// (SABnzbd-style; fully obfuscated season packs get `<job> - NN`).
+    pub deobfuscate_final: bool,
     /// Action for health-gated failures (files on disk).
     pub health_action: HealthAction,
     /// Concurrent PP jobs (PostStrategy: sequential=1, balanced=2,
@@ -74,6 +77,7 @@ impl Default for PostConfig {
             scripts_dir: None,
             unpack: true,
             cleanup: true,
+            deobfuscate_final: true,
             health_action: HealthAction::None,
             slots: 1,
             tool_timeout: Duration::from_secs(3600),
@@ -443,7 +447,11 @@ pub async fn process_job_ctx(
     };
     let mut par_ok = true;
     let mut par_did_repair = false;
+    // Names the par2 set vouches for: proven correct, off-limits to the
+    // heuristic deobfuscation pass at the end.
+    let mut par2_names: std::collections::HashSet<String> = Default::default();
     if let Some(set) = par2::load_dir(&dir)? {
+        par2_names = set.files.iter().map(|f| f.name.clone()).collect();
         set_stage(engine, job_id, PostStage::ParVerify).await;
         let quick = par2::quick_verify(&set, &evidence_of(&job, &dir, &rename_map));
         if quick == VerifyResult::Intact {
@@ -523,6 +531,27 @@ pub async fn process_job_ctx(
     if cfg.cleanup && par_ok && unpack_ok && unpacked_any {
         set_stage(engine, job_id, PostStage::Cleanup).await;
         cleanup_dir(&dir);
+    }
+
+    // ---- DEOBFUSCATE stage -------------------------------------------------
+    // Anything still meaninglessly named after par-rename, rar-rename and
+    // unpack has no recovery evidence left; the job name (from the NZB /
+    // indexer) is the last source of truth. Scripts run after this, so
+    // they see the final names.
+    if cfg.deobfuscate_final && par_ok && unpack_ok {
+        let renamed = crate::deobfuscate::deobfuscate_dir(
+            &dir,
+            &nzbd_engine::queue::sanitize_name(&job.name),
+            &par2_names,
+        );
+        for (from, to) in &renamed {
+            tracing::info!(
+                job = job_id.0,
+                from = %from.display(),
+                to = %to.display(),
+                "deobfuscate: renamed"
+            );
+        }
     }
 
     // ---- SCRIPT stage ------------------------------------------------------

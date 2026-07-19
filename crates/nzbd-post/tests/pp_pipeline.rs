@@ -321,15 +321,15 @@ async fn unpack_then_cleanup() {
         .unwrap();
 
     let hist = history(tmp.path());
-    let out = process_job(
-        &engine,
-        &PostConfig::default(),
-        &hist,
-        &tmp.path().join("dest"),
-        JobId(4),
-    )
-    .await
-    .unwrap();
+    // deobfuscate off: this test pins the unpack/cleanup contract; the
+    // final-name pass has its own e2e coverage below.
+    let cfg = PostConfig {
+        deobfuscate_final: false,
+        ..PostConfig::default()
+    };
+    let out = process_job(&engine, &cfg, &hist, &tmp.path().join("dest"), JobId(4))
+        .await
+        .unwrap();
     assert_eq!(out, PpFinal::Success);
     assert_eq!(std::fs::read(dir.join("movie.mkv")).unwrap(), inner);
     assert!(
@@ -515,6 +515,100 @@ async fn obfuscated_names_recovered_then_quick_verified() {
     engine.shutdown().await;
 }
 
+/// A job whose only media file kept an obfuscated name through PP gets
+/// renamed to the job name (SABnzbd-style final pass, no tools needed).
+#[tokio::test]
+async fn deobfuscate_final_renames_to_job_name() {
+    let tmp = tempfile::tempdir().unwrap();
+    let engine = spawn_engine(tmp.path()).await;
+    let dir = tmp.path().join("dest/Great.Show.S02.1080p.WEB");
+    std::fs::create_dir_all(&dir).unwrap();
+    let data = vec![7u8; 60_000];
+    std::fs::write(dir.join("a1b2c3d4e5f6a7b8.mkv"), &data).unwrap();
+    std::fs::write(dir.join("a1b2c3d4e5f6a7b8.eng.srt"), b"subtitles").unwrap();
+
+    let files = vec![file_entry(
+        1,
+        "a1b2c3d4e5f6a7b8.mkv",
+        Some(crc(&data)),
+        false,
+    )];
+    engine
+        .import_job(
+            completed_job(11, "Great.Show.S02.1080p.WEB", files),
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+
+    let hist = history(tmp.path());
+    let out = process_job(
+        &engine,
+        &PostConfig::default(),
+        &hist,
+        &tmp.path().join("dest"),
+        JobId(11),
+    )
+    .await
+    .unwrap();
+    assert_eq!(out, PpFinal::Success);
+    assert!(dir.join("Great.Show.S02.1080p.WEB.mkv").exists());
+    assert!(
+        dir.join("Great.Show.S02.1080p.WEB.eng.srt").exists(),
+        "companion subtitle follows the rename"
+    );
+    engine.shutdown().await;
+}
+
+/// A fully obfuscated season pack (several similar-sized videos, all
+/// hex-named) gets stable numbered names — the case SABnzbd skips.
+#[tokio::test]
+async fn deobfuscate_final_numbers_season_pack() {
+    let tmp = tempfile::tempdir().unwrap();
+    let engine = spawn_engine(tmp.path()).await;
+    let dir = tmp.path().join("dest/Show.S03.1080p.WEB");
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut files = Vec::new();
+    for (i, stem) in ["9f8e7d6c5b4a3f2e", "1a2b3c4d5e6f7a8b", "deadbeefcafef00d"]
+        .iter()
+        .enumerate()
+    {
+        let data = vec![i as u8; 40_000];
+        std::fs::write(dir.join(format!("{stem}.mkv")), &data).unwrap();
+        files.push(file_entry(
+            i as u32 + 1,
+            &format!("{stem}.mkv"),
+            Some(crc(&data)),
+            false,
+        ));
+    }
+    engine
+        .import_job(completed_job(12, "Show.S03.1080p.WEB", files), false, false)
+        .await
+        .unwrap();
+
+    let hist = history(tmp.path());
+    let out = process_job(
+        &engine,
+        &PostConfig::default(),
+        &hist,
+        &tmp.path().join("dest"),
+        JobId(12),
+    )
+    .await
+    .unwrap();
+    assert_eq!(out, PpFinal::Success);
+    for n in 1..=3 {
+        assert!(
+            dir.join(format!("Show.S03.1080p.WEB - {n:02}.mkv"))
+                .exists(),
+            "episode {n} numbered"
+        );
+    }
+    engine.shutdown().await;
+}
+
 /// Per-job password (`*Unpack:Password` parameter, NZBGet convention)
 /// reaches the extractor.
 #[tokio::test]
@@ -546,15 +640,14 @@ async fn per_job_password_unlocks_archive() {
     engine.import_job(job, false, false).await.unwrap();
 
     let hist = history(tmp.path());
-    let out = process_job(
-        &engine,
-        &PostConfig::default(),
-        &hist,
-        &tmp.path().join("dest"),
-        JobId(8),
-    )
-    .await
-    .unwrap();
+    // deobfuscate off: the password path is under test, not final naming.
+    let cfg = PostConfig {
+        deobfuscate_final: false,
+        ..PostConfig::default()
+    };
+    let out = process_job(&engine, &cfg, &hist, &tmp.path().join("dest"), JobId(8))
+        .await
+        .unwrap();
     assert_eq!(out, PpFinal::Success);
     assert_eq!(std::fs::read(dir.join("file.bin")).unwrap(), inner);
     engine.shutdown().await;

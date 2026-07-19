@@ -132,8 +132,10 @@ bind = "{api_addr}"
 
     // Wait for the finished download on disk (post-processing then retires
     // the job from the queue into history, so queue counters are transient).
+    // PP's final deobfuscation pass renames the generically-named payload
+    // to the job name, so that is the path that must appear.
     let start = Instant::now();
-    let payload_path = tmp.path().join("dest/cli demo/payload.bin");
+    let payload_path = tmp.path().join("dest/cli demo/cli demo.bin");
     loop {
         assert!(
             start.elapsed() < Duration::from_secs(30),
@@ -353,7 +355,9 @@ bind = "{api_addr}"
     let final_dir = entry["FinalDir"].as_str().unwrap();
     assert!(!final_dir.is_empty());
 
-    // 6. Import: the completed file is where history says it is.
-    let got = std::fs::read(std::path::Path::new(final_dir).join("episode.mkv")).unwrap();
+    // 6. Import: the completed file is where history says it is. The
+    // deobfuscation pass renamed the generic "episode.mkv" to the job name
+    // — exactly what Sonarr wants to see for import.
+    let got = std::fs::read(std::path::Path::new(final_dir).join("arr episode.mkv")).unwrap();
     assert_eq!(got, data);
 }
