@@ -157,12 +157,23 @@ impl ClientRegistry {
         self.current.lock().unwrap().clone()
     }
 
-    pub fn snapshot(&self) -> Vec<ClientInfo> {
-        let mut v: Vec<ClientInfo> = self.inner.lock().unwrap().values().cloned().collect();
+    /// Live clients, most-recent first. Anything not heard from within
+    /// `CLIENT_TTL_SECS` is dropped from the registry (a client that has
+    /// gone quiet for 5 minutes isn't "connected" — and this also keeps
+    /// the map from growing unbounded as clients cycle User-Agents).
+    pub fn snapshot(&self, now_unix: i64) -> Vec<ClientInfo> {
+        let mut m = self.inner.lock().unwrap();
+        m.retain(|_, c| now_unix - c.last_seen_unix < CLIENT_TTL_SECS);
+        let mut v: Vec<ClientInfo> = m.values().cloned().collect();
+        drop(m);
         v.sort_by_key(|c| std::cmp::Reverse(c.last_seen_unix));
         v
     }
 }
+
+/// A compat client not seen in this many seconds is no longer considered
+/// connected and is pruned from the registry.
+const CLIENT_TTL_SECS: i64 = 300;
 
 /// HTTP auth requirements (NZBGet `ControlUsername`/`ControlPassword`
 /// parity plus a bearer token). Enforced only when a password or token is
@@ -1013,10 +1024,14 @@ async fn post_restart(State(st): State<ApiState>) -> Response {
 /// Observed compat clients (Sonarr/Radarr polling us) — the UI's
 /// "connected clients" strip.
 async fn get_clients(State(st): State<ApiState>) -> Response {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
     let list = st
         .clients
         .as_ref()
-        .map(|c| c.snapshot())
+        .map(|c| c.snapshot(now))
         .unwrap_or_default();
     Json(json!({ "clients": list })).into_response()
 }
@@ -1246,6 +1261,30 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 
         engine.shutdown().await;
+    }
+
+    #[test]
+    fn client_registry_prunes_after_ttl() {
+        let reg = ClientRegistry::default();
+        // Two clients seen at t=0; a third arrives later.
+        reg.note(Some("Sonarr/4"), "history", 0);
+        reg.note(Some("Radarr/5"), "history", 0);
+        assert_eq!(reg.snapshot(10).len(), 2);
+
+        // At t = TTL-1 both are still live; Radarr checks in again.
+        reg.note(Some("Radarr/5"), "listgroups", CLIENT_TTL_SECS - 1);
+        let live = reg.snapshot(CLIENT_TTL_SECS - 1);
+        assert_eq!(live.len(), 2);
+        assert_eq!(live[0].user_agent, "Radarr/5", "most-recent first");
+
+        // Jump past Sonarr's TTL but within Radarr's: Sonarr is pruned.
+        let live = reg.snapshot(CLIENT_TTL_SECS + 1);
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].user_agent, "Radarr/5");
+        assert_eq!(live[0].calls, 2);
+
+        // Long silence: everyone is gone and the map is empty.
+        assert!(reg.snapshot(CLIENT_TTL_SECS * 3).is_empty());
     }
 
     #[test]
