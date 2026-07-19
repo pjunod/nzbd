@@ -93,8 +93,11 @@ nzbd run --config nzbd.toml  # or with a config file
 nzbd run --config nzbd.toml --bind 0.0.0.0:6789   # listen on all interfaces
 ```
 
-There is no config wizard — copy the annotated example from
-[CONFIGURATION.md](CONFIGURATION.md), or convert an existing NZBGet setup:
+If the `--config` path doesn't exist yet, the daemon starts in **first-run
+setup mode**: open the web UI and a short form (paths, news server, UI
+password) writes the file and restarts the daemon with it. Prefer a file?
+Copy the annotated example from [CONFIGURATION.md](CONFIGURATION.md), or
+convert an existing NZBGet setup:
 
 ```sh
 nzbd import-config /opt/nzbget/nzbget.conf --out nzbd.toml

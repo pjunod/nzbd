@@ -9,6 +9,12 @@ nzbd status [--url 127.0.0.1:6789]                    # queue/rate/remaining as 
 nzbd import-config nzbget.conf [--out nzbd.toml]      # migrate from NZBGet
 ```
 
+**First-run setup:** if the `--config` path doesn't exist yet, the daemon
+boots anyway and the web UI serves a setup form — paths, one news server,
+optional UI password. Submitting writes the config file to that path and
+restarts the daemon with it, no manual restart needed. (Everything the
+wizard writes is ordinary `nzbd.toml`; edit it by hand afterwards.)
+
 `add` and `status` are thin API clients — they talk to a running daemon,
 local or remote. Logs go to stderr; set `RUST_LOG` for verbosity
 (`RUST_LOG=debug nzbd run …`), and the same stream feeds the in-daemon

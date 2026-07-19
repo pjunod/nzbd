@@ -21,7 +21,10 @@ fn resolve_ref(r: &quick_xml::events::BytesRef<'_>) -> String {
     if let Ok(Some(ch)) = r.resolve_char_ref() {
         return ch.to_string();
     }
-    match r.as_ref() {
+    // Explicit slice type: with byte-string arms, `as_ref()` inference
+    // latches onto the first arm's `&[u8; N]` on newer rustc.
+    let name: &[u8] = r.as_ref();
+    match name {
         b"lt" => "<".into(),
         b"gt" => ">".into(),
         b"amp" => "&".into(),

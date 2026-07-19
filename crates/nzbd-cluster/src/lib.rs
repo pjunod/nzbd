@@ -308,6 +308,7 @@ impl ClusterRuntime {
                 engine: self.engine.clone(),
                 history,
                 log,
+                setup: None, // cluster mode always has a config file
             })
             .merge(nzbd_compat::router(compat_state)),
             auth,

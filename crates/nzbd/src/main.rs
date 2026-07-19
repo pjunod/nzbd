@@ -77,7 +77,14 @@ fn main() -> anyhow_lite::Result<()> {
 
     let cli = Cli::parse();
     match cli.command {
-        Command::Run { config, bind } => run(config, bind, logbuf),
+        Command::Run { config, bind } => loop {
+            match run(config.clone(), bind.clone(), logbuf.clone())? {
+                RunOutcome::Exit => break Ok(()),
+                RunOutcome::Reload => {
+                    tracing::info!("restarting with the new configuration");
+                }
+            }
+        },
         Command::Add {
             file,
             url,
@@ -302,11 +309,20 @@ fn spawn_watch_dir(
     });
 }
 
+/// How a `run()` pass ended: a real shutdown, or a first-run setup that
+/// wrote a config and wants the daemon to come back up with it.
+#[derive(PartialEq)]
+enum RunOutcome {
+    Exit,
+    Reload,
+}
+
 fn run(
     config: Option<PathBuf>,
     bind: Option<String>,
     logbuf: Arc<nzbd_api::LogBuffer>,
-) -> anyhow_lite::Result<()> {
+) -> anyhow_lite::Result<RunOutcome> {
+    let mut setup_path: Option<PathBuf> = None;
     let cfg = match &config {
         Some(path) => {
             // Actionable errors for the two classic container mistakes.
@@ -320,15 +336,27 @@ fn run(
                     path.display()
                 )));
             }
-            let text = std::fs::read_to_string(path).map_err(|e| {
-                anyhow_lite::Error::msg(format!("cannot read config {}: {e}", path.display()))
-            })?;
-            nzbd_config::Config::from_toml(&text)
-                .map_err(|e| anyhow_lite::Error::msg(format!("{}: {e}", path.display())))?
+            if !path.exists() {
+                // First-run setup: boot with defaults (no servers) and let
+                // the web UI write this file, then reload.
+                tracing::warn!(
+                    path = %path.display(),
+                    "no config file — first-run setup is live in the web UI"
+                );
+                setup_path = Some(path.clone());
+                nzbd_config::Config::default()
+            } else {
+                let text = std::fs::read_to_string(path).map_err(|e| {
+                    anyhow_lite::Error::msg(format!("cannot read config {}: {e}", path.display()))
+                })?;
+                nzbd_config::Config::from_toml(&text)
+                    .map_err(|e| anyhow_lite::Error::msg(format!("{}: {e}", path.display())))?
+            }
         }
         None => nzbd_config::Config::default(),
     };
     let bind = bind.unwrap_or_else(|| cfg.api.bind.clone());
+    let setup = setup_path.map(|p| Arc::new(nzbd_api::SetupHandle::new(p, bind.clone())));
 
     let servers = cfg.server_defs();
     for s in &servers {
@@ -362,7 +390,8 @@ fn run(
         .build()?;
 
     if cfg.cluster.enabled {
-        return runtime.block_on(run_cluster(cfg, servers, tuning, bind, logbuf));
+        runtime.block_on(run_cluster(cfg, servers, tuning, bind, logbuf))?;
+        return Ok(RunOutcome::Exit);
     }
 
     let engine_cfg = EngineConfig::single_node(
@@ -435,6 +464,7 @@ fn run(
                 engine: engine.clone(),
                 history,
                 log: Some(logbuf.clone()),
+                setup: setup.clone(),
             })
             .merge(nzbd_compat::router(compat_state)),
             nzbd_api::AuthConfig {
@@ -447,10 +477,23 @@ fn run(
         let listener = tokio::net::TcpListener::bind(&bind).await?;
         tracing::info!(%bind, "nzbd listening (phase 2: engine + post-processing)");
 
+        let shutdown_setup = setup.clone();
         axum::serve(listener, app)
-            .with_graceful_shutdown(async {
-                let _ = tokio::signal::ctrl_c().await;
-                tracing::info!("shutting down");
+            .with_graceful_shutdown(async move {
+                match &shutdown_setup {
+                    Some(s) => {
+                        tokio::select! {
+                            _ = tokio::signal::ctrl_c() => tracing::info!("shutting down"),
+                            _ = s.reload.notified() => {
+                                tracing::info!("setup applied; restarting with the new config")
+                            }
+                        }
+                    }
+                    None => {
+                        let _ = tokio::signal::ctrl_c().await;
+                        tracing::info!("shutting down");
+                    }
+                }
             })
             .await?;
 
@@ -459,7 +502,14 @@ fn run(
         pp_cancel.cancel();
         pp_tracker.wait().await;
         engine.shutdown().await;
-        Ok(())
+        let reload = setup
+            .as_ref()
+            .is_some_and(|s| s.applied.load(std::sync::atomic::Ordering::Relaxed));
+        Ok(if reload {
+            RunOutcome::Reload
+        } else {
+            RunOutcome::Exit
+        })
     })
 }
 

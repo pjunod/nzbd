@@ -64,6 +64,130 @@ impl Drop for KillOnDrop {
     }
 }
 
+/// Like `http`, but tolerates a dead/bouncing listener (returns None) and
+/// can send Basic auth. Used around the setup-reload window.
+fn try_http(
+    addr: &str,
+    method: &str,
+    path: &str,
+    body: &[u8],
+    basic: Option<&str>,
+) -> Option<(u16, String)> {
+    let mut sock = TcpStream::connect(addr).ok()?;
+    sock.set_read_timeout(Some(Duration::from_secs(10))).ok()?;
+    let auth = basic
+        .map(|cred| {
+            use base64::Engine as _;
+            format!(
+                "Authorization: Basic {}\r\n",
+                base64::engine::general_purpose::STANDARD.encode(cred)
+            )
+        })
+        .unwrap_or_default();
+    let req = format!(
+        "{method} {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Length: {}\r\nContent-Type: application/json\r\n{auth}Connection: close\r\n\r\n",
+        body.len()
+    );
+    sock.write_all(req.as_bytes()).ok()?;
+    sock.write_all(body).ok()?;
+    let mut resp = Vec::new();
+    sock.read_to_end(&mut resp).ok()?;
+    let text = String::from_utf8_lossy(&resp).into_owned();
+    let status: u16 = text.split_whitespace().nth(1)?.parse().ok()?;
+    let payload = text
+        .split_once("\r\n\r\n")
+        .map(|(_, b)| b.trim().to_string())
+        .unwrap_or_default();
+    Some((status, payload))
+}
+
+/// First-run setup: booting with a missing --config serves the wizard;
+/// POST writes the file; the daemon reloads with it (auth turns on).
+#[test]
+fn first_run_setup_wizard_writes_config_and_reloads() {
+    let tmp = tempfile::tempdir().unwrap();
+    let port = free_port();
+    let api_addr = format!("127.0.0.1:{port}");
+    // Parent dir doesn't exist either — setup must create it.
+    let cfg_path = tmp.path().join("conf/nzbd.toml");
+
+    let bin = env!("CARGO_BIN_EXE_nzbd");
+    let child = Command::new(bin)
+        .args(["run", "--config"])
+        .arg(&cfg_path)
+        .args(["--bind", &api_addr])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn nzbd");
+    let _child = KillOnDrop(child);
+    wait_healthy(&api_addr, Duration::from_secs(15));
+
+    let (code, body) = http(&api_addr, "GET", "/api/v1/setup", b"");
+    assert_eq!(code, 200);
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["setup_mode"], true, "{body}");
+
+    let req = serde_json::json!({
+        "main_dir": tmp.path().join("data").to_string_lossy(),
+        "dest_dir": tmp.path().join("data/complete").to_string_lossy(),
+        "server": {
+            "host": "127.0.0.1", "port": 1199, "tls": false,
+            "username": "u", "password": "p", "connections": 2
+        },
+        "api_password": "wizard-pw"
+    });
+    let (code, body) = http(
+        &api_addr,
+        "POST",
+        "/api/v1/setup",
+        req.to_string().as_bytes(),
+    );
+    assert_eq!(code, 200, "{body}");
+
+    // The daemon bounces its listener and comes back with auth enabled.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        assert!(Instant::now() < deadline, "daemon did not reload");
+        std::thread::sleep(Duration::from_millis(200));
+        match try_http(&api_addr, "GET", "/api/v1/status", b"", None) {
+            Some((401, _)) => break, // reloaded: new config requires auth
+            _ => continue,
+        }
+    }
+
+    // The written file exists and round-trips the strict parser.
+    let text = std::fs::read_to_string(&cfg_path).unwrap();
+    let cfg = nzbd_config::Config::from_toml(&text).unwrap();
+    assert_eq!(cfg.servers.len(), 1);
+    assert_eq!(cfg.servers[0].host, "127.0.0.1");
+    assert!(!cfg.servers[0].tls);
+    assert_eq!(cfg.api.password.as_deref(), Some("wizard-pw"));
+    assert_eq!(cfg.api.bind, api_addr);
+
+    // Authenticated requests work; setup mode is over.
+    let (code, body) = try_http(
+        &api_addr,
+        "GET",
+        "/api/v1/setup",
+        b"",
+        Some("nzbd:wizard-pw"),
+    )
+    .unwrap();
+    assert_eq!(code, 200, "{body}");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["setup_mode"], false);
+    let (code, _) = try_http(
+        &api_addr,
+        "GET",
+        "/api/v1/status",
+        b"",
+        Some("nzbd:wizard-pw"),
+    )
+    .unwrap();
+    assert_eq!(code, 200);
+}
+
 #[test]
 fn daemon_cli_compat_end_to_end() {
     // Mock provider on its own runtime.

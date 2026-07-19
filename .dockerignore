@@ -5,6 +5,7 @@ target-*
 .git
 .githooks
 dev/data
+dev/config
 dev/nzbd.toml
 badges-out
 lcov.info

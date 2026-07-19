@@ -26,6 +26,22 @@ imports fail with "path does not exist".
 
 ## Docker, by hand
 
+**Zero-config path:** skip writing a config entirely — mount an empty
+config *directory* and let the first-run setup UI create the file:
+
+```sh
+sudo mkdir -p /data/usenet /opt/nzbd/config
+sudo chown -R 1000:1000 /data/usenet /opt/nzbd/config
+docker run -d --name nzbd --restart unless-stopped -p 6789:6789 \
+  -v /data/usenet:/data \
+  -v /opt/nzbd/config:/etc/nzbd \
+  ghcr.io/pjunod/nzbd:latest
+# → http://localhost:6789/ shows the setup form; it writes
+#   /opt/nzbd/config/nzbd.toml and restarts the daemon with it.
+```
+
+Or fully declarative, config-first:
+
 ```sh
 # 1. Host directories
 sudo mkdir -p /data/usenet/complete /opt/nzbd

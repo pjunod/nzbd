@@ -26,6 +26,35 @@ pub struct ApiState {
     pub engine: EngineHandle,
     pub history: Option<Arc<HistoryDb>>,
     pub log: Option<Arc<LogBuffer>>,
+    /// First-run setup mode: present when the daemon booted with a
+    /// `--config` path that doesn't exist yet. The UI offers a setup form;
+    /// `POST /api/v1/setup` writes the file and asks the daemon to reload.
+    pub setup: Option<Arc<SetupHandle>>,
+}
+
+/// Shared handle between the setup endpoint and the daemon's run loop.
+pub struct SetupHandle {
+    /// Where the config file will be written.
+    pub config_path: std::path::PathBuf,
+    /// The effective listen address (recorded into the written config so
+    /// a later bare `nzbd run --config …` binds the same way).
+    pub bind: String,
+    /// Signals the run loop to tear down and re-run with the new config.
+    pub reload: tokio::sync::Notify,
+    /// True once a config has been written (the run loop turns this into
+    /// a reload instead of an exit).
+    pub applied: std::sync::atomic::AtomicBool,
+}
+
+impl SetupHandle {
+    pub fn new(config_path: std::path::PathBuf, bind: String) -> Self {
+        SetupHandle {
+            config_path,
+            bind,
+            reload: tokio::sync::Notify::new(),
+            applied: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
 }
 
 /// HTTP auth requirements (NZBGet `ControlUsername`/`ControlPassword`
@@ -489,7 +518,131 @@ pub fn router(engine: EngineHandle) -> Router {
         engine,
         history: None,
         log: None,
+        setup: None,
     })
+}
+
+// ---------------------------------------------------------------------------
+// First-run setup
+// ---------------------------------------------------------------------------
+
+#[derive(serde::Deserialize)]
+struct SetupServerReq {
+    #[serde(default)]
+    name: Option<String>,
+    host: String,
+    #[serde(default = "default_nntp_port")]
+    port: u16,
+    #[serde(default = "default_true")]
+    tls: bool,
+    #[serde(default)]
+    username: Option<String>,
+    #[serde(default)]
+    password: Option<String>,
+    #[serde(default)]
+    connections: Option<u16>,
+}
+
+fn default_nntp_port() -> u16 {
+    563
+}
+fn default_true() -> bool {
+    true
+}
+
+#[derive(serde::Deserialize)]
+struct SetupReq {
+    main_dir: String,
+    dest_dir: String,
+    server: SetupServerReq,
+    #[serde(default)]
+    api_password: Option<String>,
+}
+
+async fn get_setup(State(st): State<ApiState>) -> Response {
+    match &st.setup {
+        Some(s) => Json(json!({
+            "setup_mode": !s.applied.load(std::sync::atomic::Ordering::Relaxed),
+            "config_path": s.config_path.display().to_string(),
+        }))
+        .into_response(),
+        None => Json(json!({ "setup_mode": false })).into_response(),
+    }
+}
+
+async fn post_setup(State(st): State<ApiState>, Json(req): Json<SetupReq>) -> Response {
+    let Some(setup) = &st.setup else {
+        return error(StatusCode::NOT_FOUND, "not in setup mode");
+    };
+    if setup.applied.load(std::sync::atomic::Ordering::Relaxed) {
+        return error(StatusCode::CONFLICT, "setup already applied; reloading");
+    }
+    if req.main_dir.trim().is_empty()
+        || req.dest_dir.trim().is_empty()
+        || req.server.host.is_empty()
+    {
+        return error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "main_dir, dest_dir and server.host are required",
+        );
+    }
+
+    let mut cfg = nzbd_config::Config::default();
+    cfg.paths.main_dir = req.main_dir.trim().into();
+    cfg.paths.dest_dir = req.dest_dir.trim().into();
+    cfg.api.bind = setup.bind.clone();
+    cfg.api.password = req
+        .api_password
+        .as_deref()
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .map(String::from);
+    cfg.servers.push(nzbd_config::ServerConfig {
+        name: req
+            .server
+            .name
+            .clone()
+            .filter(|n| !n.trim().is_empty())
+            .unwrap_or_else(|| "primary".into()),
+        host: req.server.host.clone(),
+        port: req.server.port,
+        tls: req.server.tls,
+        username: req.server.username.clone().filter(|s| !s.is_empty()),
+        password: req.server.password.clone().filter(|s| !s.is_empty()),
+        connections: req.server.connections.unwrap_or(8).max(1),
+        ..nzbd_config::ServerConfig::default()
+    });
+
+    let toml_text = match nzbd_config::to_toml(&cfg) {
+        Ok(t) => t,
+        Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    };
+    // Round-trip through the strict parser so we never write a config the
+    // next boot would refuse.
+    if let Err(e) = nzbd_config::Config::from_toml(&toml_text) {
+        return error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string());
+    }
+    if let Some(parent) = setup.config_path.parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            return error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("create {}: {e}", parent.display()),
+            );
+        }
+    }
+    if let Err(e) = std::fs::write(&setup.config_path, &toml_text) {
+        return error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("write {}: {e}", setup.config_path.display()),
+        );
+    }
+    tracing::info!(path = %setup.config_path.display(), "setup: configuration written; reloading");
+    setup
+        .applied
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    setup.reload.notify_one();
+    Json(json!({ "written": setup.config_path.display().to_string(), "reloading": true }))
+        .into_response()
 }
 
 pub fn router_with(state: ApiState) -> Router {
@@ -505,6 +658,7 @@ pub fn router_with(state: ApiState) -> Router {
         .route("/api/v1/logs", get(get_logs))
         .route("/metrics", get(metrics))
         .route("/api/v1/openapi.json", get(openapi))
+        .route("/api/v1/setup", get(get_setup).post(post_setup))
         .route("/healthz", get(healthz))
         .route("/", get(ui_index))
         .with_state(state)

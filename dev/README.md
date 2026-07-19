@@ -6,8 +6,11 @@ faster inner loop for engine work is `cargo run -p nzbd -- run`.
 
 ```sh
 cd dev
-cp nzbd.toml.example nzbd.toml     # edit provider creds if you want real downloads
+mkdir -p config data
 docker compose up --build          # foreground with logs; Ctrl-C stops
+# → open http://localhost:6789/ — with no config present, the first-run
+#   setup UI appears and writes config/nzbd.toml for you.
+# Prefer a file? cp nzbd.toml.example config/nzbd.toml before `up`.
 ```
 
 The loop:
@@ -30,7 +33,7 @@ Web UI: <http://localhost:6789/> (no auth in the dev config).
 Notes:
 
 - Downloads and state land in `dev/data/` on the host (bind mount) —
-  inspect them directly. `dev/data/` and `dev/nzbd.toml` are gitignored.
+  inspect them directly. `dev/data/` and `dev/config/` are gitignored.
 - The repo's `.dockerignore` keeps `target/` out of the build context;
   the image build compiles from scratch inside Docker (release profile),
   so expect the first build to take a few minutes and rebuilds to reuse

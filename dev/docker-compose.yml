@@ -3,8 +3,11 @@
 # the faster inner loop for engine work is plain `cargo run -p nzbd`.
 #
 #   cd dev
-#   cp nzbd.toml.example nzbd.toml    # edit if you want a real provider
+#   mkdir -p config data
 #   docker compose up --build         # build + run (foreground, logs)
+#   # → http://localhost:6789/ serves the first-run setup UI, which
+#   #   writes config/nzbd.toml and restarts the daemon with it.
+#   # (Or pre-seed: cp nzbd.toml.example config/nzbd.toml)
 #
 # Rebuild-on-change (Compose v2.22+): `docker compose watch` rebuilds the
 # image whenever crate sources or the Dockerfile change.
@@ -20,12 +23,10 @@ services:
       - "6789:6789"
     volumes:
       - ./data:/data             # throwaway downloads/state, easy to inspect
-    # The config goes in as a compose `config`, not a bind mount: if
-    # ./nzbd.toml is missing, `docker compose up` fails immediately with a
-    # clear error instead of Docker inventing a directory in its place.
-    configs:
-      - source: nzbd_toml
-        target: /etc/nzbd/nzbd.toml
+      # Config DIRECTORY (mkdir -p config first). Start with it empty and
+      # the first-run setup UI at http://localhost:6789/ writes
+      # config/nzbd.toml for you — or pre-seed it from nzbd.toml.example.
+      - ./config:/etc/nzbd
     environment:
       - TZ=Etc/UTC
       - RUST_LOG=debug           # dev default; drop to info if too chatty
@@ -45,7 +46,3 @@ services:
           path: ../Cargo.lock
         - action: rebuild
           path: ../Dockerfile
-
-configs:
-  nzbd_toml:
-    file: ./nzbd.toml            # cp nzbd.toml.example nzbd.toml first

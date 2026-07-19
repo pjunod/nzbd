@@ -784,6 +784,7 @@ dependencies = [
  "axum",
  "base64",
  "http-body-util",
+ "nzbd-config",
  "nzbd-engine",
  "nzbd-state",
  "nzbd-types",

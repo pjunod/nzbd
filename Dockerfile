@@ -17,8 +17,10 @@ RUN apt-get update \
 COPY --from=build /src/target/release/nzbd /usr/local/bin/nzbd
 
 # Unprivileged runtime user; /data is the conventional volume mount.
+# /etc/nzbd is nzbd-writable so the first-run setup UI can create the
+# config when the container starts without one.
 RUN useradd -r -u 1000 -m -d /var/lib/nzbd nzbd \
- && mkdir -p /data /etc/nzbd && chown nzbd /data /var/lib/nzbd
+ && mkdir -p /data /etc/nzbd && chown nzbd /data /etc/nzbd /var/lib/nzbd
 USER nzbd
 VOLUME ["/data"]
 EXPOSE 6789
