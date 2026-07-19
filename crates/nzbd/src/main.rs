@@ -3,6 +3,8 @@
 //! (`add`, `status`) that talks to a running daemon over the native API.
 
 use clap::{Parser, Subcommand};
+
+mod tls;
 use nzbd_engine::{Engine, EngineConfig, Tuning};
 use nzbd_types::CertLevel;
 use std::path::PathBuf;
@@ -474,28 +476,39 @@ fn run(
             },
         );
 
-        let listener = tokio::net::TcpListener::bind(&bind).await?;
-        tracing::info!(%bind, "nzbd listening (phase 2: engine + post-processing)");
-
         let shutdown_setup = setup.clone();
-        axum::serve(listener, app)
-            .with_graceful_shutdown(async move {
-                match &shutdown_setup {
-                    Some(s) => {
-                        tokio::select! {
-                            _ = tokio::signal::ctrl_c() => tracing::info!("shutting down"),
-                            _ = s.reload.notified() => {
-                                tracing::info!("setup applied; restarting with the new config")
-                            }
+        let shutdown = async move {
+            match &shutdown_setup {
+                Some(s) => {
+                    tokio::select! {
+                        _ = tokio::signal::ctrl_c() => tracing::info!("shutting down"),
+                        _ = s.reload.notified() => {
+                            tracing::info!("setup applied; restarting with the new config")
                         }
                     }
-                    None => {
-                        let _ = tokio::signal::ctrl_c().await;
-                        tracing::info!("shutting down");
-                    }
                 }
-            })
-            .await?;
+                None => {
+                    let _ = tokio::signal::ctrl_c().await;
+                    tracing::info!("shutting down");
+                }
+            }
+        };
+
+        let tls_setup = tls::server_config(&cfg, &cfg.state_dir())
+            .map_err(|e| anyhow_lite::Error::msg(e.to_string()))?;
+        match tls_setup {
+            None => {
+                let listener = tokio::net::TcpListener::bind(&bind).await?;
+                tracing::info!(%bind, "nzbd listening");
+                axum::serve(listener, app)
+                    .with_graceful_shutdown(shutdown)
+                    .await?;
+            }
+            Some(t) => {
+                tracing::info!(%bind, %t.note, "nzbd listening (https)");
+                serve_tls(&bind, t.config, app, shutdown).await?;
+            }
+        }
 
         feed_cancel.cancel();
         feed_tracker.wait().await;
@@ -511,6 +524,43 @@ fn run(
             RunOutcome::Exit
         })
     })
+}
+
+/// Serve the router over TLS: hand-rolled accept loop (tokio-rustls +
+/// hyper-util's auto builder) so we stay on the workspace's existing
+/// rustls stack. Per-connection tasks die with the runtime when a run
+/// pass ends (shutdown or setup reload).
+async fn serve_tls(
+    bind: &str,
+    config: std::sync::Arc<rustls::ServerConfig>,
+    app: axum::Router,
+    shutdown: impl std::future::Future<Output = ()>,
+) -> anyhow_lite::Result<()> {
+    let listener = tokio::net::TcpListener::bind(bind).await?;
+    let acceptor = tokio_rustls::TlsAcceptor::from(config);
+    let mut shutdown = std::pin::pin!(shutdown);
+    loop {
+        tokio::select! {
+            _ = &mut shutdown => break,
+            accepted = listener.accept() => {
+                let Ok((stream, _peer)) = accepted else { continue };
+                let acceptor = acceptor.clone();
+                let app = app.clone();
+                tokio::spawn(async move {
+                    let Ok(stream) = acceptor.accept(stream).await else {
+                        return; // handshake failure (scanner, plain HTTP, …)
+                    };
+                    let service = hyper_util::service::TowerToHyperService::new(app);
+                    let _ = hyper_util::server::conn::auto::Builder::new(
+                        hyper_util::rt::TokioExecutor::new(),
+                    )
+                    .serve_connection_with_upgrades(hyper_util::rt::TokioIo::new(stream), service)
+                    .await;
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Cluster mode (docs/CLUSTERING.md): shared-volume state, elected leader,

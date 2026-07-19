@@ -31,6 +31,32 @@ deploy): live queue with per-job and per-file actions, pause/resume,
 speed limit control, history, log tail, dark/light. It refreshes over
 SSE, so state changes appear without polling.
 
+## On your phone (PWA)
+
+The UI is a progressive web app: responsive on small screens, installable
+to the home screen with its own icon, standalone (no browser chrome).
+Browsers only grant the full install + offline shell to origins they
+consider **secure**, which gives three tiers:
+
+1. **Plain HTTP on the LAN** — works fine as a responsive site; on iOS,
+   Safari's Share → *Add to Home Screen* still gives an icon and
+   full-screen launch. No service worker, no Android install prompt.
+2. **nzbd's built-in HTTPS** — set `[api] tls = true` (nothing else): a
+   self-signed certificate is generated once, persisted under the state
+   dir, and its sha256 fingerprint is printed at startup. Then trust that
+   cert on the phone — *clicking through the browser warning is not
+   enough for Chrome to enable service workers*: download `cert.pem` to
+   the device and install it (Android: Settings → Security → More →
+   Install certificates → CA certificate; iOS: open the file → install
+   the profile → Settings → General → About → Certificate Trust Settings
+   → enable). After that the origin is secure and install works.
+   Custom certs: `tls_cert`/`tls_key`; extra hostnames/IPs for the
+   generated one: `tls_sans`.
+3. **A real certificate** — any TLS reverse proxy (Caddy, Traefik,
+   Tailscale `tailscale serve`) in front of nzbd. Zero warnings, nothing
+   to install on devices; the best option when you have a domain or a
+   tailnet.
+
 ## Connecting Sonarr / Radarr / Lidarr
 
 Add a download client of type **NZBGet** (not SABnzbd):

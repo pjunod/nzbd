@@ -90,6 +90,13 @@ restarts (`servervolumes` in the compat API shows it).
 ```toml
 [api]
 bind = "127.0.0.1:6789"     # use 0.0.0.0:6789 to serve the LAN
+tls = false                 # true = serve HTTPS (NZBGet SecureControl).
+                            # With no cert configured, a self-signed cert is
+                            # generated once under the state dir and reused;
+                            # the startup log prints its sha256 fingerprint.
+# tls_cert = "/etc/nzbd/cert.pem"   # bring your own PEM chain + key instead
+# tls_key  = "/etc/nzbd/key.pem"    # (NZBGet SecureCert / SecureKey)
+# tls_sans = ["nas.lan", "192.168.1.10"]  # extra names for the generated cert
 compat_version = "26.2"     # version string the NZBGet shim reports
 username = "nzbd"           # HTTP Basic user (compat ControlUsername)
 # password = "secret"       # setting a password ENABLES auth everywhere

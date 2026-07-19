@@ -302,6 +302,18 @@ impl Default for QueueConfig {
 #[serde(deny_unknown_fields, default)]
 pub struct ApiConfig {
     pub bind: String,
+    /// Serve HTTPS instead of HTTP. With no cert configured, a
+    /// self-signed certificate is generated on first boot (under the
+    /// state dir) and reused after that — trust it on your devices for
+    /// full PWA install. NZBGet `SecureControl`.
+    pub tls: bool,
+    /// PEM certificate chain / private key (NZBGet `SecureCert`/`SecureKey`).
+    /// Both empty + `tls = true` = self-signed auto-generation.
+    pub tls_cert: Option<PathBuf>,
+    pub tls_key: Option<PathBuf>,
+    /// Extra subject-alt-names for the generated certificate (hostnames
+    /// and/or IPs you'll browse to). `localhost` is always included.
+    pub tls_sans: Vec<String>,
     /// Report this version string on the compat shim's `version` method.
     pub compat_version: String,
     /// Opt-in legacy default credentials for migration (off by default).
@@ -318,6 +330,10 @@ impl Default for ApiConfig {
     fn default() -> Self {
         ApiConfig {
             bind: "127.0.0.1:6789".into(),
+            tls: false,
+            tls_cert: None,
+            tls_key: None,
+            tls_sans: Vec::new(),
             compat_version: "26.2".into(),
             allow_legacy_default_credentials: false,
             username: "nzbd".into(),
@@ -825,6 +841,18 @@ pub fn import_nzbget_conf(content: &str) -> Result<(Config, ImportReport), Confi
                 cfg.post.strategy = v.to_lowercase();
                 Some("post.strategy".into())
             }
+            "securecontrol" => {
+                cfg.api.tls = yes(&v);
+                Some("api.tls".into())
+            }
+            "securecert" => {
+                cfg.api.tls_cert = (!v.is_empty()).then(|| PathBuf::from(&v));
+                Some("api.tls_cert".into())
+            }
+            "securekey" => {
+                cfg.api.tls_key = (!v.is_empty()).then(|| PathBuf::from(&v));
+                Some("api.tls_key".into())
+            }
             // Recognized, intentionally unmapped (built-in, obsolete, or a
             // policy nzbd handles differently).
             "parcheck"
@@ -864,10 +892,7 @@ pub fn import_nzbget_conf(content: &str) -> Result<(Config, ImportReport), Confi
             | "configfile"
             | "webdir"
             | "confighome"
-            | "securecontrol"
             | "secureport"
-            | "securecert"
-            | "securekey"
             | "certstore"
             | "certcheck"
             | "authorizedip"

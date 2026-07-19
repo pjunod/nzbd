@@ -2,8 +2,17 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>nzbd</title>
+<link rel="manifest" href="/manifest.webmanifest">
+<meta name="theme-color" content="#f7f7f5" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#101010" media="(prefers-color-scheme: dark)">
+<link rel="icon" href="/icons/icon-192.png" type="image/png">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="nzbd">
 <style>
   :root {
     color-scheme: light dark;
@@ -101,6 +110,20 @@
   #setup button[type=submit] { width: 100%; padding: 10px; font-weight: 600; }
   #setup-msg { margin-top: 10px; font-size: 12.5px; color: var(--muted); min-height: 1.2em; }
   #setup-msg.err { color: var(--bad); }
+  /* phones */
+  @media (max-width: 640px) {
+    .wrap { padding: 12px 10px 34px; }
+    .stats { grid-template-columns: repeat(2, 1fr); }
+    .stat .v { font-size: 16px; }
+    th.num, td.num { display: none; }        /* size/health columns */
+    th, td { padding-left: 6px; padding-right: 6px; }
+    .controls { gap: 6px; }
+    .controls label { font-size: 11px; }
+    #setup { margin: 10px auto; }
+    #setup .row { flex-wrap: wrap; }
+    #setup .row label { flex-basis: 100%; }
+    #setup .check { padding-top: 0; }
+  }
 </style>
 </head>
 <body>
@@ -422,6 +445,13 @@ async function checkSetup() {
   setInterval(refreshAll, 5000);
   refreshAll();
 })();
+
+// PWA app-shell worker. Browsers only expose serviceWorker in secure
+// contexts (HTTPS or localhost) — on plain LAN HTTP this quietly skips
+// and the page stays a normal responsive site.
+if ("serviceWorker" in navigator) {
+  navigator.serviceWorker.register("/sw.js").catch(() => {});
+}
 </script>
 </body>
 </html>

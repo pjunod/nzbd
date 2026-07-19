@@ -125,7 +125,7 @@ pub fn require_auth(router: Router, auth: AuthConfig) -> Router {
         move |req: axum::extract::Request, next: axum::middleware::Next| {
             let auth = auth.clone();
             async move {
-                if req.uri().path() == "/healthz" {
+                if auth_exempt(req.uri().path()) {
                     return next.run(req).await;
                 }
                 let header = req
@@ -199,6 +199,75 @@ async fn ui_index() -> Response {
         include_str!("../ui/index.html"),
     )
         .into_response()
+}
+
+// PWA assets, all compiled into the binary. Cache header keeps phones
+// from re-fetching icons on every open; the shell itself (/ and sw.js)
+// stays revalidated so UI updates land immediately.
+fn asset(ctype: &'static str, cache: bool, bytes: &'static [u8]) -> Response {
+    let cache_control = if cache {
+        "public, max-age=86400"
+    } else {
+        "no-cache"
+    };
+    (
+        [
+            (axum::http::header::CONTENT_TYPE, ctype),
+            (axum::http::header::CACHE_CONTROL, cache_control),
+        ],
+        bytes,
+    )
+        .into_response()
+}
+
+async fn pwa_manifest() -> Response {
+    asset(
+        "application/manifest+json",
+        false,
+        include_bytes!("../ui/manifest.webmanifest"),
+    )
+}
+async fn pwa_sw() -> Response {
+    asset("text/javascript", false, include_bytes!("../ui/sw.js"))
+}
+async fn icon_192() -> Response {
+    asset(
+        "image/png",
+        true,
+        include_bytes!("../ui/icons/icon-192.png"),
+    )
+}
+async fn icon_512() -> Response {
+    asset(
+        "image/png",
+        true,
+        include_bytes!("../ui/icons/icon-512.png"),
+    )
+}
+async fn icon_maskable() -> Response {
+    asset(
+        "image/png",
+        true,
+        include_bytes!("../ui/icons/icon-maskable-512.png"),
+    )
+}
+async fn apple_touch_icon() -> Response {
+    asset(
+        "image/png",
+        true,
+        include_bytes!("../ui/icons/apple-touch-icon.png"),
+    )
+}
+
+/// Paths that must work without credentials: health for probes, and the
+/// PWA identity assets — browsers fetch the manifest, icons and service
+/// worker updates without sending Authorization, and a 401 there breaks
+/// install/updates. They carry no user data.
+fn auth_exempt(path: &str) -> bool {
+    matches!(
+        path,
+        "/healthz" | "/manifest.webmanifest" | "/sw.js" | "/apple-touch-icon.png"
+    ) || path.starts_with("/icons/")
 }
 
 async fn list_jobs(State(st): State<ApiState>) -> Response {
@@ -661,6 +730,12 @@ pub fn router_with(state: ApiState) -> Router {
         .route("/api/v1/setup", get(get_setup).post(post_setup))
         .route("/healthz", get(healthz))
         .route("/", get(ui_index))
+        .route("/manifest.webmanifest", get(pwa_manifest))
+        .route("/sw.js", get(pwa_sw))
+        .route("/icons/icon-192.png", get(icon_192))
+        .route("/icons/icon-512.png", get(icon_512))
+        .route("/icons/icon-maskable-512.png", get(icon_maskable))
+        .route("/apple-touch-icon.png", get(apple_touch_icon))
         .with_state(state)
 }
 

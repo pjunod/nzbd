@@ -39,8 +39,10 @@ Optionally runs as a **multi-node cluster** over a shared work volume.
   (`Accept`/`Reject`/`Require`, wildcards, size/age windows, per-rule
   category/priority/dupe options).
 - **Embedded web UI** at `/` — live queue, history, log tail, speed
-  controls, SSE refresh, dark/light. One self-contained page, zero build
-  toolchain.
+  controls, SSE refresh, dark/light, first-run setup wizard. One
+  self-contained page, zero build toolchain — and an **installable PWA**
+  on phones, with built-in HTTPS (`[api] tls = true` self-generates a
+  persistent certificate) to make browsers treat it as a secure origin.
 - **Clustering** — nodes sharing a POSIX volume (Gluster is the reference)
   elect a leader, distribute downloads and post-processing with
   anti-affinity, partition provider connection budgets, and fail over

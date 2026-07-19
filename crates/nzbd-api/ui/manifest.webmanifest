@@ -1,0 +1,15 @@
+{
+  "name": "nzbd",
+  "short_name": "nzbd",
+  "description": "NZBGet-compatible usenet downloader",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#101010",
+  "theme_color": "#101010",
+  "icons": [
+    { "src": "/icons/icon-192.png", "sizes": "192x192", "type": "image/png" },
+    { "src": "/icons/icon-512.png", "sizes": "512x512", "type": "image/png" },
+    { "src": "/icons/icon-maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ]
+}
