@@ -311,6 +311,26 @@ fn spawn_watch_dir(
     });
 }
 
+/// Resolves on SIGINT (ctrl-c) or SIGTERM — the latter is what
+/// `docker stop`, tini and systemd send. Both mean the same thing:
+/// finish in-flight writes, sync journals, exit clean (no unclean
+/// marker, no recovery pass on next boot).
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("install SIGTERM handler");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = term.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
 /// How a `run()` pass ended: a real shutdown, or a first-run setup that
 /// wrote a config and wants the daemon to come back up with it.
 #[derive(PartialEq)]
@@ -358,7 +378,16 @@ fn run(
         None => nzbd_config::Config::default(),
     };
     let bind = bind.unwrap_or_else(|| cfg.api.bind.clone());
-    let setup = setup_path.map(|p| Arc::new(nzbd_api::SetupHandle::new(p, bind.clone())));
+    // Always present: in setup mode it powers the wizard; in normal runs
+    // it powers the Settings tab (view/edit config + hot reload).
+    let setup = Some(match setup_path {
+        Some(p) => Arc::new(nzbd_api::SetupHandle::new(p, bind.clone())),
+        None => Arc::new(nzbd_api::SetupHandle::for_running(
+            config.clone(),
+            bind.clone(),
+            cfg.clone(),
+        )),
+    });
 
     let servers = cfg.server_defs();
     for s in &servers {
@@ -483,14 +512,14 @@ fn run(
             match &shutdown_setup {
                 Some(s) => {
                     tokio::select! {
-                        _ = tokio::signal::ctrl_c() => tracing::info!("shutting down"),
+                        _ = shutdown_signal() => tracing::info!("shutting down"),
                         _ = s.reload.notified() => {
-                            tracing::info!("setup applied; restarting with the new config")
+                            tracing::info!("configuration changed; restarting with it")
                         }
                     }
                 }
                 None => {
-                    let _ = tokio::signal::ctrl_c().await;
+                    shutdown_signal().await;
                     tracing::info!("shutting down");
                 }
             }
@@ -804,5 +833,57 @@ mod anyhow_lite {
         fn from(e: E) -> Self {
             Error(e.to_string())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cfg_with(extra: &str) -> nzbd_config::Config {
+        let toml = format!("[paths]\nmain_dir = \"/data\"\ndest_dir = \"/data/complete\"\n{extra}");
+        nzbd_config::Config::from_toml(&toml).unwrap()
+    }
+
+    #[test]
+    fn compat_options_project_nzbget_vocabulary() {
+        let cfg = cfg_with(
+            "[[category]]\nname = \"tv\"\ndest_dir = \"/data/tv\"\n\n[post]\nunpack = false\n",
+        );
+        let opts = compat_options(&cfg, "0.0.0.0:6789");
+        let get = |k: &str| {
+            opts.iter()
+                .find(|(n, _)| n == k)
+                .map(|(_, v)| v.clone())
+                .unwrap_or_default()
+        };
+        assert_eq!(get("ControlPort"), "6789");
+        assert_eq!(get("MainDir"), "/data");
+        assert_eq!(get("DestDir"), "/data/complete");
+        assert_eq!(get("Unpack"), "no");
+        assert_eq!(get("Category1.Name"), "tv");
+        assert_eq!(get("Category1.DestDir"), "/data/tv");
+        assert!(!get("Version").is_empty());
+    }
+
+    #[test]
+    fn post_config_maps_health_and_timeouts() {
+        let cfg = cfg_with(
+            "[post]\nhealth_action = \"park\"\ntool_timeout_secs = 0\nscripts_dir = \"~/scripts\"\n",
+        );
+        let pc = post_config(&cfg, 3);
+        assert_eq!(pc.health_action, nzbd_post::manager::HealthAction::Park);
+        assert_eq!(pc.slots, 3);
+        // Zero timeout is clamped to something sane rather than "instant".
+        assert!(pc.tool_timeout >= Duration::from_secs(1));
+        assert!(pc.scripts_dir.is_some());
+    }
+
+    #[test]
+    fn anyhow_lite_error_wraps_and_displays() {
+        let e = anyhow_lite::Error::msg("boom");
+        assert_eq!(format!("{e}"), "boom");
+        let io: anyhow_lite::Error = std::io::Error::other("disk on fire").into();
+        assert!(format!("{io}").contains("disk on fire"));
     }
 }

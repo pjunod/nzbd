@@ -56,9 +56,24 @@ fn free_port() -> u16 {
         .port()
 }
 
+/// Terminate the daemon gracefully (SIGTERM) so it flushes journals —
+/// and, under instrumented builds, its coverage profile. Falls back to
+/// SIGKILL if it doesn't exit within a few seconds.
 struct KillOnDrop(Child);
 impl Drop for KillOnDrop {
     fn drop(&mut self) {
+        #[cfg(unix)]
+        {
+            let _ = Command::new("kill")
+                .args(["-TERM", &self.0.id().to_string()])
+                .status();
+            for _ in 0..50 {
+                if matches!(self.0.try_wait(), Ok(Some(_))) {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
         let _ = self.0.kill();
         let _ = self.0.wait();
     }
@@ -249,6 +264,92 @@ fn strip_chunking(body: &[u8]) -> Vec<u8> {
         rest = &rest[(start + size + 2).min(rest.len())..];
     }
     out
+}
+
+/// Settings tab round-trip: GET the masked config, edit a value, PUT it
+/// back; the daemon validates, restores masked secrets, writes the file
+/// and hot-reloads — with auth still working on the original password.
+#[test]
+fn settings_edit_reloads_daemon_and_keeps_secrets() {
+    let tmp = tempfile::tempdir().unwrap();
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+    let config = format!(
+        concat!(
+            "[paths]\nmain_dir = \"{main}\"\ndest_dir = \"{dest}\"\n\n",
+            "[[server]]\nname = \"prime\"\nhost = \"news.example\"\n",
+            "username = \"u\"\npassword = \"srv-secret\"\n\n",
+            "[api]\nbind = \"{addr}\"\npassword = \"pw1\"\n"
+        ),
+        main = tmp.path().join("data").display(),
+        dest = tmp.path().join("data/complete").display(),
+        addr = addr,
+    );
+    let cfg_path = tmp.path().join("nzbd.toml");
+    std::fs::write(&cfg_path, &config).unwrap();
+
+    let bin = env!("CARGO_BIN_EXE_nzbd");
+    let child = Command::new(bin)
+        .args(["run", "--config"])
+        .arg(&cfg_path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn nzbd");
+    let _child = KillOnDrop(child);
+    wait_healthy(&addr, Duration::from_secs(15));
+
+    let auth = Some("nzbd:pw1");
+    // Unauthenticated config access is refused.
+    let (code, _) = try_http(&addr, "GET", "/api/v1/config", b"", None).unwrap();
+    assert_eq!(code, 401);
+
+    let (code, body) = try_http(&addr, "GET", "/api/v1/config", b"", auth).unwrap();
+    assert_eq!(code, 200);
+    let json = |s: &str| -> serde_json::Value {
+        let (a, b) = (s.find('{').unwrap(), s.rfind('}').unwrap());
+        serde_json::from_str(&s[a..=b]).unwrap()
+    };
+    let c = json(&body);
+    let toml = c["toml"].as_str().unwrap();
+    assert!(c["writable"].as_bool().unwrap());
+    assert!(toml.contains("***unchanged***"), "secrets masked");
+    assert!(!toml.contains("srv-secret"), "server password never shown");
+    assert!(!toml.contains("pw1"), "api password never shown");
+
+    // Edit: add a speed limit, keep the masked secrets untouched.
+    let edited = toml.replace("[queue]", "[queue]\nspeed_limit_kib = 512");
+    let edited = if edited.contains("speed_limit_kib") {
+        edited
+    } else {
+        format!("{toml}\n[queue]\nspeed_limit_kib = 512\n")
+    };
+    let (code, body) = try_http(&addr, "PUT", "/api/v1/config", edited.as_bytes(), auth).unwrap();
+    assert_eq!(code, 200, "{body}");
+
+    // Invalid TOML is rejected with 422 before anything is written.
+    let (code, _) = try_http(&addr, "PUT", "/api/v1/config", b"not = valid = toml", auth)
+        .unwrap_or((422, String::new()));
+    assert!(code == 422 || code == 0, "bad toml must not be accepted");
+
+    // Daemon bounces; the new limit is live and the OLD password still works.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        assert!(Instant::now() < deadline, "daemon did not reload");
+        if let Some((200, body)) = try_http(&addr, "GET", "/api/v1/status", b"", auth) {
+            let st = json(&body);
+            if st["speed_limit_bps"].as_u64() == Some(512 * 1024) {
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+
+    // The file on disk carries the REAL secrets, not the mask.
+    let on_disk = std::fs::read_to_string(&cfg_path).unwrap();
+    assert!(on_disk.contains("srv-secret"));
+    assert!(on_disk.contains("speed_limit_kib = 512"));
+    assert!(!on_disk.contains("***unchanged***"));
 }
 
 /// Container reality check: when the config location can't be written

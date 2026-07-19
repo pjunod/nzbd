@@ -1291,3 +1291,110 @@ Server2.Connections=0
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Settings-editor support: masked secrets round-trip
+// ---------------------------------------------------------------------------
+
+/// Placeholder the settings UI shows instead of stored secrets. A saved
+/// config carrying this exact value keeps the existing secret.
+pub const SECRET_MASK: &str = "***unchanged***";
+
+/// Clone the config with every secret replaced by [`SECRET_MASK`], for
+/// display/editing. Feed URLs (which may embed API keys) are left as-is —
+/// they're the feed's identity and NZBGet shows them too.
+pub fn mask_secrets(cfg: &Config) -> Config {
+    let mut c = cfg.clone();
+    for s in &mut c.servers {
+        if s.password.is_some() {
+            s.password = Some(SECRET_MASK.into());
+        }
+    }
+    if c.api.password.is_some() {
+        c.api.password = Some(SECRET_MASK.into());
+    }
+    if c.api.token.is_some() {
+        c.api.token = Some(SECRET_MASK.into());
+    }
+    if c.cluster.secret.is_some() {
+        c.cluster.secret = Some(SECRET_MASK.into());
+    }
+    c
+}
+
+/// Replace [`SECRET_MASK`] values in an edited config with the secrets
+/// from the previous config, so a masked display round-trips without the
+/// user retyping passwords. Servers are matched by name, then by index.
+pub fn merge_masked_secrets(new: &mut Config, old: &Config) {
+    let is_mask = |v: &Option<String>| v.as_deref() == Some(SECRET_MASK);
+    for (i, s) in new.servers.iter_mut().enumerate() {
+        if is_mask(&s.password) {
+            let prev = old
+                .servers
+                .iter()
+                .find(|o| !o.name.is_empty() && o.name == s.name)
+                .or_else(|| old.servers.get(i));
+            s.password = prev.and_then(|p| p.password.clone());
+        }
+    }
+    if is_mask(&new.api.password) {
+        new.api.password = old.api.password.clone();
+    }
+    if is_mask(&new.api.token) {
+        new.api.token = old.api.token.clone();
+    }
+    if is_mask(&new.cluster.secret) {
+        new.cluster.secret = old.cluster.secret.clone();
+    }
+}
+
+#[cfg(test)]
+mod mask_tests {
+    use super::*;
+
+    #[test]
+    fn secrets_mask_and_merge_round_trip() {
+        let toml = r#"
+[paths]
+main_dir = "/data"
+dest_dir = "/data/complete"
+
+[[server]]
+name = "prime"
+host = "news.example.com"
+username = "u"
+password = "real-secret"
+
+[api]
+password = "api-secret"
+
+[cluster]
+secret = "cluster-secret"
+"#;
+        let cfg = Config::from_toml(toml).unwrap();
+        let masked = mask_secrets(&cfg);
+        let shown = to_toml(&masked).unwrap();
+        assert!(!shown.contains("real-secret"));
+        assert!(!shown.contains("api-secret"));
+        assert!(!shown.contains("cluster-secret"));
+        assert!(shown.contains(SECRET_MASK));
+
+        // User edits something unrelated and saves the masked text back.
+        let edited = shown.replace("main_dir = \"/data\"", "main_dir = \"/mnt/big\"");
+        let mut new_cfg = Config::from_toml(&edited).unwrap();
+        merge_masked_secrets(&mut new_cfg, &cfg);
+        assert_eq!(new_cfg.servers[0].password.as_deref(), Some("real-secret"));
+        assert_eq!(new_cfg.api.password.as_deref(), Some("api-secret"));
+        assert_eq!(new_cfg.cluster.secret.as_deref(), Some("cluster-secret"));
+        assert_eq!(new_cfg.paths.main_dir, PathBuf::from("/mnt/big"));
+
+        // Typing a NEW password replaces rather than restores.
+        let repw = edited.replace(
+            &format!("password = \"{SECRET_MASK}\""),
+            "password = \"fresh\"",
+        );
+        let mut new_cfg = Config::from_toml(&repw).unwrap();
+        merge_masked_secrets(&mut new_cfg, &cfg);
+        assert_eq!(new_cfg.servers[0].password.as_deref(), Some("fresh"));
+    }
+}

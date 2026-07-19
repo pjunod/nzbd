@@ -357,6 +357,7 @@ impl Owner {
         epoch_tx: watch::Sender<u64>,
         meter: Arc<SpeedMeter>,
         limiter: Arc<RateLimiter>,
+        config_speed_limit: Option<u64>,
         engine_tx: mpsc::Sender<EngineMsg>,
         tracker: TaskTracker,
         cancel: CancellationToken,
@@ -416,7 +417,12 @@ impl Owner {
             );
         }
 
-        // Restore the persisted speed limit.
+        // Speed limit: the config wins whenever it sets one (a config
+        // edit must take effect on reload); the runtime-set persisted
+        // value applies only when the config is silent.
+        if config_speed_limit.is_some() {
+            state.speed_limit_bps = config_speed_limit;
+        }
         limiter.set(state.speed_limit_bps);
 
         Ok(Owner {

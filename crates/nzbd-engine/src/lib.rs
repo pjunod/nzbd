@@ -185,6 +185,7 @@ impl Engine {
             epoch_tx,
             meter.clone(),
             limiter.clone(),
+            cfg.speed_limit_bps,
             engine_tx.clone(),
             tracker.clone(),
             cancel.clone(),

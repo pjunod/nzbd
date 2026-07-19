@@ -300,6 +300,37 @@ mod tests {
     use super::*;
 
     #[test]
+    fn rejects_malformed_and_handles_edge_types() {
+        assert!(parse_call("not xml at all").is_none());
+        assert!(parse_call("<methodCall><params/></methodCall>").is_none()); // no method name
+        assert!(parse_call("<methodCall><methodName>x</methodName><params><param><value><int>NaN</int></value></param></params></methodCall>").is_some());
+
+        // double, i8, negative int, base64-ish string, empty array/struct
+        let xml = r#"<methodCall><methodName>t</methodName><params>
+  <param><value><double>2.5</double></value></param>
+  <param><value><i8>9000000000</i8></value></param>
+  <param><value><int>-3</int></value></param>
+  <param><value><array><data></data></array></value></param>
+  <param><value><struct></struct></value></param>
+</params></methodCall>"#;
+        let call = parse_call(xml).unwrap();
+        assert_eq!(
+            call.params,
+            serde_json::json!([2.5, 9000000000i64, -3, [], {}])
+        );
+
+        // Serializer: null, float, escaping in keys, empty containers.
+        let v = serde_json::json!({"a&b": null, "f": 1.25, "e": [], "s": {}});
+        let mut out = String::new();
+        to_xml(&v, &mut out);
+        assert!(out.contains("<name>a&amp;b</name>"));
+        assert!(out.contains("<double>1.25</double>"));
+        assert!(
+            out.contains("<array><data></data></array>") || out.contains("<array><data/></array>")
+        );
+    }
+
+    #[test]
     fn parses_typical_call() {
         let xml = r#"<?xml version="1.0"?>
 <methodCall><methodName>editqueue</methodName><params>

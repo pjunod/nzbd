@@ -34,8 +34,13 @@ pub struct ApiState {
 
 /// Shared handle between the setup endpoint and the daemon's run loop.
 pub struct SetupHandle {
-    /// Where the config file will be written.
-    pub config_path: std::path::PathBuf,
+    /// Where the config file lives / will be written. None = the daemon
+    /// runs on pure defaults with no `--config` (settings become
+    /// read-only in the UI).
+    pub config_path: Option<std::path::PathBuf>,
+    /// True when the daemon booted with a missing config file: the UI
+    /// shows the first-run wizard instead of the app.
+    pub setup_mode: bool,
     /// The effective listen address (recorded into the written config so
     /// a later bare `nzbd run --config …` binds the same way).
     pub bind: String,
@@ -48,17 +53,41 @@ pub struct SetupHandle {
     /// False in containers with read-only config mounts (ConfigMaps,
     /// `:ro` binds) — the UI then steers to copy-the-TOML-yourself.
     pub writable: bool,
+    /// The currently-running configuration — what the settings editor
+    /// shows (masked) and merges masked secrets from on save.
+    pub current: std::sync::Mutex<nzbd_config::Config>,
 }
 
 impl SetupHandle {
+    /// First-run setup mode: the config file doesn't exist yet.
     pub fn new(config_path: std::path::PathBuf, bind: String) -> Self {
         let writable = probe_writable(&config_path);
         SetupHandle {
-            config_path,
+            config_path: Some(config_path),
+            setup_mode: true,
             bind,
             reload: tokio::sync::Notify::new(),
             applied: std::sync::atomic::AtomicBool::new(false),
             writable,
+            current: std::sync::Mutex::new(nzbd_config::Config::default()),
+        }
+    }
+
+    /// Normal running mode: powers the settings editor + hot reload.
+    pub fn for_running(
+        config_path: Option<std::path::PathBuf>,
+        bind: String,
+        current: nzbd_config::Config,
+    ) -> Self {
+        let writable = config_path.as_deref().map(probe_writable).unwrap_or(false);
+        SetupHandle {
+            config_path,
+            setup_mode: false,
+            bind,
+            reload: tokio::sync::Notify::new(),
+            applied: std::sync::atomic::AtomicBool::new(false),
+            writable,
+            current: std::sync::Mutex::new(current),
         }
     }
 }
@@ -670,8 +699,8 @@ struct SetupReq {
 async fn get_setup(State(st): State<ApiState>) -> Response {
     match &st.setup {
         Some(s) => Json(json!({
-            "setup_mode": !s.applied.load(std::sync::atomic::Ordering::Relaxed),
-            "config_path": s.config_path.display().to_string(),
+            "setup_mode": s.setup_mode && !s.applied.load(std::sync::atomic::Ordering::Relaxed),
+            "config_path": s.config_path.as_ref().map(|p| p.display().to_string()),
             "writable": s.writable,
             // Lets the UI explain that config_path is a *container* path
             // and how to find its host side (docker inspect / docker cp).
@@ -710,9 +739,18 @@ async fn post_setup(State(st): State<ApiState>, Json(req): Json<SetupReq>) -> Re
     let Some(setup) = &st.setup else {
         return error(StatusCode::NOT_FOUND, "not in setup mode");
     };
+    if !setup.setup_mode {
+        return error(StatusCode::NOT_FOUND, "not in setup mode");
+    }
     if setup.applied.load(std::sync::atomic::Ordering::Relaxed) {
         return error(StatusCode::CONFLICT, "setup already applied; reloading");
     }
+    let Some(cfg_path) = setup.config_path.clone() else {
+        return error(
+            StatusCode::CONFLICT,
+            "no config path (started without --config)",
+        );
+    };
     if req.main_dir.trim().is_empty()
         || req.dest_dir.trim().is_empty()
         || req.server.host.is_empty()
@@ -758,7 +796,7 @@ async fn post_setup(State(st): State<ApiState>, Json(req): Json<SetupReq>) -> Re
     if let Err(e) = nzbd_config::Config::from_toml(&toml_text) {
         return error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string());
     }
-    let path = setup.config_path.display().to_string();
+    let path = cfg_path.display().to_string();
     if req.preview {
         return Json(json!({ "preview": true, "path": path, "toml": toml_text })).into_response();
     }
@@ -777,20 +815,92 @@ async fn post_setup(State(st): State<ApiState>, Json(req): Json<SetupReq>) -> Re
         )
             .into_response()
     };
-    if let Some(parent) = setup.config_path.parent() {
+    if let Some(parent) = cfg_path.parent() {
         if let Err(e) = std::fs::create_dir_all(parent) {
             return write_failed(format!("create {}: {e}", parent.display()));
         }
     }
-    if let Err(e) = std::fs::write(&setup.config_path, &toml_text) {
-        return write_failed(format!("write {}: {e}", setup.config_path.display()));
+    if let Err(e) = std::fs::write(&cfg_path, &toml_text) {
+        return write_failed(format!("write {}: {e}", cfg_path.display()));
     }
-    tracing::info!(path = %setup.config_path.display(), "setup: configuration written; reloading");
+    tracing::info!(path = %cfg_path.display(), "setup: configuration written; reloading");
     setup
         .applied
         .store(true, std::sync::atomic::Ordering::Relaxed);
     setup.reload.notify_one();
     Json(json!({ "written": path, "reloading": true, "toml": toml_text })).into_response()
+}
+
+// ---------------------------------------------------------------------------
+// Settings editor (Settings tab): the live config as TOML, secrets masked
+// ---------------------------------------------------------------------------
+
+async fn get_config(State(st): State<ApiState>) -> Response {
+    let Some(h) = &st.setup else {
+        return error(StatusCode::NOT_FOUND, "no config handle");
+    };
+    let masked = {
+        let cur = h.current.lock().unwrap();
+        nzbd_config::mask_secrets(&cur)
+    };
+    match nzbd_config::to_toml(&masked) {
+        Ok(toml) => Json(json!({
+            "path": h.config_path.as_ref().map(|p| p.display().to_string()),
+            "writable": h.writable,
+            "toml": toml,
+            "mask": nzbd_config::SECRET_MASK,
+        }))
+        .into_response(),
+        Err(e) => error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+/// PUT raw TOML: validate strictly, restore masked secrets from the
+/// running config, write the file, hot-reload the daemon.
+async fn put_config(State(st): State<ApiState>, body: String) -> Response {
+    let Some(h) = &st.setup else {
+        return error(StatusCode::NOT_FOUND, "no config handle");
+    };
+    let Some(cfg_path) = h.config_path.clone() else {
+        return error(
+            StatusCode::CONFLICT,
+            "daemon is running without --config; there is no file to edit",
+        );
+    };
+    let mut new_cfg = match nzbd_config::Config::from_toml(&body) {
+        Ok(c) => c,
+        Err(e) => return error(StatusCode::UNPROCESSABLE_ENTITY, &e.to_string()),
+    };
+    {
+        let cur = h.current.lock().unwrap();
+        nzbd_config::merge_masked_secrets(&mut new_cfg, &cur);
+    }
+    let toml_text = match nzbd_config::to_toml(&new_cfg) {
+        Ok(t) => t,
+        Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    };
+    if let Some(parent) = cfg_path.parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            return error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("create {}: {e}", parent.display()),
+            );
+        }
+    }
+    if let Err(e) = std::fs::write(&cfg_path, &toml_text) {
+        return error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!(
+                "write {}: {e} — config location not writable; copy your edit into the file by hand",
+                cfg_path.display()
+            ),
+        );
+    }
+    *h.current.lock().unwrap() = new_cfg;
+    tracing::info!(path = %cfg_path.display(), "settings saved; reloading");
+    h.applied.store(true, std::sync::atomic::Ordering::Relaxed);
+    h.reload.notify_one();
+    Json(json!({ "ok": true, "reloading": true })).into_response()
 }
 
 pub fn router_with(state: ApiState) -> Router {
@@ -807,6 +917,7 @@ pub fn router_with(state: ApiState) -> Router {
         .route("/metrics", get(metrics))
         .route("/api/v1/openapi.json", get(openapi))
         .route("/api/v1/setup", get(get_setup).post(post_setup))
+        .route("/api/v1/config", get(get_config).put(put_config))
         .route("/healthz", get(healthz))
         .route("/", get(ui_index))
         .route("/manifest.webmanifest", get(pwa_manifest))
