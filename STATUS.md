@@ -89,6 +89,11 @@ performance work and operator actions
 - 👤 Branch protection on `main` requiring Tests/Lint/Coverage (repo Settings)
 - ✅ Badge rendering decision (2026-07-18): **repo goes public** — the badges-branch + raw-URL setup then works as-is, no code changes. Flip: repo Settings → General → Danger Zone → Change visibility
 
+## Docs ✅
+
+- ✅ Operator documentation (2026-07-18): reworked `README` (accurate status, quickstart, doc index) + `docs/INSTALL.md` (binaries/Docker/Homebrew/source/musl), `docs/CONFIGURATION.md` (full annotated `nzbd.toml` reference), `docs/USAGE.md` (CLI, UI, *arr hookup, feed filter language, scripts, deobfuscation), `docs/DEPLOY.md` (copy-paste recipes: Docker by hand incl. volume map + lifecycle, Compose, Kubernetes, systemd, multi-node cluster)
+- ✅ Deployable examples under `examples/`: `docker-compose/` (compose + `nzbd.toml.example`), `kubernetes/` (namespace/secret/PVC/deployment/service/kustomization + README incl. RWX cluster shape), `systemd/` (hardened unit)
+
 ## Phase 2 — Post-processing ✅ complete
 
 - ✅ par2 packet parser + **native quick-verify** from download CRCs — zero data re-read for intact sets (`nzbd-post/src/par2.rs`, proven against real `par2 create` output)

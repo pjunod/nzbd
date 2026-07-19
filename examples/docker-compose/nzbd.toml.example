@@ -1,0 +1,42 @@
+# nzbd example configuration for the Compose deployment.
+# Copy to nzbd.toml, set your news-server credentials and passwords.
+# Full reference: docs/CONFIGURATION.md
+
+[paths]
+main_dir = "/data"              # inside the container (the /data volume)
+dest_dir = "/data/complete"
+# nzb_watch_dir = "/data/nzb"   # drop .nzb files here to auto-queue
+
+[[server]]
+name = "primary"
+host = "news.example.com"
+port = 563
+tls = true
+username = "CHANGE-ME"
+password = "CHANGE-ME"
+connections = 20
+
+# Backup server on the failover ladder (tried when tier 0 misses):
+# [[server]]
+# name = "backup"
+# host = "news2.example.com"
+# port = 563
+# tls = true
+# username = "CHANGE-ME"
+# password = "CHANGE-ME"
+# tier = 1
+# connections = 10
+
+[[category]]
+name = "tv"
+
+[[category]]
+name = "movies"
+
+[api]
+bind = "0.0.0.0:6789"           # must be 0.0.0.0 inside a container
+password = "CHANGE-ME"          # web UI + API auth (user "nzbd")
+
+[post]
+deobfuscate_final = true
+# scripts_dir = "/scripts"      # mount a scripts volume to use this

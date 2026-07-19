@@ -1,0 +1,50 @@
+# nzbd — single-node Docker Compose deployment.
+#
+#   cd examples/docker-compose
+#   cp nzbd.toml.example nzbd.toml   # then edit: server credentials, paths
+#   docker compose up -d
+#
+# Web UI on http://localhost:6789/ — point Sonarr/Radarr at the same
+# host/port as an "NZBGet" download client.
+
+services:
+  nzbd:
+    image: ghcr.io/pjunod/nzbd:latest
+    # …or build from this checkout instead of pulling:
+    # build: ../..
+    container_name: nzbd
+    restart: unless-stopped
+    ports:
+      - "6789:6789"
+    volumes:
+      # Downloads + state. paths.main_dir/dest_dir in nzbd.toml must live
+      # under /data for the *arr apps to see the same paths you map here.
+      - /data/usenet:/data
+      - ./nzbd.toml:/etc/nzbd/nzbd.toml:ro
+    environment:
+      - TZ=Etc/UTC
+      # - RUST_LOG=info
+    healthcheck:
+      # The binary doubles as its own health probe (hits the local API).
+      test: ["CMD", "nzbd", "status", "--url", "127.0.0.1:6789"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  # Typical companion — uncomment to run Sonarr alongside and add nzbd as
+  # its NZBGet download client at host "nzbd", port 6789.
+  #
+  # sonarr:
+  #   image: lscr.io/linuxserver/sonarr:latest
+  #   container_name: sonarr
+  #   restart: unless-stopped
+  #   ports:
+  #     - "8989:8989"
+  #   volumes:
+  #     - ./sonarr-config:/config
+  #     - /data/usenet:/data      # same mapping as nzbd = importable paths
+  #   environment:
+  #     - PUID=1000
+  #     - PGID=1000
+  #     - TZ=Etc/UTC

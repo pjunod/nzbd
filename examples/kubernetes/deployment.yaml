@@ -1,0 +1,72 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nzbd
+  namespace: nzbd
+  labels:
+    app: nzbd
+spec:
+  replicas: 1                # keep at 1 — state on an RWO volume (README)
+  strategy:
+    type: Recreate           # never two writers on the same journal
+  selector:
+    matchLabels:
+      app: nzbd
+  template:
+    metadata:
+      labels:
+        app: nzbd
+    spec:
+      securityContext:
+        runAsUser: 1000      # image's unprivileged user
+        runAsGroup: 1000
+        fsGroup: 1000        # PVC writable by the pod
+      containers:
+        - name: nzbd
+          image: ghcr.io/pjunod/nzbd:latest
+          ports:
+            - name: http
+              containerPort: 6789
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: config
+              mountPath: /etc/nzbd
+              readOnly: true
+          env:
+            - name: TZ
+              value: Etc/UTC
+            # - name: RUST_LOG
+            #   value: info
+          readinessProbe:
+            httpGet:
+              path: /healthz       # always unauthenticated
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          resources:
+            requests:
+              cpu: 250m
+              memory: 256Mi
+            limits:
+              memory: 1Gi        # par2 repair is the hungry moment
+          # Cluster mode: mount the shared RWX volume too, and give each
+          # node Deployment its own node_name/advertise_url in its config:
+          # - name: work
+          #   mountPath: /mnt/work
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: nzbd-data
+        - name: config
+          secret:
+            secretName: nzbd-config
+        # - name: work
+        #   persistentVolumeClaim:
+        #     claimName: nzbd-work-rwx

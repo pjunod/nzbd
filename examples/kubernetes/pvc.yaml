@@ -1,0 +1,14 @@
+# Downloads + queue state. Size for your library churn; nzbd pauses new
+# work when free space drops under queue.min_free_disk_mb.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: nzbd-data
+  namespace: nzbd
+spec:
+  accessModes:
+    - ReadWriteOnce          # single replica; see README for clustering
+  resources:
+    requests:
+      storage: 100Gi
+  # storageClassName: fast-ssd

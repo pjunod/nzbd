@@ -5,50 +5,67 @@
 [![Coverage](https://raw.githubusercontent.com/pjunod/nzbd/badges/coverage.svg)](https://github.com/pjunod/nzbd/actions/workflows/coverage.yml)
 [![Test count](https://raw.githubusercontent.com/pjunod/nzbd/badges/tests.svg)](https://github.com/pjunod/nzbd/actions/workflows/ci.yml)
 
-**➜ [Project status — what's done, what's next](STATUS.md)**
-
 A ground-up Rust reimplementation of the [NZBGet](https://nzbget.com) Usenet
 downloader — modern architecture, same soul: tiny footprint, line-rate
 throughput, direct-to-disk writing, and drop-in compatibility with the
 Sonarr/Radarr ecosystem and NZBGet's post-processing script protocol.
+Optionally runs as a **multi-node cluster** over a shared work volume.
 
-> **Status: Phase 1 (core engine) + Cluster C1 (foundation) complete.**
-> The daemon downloads NZBs end-to-end — async queue owner, per-server
-> connection pools with NNTP pipelining, rustls transport, the NZBGet
-> server-failover ladder, DirectWrite disk assembly, crash-safe journal +
-> resume, token-bucket rate limiter — and optionally **clusters**: nodes
-> sharing a work volume elect a leader, distribute whole-job downloads,
-> partition provider connection budgets, and fail over automatically
-> (leases survive the failover; nothing already journaled is re-fetched).
-> Design: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) ·
-> [`docs/CLUSTERING.md`](docs/CLUSTERING.md). `nzbd` is a working title.
+> **Status:** phases 0–4 complete — download engine, full post-processing,
+> NZBGet-compatible JSON-RPC/XML-RPC API, embedded web UI, RSS feeds,
+> packaging, and cluster C1+C2 (distributed downloads *and* distributed
+> post-processing). See [STATUS.md](STATUS.md) for the live scoreboard.
 
-## What exists today
+## Highlights
 
-| Crate | State |
-|---|---|
-| `nzbd-types` | ✅ Domain model + NZBGet's exact health formulas, tested |
-| `nzbd-yenc` | ✅ Incremental (chunk-boundary-safe) yEnc decoder with NNTP dot-unstuffing, terminator-aware bounded consumption (pipelining-safe), CRC32 + `crc32_combine`, tested. SIMD via a `rapidyenc-sys` FFI feature comes in phase 3 |
-| `nzbd-nzb` | ✅ Streaming NZB parser (quick-xml), password/category meta, tested |
-| `nzbd-nntp` | ✅ Codec + async transport: TCP/TLS (rustls; `Strict`/`Minimal`/`None` cert levels), AUTHINFO, pipelined commands, streamed bodies, tested. COMPRESS DEFLATE later |
-| `nzbd-engine` | ✅ Phase 1 core: single-owner queue task (commands/arc-swap snapshots/broadcast events), priority scheduler + failover ladder (tiers/groups/fill/retention) in pull mode, per-server connection tasks with per-server pipelining depth, per-file DirectWrite writers (sparse preallocate, positional writes, gap zero-fill, atomic rename), delayed-par pausing, health gating, token-bucket rate limiter + 30×1 s speed meter, crash journal + snapshot + kill -9 resume |
-| `nzbd-nserv` | ✅ Mock NNTP server: generated yEnc posts + NZBs, failure injection (430 / CRC corruption / mid-body disconnect / latency), per-article hit counting |
-| `nzbd-state` | ✅ Append-only segment journal (torn-tail tolerant), atomic queue snapshots, unclean marker. SQLite history: phase 2 |
-| `nzbd-post` | 🔶 `ParEngine`/`Extractor`/`ScriptRunner` trait boundaries (impls: phase 2) |
-| `nzbd-config` | 🔶 TOML config model + path helpers; `nzbget.conf` importer stub (phase 3) |
-| `nzbd-api` | 🔶 `/api/v1`: status, jobs (add/list/detail), job + queue actions, speed limit. SSE/auth/OpenAPI: phase 3 |
-| `nzbd-compat` | 🔶 `/jsonrpc` shim speaking NZBGet's JSON-RPC 1.1 dialect: `version`, `status`, `listgroups` with live data and `*Lo/*Hi/*MB` triplets. Full C1 (`append`, `editqueue`, …): phase 3 |
-| `nzbd-cluster` | ✅ C1: shared-volume leader election (monotonic staleness, write–wait–verify, epoch fencing), node registry, HTTP work-lease protocol with heartbeat/adoption/reclaim, distributed whole-job downloads, cluster-wide connection-budget partitioning, any-node API proxy. Five multi-node e2e tests incl. leader-death failover and worker-death reclaim with zero re-fetch. PP leases: phase C2 |
-| `nzbd` | ✅ Daemon: engine + API + shim; single-node and `[cluster]` modes; CLI `run` / `add` / `status`; graceful shutdown; whole-daemon integration test |
+- **Drop-in for the *arr apps** — Sonarr/Radarr/Lidarr connect to it as an
+  "NZBGet" download client, unchanged: JSON-RPC 1.1 dialect (`append`,
+  `history`, `editqueue`, the `*Lo/*Hi/*MB` triplets), XML-RPC with
+  `system.multicall`, and NZBGet's extension-script protocol byte-for-byte.
+- **Fast, careful engine** — async single-owner queue, per-server connection
+  pools with NNTP pipelining (plus AIMD adaptive depth), rustls TLS, the
+  NZBGet server-failover ladder (tiers/groups/fill servers), DirectWrite
+  disk assembly, crash-safe journal with kill-9 resume, token-bucket rate
+  limiting, daily/monthly quotas and low-disk guards.
+- **Post-processing, natively verified** — par2 quick-verify uses the CRCs
+  gathered *during download* (an intact set is proven with zero data
+  re-reads), subprocess repair only when needed, hardened unrar/7z
+  extraction, cleanup, NZBGet extension scripts.
+- **Three-layer deobfuscation** — par2 16k-hash renames, archive-signature
+  renames, then a final job-name pass (SABnzbd-style dominant-file rule,
+  plus numbered season packs, which SABnzbd skips). Evidence always beats
+  heuristics; every rename is logged and recorded in history.
+- **RSS/Atom feeds** with the NZBGet filter language
+  (`Accept`/`Reject`/`Require`, wildcards, size/age windows, per-rule
+  category/priority/dupe options).
+- **Embedded web UI** at `/` — live queue, history, log tail, speed
+  controls, SSE refresh, dark/light. One self-contained page, zero build
+  toolchain.
+- **Clustering** — nodes sharing a POSIX volume (Gluster is the reference)
+  elect a leader, distribute downloads and post-processing with
+  anti-affinity, partition provider connection budgets, and fail over
+  automatically without re-fetching. No extra services: the volume is the
+  coordinator. Design: [docs/CLUSTERING.md](docs/CLUSTERING.md).
+
+## Quickstart
 
 ```sh
-cargo test          # all green (unit + e2e incl. crash-resume)
+# Docker
+docker run -d --name nzbd -p 6789:6789 \
+  -v /data/usenet:/data \
+  -v $PWD/nzbd.toml:/etc/nzbd/nzbd.toml:ro \
+  ghcr.io/pjunod/nzbd:latest
 
-# run against a real provider:
-cat > nzbd.toml <<'EOF'
+# …or a release binary / source build (see docs/INSTALL.md)
+nzbd run --config nzbd.toml
+```
+
+Minimal `nzbd.toml`:
+
+```toml
 [paths]
-main_dir = "~/downloads"
-dest_dir = "~/downloads/complete"
+main_dir = "/data"
+dest_dir = "/data/complete"
 
 [[server]]
 name = "primary"
@@ -58,56 +75,53 @@ tls = true
 username = "user"
 password = "pass"
 connections = 20
-pipeline_depth = 2
-EOF
-nzbd run --config nzbd.toml
-nzbd add show.nzb            # queue an NZB via the API
-nzbd status                  # queue/rate/remaining as JSON
-curl localhost:6789/jsonrpc -d '{"method":"listgroups"}'   # NZBGet-dialect view
 ```
 
-### Clustering (per-node additions to `nzbd.toml`)
+Then open `http://localhost:6789/` for the UI, or point Sonarr/Radarr at
+host `localhost`, port `6789`, client type **NZBGet**.
 
-```toml
-[cluster]
-enabled = true
-node_name = "node-a"                      # unique per node
-shared_dir = "/mnt/work"                  # the Gluster mount (all nodes)
-advertise_url = "http://10.0.0.11:6789"   # how peers reach THIS node
-secret_file = "/etc/nzbd/cluster.secret"  # same secret everywhere
-# coordinator = true    # election-eligible (priority = lower wins)
-# download = true       # takes download-job leases
-# max_download_jobs = 2
-```
+Migrating? `nzbd import-config /path/to/nzbget.conf` converts an existing
+NZBGet configuration and prints a mapping report.
 
-Point Sonarr at any node (or a load balancer across all of them): every
-node serves the full API and proxies to the current leader; leadership
-fails over automatically. Run Gluster with quorum — see
-`docs/CLUSTERING.md` for semantics, failure matrix and operational notes.
+## Documentation
+
+| Doc | What it covers |
+|---|---|
+| [docs/INSTALL.md](docs/INSTALL.md) | Release binaries, Docker, Homebrew, building from source, musl static builds |
+| [docs/CONFIGURATION.md](docs/CONFIGURATION.md) | The complete annotated `nzbd.toml` reference |
+| [docs/USAGE.md](docs/USAGE.md) | CLI, web UI, connecting the *arr apps, RSS feeds + filter language, extension scripts, deobfuscation |
+| [docs/DEPLOY.md](docs/DEPLOY.md) | systemd, Docker Compose, Kubernetes, multi-node cluster deployment |
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Design: the whole system, phase by phase |
+| [docs/CLUSTERING.md](docs/CLUSTERING.md) | Cluster design (ADR-13…16), failure matrix, operations |
+| [STATUS.md](STATUS.md) | What's done, what's next, with commit evidence |
+
+Deployable examples live under [`examples/`](examples/):
+[`docker-compose/`](examples/docker-compose/) (compose file + example
+config), [`kubernetes/`](examples/kubernetes/) (full manifest set) and
+[`systemd/`](examples/systemd/) (hardened unit file).
 
 ## Development
 
-Three GitHub Actions workflows gate every push/PR — **Tests** (the full
-suite: unit + engine e2e + multi-node cluster tests + the whole-daemon
-test, plus an MSRV 1.85 check), **Lint** (`cargo fmt --check`, `clippy
--D warnings`), and **Coverage** (`cargo llvm-cov`; publishes the line-%
-and test-count badges above to the `badges` branch and uploads the
-lcov + HTML report as a build artifact). Badges are self-hosted
-(`scripts/coverage-badges.py`) — no external badge service.
-
-Run the same gates locally via the committed git hooks:
+Three GitHub Actions workflows gate every push/PR — **Tests** (unit +
+engine e2e + multi-node cluster tests + the whole-daemon test, plus an
+MSRV 1.85 check), **Lint** (`cargo fmt --check`, `clippy -D warnings`),
+and **Coverage** (`cargo llvm-cov`, self-hosted badges). Run the same
+gates locally via the committed hooks:
 
 ```sh
 git config core.hooksPath .githooks   # once per clone
 # pre-commit: fmt check · pre-push: clippy -D warnings + cargo test
 
-cargo llvm-cov --workspace --open      # local coverage report (optional)
+# optional: full local test coverage needs the PP tools
+brew install par2 p7zip     # macOS (Linux: apt-get install par2 p7zip-full)
 ```
 
-## Roadmap
+Tests that exercise external tools (`par2`, `7z`) self-skip with a notice
+when the binary is missing; CI installs them and sets
+`NZBD_REQUIRE_TOOLS=1` so a skip there is a failure.
 
-Phase 2 post-processing (par2 verify/repair, unpack, script protocol, SQLite
-history) → Phase 3 native API completion + full *arr-compatible shim
-(`append`/`history`/`editqueue` + golden tests) + config importer +
-`rapidyenc` FFI → Phase 4 web UI + extensions + feeds. Details and exit
-criteria: `docs/ARCHITECTURE.md` §16.
+## License
+
+MIT OR Apache-2.0. Written from scratch against a behavioral spec
+([docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) §3); no NZBGet (GPL) code is
+ported.

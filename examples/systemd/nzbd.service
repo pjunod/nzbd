@@ -1,0 +1,35 @@
+# nzbd systemd unit — install to /etc/systemd/system/nzbd.service
+#
+#   sudo useradd -r -m -d /var/lib/nzbd nzbd
+#   sudo install -m 755 nzbd /usr/local/bin/
+#   sudo mkdir -p /etc/nzbd && sudo cp nzbd.toml /etc/nzbd/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now nzbd
+#
+# Adjust ReadWritePaths to wherever paths.main_dir/dest_dir point.
+
+[Unit]
+Description=nzbd Usenet downloader
+Documentation=https://github.com/pjunod/nzbd
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=nzbd
+Group=nzbd
+ExecStart=/usr/local/bin/nzbd run --config /etc/nzbd/nzbd.toml
+Restart=on-failure
+RestartSec=5
+
+# Hardening — the daemon needs the network, its download dirs, and nothing else.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/data
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+
+[Install]
+WantedBy=multi-user.target
