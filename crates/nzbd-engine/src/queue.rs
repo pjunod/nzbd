@@ -169,6 +169,9 @@ impl QueueState {
         if job.category.is_none() {
             job.category = meta_category;
         }
+        // URL jobs were named from the URL tail; re-clean now that the
+        // NZB's own metadata (meta title, par2 set name) is available.
+        job.name = clean_job_name(&job.name, parsed);
         job.files = files;
         job.status = JobStatus::Queued;
         recompute_job_totals(job);
@@ -281,6 +284,128 @@ pub fn recompute_job_totals(job: &mut Job) {
     job.totals = t;
 }
 
+/// Turn whatever an indexer/*arr handed us into a human job name.
+///
+/// Handles the classic garbage: an obfuscated hash filename with the
+/// download URL's query glued on (`a7709….nzb&i=136144&r=<apikey>`).
+/// Strategy: strip URL/query junk and the .nzb extension, percent-decode,
+/// and if what's left still looks obfuscated, prefer the NZB's own
+/// `<meta name>` title, then the par2 recovery-set base name.
+pub fn clean_job_name(raw: &str, nzb: &nzbd_nzb::ParsedNzb) -> String {
+    let cleaned = strip_name_junk(raw);
+    if !looks_obfuscated(&cleaned) && !cleaned.is_empty() {
+        return cleaned;
+    }
+    if let Some(title) = nzb.meta.title.as_deref() {
+        let t = strip_name_junk(title);
+        if !t.is_empty() && !looks_obfuscated(&t) {
+            return t;
+        }
+    }
+    if let Some(base) = par2_base_name(nzb) {
+        let b = strip_name_junk(&base);
+        if !b.is_empty() && !looks_obfuscated(&b) {
+            return b;
+        }
+    }
+    if cleaned.is_empty() {
+        "download".into()
+    } else {
+        cleaned
+    }
+}
+
+/// URL tail → name: cut glued query params, drop the extension, decode.
+fn strip_name_junk(raw: &str) -> String {
+    let mut name = raw.trim();
+    // Full URL? Take the path's last segment.
+    if name.starts_with("http://") || name.starts_with("https://") {
+        let no_query = name.split(['?', '#']).next().unwrap_or(name);
+        name = no_query.rsplit('/').next().unwrap_or(no_query);
+    }
+    // Query string glued onto a filename: cut at '?', or at '&' when the
+    // remainder looks like k=v pairs (release names may contain a bare &).
+    let mut cut = name.len();
+    if let Some(q) = name.find('?') {
+        cut = q;
+    }
+    let mut search = 0;
+    while let Some(a) = name[search..cut].find('&') {
+        let at = search + a;
+        let rest = &name[at + 1..cut.min(name.len())];
+        let param_like = rest
+            .split('&')
+            .next()
+            .is_some_and(|p| p.contains('=') && !p.split('=').next().unwrap_or("").contains(' '));
+        if param_like {
+            cut = at;
+            break;
+        }
+        search = at + 1;
+    }
+    let mut name = percent_decode(name[..cut].trim());
+    for ext in [".nzb", ".NZB", ".Nzb"] {
+        if let Some(stripped) = name.strip_suffix(ext) {
+            name = stripped.to_string();
+        }
+    }
+    name.trim().trim_matches('.').trim().to_string()
+}
+
+fn percent_decode(s: &str) -> String {
+    if !s.contains('%') {
+        return s.to_string();
+    }
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Ok(v) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
+                out.push(v);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Hash-looking single token: long, one "word", overwhelmingly hex.
+fn looks_obfuscated(name: &str) -> bool {
+    let core: String = name.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
+    if core.len() < 16 || name.contains(' ') {
+        return false;
+    }
+    // Real release names carry dots/spaces and words; hashes don't.
+    let hexish = core.chars().filter(|c| c.is_ascii_hexdigit()).count();
+    let word_chars = name.chars().filter(|c| c.is_ascii_alphabetic()).count();
+    hexish * 10 >= core.len() * 9 && word_chars * 3 < core.len() * 2
+}
+
+/// Recovery-set base: the main `<base>.par2` (not `.volXX+YY`) filename.
+fn par2_base_name(nzb: &nzbd_nzb::ParsedNzb) -> Option<String> {
+    let mut best: Option<String> = None;
+    for f in &nzb.files {
+        let hint = f.filename_hint();
+        let lower = hint.to_ascii_lowercase();
+        if !lower.ends_with(".par2") {
+            continue;
+        }
+        let base = &hint[..hint.len() - 5];
+        // Prefer the main par2 (no .volXX+YY suffix).
+        if let Some(vol) = base.to_ascii_lowercase().rfind(".vol") {
+            let candidate = base[..vol].to_string();
+            best.get_or_insert(candidate);
+        } else {
+            return Some(base.to_string());
+        }
+    }
+    best
+}
+
 /// Filesystem-safe job/file names (path separators and control chars out).
 pub fn sanitize_name(name: &str) -> String {
     let cleaned: String = name
@@ -342,7 +467,9 @@ pub fn next_for_server(
         .filter(|j| !ctx.delegated.contains_key(&j.id))
         .filter(|j| job_schedulable(j, state.download_paused || ctx.soft_hold))
         .collect();
-    order.sort_by(|a, b| b.priority.cmp(&a.priority).then(a.id.cmp(&b.id)));
+    // Stable sort: equal priorities keep their queue-vec order, which is
+    // user-controlled (move top/up/down/bottom) and persisted.
+    order.sort_by_key(|j| std::cmp::Reverse(j.priority));
 
     for job in order {
         for file in &job.files {
@@ -450,6 +577,82 @@ pub fn final_status(job: &Job) -> (JobStatus, Health) {
 mod tests {
     use super::*;
     use nzbd_types::{CertLevel, TlsMode};
+
+    fn nzb_with(files: &[&str], title: Option<&str>) -> nzbd_nzb::ParsedNzb {
+        let mut nzb = nzbd_nzb::ParsedNzb::default();
+        nzb.meta.title = title.map(String::from);
+        for f in files {
+            nzb.files.push(nzbd_nzb::ParsedFile {
+                subject: format!("desc \"{f}\" yEnc (1/3)"),
+                ..Default::default()
+            });
+        }
+        nzb
+    }
+
+    #[test]
+    fn clean_name_strips_glued_indexer_query() {
+        // The exact shape *arr + indexers produce.
+        let nzb = nzb_with(&[], None);
+        assert_eq!(
+            clean_job_name(
+                "a7709e1cd0b524e6cc3aef1999c99e7d1192c64a.nzb&i=136144&r=104c19dfb6da49e6daff4d158f6e39f7",
+                &nzb
+            ),
+            // Still a hash after stripping, no better source -> cleaned raw.
+            "a7709e1cd0b524e6cc3aef1999c99e7d1192c64a"
+        );
+    }
+
+    #[test]
+    fn clean_name_prefers_meta_title_for_obfuscated() {
+        let nzb = nzb_with(&[], Some("Some.Show.S01E02.1080p.WEB.x264-GRP"));
+        assert_eq!(
+            clean_job_name(
+                "7e1670882200f843144795b5c064a882811426d8.nzb&i=1&r=abc",
+                &nzb
+            ),
+            "Some.Show.S01E02.1080p.WEB.x264-GRP"
+        );
+    }
+
+    #[test]
+    fn clean_name_falls_back_to_par2_set_name() {
+        let nzb = nzb_with(
+            &[
+                "abadc0ffee123456789.part01.rar",
+                "Cool.Movie.2024.1080p-GRP.par2",
+                "Cool.Movie.2024.1080p-GRP.vol00+01.par2",
+            ],
+            None,
+        );
+        assert_eq!(
+            clean_job_name("104c19dfb6da49e6daff4d158f6e39f7", &nzb),
+            "Cool.Movie.2024.1080p-GRP"
+        );
+    }
+
+    #[test]
+    fn clean_name_keeps_real_release_names() {
+        let nzb = nzb_with(&[], Some("should not be used"));
+        assert_eq!(
+            clean_job_name("Great.Doc.2023.2160p.WEB-DL.nzb", &nzb),
+            "Great.Doc.2023.2160p.WEB-DL"
+        );
+        // Ampersand inside a real name survives (no k=v after it).
+        assert_eq!(
+            clean_job_name("Tom & Jerry Collection.nzb", &nzb),
+            "Tom & Jerry Collection"
+        );
+        // Full URL: last path segment, query dropped, percent-decoded.
+        assert_eq!(
+            clean_job_name(
+                "https://indexer.example/get/Nice%20Show%20S02.nzb?apikey=zzz",
+                &nzb
+            ),
+            "Nice Show S02"
+        );
+    }
 
     fn server(id: u32, tier: u8) -> ServerDef {
         ServerDef {

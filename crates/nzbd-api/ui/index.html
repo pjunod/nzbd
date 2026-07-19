@@ -14,17 +14,26 @@
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <meta name="apple-mobile-web-app-title" content="nzbd">
 <style>
+  /* Dark is the default; the system's light preference (or a manual
+     override) switches. Auto = system-else-dark. */
   :root {
-    color-scheme: light dark;
-    --bg: #f7f7f5; --panel: #ffffff; --ink: #111; --ink2: #555; --muted: #8a8a84;
-    --line: rgba(0,0,0,.09); --accent: #2a78d6; --ok: #0a7d0a; --warn: #b07800; --bad: #b3261e;
-    --track: #e8e8e4;
+    color-scheme: dark light;
+    --bg: #0f1013; --panel: #17181c; --panel2: #1d1f24; --ink: #f2f2f2; --ink2: #b9b9b3;
+    --muted: #84847e; --line: rgba(255,255,255,.09); --accent: #4a8fe0;
+    --ok: #3fae3f; --warn: #d8a63a; --bad: #e05a52; --track: #26282e;
   }
-  @media (prefers-color-scheme: dark) {
-    :root {
-      --bg: #101010; --panel: #191919; --ink: #f2f2f2; --ink2: #b9b9b3; --muted: #84847e;
-      --line: rgba(255,255,255,.10); --accent: #4a8fe0; --ok: #3fae3f; --warn: #d8a63a; --bad: #e05a52;
-      --track: #2a2a28;
+  :root[data-theme="light"] {
+    color-scheme: light;
+    --bg: #f7f7f5; --panel: #ffffff; --panel2: #f1f1ee; --ink: #111; --ink2: #555;
+    --muted: #8a8a84; --line: rgba(0,0,0,.09); --accent: #2a78d6;
+    --ok: #0a7d0a; --warn: #b07800; --bad: #b3261e; --track: #e8e8e4;
+  }
+  @media (prefers-color-scheme: light) {
+    :root:not([data-theme="dark"]) {
+      color-scheme: light;
+      --bg: #f7f7f5; --panel: #ffffff; --panel2: #f1f1ee; --ink: #111; --ink2: #555;
+      --muted: #8a8a84; --line: rgba(0,0,0,.09); --accent: #2a78d6;
+      --ok: #0a7d0a; --warn: #b07800; --bad: #b3261e; --track: #e8e8e4;
     }
   }
   * { box-sizing: border-box; }
@@ -33,6 +42,7 @@
   .wrap { max-width: 1060px; margin: 0 auto; padding: 18px 16px 48px; }
 
   header { display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap; }
+  #theme { margin-left: 8px; }
   header h1 { font-size: 20px; margin: 0; letter-spacing: -.01em; }
   header .ver { color: var(--muted); font-size: 12px; }
   header .spacer { flex: 1; }
@@ -74,18 +84,43 @@
        letter-spacing: .04em; }
   tr:last-child td { border-bottom: none; }
   td.num, th.num { text-align: right; }
-  td .name { font-weight: 550; word-break: break-word; }
+  td .name { font-weight: 550; word-break: break-word; display: -webkit-box;
+             -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+  .st-inline { display: none; }
   td .sub { color: var(--muted); font-size: 12px; }
 
-  .meter { display: flex; align-items: center; gap: 8px; min-width: 140px; }
-  .meter .track { flex: 1; height: 7px; background: var(--track); border-radius: 4px; overflow: hidden; }
-  .meter .fill { height: 100%; background: var(--accent); border-radius: 4px 0 0 4px; }
-  .meter .fill.done { background: var(--ok); border-radius: 4px; }
-  .meter .pct { color: var(--ink2); font-size: 12px; min-width: 38px; text-align: right; }
+  .meter { min-width: 170px; }
+  .meter .bar { display: flex; align-items: center; gap: 8px; }
+  .meter .track { flex: 1; height: 6px; background: var(--track); border-radius: 4px; overflow: hidden; }
+  .meter .fill { height: 100%; background: var(--accent); border-radius: 4px;
+                 transition: width .6s ease; min-width: 2px; }
+  .meter .fill.done { background: var(--ok); }
+  .meter .pct { color: var(--ink2); font-size: 12px; min-width: 36px; text-align: right; }
+  .meter .detail { color: var(--muted); font-size: 11.5px; margin-top: 4px;
+                   font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .meter .detail b { color: var(--ink2); font-weight: 600; }
 
-  .st { font-size: 11.5px; font-weight: 650; }
+  .st { display: inline-block; font-size: 11px; font-weight: 650; letter-spacing: .03em;
+        padding: 2px 8px; border-radius: 999px;
+        background: color-mix(in srgb, currentColor 12%, transparent); }
   .st.ok { color: var(--ok); } .st.warn { color: var(--warn); }
   .st.bad { color: var(--bad); } .st.dim { color: var(--muted); }
+
+  tbody tr { transition: background .15s ease; }
+  tbody tr:hover { background: color-mix(in srgb, var(--accent) 4%, transparent); }
+  td .health { font-weight: 650; }
+
+  #hold { display: none; margin: 0 0 12px; padding: 8px 12px; border-radius: 8px;
+          font-size: 12.5px; font-weight: 550; color: var(--warn);
+          background: color-mix(in srgb, var(--warn) 10%, transparent);
+          border: 1px solid color-mix(in srgb, var(--warn) 35%, transparent); }
+  #hold.show { display: block; }
+
+  .acts { display: flex; gap: 3px; justify-content: flex-end; flex-wrap: wrap; }
+  .acts button { padding: 2px 7px; font-size: 12px; line-height: 1.5; color: var(--ink2); }
+  .acts button:hover { color: var(--ink); }
+  .acts .mv { font-size: 11px; padding: 2px 6px; }
+  .acts .del:hover { border-color: var(--bad); color: var(--bad); }
 
   #logbox { background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
             margin-top: 12px; padding: 10px 12px; max-height: 480px; overflow-y: auto;
@@ -130,6 +165,12 @@
     .stats { grid-template-columns: repeat(2, 1fr); }
     .stat .v { font-size: 16px; }
     th.num, td.num { display: none; }        /* size/health columns */
+    th:nth-child(2), td:nth-child(2) { display: none; } /* status column */
+    .st-inline { display: inline-block; margin-top: 3px; }
+    .acts .mv { display: none; }             /* move buttons: desktop only */
+    .acts { flex-direction: column; align-items: stretch; }
+    .meter { min-width: 110px; }
+    .meter .detail { white-space: normal; }
     th, td { padding-left: 6px; padding-right: 6px; }
     .controls { gap: 6px; }
     .controls label { font-size: 11px; }
@@ -208,10 +249,13 @@
 
   <div class="stats">
     <div class="stat"><div class="v" id="s-rate">—</div><div class="l">download rate</div></div>
+    <div class="stat"><div class="v" id="s-eta">—</div><div class="l">time left</div></div>
     <div class="stat"><div class="v" id="s-remaining">—</div><div class="l">remaining</div></div>
     <div class="stat"><div class="v" id="s-session">—</div><div class="l">this session</div></div>
     <div class="stat"><div class="v" id="s-active">—</div><div class="l">active / queued</div></div>
   </div>
+
+  <div id="hold"></div>
 
   <div class="controls">
     <button id="btn-pause">Pause queue</button>
@@ -219,6 +263,7 @@
     <label>Limit <input type="number" id="limit" min="0" step="128" placeholder="KiB/s">
       <button class="small" id="btn-limit">set</button></label>
     <span class="spacer" style="flex:1"></span>
+    <button class="small" id="theme" title="theme: follows your system, dark otherwise">auto</button>
     <label style="font-size:11.5px" id="conn">connecting…</label>
   </div>
 
@@ -230,8 +275,8 @@
 
   <section id="tab-queue">
     <table>
-      <thead><tr><th>Job</th><th>Status</th><th style="width:220px">Progress</th>
-        <th class="num">Size</th><th class="num">Health</th><th style="width:150px"></th></tr></thead>
+      <thead><tr><th>Job</th><th>Status</th><th style="width:250px">Progress</th>
+        <th class="num">Size</th><th class="num">Health</th><th style="width:190px"></th></tr></thead>
       <tbody id="queue-body"><tr><td colspan="6" class="empty">loading…</td></tr></tbody>
     </table>
   </section>
@@ -263,6 +308,40 @@ function fmtBytes(n) {
   return (i === 0 ? v : v.toFixed(v >= 100 ? 0 : 1)) + " " + u[i];
 }
 function fmtRate(bps) { return bps > 0 ? fmtBytes(bps) + "/s" : "0"; }
+function fmtEta(bytes, bps) {
+  if (!bps || bps <= 0 || bytes == null) return "—";
+  let sec = bytes / bps;
+  if (sec < 1) return "0s";
+  if (sec > 30 * 86400) return ">30d";
+  const d = Math.floor(sec / 86400); sec %= 86400;
+  const h = Math.floor(sec / 3600); sec %= 3600;
+  const m = Math.floor(sec / 60); const ss = Math.floor(sec % 60);
+  if (d) return d + "d " + h + "h";
+  if (h) return h + "h " + m + "m";
+  if (m) return m + "m" + (m < 10 ? " " + ss + "s" : "");
+  return ss + "s";
+}
+
+// ---- theme: auto (system, else dark) -> dark -> light --------------------
+const THEMES = ["auto", "dark", "light"];
+function applyTheme(t) {
+  if (t === "auto") document.documentElement.removeAttribute("data-theme");
+  else document.documentElement.setAttribute("data-theme", t);
+  const btn = $("theme");
+  if (btn) btn.textContent = t;
+}
+function initTheme() {
+  let t = "auto";
+  try { t = localStorage.getItem("nzbd-theme") || "auto"; } catch {}
+  if (!THEMES.includes(t)) t = "auto";
+  applyTheme(t);
+  $("theme").onclick = () => {
+    const cur = (() => { try { return localStorage.getItem("nzbd-theme") || "auto"; } catch { return "auto"; } })();
+    const next = THEMES[(THEMES.indexOf(cur) + 1) % THEMES.length];
+    try { localStorage.setItem("nzbd-theme", next); } catch {}
+    applyTheme(next);
+  };
+}
 function fmtTime(unix) {
   if (!unix) return "—";
   return new Date(unix * 1000).toLocaleString();
@@ -278,6 +357,7 @@ async function refreshStatus() {
   const s = await r.json();
   $("ver").textContent = "v" + s.version;
   $("s-rate").textContent = fmtRate(s.download_rate_bps);
+  $("s-eta").textContent = s.download_paused ? "paused" : fmtEta(s.remaining_bytes, s.download_rate_bps);
   $("s-remaining").textContent = fmtBytes(s.remaining_bytes);
   $("s-session").textContent = fmtBytes(s.session_downloaded_bytes);
   $("s-active").textContent = s.jobs_downloading + " / " + s.jobs_queued;
@@ -285,6 +365,16 @@ async function refreshStatus() {
   if (s.download_paused) badges.push('<span class="badge on-warn">paused</span>');
   if (s.speed_limit_bps) badges.push('<span class="badge">limit ' + fmtRate(s.speed_limit_bps) + "</span>");
   $("badges").innerHTML = badges.join("");
+  // Why is nothing downloading? Say so instead of sitting silently.
+  const holds = [];
+  if (s.disk_low) holds.push("low disk space on the destination volume — downloads held until space is freed");
+  if (s.quota_reached) holds.push("download quota reached — normal jobs held (force-priority still runs)");
+  if (s.blocked_servers && s.blocked_servers.length)
+    holds.push("news server " + s.blocked_servers.map(x => "#" + x).join(", ") +
+               " blocked after connection failures — retrying automatically");
+  const hold = $("hold");
+  hold.textContent = holds.length ? "⚠ " + holds.join(" · ") : "";
+  hold.className = holds.length ? "show" : "";
   if (s.speed_limit_bps && !$("limit").matches(":focus"))
     $("limit").value = Math.round(s.speed_limit_bps / 1024);
 }
@@ -305,26 +395,55 @@ async function refreshQueue() {
     body.innerHTML = '<tr><td colspan="6" class="empty">queue is empty</td></tr>';
     return;
   }
-  body.innerHTML = jobs.map(j => {
+  body.innerHTML = jobs.map((j, idx) => {
     const total = j.size_bytes || 0;
     const done = Math.min(j.downloaded_bytes || 0, total);
     const pct = total ? Math.floor(done * 100 / total) : 0;
     const st = statusName(j.status);
     const cls = STATUS_CLASS[st] || "dim";
     const paused = st === "paused";
+    const dl = st === "downloading";
+    const detail = [`<b>${fmtBytes(done)}</b> of ${fmtBytes(total)}`];
+    if (dl && j.rate_bps > 0) {
+      detail.push(fmtRate(j.rate_bps));
+      detail.push("~" + fmtEta(Math.max(0, j.remaining_bytes), j.rate_bps));
+    }
     return `<tr>
-      <td><div class="name">${esc(j.name)}</div>
-          <div class="sub">#${j.id}${j.category ? " · " + esc(j.category) : ""}${j.assigned_node ? " · on " + esc(j.assigned_node) : ""}</div></td>
+      <td><div class="name" title="${esc(j.name)}">${esc(j.name)}</div>
+          <div class="sub">#${j.id}${j.category ? " · " + esc(j.category) : ""}${j.assigned_node ? " · on " + esc(j.assigned_node) : ""}
+          <span class="st ${cls} st-inline">${esc(st).toUpperCase()}</span></div></td>
       <td><span class="st ${cls}">${esc(st).toUpperCase()}</span></td>
-      <td><div class="meter"><div class="track"><div class="fill${pct >= 100 ? " done" : ""}" style="width:${pct}%"></div></div><span class="pct">${pct}%</span></div></td>
+      <td><div class="meter">
+            <div class="bar"><div class="track"><div class="fill${pct >= 100 ? " done" : ""}" style="width:${pct}%"></div></div><span class="pct">${pct}%</span></div>
+            <div class="detail">${detail.join(" · ")}</div>
+          </div></td>
       <td class="num">${fmtBytes(total)}</td>
-      <td class="num">${(j.health / 10).toFixed(1)}%</td>
-      <td>
-        <button class="small" onclick="jobAction(${j.id}, '${paused ? "resume" : "pause"}')">${paused ? "resume" : "pause"}</button>
-        <button class="small" onclick="if(confirm('Delete ${esc(j.name).replace(/'/g, "\\'")}?')) jobAction(${j.id}, 'delete')">delete</button>
-      </td>
+      <td class="num"><span class="health" style="color:${healthColor(j.health, j.critical_health)}" title="${healthTip(j.health, j.critical_health)}">${(j.health / 10).toFixed(1)}%</span></td>
+      <td><div class="acts">
+        <button class="mv" title="move to top" onclick="jobAction(${j.id}, 'move-top')" ${idx === 0 ? "disabled" : ""}>⤒</button>
+        <button class="mv" title="move up" onclick="jobAction(${j.id}, 'move-up')" ${idx === 0 ? "disabled" : ""}>↑</button>
+        <button class="mv" title="move down" onclick="jobAction(${j.id}, 'move-down')" ${idx === jobs.length - 1 ? "disabled" : ""}>↓</button>
+        <button class="mv" title="move to bottom" onclick="jobAction(${j.id}, 'move-bottom')" ${idx === jobs.length - 1 ? "disabled" : ""}>⤓</button>
+        <button onclick="jobAction(${j.id}, '${paused ? "resume" : "pause"}')">${paused ? "resume" : "pause"}</button>
+        <button class="del" onclick="if(confirm('Delete ${esc(j.name).replace(/'/g, "\\'")}?')) jobAction(${j.id}, 'delete')">delete</button>
+      </div></td>
     </tr>`;
   }).join("");
+}
+
+// Health color: green at 100% fading to red at the par-repair limit
+// (critical health). Below it the job is unrepairable — full red.
+function healthColor(health, critical) {
+  const crit = Math.min(critical || 850, 999);
+  const t = Math.max(0, Math.min(1, (health - crit) / (1000 - crit)));
+  const hue = 4 + t * 136; // red 4° -> green 140°
+  return `hsl(${hue.toFixed(0)} 62% 46%)`;
+}
+function healthTip(health, critical) {
+  const crit = ((critical || 850) / 10).toFixed(1);
+  return health < (critical || 850)
+    ? `below the par2 repair limit (${crit}%) — unrepairable`
+    : `repairable down to ${crit}% with the set's par2 blocks`;
 }
 async function jobAction(id, action) {
   await fetch(`/api/v1/jobs/${id}/actions/${action}`, { method: "POST" });
@@ -533,6 +652,7 @@ async function checkSetup() {
   return true;
 }
 
+initTheme();
 (async () => {
   if (await checkSetup()) return;
   connectSse();

@@ -126,7 +126,11 @@ deobfuscate_final = true    # rename still-obfuscated files to the job name
 strategy = "balanced"       # sequential | balanced | aggressive | rocket
                             # (1 / 2 / 3 / 6 concurrent PP jobs)
 health_action = "none"      # none | park | delete — what to do with
-                            # failed-health downloads on disk
+                            # unrepairable downloads. Anything but "none"
+                            # also aborts a download the moment its health
+                            # drops below critical health (the point where
+                            # even all par2 blocks can't repair it), instead
+                            # of finishing a doomed download
 tool_timeout_secs = 3600
 script_timeout_secs = 3600
 par_fetch_timeout_secs = 600   # wait for delayed par files during repair

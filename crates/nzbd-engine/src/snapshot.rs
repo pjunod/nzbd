@@ -27,6 +27,9 @@ pub struct JobSummary {
     /// Per-mille (NZBGet scale: 1000 = 100.0%).
     pub health: u16,
     pub critical_health: u16,
+    /// This job's current download rate (EMA, bytes/sec; 0 unless
+    /// actively downloading).
+    pub rate_bps: u64,
     /// Cluster: node currently executing this job remotely (None = local).
     pub assigned_node: Option<String>,
     /// Post-processing already finished (the `*PP:done` stamp is present).
@@ -55,6 +58,9 @@ pub struct QueueSnapshot {
     pub disk_low: bool,
     /// Per-server session/day/month volume counters (this node).
     pub server_volumes: Vec<ServerVolume>,
+    /// Servers currently blocked after connect failures (retrying on a
+    /// timer). Surfaced so the UI can explain a stalled queue.
+    pub blocked_servers: Vec<u32>,
     pub speed_limit_bps: Option<u64>,
     pub download_rate_bps: u64,
     pub session_downloaded_bytes: u64,

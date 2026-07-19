@@ -179,6 +179,10 @@ pub struct StatusDto {
     pub remaining_bytes: u64,
     pub session_downloaded_bytes: u64,
     pub download_paused: bool,
+    /// Queue-hold reasons (why nothing is downloading right now).
+    pub disk_low: bool,
+    pub quota_reached: bool,
+    pub blocked_servers: Vec<u32>,
     pub speed_limit_bps: Option<u64>,
     pub jobs_queued: u32,
     pub jobs_downloading: u32,
@@ -195,6 +199,9 @@ pub fn status_dto(snap: &QueueSnapshot) -> StatusDto {
         remaining_bytes: snap.remaining_bytes,
         session_downloaded_bytes: snap.session_downloaded_bytes,
         download_paused: snap.download_paused,
+        disk_low: snap.disk_low,
+        quota_reached: snap.quota_reached,
+        blocked_servers: snap.blocked_servers.clone(),
         speed_limit_bps: snap.speed_limit_bps,
         jobs_queued: count(&|j| matches!(j.status, JobStatus::Queued | JobStatus::Paused)),
         jobs_downloading: count(&|j| matches!(j.status, JobStatus::Downloading)),
@@ -365,10 +372,14 @@ async fn job_action(
         "resume" => engine.resume_job(job).await,
         "delete" => engine.delete_job(job, false).await,
         "delete-files" => engine.delete_job(job, true).await,
+        "move-top" => engine.move_job(job, nzbd_engine::MoveOp::Top).await,
+        "move-up" => engine.move_job(job, nzbd_engine::MoveOp::Up).await,
+        "move-down" => engine.move_job(job, nzbd_engine::MoveOp::Down).await,
+        "move-bottom" => engine.move_job(job, nzbd_engine::MoveOp::Bottom).await,
         _ => {
             return error(
                 StatusCode::BAD_REQUEST,
-                "unknown action (pause|resume|delete|delete-files)",
+                "unknown action (pause|resume|delete|delete-files|move-top|move-up|move-down|move-bottom)",
             )
         }
     };

@@ -290,6 +290,64 @@ async fn unrecoverable_articles_gate_health_and_zero_fill_gaps() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn critical_health_abort_stops_wasting_bandwidth() {
+    let tmp = tempfile::tempdir().unwrap();
+    let data = prng_bytes(77, 10 * 5000);
+    let post = build_post("doomed", &[("doomed.bin", data)], 5000);
+
+    // Parts 1..=4 gone everywhere (40% of bytes): health 600 < critical
+    // 850 (no par2 in the set). Parts 5..=10 are served only after a long
+    // delay — without the abort, the job would sit through ~3s+ of
+    // downloads it can never repair.
+    let mut b = NservBuilder::new().with_post(&post);
+    for part in 1..=4 {
+        b = b.behavior(&post.message_id("doomed.bin", part), Behavior::NotFound);
+    }
+    for part in 5..=10 {
+        b = b.behavior(
+            &post.message_id("doomed.bin", part),
+            Behavior::Delay(Duration::from_secs(3)),
+        );
+    }
+    let ns = b.start().await.unwrap();
+
+    let engine = Engine::spawn(EngineConfig::single_node(
+        vec![server_def(1, ns.port(), 0, 2, 2)],
+        tmp.path().join("state"),
+        tmp.path().join("dest"),
+        Tuning {
+            health_abort: true,
+            ..test_tuning()
+        },
+        None,
+    ))
+    .await
+    .expect("engine spawn");
+
+    let started = std::time::Instant::now();
+    let mut rx = engine.subscribe();
+    let job = engine
+        .add_nzb("doomed", post.nzb.as_bytes(), None, 0)
+        .await
+        .unwrap();
+    let (status, health) = wait_finished(&mut rx, job, 30).await;
+    assert_eq!(status, JobStatus::Failed, "unrepairable -> failed");
+    // Pending delayed parts were failed by the abort, not downloaded:
+    // health lands below the no-abort value of 600.
+    assert!(
+        health < 600,
+        "abort must fail pending segments, got {health}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(8),
+        "job should abort quickly, took {:?}",
+        started.elapsed()
+    );
+
+    engine.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn pause_resume_and_delete() {
     let tmp = tempfile::tempdir().unwrap();
     let post = build_post("pausable", &[("p.bin", prng_bytes(41, 40_000))], 10_000);

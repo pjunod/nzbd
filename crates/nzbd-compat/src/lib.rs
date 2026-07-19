@@ -709,6 +709,40 @@ async fn editqueue(state: &CompatState, params: &Value) -> Result<Value, (i64, &
                 let prio: i32 = text.parse().unwrap_or(0);
                 state.engine.set_priority(id, prio).await.unwrap_or(false)
             }
+            "GroupMoveTop" => state
+                .engine
+                .move_job(id, nzbd_engine::MoveOp::Top)
+                .await
+                .unwrap_or(false),
+            "GroupMoveBottom" => state
+                .engine
+                .move_job(id, nzbd_engine::MoveOp::Bottom)
+                .await
+                .unwrap_or(false),
+            "GroupMoveUp" => state
+                .engine
+                .move_job(id, nzbd_engine::MoveOp::Up)
+                .await
+                .unwrap_or(false),
+            "GroupMoveDown" => state
+                .engine
+                .move_job(id, nzbd_engine::MoveOp::Down)
+                .await
+                .unwrap_or(false),
+            "GroupMoveOffset" => {
+                // Approximate a signed offset with repeated single steps.
+                let offset: i64 = text.parse().unwrap_or(0);
+                let op = if offset < 0 {
+                    nzbd_engine::MoveOp::Up
+                } else {
+                    nzbd_engine::MoveOp::Down
+                };
+                let mut done = true;
+                for _ in 0..offset.unsigned_abs().min(1000) {
+                    done &= state.engine.move_job(id, op).await.unwrap_or(false);
+                }
+                done
+            }
             "GroupSetCategory" => {
                 edit_job(state, id, |j| {
                     j.category = (!text.is_empty()).then(|| text.clone());

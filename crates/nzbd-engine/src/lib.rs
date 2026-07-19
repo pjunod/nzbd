@@ -24,7 +24,8 @@ mod pool;
 mod writer;
 
 pub use events::Event;
-pub use owner::MirrorStats;
+pub use owner::{MirrorStats, MoveOp};
+pub use queue::clean_job_name;
 pub use snapshot::{new_shared_snapshot, JobSummary, QueueSnapshot, SharedSnapshot};
 
 use nzbd_nntp::transport::{tls_client_config, TlsClientConfig};
@@ -71,6 +72,12 @@ pub struct Tuning {
     pub monthly_quota_bytes: u64,
     /// Day of month the monthly quota window starts (1–28).
     pub quota_start_day: u32,
+    /// Abort a download the moment its health falls below critical health
+    /// (unrepairable even with all par2): remaining segments are failed
+    /// instead of downloaded, and the job finishes as Failed — the PP
+    /// health gate then parks/deletes per `[post] health_action`. Wired
+    /// from `health_action != "none"`.
+    pub health_abort: bool,
 }
 
 impl Default for Tuning {
@@ -87,6 +94,7 @@ impl Default for Tuning {
             daily_quota_bytes: 0,
             monthly_quota_bytes: 0,
             quota_start_day: 1,
+            health_abort: false,
         }
     }
 }
@@ -339,19 +347,7 @@ impl EngineHandle {
         opts: AddOpts,
     ) -> Result<JobId, EngineError> {
         let parsed = nzbd_nzb::parse(content)?;
-        let name = name
-            .trim()
-            .trim_end_matches(".nzb")
-            .trim_end_matches(".NZB");
-        let name = if name.is_empty() {
-            parsed
-                .meta
-                .title
-                .clone()
-                .unwrap_or_else(|| "download".to_string())
-        } else {
-            name.to_string()
-        };
+        let name = crate::queue::clean_job_name(name, &parsed);
         let (tx, rx) = oneshot::channel();
         self.send(QueueCommand::AddParsed {
             name,
@@ -392,6 +388,13 @@ impl EngineHandle {
             reply,
         })
         .await
+    }
+
+    /// Reorder a job in the queue (position is the scheduling tiebreaker
+    /// within a priority band).
+    pub async fn move_job(&self, job: JobId, op: MoveOp) -> Result<bool, EngineError> {
+        self.roundtrip_bool(|reply| QueueCommand::Move { job, op, reply })
+            .await
     }
 
     pub async fn pause_all(&self) -> Result<(), EngineError> {

@@ -93,6 +93,13 @@ pub(crate) enum QueueCommand {
         priority: i32,
         reply: oneshot::Sender<bool>,
     },
+    /// Reorder within the queue vec — the scheduling tiebreaker inside a
+    /// priority band, and the order the UI displays.
+    Move {
+        job: JobId,
+        op: MoveOp,
+        reply: oneshot::Sender<bool>,
+    },
     PauseAll {
         reply: oneshot::Sender<()>,
     },
@@ -181,6 +188,39 @@ pub(crate) enum QueueCommand {
     },
 }
 
+/// Queue reorder operations (NZBGet GroupMoveTop/Up/Down/Bottom).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MoveOp {
+    Top,
+    Up,
+    Down,
+    Bottom,
+}
+
+/// Sliding per-job rate from downloaded-byte deltas between snapshots.
+struct JobRateMeter {
+    last_bytes: u64,
+    last_at: std::time::Instant,
+    ema_bps: f64,
+}
+
+impl JobRateMeter {
+    /// EMA over ~5s; ignores sub-250ms deltas (snapshot bursts).
+    fn update(&mut self, bytes_now: u64) -> u64 {
+        let now = std::time::Instant::now();
+        let dt = now.duration_since(self.last_at).as_secs_f64();
+        if dt >= 0.25 {
+            let delta = bytes_now.saturating_sub(self.last_bytes) as f64;
+            let inst = delta / dt;
+            let alpha = (dt / 5.0).min(1.0);
+            self.ema_bps += alpha * (inst - self.ema_bps);
+            self.last_bytes = bytes_now;
+            self.last_at = now;
+        }
+        self.ema_bps.max(0.0) as u64
+    }
+}
+
 /// Remote progress counters mirrored into a delegated job's summary.
 #[derive(Debug, Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
 pub struct MirrorStats {
@@ -256,6 +296,9 @@ pub(crate) struct Owner {
     /// Jobs executing on another node (job → node name).
     delegated: HashMap<JobId, String>,
     mirror: HashMap<JobId, MirrorStats>,
+    /// Per-job download-rate EMA, fed from downloaded-byte deltas at
+    /// snapshot time (job id → meter).
+    job_rates: HashMap<u32, JobRateMeter>,
 
     state_dir: PathBuf,
     journal: JobJournals,
@@ -386,6 +429,7 @@ impl Owner {
             file_sizes,
             delegated: HashMap::new(),
             mirror: HashMap::new(),
+            job_rates: HashMap::new(),
             state_dir: state_dir.to_path_buf(),
             journal,
             snap_store,
@@ -733,6 +777,10 @@ impl Owner {
                     self.bump_epoch();
                     self.publish_now();
                 }
+                let _ = reply.send(ok);
+            }
+            QueueCommand::Move { job, op, reply } => {
+                let ok = self.move_job(job, op);
                 let _ = reply.send(ok);
             }
             QueueCommand::PauseAll { reply } => {
@@ -1207,6 +1255,74 @@ impl Owner {
             segment: r.seg_number,
         });
         self.after_file_change(r.job, r.file);
+        self.maybe_abort_unhealthy(r.job);
+    }
+
+    /// NZBGet-style critical-health abort: once enough articles have
+    /// failed that the job can't be repaired even with every par2 block
+    /// (`health < critical_health`), stop wasting bandwidth. Pending
+    /// segments are failed outright; leased ones finish their in-flight
+    /// attempt honestly. The job then completes as Failed through the
+    /// normal path, and the PP health gate parks/deletes per policy.
+    fn maybe_abort_unhealthy(&mut self, job_id: JobId) {
+        if !self.tuning.health_abort {
+            return;
+        }
+        let Some(job) = self.state.job(job_id) else {
+            return;
+        };
+        if !matches!(
+            job.status,
+            JobStatus::Queued | JobStatus::Downloading | JobStatus::Paused
+        ) {
+            return;
+        }
+        let health = Health::calc(&job.totals);
+        let critical = Health::calc_critical(&job.totals, true);
+        if health.0 >= critical.0 {
+            return;
+        }
+        let name = job.name.clone();
+        let pending: Vec<(FileId, Vec<u32>)> = job
+            .files
+            .iter()
+            .filter(|f| !f.is_terminal())
+            .map(|f| {
+                (
+                    f.id,
+                    f.segments
+                        .iter()
+                        .filter(|s| matches!(s.state, SegmentState::Pending))
+                        .map(|s| s.number)
+                        .collect(),
+                )
+            })
+            .collect();
+        tracing::warn!(
+            job = job_id.0,
+            %name,
+            health = health.0,
+            critical = critical.0,
+            "aborting download: health below critical (unrepairable even with all par2)"
+        );
+        for (file, segs) in pending {
+            for seg_number in segs {
+                let r = SegRef {
+                    job: job_id,
+                    file,
+                    seg_number,
+                };
+                if let Some(seg) = self.state.segment_mut(r) {
+                    seg.state = SegmentState::Failed;
+                }
+                self.attempts.remove(&r);
+            }
+            if let Some(j) = self.state.job_mut(job_id) {
+                recompute_job_totals(j);
+            }
+            self.after_file_change(job_id, file);
+        }
+        self.bump_epoch();
     }
 
     /// Writer reported an unrecoverable disk error: fail every non-done
@@ -1393,10 +1509,10 @@ impl Owner {
             .insert(server, until)
             .is_none_or(|prev| prev <= Instant::now());
         if newly {
-            tracing::debug!(
+            tracing::warn!(
                 server = server.0,
                 secs = self.tuning.retry_interval.as_secs(),
-                "server blocked"
+                "server blocked after connection failure — retrying on a timer"
             );
             self.emit(Event::ServerBlocked {
                 server,
@@ -1521,6 +1637,29 @@ impl Owner {
 
     /// Disk + quota guards, evaluated every 10 s (cluster-aware quota:
     /// peers' volume files on the shared state dir are summed in).
+    /// Reposition a job in the queue vec. Position is the scheduler's
+    /// tiebreaker within a priority band and persists via the snapshot.
+    fn move_job(&mut self, job_id: JobId, op: MoveOp) -> bool {
+        let Some(idx) = self.state.jobs.iter().position(|j| j.id == job_id) else {
+            return false;
+        };
+        let last = self.state.jobs.len() - 1;
+        let target = match op {
+            MoveOp::Top => 0,
+            MoveOp::Up => idx.saturating_sub(1),
+            MoveOp::Down => (idx + 1).min(last),
+            MoveOp::Bottom => last,
+        };
+        if target != idx {
+            let job = self.state.jobs.remove(idx);
+            self.state.jobs.insert(target, job);
+            self.dirty = true;
+            self.bump_epoch();
+            self.publish_now();
+        }
+        true
+    }
+
     fn update_guards(&mut self) {
         if self.tuning.min_free_disk_bytes > 0 {
             let free = crate::volumes::free_space(&self.dest_dir);
@@ -1640,6 +1779,7 @@ impl Owner {
                     pp_done: j.params.iter().any(|(k, _)| k == nzbd_types::PP_DONE_PARAM),
                     dupe_key: j.dupe.key.clone(),
                     dupe_score: j.dupe.score,
+                    rate_bps: 0,
                 };
                 // Delegated jobs progress remotely; overlay heartbeat stats.
                 if let Some(m) = self.mirror.get(&j.id) {
@@ -1657,12 +1797,45 @@ impl Owner {
                 }
                 summary
             })
+            .collect::<Vec<_>>();
+        let jobs: Vec<JobSummary> = {
+            let mut jobs = jobs;
+            for summary in &mut jobs {
+                let meter = self
+                    .job_rates
+                    .entry(summary.id.0)
+                    .or_insert_with(|| JobRateMeter {
+                        last_bytes: summary.downloaded_bytes,
+                        last_at: std::time::Instant::now(),
+                        ema_bps: 0.0,
+                    });
+                summary.rate_bps = if summary.status == JobStatus::Downloading {
+                    meter.update(summary.downloaded_bytes)
+                } else {
+                    // Reset the baseline so a resume doesn't spike.
+                    meter.last_bytes = summary.downloaded_bytes;
+                    meter.ema_bps = 0.0;
+                    0
+                };
+            }
+            let live: HashSet<u32> = jobs.iter().map(|s| s.id.0).collect();
+            self.job_rates.retain(|id, _| live.contains(id));
+            jobs
+        };
+        let now_block = Instant::now();
+        let mut blocked_servers: Vec<u32> = self
+            .blocked
+            .iter()
+            .filter(|(_, until)| **until > now_block)
+            .map(|(id, _)| id.0)
             .collect();
+        blocked_servers.sort_unstable();
         let snap = QueueSnapshot {
             up_since_unix: self.up_since_unix,
             download_paused: self.state.download_paused,
             quota_reached: self.quota_reached,
             disk_low: self.disk_low,
+            blocked_servers,
             server_volumes: {
                 let now_day = unix_now().div_euclid(86_400);
                 let mut v: Vec<crate::snapshot::ServerVolume> = self

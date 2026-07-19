@@ -151,6 +151,15 @@ pub(crate) async fn connection_task(mut ctx: ConnCtx) {
         }
 
         if conn.is_none() {
+            // Stagger cold reconnects across the pool: after a resume, all
+            // tasks wake at once, and a thundering herd of TCP+TLS+AUTH can
+            // trip provider connection limits.
+            if ctx.conn_index > 0 {
+                tokio::select! {
+                    _ = ctx.cancel.cancelled() => break,
+                    _ = tokio::time::sleep(Duration::from_millis(75 * ctx.conn_index as u64)) => {}
+                }
+            }
             match connect_and_auth(&ctx).await {
                 Ok(c) => conn = Some(c),
                 Err(e) => {

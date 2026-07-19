@@ -384,6 +384,8 @@ fn run(
         daily_quota_bytes: cfg.queue.daily_quota_mb * 1024 * 1024,
         monthly_quota_bytes: cfg.queue.monthly_quota_mb * 1024 * 1024,
         quota_start_day: cfg.queue.quota_start_day.clamp(1, 28),
+        health_abort: nzbd_post::manager::HealthAction::parse(&cfg.post.health_action)
+            != nzbd_post::manager::HealthAction::None,
         ..Tuning::default()
     };
 
