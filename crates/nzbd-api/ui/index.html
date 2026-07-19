@@ -324,7 +324,7 @@
     <label>Limit <input type="number" id="limit" min="0" step="128" placeholder="KiB/s">
       <button class="small" id="btn-limit">set</button></label>
     <span class="spacer" style="flex:1"></span>
-    <button class="small" id="theme" title="theme: follows your system, dark otherwise">auto</button>
+    <button class="small" id="theme" title="Theme: follows your system setting (dark if it has none). Click to cycle auto / dark / light.">\u25D1 theme: auto</button>
     <label class="conn dim" id="conn" title="Establishing the live event stream to the daemon.">○ connecting…</label>
   </div>
 
@@ -413,7 +413,13 @@ function applyTheme(t) {
   if (t === "auto") document.documentElement.removeAttribute("data-theme");
   else document.documentElement.setAttribute("data-theme", t);
   const btn = $("theme");
-  if (btn) btn.textContent = t;
+  if (btn) {
+    const icon = t === "dark" ? "\u263E" : t === "light" ? "\u2600" : "\u25D1";
+    btn.textContent = icon + " theme: " + t;
+    btn.title = t === "auto"
+      ? "Theme: follows your system setting (dark if it has none). Click to switch to dark."
+      : "Theme: forced " + t + ". Click to switch to " + (t === "dark" ? "light" : "auto") + ".";
+  }
 }
 function initTheme() {
   let t = "auto";
