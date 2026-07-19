@@ -20,7 +20,12 @@ services:
       - "6789:6789"
     volumes:
       - ./data:/data             # throwaway downloads/state, easy to inspect
-      - ./nzbd.toml:/etc/nzbd/nzbd.toml:ro
+    # The config goes in as a compose `config`, not a bind mount: if
+    # ./nzbd.toml is missing, `docker compose up` fails immediately with a
+    # clear error instead of Docker inventing a directory in its place.
+    configs:
+      - source: nzbd_toml
+        target: /etc/nzbd/nzbd.toml
     environment:
       - TZ=Etc/UTC
       - RUST_LOG=debug           # dev default; drop to info if too chatty
@@ -40,3 +45,7 @@ services:
           path: ../Cargo.lock
         - action: rebuild
           path: ../Dockerfile
+
+configs:
+  nzbd_toml:
+    file: ./nzbd.toml            # cp nzbd.toml.example nzbd.toml first

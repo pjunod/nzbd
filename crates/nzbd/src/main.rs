@@ -308,8 +308,24 @@ fn run(
     logbuf: Arc<nzbd_api::LogBuffer>,
 ) -> anyhow_lite::Result<()> {
     let cfg = match &config {
-        Some(path) => nzbd_config::Config::from_toml(&std::fs::read_to_string(path)?)
-            .map_err(|e| anyhow_lite::Error::msg(e.to_string()))?,
+        Some(path) => {
+            // Actionable errors for the two classic container mistakes.
+            if path.is_dir() {
+                return Err(anyhow_lite::Error::msg(format!(
+                    "config path {} is a DIRECTORY, not a file — if this is a \
+                     Docker bind mount, the host file didn't exist when the \
+                     container was created, so Docker made a directory in its \
+                     place. Remove it on the host (rmdir), create the real \
+                     config file, and recreate the container.",
+                    path.display()
+                )));
+            }
+            let text = std::fs::read_to_string(path).map_err(|e| {
+                anyhow_lite::Error::msg(format!("cannot read config {}: {e}", path.display()))
+            })?;
+            nzbd_config::Config::from_toml(&text)
+                .map_err(|e| anyhow_lite::Error::msg(format!("{}: {e}", path.display())))?
+        }
         None => nzbd_config::Config::default(),
     };
     let bind = bind.unwrap_or_else(|| cfg.api.bind.clone());

@@ -20,7 +20,12 @@ services:
       # Downloads + state. paths.main_dir/dest_dir in nzbd.toml must live
       # under /data for the *arr apps to see the same paths you map here.
       - /data/usenet:/data
-      - ./nzbd.toml:/etc/nzbd/nzbd.toml:ro
+    # The config goes in as a compose `config`, not a bind mount: if
+    # ./nzbd.toml is missing, `docker compose up` fails immediately with a
+    # clear error instead of Docker inventing a directory in its place.
+    configs:
+      - source: nzbd_toml
+        target: /etc/nzbd/nzbd.toml
     environment:
       - TZ=Etc/UTC
       # - RUST_LOG=info
@@ -48,3 +53,7 @@ services:
   #     - PUID=1000
   #     - PGID=1000
   #     - TZ=Etc/UTC
+
+configs:
+  nzbd_toml:
+    file: ./nzbd.toml            # cp nzbd.toml.example nzbd.toml first

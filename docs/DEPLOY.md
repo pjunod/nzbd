@@ -75,6 +75,14 @@ curl -s localhost:6789/healthz # -> ok
 The host volume is owned by the container's UID 1000; if your host dir
 belongs to someone else: `sudo chown -R 1000:1000 /data/usenet`.
 
+**Mind the order:** create the config file *before* the first
+`docker run`. Docker turns a missing bind-mount source into an empty
+*directory*, and the daemon will refuse to start with a "config path is
+a DIRECTORY" error — remove the accidental directory on the host
+(`rmdir /opt/nzbd/nzbd.toml`), write the file, and recreate the
+container. (The Compose deployments are immune: they use compose
+`configs`, which fail fast when the file is missing.)
+
 Useful lifecycle commands:
 
 ```sh
