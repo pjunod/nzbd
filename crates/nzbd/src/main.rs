@@ -481,6 +481,7 @@ fn run(
             )
         });
         feed_tracker.close();
+        let clients_registry = Arc::new(nzbd_api::ClientRegistry::default());
         let compat_state = nzbd_compat::CompatState {
             config: Arc::new(nzbd_compat::CompatConfig {
                 version: cfg.api.compat_version.clone(),
@@ -491,6 +492,7 @@ fn run(
             log: Some(logbuf.clone()),
             scan_notify: Some(scan_notify),
             feeds: feeds_handle,
+            clients: Some(clients_registry.clone()),
         };
         let app = nzbd_api::require_auth(
             nzbd_api::router_with(nzbd_api::ApiState {
@@ -498,6 +500,7 @@ fn run(
                 history,
                 log: Some(logbuf.clone()),
                 setup: setup.clone(),
+                clients: Some(clients_registry.clone()),
             })
             .merge(nzbd_compat::router(compat_state)),
             nzbd_api::AuthConfig {

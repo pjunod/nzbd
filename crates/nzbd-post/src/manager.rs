@@ -235,6 +235,12 @@ async fn manager_task(
                                 .unwrap_or_default(),
                             dupe_score: exported.as_ref().map(|j| j.dupe.score).unwrap_or(0),
                             completed_at_unix: now(),
+                            hidden: false,
+                            first_seen_at_unix: None,
+                            last_seen_at_unix: None,
+                            seen_count: 0,
+                            removed_at_unix: None,
+                            picked_up_by: None,
                         };
                         let h = history.clone();
                         let _ = tokio::task::spawn_blocking(move || h.record(&entry)).await;
@@ -666,6 +672,12 @@ pub async fn process_job_ctx(
             dupe_key: fin.dupe.key.clone(),
             dupe_score: fin.dupe.score,
             completed_at_unix: now(),
+            hidden: false,
+            first_seen_at_unix: None,
+            last_seen_at_unix: None,
+            seen_count: 0,
+            removed_at_unix: None,
+            picked_up_by: None,
         };
         // History first, stamp second: a crash in between re-runs PP (the
         // stages are idempotent) — the reverse would lose the entry forever.

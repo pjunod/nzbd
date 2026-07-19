@@ -30,6 +30,8 @@ pub struct ApiState {
     /// `--config` path that doesn't exist yet. The UI offers a setup form;
     /// `POST /api/v1/setup` writes the file and asks the daemon to reload.
     pub setup: Option<Arc<SetupHandle>>,
+    /// Observed compat-API consumers (shared with the compat shim).
+    pub clients: Option<Arc<ClientRegistry>>,
 }
 
 /// Shared handle between the setup endpoint and the daemon's run loop.
@@ -112,6 +114,54 @@ fn probe_writable(config_path: &std::path::Path) -> bool {
     }
     let _ = std::fs::remove_file(&probe);
     true
+}
+
+/// Observed API consumers (the *arrs polling the compat shim). Answers
+/// "is Sonarr even talking to this daemon?" without reading its logs.
+#[derive(Default)]
+pub struct ClientRegistry {
+    inner: std::sync::Mutex<std::collections::HashMap<String, ClientInfo>>,
+    /// UA of the request currently being dispatched (advisory — used to
+    /// stamp history observations without threading it everywhere).
+    current: std::sync::Mutex<Option<String>>,
+}
+
+#[derive(Clone, Serialize)]
+pub struct ClientInfo {
+    pub user_agent: String,
+    pub first_seen_unix: i64,
+    pub last_seen_unix: i64,
+    pub calls: u64,
+    pub last_method: String,
+}
+
+impl ClientRegistry {
+    pub fn note(&self, user_agent: Option<&str>, method: &str, now_unix: i64) {
+        let ua = user_agent.unwrap_or("unknown").to_string();
+        *self.current.lock().unwrap() = user_agent.map(String::from);
+        let mut m = self.inner.lock().unwrap();
+        let e = m.entry(ua.clone()).or_insert_with(|| ClientInfo {
+            user_agent: ua,
+            first_seen_unix: now_unix,
+            last_seen_unix: now_unix,
+            calls: 0,
+            last_method: String::new(),
+        });
+        e.last_seen_unix = now_unix;
+        e.calls += 1;
+        e.last_method = method.to_string();
+    }
+
+    /// UA of the in-flight compat request (best effort).
+    pub fn current(&self) -> Option<String> {
+        self.current.lock().unwrap().clone()
+    }
+
+    pub fn snapshot(&self) -> Vec<ClientInfo> {
+        let mut v: Vec<ClientInfo> = self.inner.lock().unwrap().values().cloned().collect();
+        v.sort_by_key(|c| std::cmp::Reverse(c.last_seen_unix));
+        v
+    }
 }
 
 /// HTTP auth requirements (NZBGet `ControlUsername`/`ControlPassword`
@@ -597,7 +647,7 @@ async fn get_history(State(st): State<ApiState>, Query(q): Query<HistoryQuery>) 
     let limit = q.limit.unwrap_or(200).min(10_000);
     let entries = tokio::task::spawn_blocking(move || {
         let _ = db.refresh(); // pick up other nodes' appends (throttled)
-        db.list(limit)
+        db.list_filtered(limit, true)
     })
     .await;
     match entries {
@@ -656,6 +706,7 @@ pub fn router(engine: EngineHandle) -> Router {
         history: None,
         log: None,
         setup: None,
+        clients: None,
     })
 }
 
@@ -959,6 +1010,68 @@ async fn post_restart(State(st): State<ApiState>) -> Response {
     Json(json!({ "ok": true, "restarting": true })).into_response()
 }
 
+/// Observed compat clients (Sonarr/Radarr polling us) — the UI's
+/// "connected clients" strip.
+async fn get_clients(State(st): State<ApiState>) -> Response {
+    let list = st
+        .clients
+        .as_ref()
+        .map(|c| c.snapshot())
+        .unwrap_or_default();
+    Json(json!({ "clients": list })).into_response()
+}
+
+/// Manual handoff controls. `restore` un-hides an entry so a connected
+/// *arr sees it again on its next poll and re-imports; `hide` does the
+/// reverse; `delete` removes the record; `delete-files` also removes the
+/// job's final directory from disk.
+async fn history_action(
+    State(st): State<ApiState>,
+    Path((id, action)): Path<(u32, String)>,
+) -> Response {
+    let Some(db) = st.history.clone() else {
+        return error(StatusCode::NOT_IMPLEMENTED, "history store not configured");
+    };
+    let job = JobId(id);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let act = action.clone();
+    let result = tokio::task::spawn_blocking(move || match act.as_str() {
+        "restore" => db.restore(job).map(|ok| (ok, None)),
+        "hide" => db.hide(job, Some("user"), now).map(|ok| (ok, None)),
+        "delete" => db.delete(job).map(|ok| (ok, None)),
+        "delete-files" => {
+            let dir = db
+                .list_filtered(10_000, true)
+                .ok()
+                .and_then(|v| v.into_iter().find(|e| e.job == job))
+                .and_then(|e| e.final_dir);
+            let removed = dir.as_ref().is_some_and(|d| {
+                let p = std::path::Path::new(d);
+                p.is_dir() && std::fs::remove_dir_all(p).is_ok()
+            });
+            db.delete(job).map(|ok| (ok, Some(removed)))
+        }
+        _ => Ok((false, None)),
+    })
+    .await;
+    match result {
+        Ok(Ok((true, files))) => {
+            Json(json!({ "ok": true, "files_removed": files })).into_response()
+        }
+        Ok(Ok((false, _))) => match action.as_str() {
+            "restore" | "hide" | "delete" | "delete-files" => not_found(),
+            _ => error(
+                StatusCode::BAD_REQUEST,
+                "unknown action (restore|hide|delete|delete-files)",
+            ),
+        },
+        _ => error(StatusCode::INTERNAL_SERVER_ERROR, "history store error"),
+    }
+}
+
 pub fn router_with(state: ApiState) -> Router {
     Router::new()
         .route("/api/v1/status", get(get_status))
@@ -968,6 +1081,11 @@ pub fn router_with(state: ApiState) -> Router {
         .route("/api/v1/queue/actions/{action}", post(queue_action))
         .route("/api/v1/queue/speed-limit", put(set_speed_limit))
         .route("/api/v1/history", get(get_history))
+        .route(
+            "/api/v1/history/{id}/actions/{action}",
+            post(history_action),
+        )
+        .route("/api/v1/clients", get(get_clients))
         .route("/api/v1/events", get(sse_events))
         .route("/api/v1/logs", get(get_logs))
         .route("/metrics", get(metrics))

@@ -259,10 +259,15 @@ fn response_fault(code: i64, message: &str) -> String {
 // endpoint
 // ---------------------------------------------------------------------------
 
-pub async fn handle(State(state): State<CompatState>, body: String) -> Response {
+pub async fn handle(
+    State(state): State<CompatState>,
+    headers: axum::http::HeaderMap,
+    body: String,
+) -> Response {
     let Some(call) = parse_call(&body) else {
         return xml_response(response_fault(4, "Parse error"));
     };
+    crate::note_client(&state, &headers, &call.name);
 
     // system.multicall: params[0] = [{methodName, params}, …]
     if call.name == "system.multicall" {

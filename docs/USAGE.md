@@ -86,6 +86,35 @@ family, `listfiles`, `log`/`writelog`, `scan`, `servervolumes`,
 per-job passwords (`*Unpack:Password`) behave like NZBGet. XML-RPC
 (including `system.multicall`) is served on `/xmlrpc` for older tooling.
 
+## The *arr handoff, demystified
+
+There is no push: **Sonarr/Radarr poll nzbd's history** (every ~30 s)
+for entries they queued, import the files themselves, and then delete
+the history entry (NZBGet `HistoryDelete` — which *hides*, not erases).
+If the *arr is down when a download finishes, nothing is lost — the
+entry waits in history and gets picked up on the next poll after it
+returns. Downloads only rot on disk when an import fails silently on
+the *arr side, which is exactly the case nzbd now makes visible.
+
+The **History** tab shows each stage of that pull:
+
+- **connected clients** strip — every API consumer seen (User-Agent),
+  whether it's actively polling, and when it last called. If your *arr
+  isn't listed or shows "quiet", it isn't talking to nzbd at all.
+- **⏳ awaiting pickup** — finished, but no client history poll has
+  listed it yet (normal for ~30 s; suspicious after hours).
+- **seen by <client> ×N** — the client's polls have returned this entry
+  N times. It knows. If this state persists, the *arr saw the download
+  but hasn't imported it — check its Activity queue for import errors.
+- **✓ imported by <client>** — the client deleted the entry after
+  import (shown dimmed, kept for the record).
+
+Manual controls per entry: **restore** re-exposes a hidden entry so a
+connected *arr re-imports it on its next poll (the fix for "imported
+but the files went missing"); **hide** does the reverse; **forget**
+drops the record and keeps files; **delete files** removes both.
+
+
 ## Native API
 
 The compat shim is for NZBGet clients; automation you write yourself

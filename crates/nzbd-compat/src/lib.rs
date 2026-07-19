@@ -55,6 +55,9 @@ pub struct CompatState {
     pub scan_notify: Option<Arc<tokio::sync::Notify>>,
     /// RSS feed engine (`fetchfeeds`/`viewfeed`).
     pub feeds: Option<nzbd_feed::FeedsHandle>,
+    /// Shared consumer registry (who is polling us; stamps history
+    /// observations with the client's User-Agent).
+    pub clients: Option<Arc<nzbd_api::ClientRegistry>>,
 }
 
 impl CompatState {
@@ -67,6 +70,7 @@ impl CompatState {
             log: None,
             scan_notify: None,
             feeds: None,
+            clients: None,
         }
     }
 }
@@ -260,7 +264,7 @@ pub async fn dispatch(
         "status" => Ok(status_json(state)),
         "listgroups" => Ok(listgroups_json(state)),
         "append" => append(state, params).await,
-        "history" => history(state).await,
+        "history" => history(state, params).await,
         "editqueue" => editqueue(state, params).await,
         "config" | "loadconfig" => {
             let opts: Vec<Value> = state
@@ -660,19 +664,36 @@ async fn record_dupe_reject(state: &CompatState, filename: &str, d: &nzbd_types:
         dupe_key: d.key.clone(),
         dupe_score: d.score,
         completed_at_unix: nowish(),
+        hidden: false,
+        first_seen_at_unix: None,
+        last_seen_at_unix: None,
+        seen_count: 0,
+        removed_at_unix: None,
+        picked_up_by: None,
     };
     let db = db.clone();
     let _ = tokio::task::spawn_blocking(move || db.record(&entry)).await;
 }
 
-async fn history(state: &CompatState) -> Result<Value, (i64, &'static str)> {
+async fn history(state: &CompatState, params: &Value) -> Result<Value, (i64, &'static str)> {
     let Some(db) = &state.history else {
         return Ok(Value::Array(vec![]));
     };
+    // NZBGet `history(hidden)`: true includes hidden (client-removed) rows.
+    let include_hidden = matches!(params.get(0), Some(Value::Bool(true)));
+    let ua = state.clients.as_ref().and_then(|c| c.current());
     let db = db.clone();
     let entries = tokio::task::spawn_blocking(move || {
         let _ = db.refresh();
-        db.list(1000)
+        let entries = db.list_filtered(1000, include_hidden)?;
+        // The pull we exist to observe: this poll SAW these entries.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let jobs: Vec<nzbd_types::JobId> = entries.iter().map(|e| e.job).collect();
+        let _ = db.mark_seen(&jobs, ua.as_deref(), now);
+        Ok::<_, nzbd_state::StateError>(entries)
     })
     .await;
     match entries {
@@ -791,7 +812,26 @@ async fn editqueue(state: &CompatState, params: &Value) -> Result<Value, (i64, &
                 }
                 done
             }
-            "HistoryDelete" | "HistoryFinalDelete" => match &state.history {
+            // NZBGet semantics: HistoryDelete HIDES the entry (this is how
+            // Sonarr/Radarr clean up after a successful import — we record
+            // it as the imported-by signal); FinalDelete removes it.
+            "HistoryDelete" => match &state.history {
+                Some(db) => {
+                    let db = db.clone();
+                    let ua = state.clients.as_ref().and_then(|c| c.current());
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs() as i64)
+                        .unwrap_or(0);
+                    tokio::task::spawn_blocking(move || {
+                        db.hide(id, ua.as_deref(), now).unwrap_or(false)
+                    })
+                    .await
+                    .unwrap_or(false)
+                }
+                None => false,
+            },
+            "HistoryFinalDelete" => match &state.history {
                 Some(db) => {
                     let db = db.clone();
                     tokio::task::spawn_blocking(move || db.delete(id).unwrap_or(false))
@@ -946,6 +986,12 @@ async fn delete_to_history(state: &CompatState, id: JobId, with_files: bool) -> 
                 dupe_key: job.dupe.key.clone(),
                 dupe_score: job.dupe.score,
                 completed_at_unix: nowish(),
+                hidden: false,
+                first_seen_at_unix: None,
+                last_seen_at_unix: None,
+                seen_count: 0,
+                removed_at_unix: None,
+                picked_up_by: None,
             };
             let db = db.clone();
             let _ = tokio::task::spawn_blocking(move || db.record(&entry)).await;
@@ -976,10 +1022,12 @@ fn nowish() -> i64 {
 /// `?method=X&params=[…]` (params = JSON array, URL-encoded).
 async fn jsonrpc_get(
     State(state): State<CompatState>,
+    headers: axum::http::HeaderMap,
     axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
     let method = q.get("method").cloned().unwrap_or_default();
+    note_client(&state, &headers, &method);
     let params: Value = q
         .get("params")
         .and_then(|p| serde_json::from_str(p).ok())
@@ -997,7 +1045,11 @@ async fn jsonrpc_get(
     }
 }
 
-async fn jsonrpc(State(state): State<CompatState>, body: String) -> Json<Value> {
+async fn jsonrpc(
+    State(state): State<CompatState>,
+    headers: axum::http::HeaderMap,
+    body: String,
+) -> Json<Value> {
     let req: Value = match serde_json::from_str(&body) {
         Ok(v) => v,
         Err(_) => return Json(envelope(Value::Null, Err((4, "Parse error")))),
@@ -1008,7 +1060,24 @@ async fn jsonrpc(State(state): State<CompatState>, body: String) -> Json<Value> 
         .and_then(Value::as_str)
         .unwrap_or_default();
     let params = req.get("params").cloned().unwrap_or(Value::Array(vec![]));
+    note_client(&state, &headers, method);
     Json(envelope(id, dispatch(&state, method, &params).await))
+}
+
+/// Record who is talking to the compat API (User-Agent), so the UI can
+/// show "Radarr polling, last seen 12s ago" and history observations can
+/// be stamped with the client that made them.
+pub fn note_client(state: &CompatState, headers: &axum::http::HeaderMap, method: &str) {
+    if let Some(reg) = &state.clients {
+        let ua = headers
+            .get(axum::http::header::USER_AGENT)
+            .and_then(|v| v.to_str().ok());
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        reg.note(ua, method, now);
+    }
 }
 
 pub fn router(state: CompatState) -> Router {
@@ -1037,6 +1106,7 @@ mod tests {
         let history = HistoryDb::open(&tmp.path().join("history.sqlite"), None).unwrap();
         CompatState {
             config: Arc::new(CompatConfig::default()),
+            clients: Some(Arc::new(nzbd_api::ClientRegistry::default())),
             engine,
             history: Some(Arc::new(history)),
             options: Arc::new(vec![
@@ -1235,6 +1305,84 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn handoff_pickup_tracking_and_hidden_semantics() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state(&tmp).await;
+        let db = state.history.as_ref().unwrap();
+        db.record(&HistoryEntry {
+            job: JobId(42),
+            name: "picked-up".into(),
+            category: Some("monarr".into()),
+            final_dir: Some("/dest/picked-up".into()),
+            status: "SUCCESS".into(),
+            size: 1000,
+            health: 1000,
+            params: vec![],
+            dupe_key: String::new(),
+            dupe_score: 0,
+            completed_at_unix: 100,
+            hidden: false,
+            first_seen_at_unix: None,
+            last_seen_at_unix: None,
+            seen_count: 0,
+            removed_at_unix: None,
+            picked_up_by: None,
+        })
+        .unwrap();
+
+        // Radarr identifies itself, then polls history: nzbd records the
+        // pull — this is the "seen by client" signal.
+        state
+            .clients
+            .as_ref()
+            .unwrap()
+            .note(Some("Radarr/5.26.2"), "history", 500);
+        let r = dispatch(&state, "history", &json!([])).await.unwrap();
+        assert_eq!(r.as_array().unwrap().len(), 1);
+        let e = &db.list_filtered(10, true).unwrap()[0];
+        assert_eq!(e.seen_count, 1);
+        assert!(e.first_seen_at_unix.is_some());
+        assert_eq!(e.picked_up_by.as_deref(), Some("Radarr/5.26.2"));
+
+        // Radarr imports and cleans up: HistoryDelete HIDES (not removes)
+        // and stamps the imported-by signal.
+        let r = dispatch(&state, "editqueue", &json!(["HistoryDelete", "", [42]]))
+            .await
+            .unwrap();
+        assert_eq!(r, Value::Bool(true));
+        let visible = dispatch(&state, "history", &json!([])).await.unwrap();
+        assert_eq!(visible.as_array().unwrap().len(), 0, "hidden from clients");
+        let with_hidden = dispatch(&state, "history", &json!([true])).await.unwrap();
+        assert_eq!(
+            with_hidden.as_array().unwrap().len(),
+            1,
+            "history(true) shows it"
+        );
+        let e = &db.list_filtered(10, true).unwrap()[0];
+        assert!(e.hidden);
+        assert!(e.removed_at_unix.is_some(), "imported-at recorded");
+
+        // Manual restore: the entry is visible to clients again, so a
+        // connected *arr re-imports on its next poll.
+        assert!(db.restore(JobId(42)).unwrap());
+        let visible = dispatch(&state, "history", &json!([])).await.unwrap();
+        assert_eq!(visible.as_array().unwrap().len(), 1);
+        let e = &db.list_filtered(10, true).unwrap()[0];
+        assert!(!e.hidden && e.removed_at_unix.is_none());
+
+        // FinalDelete really removes.
+        let r = dispatch(
+            &state,
+            "editqueue",
+            &json!(["HistoryFinalDelete", "", [42]]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(r, Value::Bool(true));
+        assert_eq!(db.list_filtered(10, true).unwrap().len(), 0);
+    }
+
+    #[tokio::test]
     async fn history_status_mapping_and_config() {
         let tmp = tempfile::tempdir().unwrap();
         let state = test_state(&tmp).await;
@@ -1257,6 +1405,12 @@ mod tests {
                 dupe_key: String::new(),
                 dupe_score: 0,
                 completed_at_unix: 100 + native.len() as i64,
+                hidden: false,
+                first_seen_at_unix: None,
+                last_seen_at_unix: None,
+                seen_count: 0,
+                removed_at_unix: None,
+                picked_up_by: None,
             })
             .unwrap();
         }
@@ -1336,6 +1490,12 @@ mod tests {
                 dupe_key: "show-s01e01".into(),
                 dupe_score: 100,
                 completed_at_unix: 50,
+                hidden: false,
+                first_seen_at_unix: None,
+                last_seen_at_unix: None,
+                seen_count: 0,
+                removed_at_unix: None,
+                picked_up_by: None,
             })
             .unwrap();
 

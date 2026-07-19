@@ -292,6 +292,7 @@ impl ClusterRuntime {
         feeds: Option<nzbd_feed::FeedsHandle>,
     ) -> Router {
         let history = self.pp.as_ref().map(|s| s.history.clone());
+        let shared_clients = std::sync::Arc::new(nzbd_api::ClientRegistry::default());
         let compat_state = nzbd_compat::CompatState {
             config: Arc::new(nzbd_compat::CompatConfig {
                 version: compat_version.to_string(),
@@ -302,6 +303,7 @@ impl ClusterRuntime {
             log: log.clone(),
             scan_notify,
             feeds,
+            clients: Some(shared_clients.clone()),
         };
         let proxied = nzbd_api::require_auth(
             nzbd_api::router_with(nzbd_api::ApiState {
@@ -309,6 +311,7 @@ impl ClusterRuntime {
                 history,
                 log,
                 setup: None, // cluster mode always has a config file
+                clients: Some(shared_clients.clone()),
             })
             .merge(nzbd_compat::router(compat_state)),
             auth,

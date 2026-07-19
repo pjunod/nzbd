@@ -76,6 +76,16 @@ impl HistoryDb {
             "ALTER TABLE history ADD COLUMN dupe_score INTEGER NOT NULL DEFAULT 0",
             [],
         );
+        for ddl in [
+            "ALTER TABLE history ADD COLUMN hidden INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE history ADD COLUMN first_seen INTEGER",
+            "ALTER TABLE history ADD COLUMN last_seen INTEGER",
+            "ALTER TABLE history ADD COLUMN seen_count INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE history ADD COLUMN removed_at INTEGER",
+            "ALTER TABLE history ADD COLUMN picked_up_by TEXT",
+        ] {
+            let _ = conn.execute(ddl, []);
+        }
 
         let jsonl = jsonl_dir.map(|d| {
             let file = match tag {
@@ -159,10 +169,14 @@ impl HistoryDb {
         let conn = self.conn.lock().unwrap();
         let n = conn
             .execute(
-                "INSERT OR IGNORE INTO history
+                "INSERT INTO history
                  (job_id, name, category, final_dir, status, size, health, params,
-                  dupe_key, dupe_score, completed_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                  dupe_key, dupe_score, completed_at, hidden, removed_at, picked_up_by)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+                 ON CONFLICT(job_id, completed_at) DO UPDATE SET
+                   hidden = excluded.hidden,
+                   removed_at = COALESCE(excluded.removed_at, history.removed_at),
+                   picked_up_by = COALESCE(excluded.picked_up_by, history.picked_up_by)",
                 rusqlite::params![
                     entry.job.0,
                     entry.name,
@@ -175,6 +189,9 @@ impl HistoryDb {
                     entry.dupe_key,
                     entry.dupe_score,
                     entry.completed_at_unix,
+                    entry.hidden as i64,
+                    entry.removed_at_unix,
+                    entry.picked_up_by,
                 ],
             )
             .map_err(|e| StateError::Corrupt(format!("sqlite insert: {e}")))?;
@@ -199,14 +216,30 @@ impl HistoryDb {
         Ok(())
     }
 
+    /// Visible (non-hidden) entries — what NZBGet-compat clients see.
     pub fn list(&self, limit: usize) -> Result<Vec<HistoryEntry>, StateError> {
+        self.list_filtered(limit, false)
+    }
+
+    pub fn list_filtered(
+        &self,
+        limit: usize,
+        include_hidden: bool,
+    ) -> Result<Vec<HistoryEntry>, StateError> {
         let conn = self.conn.lock().unwrap();
+        let sql = format!(
+            "SELECT job_id, name, category, final_dir, status, size, health, params,
+                    dupe_key, dupe_score, completed_at, hidden, first_seen, last_seen,
+                    seen_count, removed_at, picked_up_by
+             FROM history {} ORDER BY completed_at DESC, id DESC LIMIT ?1",
+            if include_hidden {
+                ""
+            } else {
+                "WHERE hidden = 0"
+            }
+        );
         let mut stmt = conn
-            .prepare(
-                "SELECT job_id, name, category, final_dir, status, size, health, params,
-                        dupe_key, dupe_score, completed_at
-                 FROM history ORDER BY completed_at DESC, id DESC LIMIT ?1",
-            )
+            .prepare(&sql)
             .map_err(|e| StateError::Corrupt(e.to_string()))?;
         let rows = stmt
             .query_map([limit as i64], |r| {
@@ -223,6 +256,12 @@ impl HistoryDb {
                     dupe_key: r.get(8)?,
                     dupe_score: r.get::<_, i64>(9)? as i32,
                     completed_at_unix: r.get(10)?,
+                    hidden: r.get::<_, i64>(11)? != 0,
+                    first_seen_at_unix: r.get(12)?,
+                    last_seen_at_unix: r.get(13)?,
+                    seen_count: r.get::<_, i64>(14)? as u32,
+                    removed_at_unix: r.get(15)?,
+                    picked_up_by: r.get(16)?,
                 })
             })
             .map_err(|e| StateError::Corrupt(e.to_string()))?;
@@ -231,6 +270,94 @@ impl HistoryDb {
             out.push(r.map_err(|e| StateError::Corrupt(e.to_string()))?);
         }
         Ok(out)
+    }
+
+    /// A compat client's history poll listed these entries: record the
+    /// observation (index-local; cheap, no JSONL churn).
+    pub fn mark_seen(
+        &self,
+        jobs: &[crate::JobId],
+        client: Option<&str>,
+        now_unix: i64,
+    ) -> Result<(), StateError> {
+        let conn = self.conn.lock().unwrap();
+        for job in jobs {
+            conn.execute(
+                "UPDATE history SET
+                   first_seen = COALESCE(first_seen, ?2),
+                   last_seen = ?2,
+                   seen_count = seen_count + 1,
+                   picked_up_by = COALESCE(?3, picked_up_by)
+                 WHERE job_id = ?1",
+                rusqlite::params![job.0, now_unix, client],
+            )
+            .map_err(|e| StateError::Corrupt(e.to_string()))?;
+        }
+        Ok(())
+    }
+
+    /// Hide an entry (NZBGet HistoryDelete semantics). When a client did
+    /// it right after import, this IS the "imported" signal — stamp who.
+    pub fn hide(
+        &self,
+        job: crate::JobId,
+        by_client: Option<&str>,
+        now_unix: i64,
+    ) -> Result<bool, StateError> {
+        self.set_hidden(job, true, by_client, Some(now_unix))
+    }
+
+    /// Un-hide: the entry reappears in compat history, so a connected
+    /// *arr will see it again and re-import.
+    pub fn restore(&self, job: crate::JobId) -> Result<bool, StateError> {
+        self.set_hidden(job, false, None, None)
+    }
+
+    fn set_hidden(
+        &self,
+        job: crate::JobId,
+        hidden: bool,
+        by_client: Option<&str>,
+        removed_at: Option<i64>,
+    ) -> Result<bool, StateError> {
+        let changed = {
+            let conn = self.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE history SET hidden = ?2,
+                   removed_at = CASE WHEN ?2 = 1 THEN ?3 ELSE NULL END,
+                   picked_up_by = COALESCE(?4, picked_up_by)
+                 WHERE job_id = ?1",
+                rusqlite::params![job.0, hidden as i64, removed_at, by_client],
+            )
+            .map_err(|e| StateError::Corrupt(e.to_string()))?
+                > 0
+        };
+        if changed {
+            // Re-append the updated entry so the hidden state survives an
+            // index rebuild (the upsert makes the last JSONL line win).
+            if let Some(entry) = self
+                .list_filtered(10_000, true)?
+                .into_iter()
+                .find(|e| e.job == job)
+            {
+                let _ = self.append_jsonl(&entry);
+            }
+        }
+        Ok(changed)
+    }
+
+    fn append_jsonl(&self, entry: &HistoryEntry) -> Result<(), StateError> {
+        if let Some(path) = &self.jsonl {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let mut f = OpenOptions::new().create(true).append(true).open(path)?;
+            let mut line = serde_json::to_vec(entry)?;
+            line.push(b'\n');
+            f.write_all(&line)?;
+            f.sync_data()?;
+        }
+        Ok(())
     }
 
     pub fn delete(&self, job: crate::JobId) -> Result<bool, StateError> {
@@ -259,6 +386,12 @@ mod tests {
             dupe_key: String::new(),
             dupe_score: 0,
             completed_at_unix: at,
+            hidden: false,
+            first_seen_at_unix: None,
+            last_seen_at_unix: None,
+            seen_count: 0,
+            removed_at_unix: None,
+            picked_up_by: None,
         }
     }
 

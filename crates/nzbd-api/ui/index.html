@@ -166,6 +166,19 @@
     margin-top: 8px; font: 12px/1.55 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
     background: var(--panel); color: var(--ink); border: 1px solid var(--line);
     border-radius: 8px; padding: 12px; tab-size: 2; }
+  #clients-strip { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 12px;
+    font-size: 12px; color: var(--muted); align-items: center; }
+  #clients-strip .cl { border: 1px solid var(--line); border-radius: 999px;
+    padding: 3px 11px; background: var(--panel); color: var(--ink2); }
+  #clients-strip .cl b { color: var(--ink); font-weight: 600; }
+  #clients-strip .cl.live { border-color: color-mix(in srgb, var(--ok) 45%, transparent); }
+  .ho { display: inline-block; font-size: 11px; font-weight: 600; padding: 2px 8px;
+    border-radius: 999px; background: color-mix(in srgb, currentColor 12%, transparent); }
+  .ho.wait { color: var(--warn); }
+  .ho.seen { color: var(--accent); }
+  .ho.done { color: var(--ok); }
+  .ho.na { color: var(--muted); }
+  tr.hidden-row td { opacity: .55; }
   #logbox { background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
             margin-top: 12px; padding: 10px 12px; max-height: 480px; overflow-y: auto;
             font: 12px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace; }
@@ -327,10 +340,11 @@
   </section>
 
   <section id="tab-history" hidden>
+    <div id="clients-strip" hidden></div>
     <table>
-      <thead><tr><th>Job</th><th>Status</th><th class="num">Size</th>
-        <th>Finished</th><th>Location</th></tr></thead>
-      <tbody id="history-body"><tr><td colspan="5" class="empty">loading…</td></tr></tbody>
+      <thead><tr><th>Job</th><th>Status</th><th>Handoff</th><th class="num">Size</th>
+        <th>Finished</th><th style="width:170px"></th></tr></thead>
+      <tbody id="history-body"><tr><td colspan="6" class="empty">loading…</td></tr></tbody>
     </table>
   </section>
 
@@ -524,25 +538,80 @@ function histClass(status) {
   if (status.startsWith("DELETED")) return "dim";
   return "bad";
 }
+function fmtAgo(unix) {
+  if (!unix) return "";
+  const s = Math.max(0, Math.floor(Date.now() / 1000 - unix));
+  if (s < 90) return s + "s ago";
+  if (s < 5400) return Math.round(s / 60) + "m ago";
+  if (s < 129600) return Math.round(s / 3600) + "h ago";
+  return Math.round(s / 86400) + "d ago";
+}
+
+// The *arr handoff is a PULL: clients poll our history, import, then
+// delete the entry. Each stage is observed and shown here.
+function handoffChip(e) {
+  const who = e.picked_up_by ? esc(e.picked_up_by.split("/")[0]) : "client";
+  if (e.hidden && e.removed_at_unix)
+    return `<span class="ho done" title="the client deleted this entry after importing — files were picked up">✓ imported by ${who} ${fmtAgo(e.removed_at_unix)}</span>`;
+  if (e.hidden)
+    return `<span class="ho na">hidden</span>`;
+  if (e.last_seen_at_unix)
+    return `<span class="ho seen" title="a client's history poll listed this entry ${e.seen_count}× — it knows; import/removal not yet observed">seen by ${who} ${fmtAgo(e.last_seen_at_unix)} ×${e.seen_count}</span>`;
+  return `<span class="ho wait" title="no client has polled history since this finished — if your *arr is down, it will pick this up when it returns">⏳ awaiting pickup ${fmtAgo(e.completed_at_unix)}</span>`;
+}
+
 async function refreshHistory() {
+  refreshClients().catch(() => {});
   const r = await fetch("/api/v1/history?limit=200");
   if (r.status === 501) {
-    $("history-body").innerHTML = '<tr><td colspan="5" class="empty">history store not configured</td></tr>';
+    $("history-body").innerHTML = '<tr><td colspan="6" class="empty">history store not configured</td></tr>';
     return;
   }
   const { entries } = await r.json();
   const body = $("history-body");
   if (!entries.length) {
-    body.innerHTML = '<tr><td colspan="5" class="empty">no finished jobs yet</td></tr>';
+    body.innerHTML = '<tr><td colspan="6" class="empty">no finished jobs yet</td></tr>';
     return;
   }
-  body.innerHTML = entries.map(e => `<tr>
-    <td><div class="name">${esc(e.name)}</div><div class="sub">#${e.job}${e.category ? " · " + esc(e.category) : ""}</div></td>
+  body.innerHTML = entries.map(e => `<tr class="${e.hidden ? "hidden-row" : ""}">
+    <td><div class="name" title="${esc(e.final_dir || "")}">${esc(e.name)}</div>
+        <div class="sub">#${e.job}${e.category ? " · " + esc(e.category) : ""}</div></td>
     <td><span class="st ${histClass(e.status)}">${esc(e.status)}</span></td>
+    <td>${handoffChip(e)}</td>
     <td class="num">${fmtBytes(e.size)}</td>
     <td>${fmtTime(e.completed_at_unix)}</td>
-    <td class="sub">${esc(e.final_dir || "")}</td>
+    <td><div class="acts">
+      ${e.hidden
+        ? `<button title="make this visible to clients again — a connected *arr will re-import it on its next poll" onclick="histAction(${e.job}, 'restore')">restore</button>`
+        : `<button title="hide from clients (keeps files and record)" onclick="histAction(${e.job}, 'hide')">hide</button>`}
+      <button title="remove the history record, keep files" onclick="if(confirm('Forget ${esc(e.name).replace(/'/g, "\\'")}? (files stay)')) histAction(${e.job}, 'delete')">forget</button>
+      <button class="del" title="remove the record AND delete the downloaded files" onclick="if(confirm('Delete FILES of ${esc(e.name).replace(/'/g, "\\'")}?')) histAction(${e.job}, 'delete-files')">delete files</button>
+    </div></td>
   </tr>`).join("");
+}
+async function histAction(id, action) {
+  await fetch(`/api/v1/history/${id}/actions/${action}`, { method: "POST" });
+  refreshHistory().catch(() => {});
+}
+
+// Who is polling us — is the *arr even connected?
+async function refreshClients() {
+  const r = await fetch("/api/v1/clients");
+  if (!r.ok) return;
+  const { clients } = await r.json();
+  const strip = $("clients-strip");
+  if (!clients.length) {
+    strip.hidden = false;
+    strip.innerHTML = '<span class="cl">no API clients seen yet — a connected Sonarr/Radarr polls every ~30 s</span>';
+    return;
+  }
+  strip.hidden = false;
+  const now = Date.now() / 1000;
+  strip.innerHTML = "connected clients:" + clients.map(c => {
+    const live = now - c.last_seen_unix < 120;
+    return `<span class="cl ${live ? "live" : ""}" title="${c.calls} calls since ${fmtTime(c.first_seen_unix)} — last: ${esc(c.last_method)}">` +
+      `<b>${esc(c.user_agent)}</b> · ${live ? "polling" : "quiet"} · ${fmtAgo(c.last_seen_unix)}</span>`;
+  }).join("");
 }
 
 // ---- logs ---------------------------------------------------------------

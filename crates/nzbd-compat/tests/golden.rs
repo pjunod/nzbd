@@ -153,6 +153,12 @@ async fn golden_history_fields() {
             dupe_key: String::new(),
             dupe_score: 0,
             completed_at_unix: 10,
+            hidden: false,
+            first_seen_at_unix: None,
+            last_seen_at_unix: None,
+            seen_count: 0,
+            removed_at_unix: None,
+            picked_up_by: None,
         })
         .unwrap();
     let v = dispatch(&st, "history", &json!([false])).await.unwrap();

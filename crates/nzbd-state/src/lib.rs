@@ -410,6 +410,26 @@ pub struct HistoryEntry {
     #[serde(default)]
     pub dupe_score: i32,
     pub completed_at_unix: i64,
+    // ---- handoff tracking (ARCH: the *arr pickup is a PULL; these record
+    // what we observed of it) ------------------------------------------
+    /// Hidden from compat `history` responses — set when a client deletes
+    /// the entry after import (NZBGet HistoryDelete semantics) or the user
+    /// hides it. Restorable.
+    #[serde(default)]
+    pub hidden: bool,
+    /// First/last time a compat client's history poll listed this entry.
+    #[serde(default)]
+    pub first_seen_at_unix: Option<i64>,
+    #[serde(default)]
+    pub last_seen_at_unix: Option<i64>,
+    #[serde(default)]
+    pub seen_count: u32,
+    /// When a client deleted (hid) the entry — the "imported" signal.
+    #[serde(default)]
+    pub removed_at_unix: Option<i64>,
+    /// User-Agent of the polling/deleting client (Sonarr/x, Radarr/x…).
+    #[serde(default)]
+    pub picked_up_by: Option<String>,
 }
 
 fn default_health() -> u16 {
