@@ -537,19 +537,31 @@ pub async fn process_job_ctx(
     // Anything still meaninglessly named after par-rename, rar-rename and
     // unpack has no recovery evidence left; the job name (from the NZB /
     // indexer) is the last source of truth. Scripts run after this, so
-    // they see the final names.
+    // they see the final names. Discrete status: the queue shows the
+    // PostUnpackRename stage (compat: "RENAMING") while the pass runs, and
+    // the applied renames are recorded on the job as `Deobfuscate:*`
+    // parameters, which persist into history.
+    let mut deobfuscated: Vec<(PathBuf, PathBuf)> = Vec::new();
     if cfg.deobfuscate_final && par_ok && unpack_ok {
-        let renamed = crate::deobfuscate::deobfuscate_dir(
+        set_stage(engine, job_id, PostStage::PostUnpackRename).await;
+        deobfuscated = crate::deobfuscate::deobfuscate_dir(
             &dir,
             &nzbd_engine::queue::sanitize_name(&job.name),
             &par2_names,
         );
-        for (from, to) in &renamed {
+        for (from, to) in &deobfuscated {
             tracing::info!(
                 job = job_id.0,
                 from = %from.display(),
                 to = %to.display(),
                 "deobfuscate: renamed"
+            );
+        }
+        if !deobfuscated.is_empty() {
+            tracing::info!(
+                job = job_id.0,
+                count = deobfuscated.len(),
+                "deobfuscate: pass applied renames"
             );
         }
     }
@@ -615,6 +627,27 @@ pub async fn process_job_ctx(
     if let Ok(Some(mut fin)) = engine.export_job(job_id).await {
         fin.params
             .push((PP_DONE_PARAM.into(), outcome.as_str().into()));
+        // Durable deobfuscation record: plain (non-`*`) params survive
+        // into history and the compat `Parameters` array.
+        if !deobfuscated.is_empty() {
+            fin.params
+                .push(("Deobfuscate:Count".into(), deobfuscated.len().to_string()));
+            let base = |p: &PathBuf| {
+                p.file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default()
+            };
+            let mut list = deobfuscated
+                .iter()
+                .take(10)
+                .map(|(f, t)| format!("{} → {}", base(f), base(t)))
+                .collect::<Vec<_>>()
+                .join("; ");
+            if deobfuscated.len() > 10 {
+                list.push_str("; …");
+            }
+            fin.params.push(("Deobfuscate:Files".into(), list));
+        }
         fin.status = if outcome == PpFinal::Success {
             JobStatus::Completed
         } else {

@@ -558,6 +558,21 @@ async fn deobfuscate_final_renames_to_job_name() {
         dir.join("Great.Show.S02.1080p.WEB.eng.srt").exists(),
         "companion subtitle follows the rename"
     );
+
+    // Durable record: the renames land as job params and reach history.
+    let job = engine.export_job(JobId(11)).await.unwrap().unwrap();
+    assert!(job
+        .params
+        .iter()
+        .any(|(k, v)| k == "Deobfuscate:Count" && v == "2"));
+    let entry = &hist.list(10).unwrap()[0];
+    let files = &entry
+        .params
+        .iter()
+        .find(|(k, _)| k == "Deobfuscate:Files")
+        .expect("history keeps the rename list")
+        .1;
+    assert!(files.contains("a1b2c3d4e5f6a7b8.mkv → Great.Show.S02.1080p.WEB.mkv"));
     engine.shutdown().await;
 }
 
