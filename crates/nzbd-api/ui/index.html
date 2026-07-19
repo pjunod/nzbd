@@ -107,9 +107,18 @@
     width: 100%; box-sizing: border-box; background: var(--bg); color: var(--ink);
     border: 1px solid var(--line); border-radius: 6px; padding: 7px 9px; font: inherit; }
   #setup .check { flex: 0 0 auto; flex-direction: row; align-items: center; gap: 6px; padding-top: 16px; }
-  #setup button[type=submit] { width: 100%; padding: 10px; font-weight: 600; }
+  #setup .btns { display: flex; gap: 8px; }
+  #setup button[type=submit] { flex: 1; padding: 10px; font-weight: 600; }
   #setup-msg { margin-top: 10px; font-size: 12.5px; color: var(--muted); min-height: 1.2em; }
   #setup-msg.err { color: var(--bad); }
+  #setup-toml { margin-top: 12px; }
+  #setup-toml .bar { display: flex; align-items: center; gap: 8px; margin-bottom: 6px;
+    font-size: 12px; color: var(--muted); }
+  #setup-toml .bar span { flex: 1; }
+  #setup-toml textarea { width: 100%; height: 220px; box-sizing: border-box; resize: vertical;
+    font: 11.5px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    background: var(--panel); color: var(--ink); border: 1px solid var(--line);
+    border-radius: 8px; padding: 10px; }
   /* phones */
   @media (max-width: 640px) {
     .wrap { padding: 12px 10px 34px; }
@@ -139,6 +148,10 @@
     <h2>First-run setup</h2>
     <p class="sub">No configuration found. This writes <code id="setup-path"></code>
       and restarts the daemon with it — you can edit that file by hand later.</p>
+    <p class="sub" id="setup-ro" hidden style="color: var(--warn)">Heads-up: that
+      location isn't writable from inside the daemon (read-only mount?). Fill the
+      form, then use <b>Show config</b> to copy or download the file and place it
+      there yourself.</p>
     <form id="setup-form">
       <fieldset>
         <legend>Paths</legend>
@@ -171,8 +184,19 @@
             <input type="password" id="su-api-pass" autocomplete="new-password"></label>
         </div>
       </fieldset>
-      <button type="submit">Save &amp; start</button>
+      <div class="btns">
+        <button type="submit">Save &amp; start</button>
+        <button type="button" id="su-show">Show config</button>
+      </div>
       <div id="setup-msg"></div>
+      <div id="setup-toml" hidden>
+        <div class="bar">
+          <span id="setup-toml-hint"></span>
+          <button type="button" id="su-copy">Copy</button>
+          <button type="button" id="su-download">Download</button>
+        </div>
+        <textarea id="setup-toml-text" readonly spellcheck="false"></textarea>
+      </div>
     </form>
   </section>
 
@@ -393,33 +417,71 @@ async function checkSetup() {
   if (!s.setup_mode) return false;
 
   $("setup-path").textContent = s.config_path;
+  if (s.writable === false) $("setup-ro").hidden = false;
   for (const el of document.querySelectorAll(".wrap > *"))
     if (!el.matches("header, #setup, footer")) el.hidden = true;
   $("setup").hidden = false;
   $("conn").textContent = "setup";
 
+  const collect = (preview) => ({
+    main_dir: $("su-main").value, dest_dir: $("su-dest").value,
+    server: {
+      host: $("su-host").value, port: Number($("su-port").value) || 563,
+      tls: $("su-tls").checked,
+      username: $("su-user").value || null, password: $("su-pass").value || null,
+      connections: Number($("su-conn").value) || 8,
+    },
+    api_password: $("su-api-pass").value || null,
+    preview: !!preview,
+  });
+  const postSetup = (body) => fetch("/api/v1/setup", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  // Manual fallback: the rendered TOML, copyable even where the daemon
+  // can't write it itself (read-only mount, ConfigMap, ephemeral layer).
+  const showToml = (toml, hint) => {
+    $("setup-toml").hidden = false;
+    $("setup-toml-hint").textContent = hint || "";
+    $("setup-toml-text").value = toml;
+  };
+  $("su-copy").onclick = async () => {
+    const ta = $("setup-toml-text");
+    ta.select();
+    try { await navigator.clipboard.writeText(ta.value); }
+    catch { document.execCommand("copy"); } // plain-http origins
+    $("su-copy").textContent = "Copied";
+    setTimeout(() => { $("su-copy").textContent = "Copy"; }, 1500);
+  };
+  $("su-download").onclick = () => {
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(new Blob([$("setup-toml-text").value], { type: "text/plain" }));
+    a.download = "nzbd.toml";
+    a.click();
+    URL.revokeObjectURL(a.href);
+  };
+  $("su-show").onclick = async () => {
+    const msg = $("setup-msg");
+    msg.className = ""; msg.textContent = "";
+    if (!$("setup-form").reportValidity()) return;
+    try {
+      const r = await postSetup(collect(true));
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok) { msg.className = "err"; msg.textContent = j.error || ("preview failed: " + r.status); return; }
+      showToml(j.toml, "this is what Save writes to " + j.path);
+    } catch (e) { msg.className = "err"; msg.textContent = String(e); }
+  };
+
   $("setup-form").onsubmit = async (ev) => {
     ev.preventDefault();
     const msg = $("setup-msg");
     msg.className = ""; msg.textContent = "saving…";
-    const body = {
-      main_dir: $("su-main").value, dest_dir: $("su-dest").value,
-      server: {
-        host: $("su-host").value, port: Number($("su-port").value) || 563,
-        tls: $("su-tls").checked,
-        username: $("su-user").value || null, password: $("su-pass").value || null,
-        connections: Number($("su-conn").value) || 8,
-      },
-      api_password: $("su-api-pass").value || null,
-    };
     try {
-      const r = await fetch("/api/v1/setup", {
-        method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(body),
-      });
+      const r = await postSetup(collect(false));
       if (!r.ok) {
         const e = await r.json().catch(() => ({}));
         msg.className = "err"; msg.textContent = e.error || ("setup failed: " + r.status);
+        if (e.toml) showToml(e.toml, e.hint || "copy this into the config file yourself, then restart nzbd");
         return;
       }
     } catch (e) { msg.className = "err"; msg.textContent = String(e); return; }

@@ -971,7 +971,18 @@ pub fn import_nzbget_conf(content: &str) -> Result<(Config, ImportReport), Confi
 
 /// Render a [`Config`] as nzbd.toml text.
 pub fn to_toml(cfg: &Config) -> Result<String, ConfigError> {
-    toml::to_string_pretty(cfg).map_err(|e| ConfigError::Invalid(format!("serialize: {e}")))
+    let text =
+        toml::to_string_pretty(cfg).map_err(|e| ConfigError::Invalid(format!("serialize: {e}")))?;
+    // Empty top-level arrays ("category = []") are just noise in a file
+    // people read and edit; the parser defaults them anyway.
+    Ok(text
+        .lines()
+        .filter(|l| !matches!(l.trim(), "category = []" | "feed = []" | "server = []"))
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim_start()
+        .to_string()
+        + "\n")
 }
 
 #[cfg(test)]

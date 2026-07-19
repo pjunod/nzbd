@@ -2,7 +2,11 @@
 #
 #   docker build -t nzbd .
 #   docker run -d -p 6789:6789 \
-#     -v /data/usenet:/data -v ./nzbd.toml:/etc/nzbd/nzbd.toml nzbd
+#     -v /data/usenet:/data -v ./config:/etc/nzbd nzbd
+#
+# Mount the config DIRECTORY, not the file: a file bind mount whose host
+# side doesn't exist yet makes Docker create a directory in its place,
+# and the first-run setup UI couldn't persist the config it writes.
 
 FROM rust:1-bookworm AS build
 WORKDIR /src

@@ -40,6 +40,25 @@ docker run -d --name nzbd --restart unless-stopped -p 6789:6789 \
 #   /opt/nzbd/config/nzbd.toml and restarts the daemon with it.
 ```
 
+Where the wizard's write actually lands, by deployment shape:
+
+- **Config directory mounted (above)** — written to the host, survives
+  anything. This is the recommended shape.
+- **No config volume** — the write succeeds into the container's own
+  filesystem layer and works fine *until the container is recreated*
+  (`docker rm` / image update), which silently starts setup over. Fine
+  for kicking the tires, not for keeps.
+- **Read-only config (`:ro` bind, Kubernetes ConfigMap)** — the daemon
+  can't write at all. The setup page detects this at boot and says so;
+  fill the form anyway and use **Show config** to copy or download the
+  generated `nzbd.toml`, place it yourself, and restart. (The same
+  button works in every deployment if you'd rather manage the file by
+  hand.)
+- **File bind mount of a missing file** (`-v ./nzbd.toml:/etc/nzbd/nzbd.toml`
+  before the host file exists) — Docker invents a *directory* at that
+  path; nzbd refuses to start with a message explaining the fix. Mount
+  the directory instead.
+
 Or fully declarative, config-first:
 
 ```sh

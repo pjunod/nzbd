@@ -44,17 +44,40 @@ pub struct SetupHandle {
     /// True once a config has been written (the run loop turns this into
     /// a reload instead of an exit).
     pub applied: std::sync::atomic::AtomicBool,
+    /// Probed at boot: can the daemon actually create the config file?
+    /// False in containers with read-only config mounts (ConfigMaps,
+    /// `:ro` binds) — the UI then steers to copy-the-TOML-yourself.
+    pub writable: bool,
 }
 
 impl SetupHandle {
     pub fn new(config_path: std::path::PathBuf, bind: String) -> Self {
+        let writable = probe_writable(&config_path);
         SetupHandle {
             config_path,
             bind,
             reload: tokio::sync::Notify::new(),
             applied: std::sync::atomic::AtomicBool::new(false),
+            writable,
         }
     }
+}
+
+/// Try to create (and remove) a sibling probe file where the config will
+/// go. Advisory only — the real write still reports its own error.
+fn probe_writable(config_path: &std::path::Path) -> bool {
+    let Some(parent) = config_path.parent() else {
+        return false;
+    };
+    if std::fs::create_dir_all(parent).is_err() {
+        return false;
+    }
+    let probe = parent.join(".nzbd-setup-probe");
+    if std::fs::write(&probe, b"").is_err() {
+        return false;
+    }
+    let _ = std::fs::remove_file(&probe);
+    true
 }
 
 /// HTTP auth requirements (NZBGet `ControlUsername`/`ControlPassword`
@@ -626,6 +649,11 @@ struct SetupReq {
     server: SetupServerReq,
     #[serde(default)]
     api_password: Option<String>,
+    /// Validate and render the TOML without writing or reloading — the UI's
+    /// "show config" button, and the manual fallback for deployments where
+    /// the config path isn't writable (read-only mounts, ConfigMaps).
+    #[serde(default)]
+    preview: bool,
 }
 
 async fn get_setup(State(st): State<ApiState>) -> Response {
@@ -633,6 +661,7 @@ async fn get_setup(State(st): State<ApiState>) -> Response {
         Some(s) => Json(json!({
             "setup_mode": !s.applied.load(std::sync::atomic::Ordering::Relaxed),
             "config_path": s.config_path.display().to_string(),
+            "writable": s.writable,
         }))
         .into_response(),
         None => Json(json!({ "setup_mode": false })).into_response(),
@@ -691,27 +720,39 @@ async fn post_setup(State(st): State<ApiState>, Json(req): Json<SetupReq>) -> Re
     if let Err(e) = nzbd_config::Config::from_toml(&toml_text) {
         return error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string());
     }
+    let path = setup.config_path.display().to_string();
+    if req.preview {
+        return Json(json!({ "preview": true, "path": path, "toml": toml_text })).into_response();
+    }
+    // A failed write is common in containers (read-only mount, ConfigMap,
+    // unmounted volume path owned by root). Hand the rendered TOML back so
+    // the UI can offer copy-it-yourself instead of eating the form.
+    let write_failed = |op: String| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({
+                "error": op,
+                "path": path,
+                "toml": toml_text,
+                "hint": "config location not writable — copy this TOML into the file yourself (place it on the volume mounted at the path above), then restart nzbd",
+            })),
+        )
+            .into_response()
+    };
     if let Some(parent) = setup.config_path.parent() {
         if let Err(e) = std::fs::create_dir_all(parent) {
-            return error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                &format!("create {}: {e}", parent.display()),
-            );
+            return write_failed(format!("create {}: {e}", parent.display()));
         }
     }
     if let Err(e) = std::fs::write(&setup.config_path, &toml_text) {
-        return error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &format!("write {}: {e}", setup.config_path.display()),
-        );
+        return write_failed(format!("write {}: {e}", setup.config_path.display()));
     }
     tracing::info!(path = %setup.config_path.display(), "setup: configuration written; reloading");
     setup
         .applied
         .store(true, std::sync::atomic::Ordering::Relaxed);
     setup.reload.notify_one();
-    Json(json!({ "written": setup.config_path.display().to_string(), "reloading": true }))
-        .into_response()
+    Json(json!({ "written": path, "reloading": true, "toml": toml_text })).into_response()
 }
 
 pub fn router_with(state: ApiState) -> Router {

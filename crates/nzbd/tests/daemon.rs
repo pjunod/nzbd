@@ -251,6 +251,81 @@ fn strip_chunking(body: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Container reality check: when the config location can't be written
+/// (read-only mount, ConfigMap), setup still functions as a form —
+/// GET reports `writable: false` up front, preview returns the rendered
+/// TOML without writing, a failed save hands the TOML back copyable,
+/// and the daemon stays up in setup mode throughout.
+#[test]
+fn setup_unwritable_config_offers_copyable_toml() {
+    let tmp = tempfile::tempdir().unwrap();
+    // A regular FILE where the config's parent dir should be:
+    // create_dir_all fails for everyone (root included, ENOTDIR) — a
+    // portable stand-in for a read-only mount.
+    let blocker = tmp.path().join("blocked");
+    std::fs::write(&blocker, b"i am a file").unwrap();
+    let cfg_path = blocker.join("nzbd.toml");
+
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+    let bin = env!("CARGO_BIN_EXE_nzbd");
+    let child = Command::new(bin)
+        .args(["run", "--config"])
+        .arg(&cfg_path)
+        .args(["--bind", &addr])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn nzbd");
+    let _child = KillOnDrop(child);
+    wait_healthy(&addr, Duration::from_secs(15));
+
+    let json = |s: &str| -> serde_json::Value {
+        let (start, end) = (s.find('{').unwrap(), s.rfind('}').unwrap());
+        serde_json::from_str(&s[start..=end]).unwrap()
+    };
+
+    // The boot-time probe already knows the location is unwritable.
+    let (code, body) = http(&addr, "GET", "/api/v1/setup", b"");
+    assert_eq!(code, 200);
+    let s = json(&body);
+    assert_eq!(s["setup_mode"], true);
+    assert_eq!(s["writable"], false);
+
+    let form = serde_json::json!({
+        "main_dir": "/data", "dest_dir": "/data/complete",
+        "server": { "host": "news.example.com" },
+    });
+
+    // Preview: full TOML, nothing written, setup not consumed.
+    let mut preview = form.clone();
+    preview["preview"] = serde_json::Value::Bool(true);
+    let (code, body) = http(
+        &addr,
+        "POST",
+        "/api/v1/setup",
+        preview.to_string().as_bytes(),
+    );
+    assert_eq!(code, 200);
+    let toml_text = json(&body)["toml"].as_str().unwrap().to_string();
+    assert!(toml_text.contains("main_dir"));
+    assert!(toml_text.contains("news.example.com"));
+    nzbd_config::Config::from_toml(&toml_text).expect("preview TOML must parse strictly");
+
+    // Real save: fails against the mount, but hands the TOML back.
+    let (code, body) = http(&addr, "POST", "/api/v1/setup", form.to_string().as_bytes());
+    assert_eq!(code, 500);
+    let e = json(&body);
+    assert!(e["error"].as_str().unwrap().contains("blocked"));
+    assert_eq!(e["toml"].as_str().unwrap(), toml_text);
+    assert!(e["hint"].as_str().unwrap().contains("copy"));
+
+    // Daemon alive, still serving the form.
+    let (code, body) = http(&addr, "GET", "/api/v1/setup", b"");
+    assert_eq!(code, 200);
+    assert_eq!(json(&body)["setup_mode"], true);
+}
+
 /// First-run setup: booting with a missing --config serves the wizard;
 /// POST writes the file; the daemon reloads with it (auth turns on).
 #[test]
