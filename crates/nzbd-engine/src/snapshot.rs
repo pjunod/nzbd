@@ -61,6 +61,10 @@ pub struct QueueSnapshot {
     /// Servers currently blocked after connect failures (retrying on a
     /// timer). Surfaced so the UI can explain a stalled queue.
     pub blocked_servers: Vec<u32>,
+    /// Whether critical-health abort is armed (`[post] health_action` is
+    /// park/delete). Surfaced so the UI can tell the user whether a doomed
+    /// download will be cut off early or just run to completion.
+    pub health_abort: bool,
     pub speed_limit_bps: Option<u64>,
     pub download_rate_bps: u64,
     pub session_downloaded_bytes: u64,

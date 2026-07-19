@@ -1842,6 +1842,7 @@ impl Owner {
             quota_reached: self.quota_reached,
             disk_low: self.disk_low,
             blocked_servers,
+            health_abort: self.tuning.health_abort,
             server_volumes: {
                 let now_day = unix_now().div_euclid(86_400);
                 let mut v: Vec<crate::snapshot::ServerVolume> = self

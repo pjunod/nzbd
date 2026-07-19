@@ -278,6 +278,8 @@ pub struct StatusDto {
     pub disk_low: bool,
     pub quota_reached: bool,
     pub blocked_servers: Vec<u32>,
+    /// Critical-health abort armed (`[post] health_action` park/delete)?
+    pub health_abort: bool,
     pub speed_limit_bps: Option<u64>,
     pub jobs_queued: u32,
     pub jobs_downloading: u32,
@@ -297,6 +299,7 @@ pub fn status_dto(snap: &QueueSnapshot) -> StatusDto {
         disk_low: snap.disk_low,
         quota_reached: snap.quota_reached,
         blocked_servers: snap.blocked_servers.clone(),
+        health_abort: snap.health_abort,
         speed_limit_bps: snap.speed_limit_bps,
         jobs_queued: count(&|j| matches!(j.status, JobStatus::Queued | JobStatus::Paused)),
         jobs_downloading: count(&|j| matches!(j.status, JobStatus::Downloading)),

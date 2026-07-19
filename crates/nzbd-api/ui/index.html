@@ -446,6 +446,7 @@ async function refreshStatus() {
   const r = await fetch("/api/v1/status");
   if (!r.ok) throw new Error("status " + r.status);
   const s = await r.json();
+  healthAbortArmed = !!s.health_abort;
   $("ver").textContent = "v" + s.version;
   $("s-rate").textContent = fmtRate(s.download_rate_bps);
   $("s-eta").textContent = s.download_paused ? "paused" : fmtEta(s.remaining_bytes, s.download_rate_bps);
@@ -471,6 +472,10 @@ async function refreshStatus() {
 }
 
 // ---- queue --------------------------------------------------------------
+// Whether the daemon will abort downloads that drop below repair limit
+// ([post] health_action = park/delete). Captured from /status so the
+// queue can say whether a doomed job gets cut off or runs to the end.
+let healthAbortArmed = false;
 const STATUS_CLASS = {
   downloading: "ok", queued: "dim", paused: "warn", fetching: "dim",
   completed: "ok", failed: "bad", post_queued: "warn"
@@ -509,7 +514,7 @@ async function refreshQueue() {
             <div class="detail">${detail.join(" · ")}</div>
           </div></td>
       <td class="num">${fmtBytes(total)}</td>
-      <td class="num"><span class="health" style="color:${healthColor(j.health, j.critical_health)}" title="${healthTip(j.health, j.critical_health)}">${(j.health / 10).toFixed(1)}%</span></td>
+      <td class="num">${healthCell(j, dl)}</td>
       <td><div class="acts">
         <button class="mv" title="move to top" onclick="jobAction(${j.id}, 'move-top')" ${idx === 0 ? "disabled" : ""}>⤒</button>
         <button class="mv" title="move up" onclick="jobAction(${j.id}, 'move-up')" ${idx === 0 ? "disabled" : ""}>↑</button>
@@ -533,8 +538,25 @@ function healthColor(health, critical) {
 function healthTip(health, critical) {
   const crit = ((critical || 850) / 10).toFixed(1);
   return health < (critical || 850)
-    ? `below the par2 repair limit (${crit}%) — unrepairable`
+    ? `below the par2 repair limit (${crit}%) — unrepairable even with all par2`
     : `repairable down to ${crit}% with the set's par2 blocks`;
+}
+// Health cell: the % (color-graded), the repair limit beneath it, and —
+// for a still-running job that has already dropped below that limit — an
+// explicit note on whether it will be cut off or run to the end.
+function healthCell(j, downloading) {
+  const crit = j.critical_health || 850;
+  const critPct = (crit / 10).toFixed(0);
+  const doomed = j.health < crit;
+  let note = `<div class="sub" style="font-size:10.5px">repair limit ${critPct}%</div>`;
+  if (doomed && downloading) {
+    note = healthAbortArmed
+      ? `<div class="ho bad" title="health is below the par2 repair limit — the daemon is aborting this download">unrepairable · aborting</div>`
+      : `<div class="ho warn" title="below the par2 repair limit — it can't be repaired, but health-abort is off so it will keep downloading and fail the par-check at the end. Enable it in Settings → Post-processing (‘unrepairable downloads’ → park).">unrepairable · will fail at end</div>`;
+  } else if (doomed) {
+    note = `<div class="sub" style="font-size:10.5px;color:var(--bad)">was unrepairable (limit ${critPct}%)</div>`;
+  }
+  return `<span class="health" style="color:${healthColor(j.health, j.critical_health)}" title="${healthTip(j.health, j.critical_health)}">${(j.health / 10).toFixed(1)}%</span>${note}`;
 }
 async function jobAction(id, action) {
   await fetch(`/api/v1/jobs/${id}/actions/${action}`, { method: "POST" });
