@@ -138,6 +138,8 @@
   .cfg-grid label { display: flex; flex-direction: column; gap: 3px;
     font-size: 11.5px; color: var(--muted); min-width: 0; }
   .cfg-grid label.wide { grid-column: span 2; }
+  .cfg-grid label:has(#f-post-health_action) { grid-column: 1 / -1; }
+  .field-help { color: var(--muted); font-size: 10.5px; line-height: 1.45; margin-top: 2px; }
   .cfg-grid input[type=text], .cfg-grid input[type=password], .cfg-grid input[type=number],
   .cfg-grid select { width: 100%; box-sizing: border-box; background: var(--bg);
     color: var(--ink); border: 1px solid var(--line); border-radius: 6px;
@@ -757,12 +759,17 @@ const SETTINGS_SECTIONS = [
     ["api.tls_key", "TLS key path (optional)", "text?"],
     ["api.tls_sans", "extra cert names (comma-separated)", "list"],
   ]},
-  { key: "post", title: "Post-processing", desc: "Par verify/repair, unpack, cleanup and scripts.", fields: [
+  { key: "post", title: "Post-processing", desc: "Par verify/repair, unpack, cleanup and scripts. The critical-health abort (stop downloads that can\u2019t be repaired) lives here.", fields: [
     ["post.unpack", "unpack archives", "check"],
     ["post.cleanup", "delete archives after unpack", "check"],
     ["post.deobfuscate_final", "deobfuscate file names", "check"],
     ["post.strategy", "strategy", "select", SEL(["sequential", "balanced", "aggressive", "rocket"])],
-    ["post.health_action", "unrepairable downloads (also aborts early)", "select", SEL(["none", "park", "delete"])],
+    ["post.health_action", "critical health — abort unrepairable downloads",
+      "select",
+      [["none", "none — keep downloading, fail at the end (default)"],
+       ["park", "park — abort early, keep the failed job in history"],
+       ["delete", "delete — abort early and delete the files"]],
+      "When failed articles pass what par2 can repair, the download can never succeed. 'park' or 'delete' stops it the moment it crosses that limit instead of grinding to the end; the queue shows each job's repair limit."],
     ["post.scripts_dir", "extension scripts dir (optional)", "text?"],
     ["post.par2_cmd", "par2 command", "text"],
     ["post.unrar_cmd", "unrar command", "text"],
@@ -779,22 +786,27 @@ const setPath = (obj, path, v) => {
   ks.reduce((o, k) => o[k], obj)[last] = v;
 };
 
-function fieldControl(path, label, type, opts) {
+function fieldControl(path, label, type, opts, help) {
   const id = "f-" + path.replace(/\./g, "-");
   const v = getPath(cfgModel, path);
+  const hint = help ? `<span class="field-help">${esc(help)}</span>` : "";
   if (type === "check")
-    return `<label class="chk"><input type="checkbox" id="${id}" data-path="${path}" data-type="check" ${v ? "checked" : ""}> ${esc(label)}</label>`;
+    return `<label class="chk"><input type="checkbox" id="${id}" data-path="${path}" data-type="check" ${v ? "checked" : ""}> ${esc(label)}${help ? " " + hint : ""}</label>`;
   if (type === "select") {
-    const os = opts.map(o => `<option value="${esc(o)}" ${o === v ? "selected" : ""}>${esc(o)}</option>`).join("");
-    return `<label>${esc(label)}<select id="${id}" data-path="${path}" data-type="select">${os}</select></label>`;
+    // opts entries may be "value" or [value, label] for readable choices.
+    const os = opts.map(o => {
+      const [val, lab] = Array.isArray(o) ? o : [o, o];
+      return `<option value="${esc(val)}" ${val === v ? "selected" : ""}>${esc(lab)}</option>`;
+    }).join("");
+    return `<label>${esc(label)}<select id="${id}" data-path="${path}" data-type="select">${os}</select>${hint}</label>`;
   }
   if (type === "secret") {
     const has = v != null;
-    return `<label>${esc(label)}<input type="password" id="${id}" data-path="${path}" data-type="secret" autocomplete="new-password" placeholder="${has ? "(unchanged)" : "(none set)"}"></label>`;
+    return `<label>${esc(label)}<input type="password" id="${id}" data-path="${path}" data-type="secret" autocomplete="new-password" placeholder="${has ? "(unchanged)" : "(none set)"}">${hint}</label>`;
   }
   const numeric = type.startsWith("num");
   const val = v == null ? "" : (type === "list" ? v.join(", ") : String(v));
-  return `<label>${esc(label)}<input type="${numeric ? "number" : "text"}" id="${id}" data-path="${path}" data-type="${type}" value="${esc(val)}"></label>`;
+  return `<label>${esc(label)}<input type="${numeric ? "number" : "text"}" id="${id}" data-path="${path}" data-type="${type}" value="${esc(val)}">${hint}</label>`;
 }
 
 function serverCard(sIdx) {
@@ -844,7 +856,7 @@ function renderSettingsForm() {
         `<button type="button" class="small cfg-add" onclick="addCategory()">+ add category</button>`;
     } else {
       body = `<div class="cfg-grid">` +
-        sec.fields.map(([p, l, t, o]) => fieldControl(p, l, t, o)).join("") + `</div>`;
+        sec.fields.map(([p, l, t, o, help]) => fieldControl(p, l, t, o, help)).join("") + `</div>`;
     }
     return `<div class="cfg-card"><h3>${esc(sec.title)}</h3><p class="desc">${esc(sec.desc)}</p>${body}</div>`;
   }).join("");
