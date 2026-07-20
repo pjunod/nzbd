@@ -494,6 +494,10 @@ fn run(
             feeds: feeds_handle,
             clients: Some(clients_registry.clone()),
         };
+        // Signals in-flight SSE streams to end when we start shutting down,
+        // so graceful shutdown can drain and a restart isn't held open by an
+        // open `/api/v1/events` connection.
+        let (sse_shutdown_tx, sse_shutdown_rx) = tokio::sync::watch::channel(false);
         let app = nzbd_api::require_auth(
             nzbd_api::router_with(nzbd_api::ApiState {
                 engine: engine.clone(),
@@ -501,6 +505,7 @@ fn run(
                 log: Some(logbuf.clone()),
                 setup: setup.clone(),
                 clients: Some(clients_registry.clone()),
+                shutdown: Some(sse_shutdown_rx),
             })
             .merge(nzbd_compat::router(compat_state)),
             nzbd_api::AuthConfig {
@@ -510,6 +515,8 @@ fn run(
             },
         );
 
+        // A second view of the shutdown signal for the drain deadline below.
+        let mut force_rx = sse_shutdown_tx.subscribe();
         let shutdown_setup = setup.clone();
         let shutdown = async move {
             match &shutdown_setup {
@@ -526,6 +533,18 @@ fn run(
                     tracing::info!("shutting down");
                 }
             }
+            // Tell open SSE streams to end so graceful shutdown can drain
+            // (otherwise a live `/api/v1/events` connection blocks forever).
+            let _ = sse_shutdown_tx.send(true);
+        };
+
+        // Hard deadline on the drain: once shutdown is triggered, a client
+        // holding a connection open must never stall a restart. If graceful
+        // shutdown hasn't finished a few seconds after the trigger, proceed
+        // anyway — dropping `serve` closes whatever is left.
+        let force = async move {
+            let _ = force_rx.wait_for(|triggered| *triggered).await;
+            tokio::time::sleep(Duration::from_secs(3)).await;
         };
 
         let tls_setup = tls::server_config(&cfg, &cfg.state_dir())
@@ -534,9 +553,16 @@ fn run(
             None => {
                 let listener = tokio::net::TcpListener::bind(&bind).await?;
                 tracing::info!(%bind, "nzbd listening");
-                axum::serve(listener, app)
-                    .with_graceful_shutdown(shutdown)
-                    .await?;
+                let serve = std::future::IntoFuture::into_future(
+                    axum::serve(listener, app).with_graceful_shutdown(shutdown),
+                );
+                tokio::pin!(serve, force);
+                tokio::select! {
+                    r = &mut serve => r?,
+                    _ = &mut force => {
+                        tracing::warn!("graceful shutdown exceeded its deadline; forcing restart");
+                    }
+                }
             }
             Some(t) => {
                 tracing::info!(%bind, %t.note, "nzbd listening (https)");

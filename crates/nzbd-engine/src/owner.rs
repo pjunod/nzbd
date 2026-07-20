@@ -1746,6 +1746,14 @@ impl Owner {
         self.publish_snapshot(rate);
     }
 
+    /// Publish the recovered queue into the shared snapshot *before* the
+    /// async run loop is scheduled, so the very first API read reflects
+    /// real state — otherwise `/api/v1/jobs` can serve the empty initial
+    /// snapshot in the startup window and the UI flashes "queue is empty".
+    pub(crate) fn seed_snapshot(&mut self) {
+        self.publish_snapshot(0);
+    }
+
     fn publish_snapshot(&mut self, rate: u64) {
         let jobs = self
             .state

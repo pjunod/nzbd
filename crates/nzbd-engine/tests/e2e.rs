@@ -93,6 +93,44 @@ fn nasty_bytes(len: usize) -> Vec<u8> {
 
 // ---------------------------------------------------------------------------
 
+/// Regression: the recovered queue must be visible in the shared snapshot
+/// the instant `Engine::spawn` returns — not one async tick later. The
+/// first publish used to happen inside the spawned run loop, so an API
+/// read in that startup window saw an empty snapshot and the UI flashed
+/// "queue is empty" before the jobs appeared.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recovered_snapshot_is_visible_immediately_after_spawn() {
+    let tmp = tempfile::tempdir().unwrap();
+    let post = build_post("persisted", &[("p.bin", prng_bytes(9, 20_000))], 10_000);
+
+    // First engine: queue a job (no servers, so it just sits), then shut
+    // down — which persists the snapshot.
+    let engine = spawn_engine(tmp.path(), vec![]).await;
+    engine
+        .add_nzb("persisted", post.nzb.as_bytes(), None, 0)
+        .await
+        .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while engine.snapshot().jobs.is_empty() {
+        assert!(std::time::Instant::now() < deadline, "job never queued");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    engine.shutdown().await;
+
+    // Second engine on the same state dir: the recovered job must be in
+    // the snapshot IMMEDIATELY — read it synchronously, with no tick, no
+    // sleep, no await between spawn and read.
+    let engine = spawn_engine(tmp.path(), vec![]).await;
+    let snap = engine.snapshot();
+    assert_eq!(
+        snap.jobs.len(),
+        1,
+        "recovered queue must be visible the moment spawn returns"
+    );
+    assert_eq!(snap.jobs[0].name, "persisted");
+    engine.shutdown().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn downloads_bit_identical_with_auth_and_pipelining() {
     let tmp = tempfile::tempdir().unwrap();

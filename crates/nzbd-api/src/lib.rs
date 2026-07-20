@@ -32,6 +32,11 @@ pub struct ApiState {
     pub setup: Option<Arc<SetupHandle>>,
     /// Observed compat-API consumers (shared with the compat shim).
     pub clients: Option<Arc<ClientRegistry>>,
+    /// Flips to `true` when the daemon is shutting down / reloading.
+    /// Long-lived SSE streams watch it and end promptly so axum's
+    /// graceful shutdown can drain and the process can re-serve — without
+    /// it, an open `/api/v1/events` stream blocks a restart forever.
+    pub shutdown: Option<tokio::sync::watch::Receiver<bool>>,
 }
 
 /// Shared handle between the setup endpoint and the daemon's run loop.
@@ -517,21 +522,53 @@ async fn set_speed_limit(State(st): State<ApiState>, Json(body): Json<SpeedLimit
 /// `data:` = JSON payload). Lagged consumers observe a `lagged` event and
 /// should resync from `/api/v1/status`.
 async fn sse_events(State(st): State<ApiState>) -> Response {
-    let rx = st.engine.subscribe();
-    let stream = tokio_stream::wrappers::BroadcastStream::new(rx).map(|ev| match ev {
-        Ok(ev) => {
-            let (name, data) = event_wire(&ev);
-            Ok::<SseEvent, std::convert::Infallible>(SseEvent::default().event(name).data(data))
-        }
-        Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(n)) => {
-            Ok(SseEvent::default()
-                .event("lagged")
-                .data(json!({ "skipped": n }).to_string()))
+    use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
+    use tokio_stream::wrappers::{BroadcastStream, ReceiverStream};
+
+    let events = BroadcastStream::new(st.engine.subscribe());
+    let mut shutdown = st.shutdown.clone();
+    // Forward engine events into the SSE body, but stop the instant the
+    // daemon starts shutting down — an open `/api/v1/events` connection
+    // must never hold graceful shutdown (and thus a restart) open.
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<SseEvent, std::convert::Infallible>>(64);
+    tokio::spawn(async move {
+        tokio::pin!(events);
+        loop {
+            tokio::select! {
+                _ = wait_shutdown(&mut shutdown) => break,
+                next = events.next() => match next {
+                    Some(Ok(ev)) => {
+                        let (name, data) = event_wire(&ev);
+                        let sse = SseEvent::default().event(name).data(data);
+                        if tx.send(Ok(sse)).await.is_err() {
+                            break; // client hung up
+                        }
+                    }
+                    Some(Err(BroadcastStreamRecvError::Lagged(n))) => {
+                        let sse = SseEvent::default()
+                            .event("lagged")
+                            .data(json!({ "skipped": n }).to_string());
+                        let _ = tx.send(Ok(sse)).await;
+                    }
+                    None => break, // broadcast closed (engine gone)
+                },
+            }
         }
     });
-    Sse::new(stream)
+    Sse::new(ReceiverStream::new(rx))
         .keep_alive(KeepAlive::default())
         .into_response()
+}
+
+/// Resolve when the daemon is shutting down; pend forever if no shutdown
+/// signal was wired (e.g. bare test router, cluster proxy).
+async fn wait_shutdown(rx: &mut Option<tokio::sync::watch::Receiver<bool>>) {
+    match rx {
+        Some(rx) => {
+            let _ = rx.wait_for(|down| *down).await;
+        }
+        None => std::future::pending::<()>().await,
+    }
 }
 
 fn event_wire(ev: &nzbd_engine::Event) -> (&'static str, String) {
@@ -721,6 +758,7 @@ pub fn router(engine: EngineHandle) -> Router {
         log: None,
         setup: None,
         clients: None,
+        shutdown: None,
     })
 }
 

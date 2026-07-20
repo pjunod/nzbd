@@ -266,6 +266,84 @@ fn strip_chunking(body: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Regression: an open SSE stream (`/api/v1/events`) must NOT block a
+/// restart. The browser keeps that connection alive, so graceful
+/// shutdown has to end it — otherwise the daemon hangs mid-restart and
+/// never re-binds ("clicking restart does nothing"). The earlier restart
+/// test used `Connection: close` and missed this entirely.
+#[test]
+fn restart_completes_with_an_open_sse_stream() {
+    let tmp = tempfile::tempdir().unwrap();
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+    let config = format!(
+        "[paths]\nmain_dir = \"{main}\"\ndest_dir = \"{dest}\"\n\n[api]\nbind = \"{addr}\"\n",
+        main = tmp.path().join("data").display(),
+        dest = tmp.path().join("data/complete").display(),
+    );
+    let cfg_path = tmp.path().join("nzbd.toml");
+    std::fs::write(&cfg_path, config).unwrap();
+
+    let bin = env!("CARGO_BIN_EXE_nzbd");
+    let child = Command::new(bin)
+        .args(["run", "--config"])
+        .arg(&cfg_path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn nzbd");
+    let _child = KillOnDrop(child);
+    wait_healthy(&addr, Duration::from_secs(15));
+
+    // Open an SSE stream and HOLD it open (like a browser tab): read the
+    // response head, then keep the socket alive across the restart.
+    let mut sse = TcpStream::connect(&addr).unwrap();
+    sse.write_all(
+        format!("GET /api/v1/events HTTP/1.1\r\nHost: {addr}\r\nAccept: text/event-stream\r\n\r\n")
+            .as_bytes(),
+    )
+    .unwrap();
+    let mut head = [0u8; 64];
+    sse.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let n = sse.read(&mut head).unwrap_or(0);
+    assert!(
+        String::from_utf8_lossy(&head[..n]).contains("200"),
+        "SSE stream should open"
+    );
+
+    // Trigger the restart on a separate connection while the SSE is open.
+    let (code, _) = http(&addr, "POST", "/api/v1/restart", b"");
+    assert_eq!(code, 200);
+
+    // The daemon must CLOSE our SSE stream so graceful shutdown can drain
+    // and the process can re-serve. If the stream blocked shutdown (the
+    // bug), the socket stays open — only keep-alive pings arrive, never
+    // EOF — and this times out. `up_since_unix` can't be used here: the
+    // restart is sub-second, so it lands in the same whole second.
+    sse.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    let mut buf = [0u8; 256];
+    let deadline = Instant::now() + Duration::from_secs(12);
+    let mut closed = false;
+    while Instant::now() < deadline {
+        match sse.read(&mut buf) {
+            Ok(0) => {
+                closed = true; // server closed the stream — restart proceeded
+                break;
+            }
+            Ok(_) => continue, // keep-alive ping; keep waiting for the close
+            Err(_) => break,   // read timeout
+        }
+    }
+    assert!(
+        closed,
+        "SSE stream was not closed on restart — it blocked graceful shutdown (the daemon hung)"
+    );
+    drop(sse);
+
+    // And the daemon is serving again.
+    wait_healthy(&addr, Duration::from_secs(10));
+}
+
 /// Settings round-trip with the new contract: a speed-limit change
 /// applies LIVE (no restart); other sections mark restart-required;
 /// POST /api/v1/restart bounces the daemon; secrets survive throughout.

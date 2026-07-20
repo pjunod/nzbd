@@ -190,6 +190,11 @@ impl Engine {
             tracker.clone(),
             cancel.clone(),
         )?;
+        // Seed the shared snapshot with recovered state synchronously, so
+        // the API never serves an empty queue in the window before the
+        // async run loop's first publish (UI "queue is empty" flash).
+        let mut owner = owner;
+        owner.seed_snapshot();
         tracker.spawn(owner.run(engine_rx));
 
         // Connection tasks: `max_connections` per active server. Tasks are

@@ -341,7 +341,7 @@
     <table>
       <thead><tr><th>Job</th><th>Status</th><th style="width:250px">Progress</th>
         <th class="num">Size</th><th class="num">Health</th><th style="width:190px"></th></tr></thead>
-      <tbody id="queue-body"><tr><td colspan="6" class="empty">loading…</td></tr></tbody>
+      <tbody id="queue-body"><tr><td colspan="6" class="empty">Loading the queue…</td></tr></tbody>
     </table>
   </section>
 
@@ -486,11 +486,16 @@ function statusName(st) {
   return typeof st === "string" ? st : ("post: " + (st.post ? st.post.stage : "…"));
 }
 async function refreshQueue() {
+  // A failed fetch (daemon bouncing during a restart) throws here and is
+  // swallowed by refreshAll's catch, leaving the last render — or the
+  // "Loading the queue…" placeholder — in place rather than flashing an
+  // empty state. The daemon seeds its snapshot before serving, so a
+  // successful read is authoritative: empty means genuinely empty.
   const r = await fetch("/api/v1/jobs");
   const { jobs } = await r.json();
   const body = $("queue-body");
   if (!jobs.length) {
-    body.innerHTML = '<tr><td colspan="6" class="empty">queue is empty</td></tr>';
+    body.innerHTML = '<tr><td colspan="6" class="empty">No downloads in the queue.</td></tr>';
     return;
   }
   body.innerHTML = jobs.map((j, idx) => {
