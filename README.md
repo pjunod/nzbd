@@ -107,20 +107,24 @@ config), [`kubernetes/`](examples/kubernetes/) (full manifest set) and
 Three GitHub Actions workflows gate every push/PR — **Tests** (unit +
 engine e2e + multi-node cluster tests + the whole-daemon test, plus an
 MSRV 1.85 check), **Lint** (`cargo fmt --check`, `clippy -D warnings`),
-and **Coverage** (`cargo llvm-cov`, self-hosted badges). Run the same
-gates locally via the committed hooks:
+and **Coverage** (`cargo llvm-cov`, self-hosted badges).
+
+The `Makefile` wraps the whole workflow — `make` (or `make help`) lists
+every target:
 
 ```sh
-git config core.hooksPath .githooks   # once per clone
-# pre-commit: fmt check · pre-push: clippy -D warnings + cargo test
-
-# optional: full local test coverage needs the PP tools
-brew install par2 p7zip     # macOS (Linux: apt-get install par2 p7zip-full)
+make setup    # one-shot: toolchain (+ MSRV + llvm-cov), par2/7z, git hooks
+make run      # build + run the daemon (first-run setup UI on :6789)
+make check    # everything CI enforces: fmt + clippy + tests + MSRV
+make test     # the workspace suite; `make coverage` for line coverage
 ```
 
-Tests that exercise external tools (`par2`, `7z`) self-skip with a notice
-when the binary is missing; CI installs them and sets
-`NZBD_REQUIRE_TOOLS=1` so a skip there is a failure.
+`make setup` installs the post-processing tools (`par2`, `7z`) the tests
+exercise and wires the committed git hooks (pre-commit: fmt check;
+pre-push: `clippy -D warnings` + `cargo test`). Tests that need those
+tools self-skip with a notice when they're missing; CI installs them and
+sets `NZBD_REQUIRE_TOOLS=1` so a skip there is a failure (`make
+test-strict` reproduces that locally).
 
 To hack on the *container* rather than the engine, [`dev/`](dev/) has a
 compose file that builds the image locally from the Dockerfile
