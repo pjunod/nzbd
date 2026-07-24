@@ -938,3 +938,114 @@ bind = "{api_addr}"
     let got = std::fs::read(std::path::Path::new(final_dir).join("arr episode.mkv")).unwrap();
     assert_eq!(got, data);
 }
+
+/// Regression (reported 2026-07-24): a state directory the daemon could
+/// not write killed startup with a bare
+/// `state: io: Permission denied (os error 13)` — no path, so an operator
+/// had no way to tell which directory to fix.
+///
+/// Portable half: a regular FILE where the state dir belongs fails with
+/// ENOTDIR for everyone, root included, so this always runs.
+#[test]
+fn unwritable_state_dir_names_the_path_at_startup() {
+    let tmp = tempfile::tempdir().unwrap();
+    let main_dir = tmp.path().join("data");
+    std::fs::write(&main_dir, b"i am a file").unwrap();
+    // The state dir defaults to `<main_dir>/queue`, which cannot be made.
+    let queue_dir = main_dir.join("queue");
+
+    let cfg_path = tmp.path().join("nzbd.toml");
+    std::fs::write(
+        &cfg_path,
+        format!(
+            "[paths]\nmain_dir = \"{}\"\ndest_dir = \"{}\"\n",
+            main_dir.display(),
+            main_dir.join("complete").display()
+        ),
+    )
+    .unwrap();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_nzbd"))
+        .args(["run", "--config"])
+        .arg(&cfg_path)
+        .args(["--bind", &format!("127.0.0.1:{}", free_port())])
+        .output()
+        .expect("spawn nzbd");
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success(),
+        "daemon should refuse to start:\n{stderr}"
+    );
+    assert!(
+        stderr.contains(&queue_dir.display().to_string()),
+        "startup error must name the directory it failed on:\n{stderr}"
+    );
+    // The resolved dirs are logged before anything touches them (the fmt
+    // layer writes to stdout; the fatal error goes to stderr).
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("resolved data directories")
+            && stdout.contains(&queue_dir.display().to_string()),
+        "startup should log the resolved paths:\n{stdout}"
+    );
+    // `main` prints the error with Debug; it must not escape to one line.
+    assert!(
+        !stderr.contains("\\n"),
+        "error should print readably, not Debug-escaped:\n{stderr}"
+    );
+}
+
+/// EACCES half: the exact reported case — a state dir owned by someone
+/// else. Mode bits mean nothing to root, so this self-skips there.
+#[test]
+fn permission_denied_state_dir_suggests_the_fix() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let main_dir = tmp.path().join("data");
+    let queue_dir = main_dir.join("queue");
+    std::fs::create_dir_all(&queue_dir).unwrap();
+    std::fs::set_permissions(&queue_dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+
+    if std::fs::write(queue_dir.join(".probe"), b"").is_ok() {
+        eprintln!("SKIP permission_denied_state_dir_suggests_the_fix: running privileged");
+        return;
+    }
+
+    let cfg_path = tmp.path().join("nzbd.toml");
+    std::fs::write(
+        &cfg_path,
+        format!(
+            "[paths]\nmain_dir = \"{}\"\ndest_dir = \"{}\"\n",
+            main_dir.display(),
+            main_dir.join("complete").display()
+        ),
+    )
+    .unwrap();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_nzbd"))
+        .args(["run", "--config"])
+        .arg(&cfg_path)
+        .args(["--bind", &format!("127.0.0.1:{}", free_port())])
+        .output()
+        .expect("spawn nzbd");
+
+    // Restore before asserting so tempdir cleanup always succeeds.
+    std::fs::set_permissions(&queue_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "daemon should refuse to start");
+    assert!(
+        stderr.contains(&queue_dir.display().to_string()),
+        "must name the unwritable directory:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("Permission denied"),
+        "must still report the errno:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("hint:") && stderr.contains("paths.queue_dir"),
+        "must tell the operator how to fix it:\n{stderr}"
+    );
+}

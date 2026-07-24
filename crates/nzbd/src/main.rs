@@ -248,15 +248,21 @@ fn open_history(
     jsonl_dir: &std::path::Path,
     node_tag: Option<&str>,
 ) -> anyhow_lite::Result<Arc<nzbd_state::history::HistoryDb>> {
-    std::fs::create_dir_all(local_dir)?;
-    std::fs::create_dir_all(jsonl_dir)?;
+    for dir in [local_dir, jsonl_dir] {
+        std::fs::create_dir_all(dir).map_err(|e| {
+            anyhow_lite::Error::msg(format!(
+                "history db: create directory {}: {e}",
+                dir.display()
+            ))
+        })?;
+    }
     nzbd_state::history::HistoryDb::open_tagged(
         &local_dir.join("history.sqlite"),
         Some(jsonl_dir),
         node_tag,
     )
     .map(Arc::new)
-    .map_err(|e| anyhow_lite::Error::msg(format!("history db: {e}")))
+    .map_err(|e| anyhow_lite::Error::msg(format!("history db: {}", with_fs_hint(e))))
 }
 
 /// Watch-dir scanner: `.nzb` files dropped into `NzbDir` are added and
@@ -339,6 +345,34 @@ enum RunOutcome {
     Reload,
 }
 
+/// Turn a startup failure into an operator-actionable message.
+///
+/// A daemon that can't write its state directory dies with EACCES and,
+/// historically, no clue which path was at fault. `nzbd-state` now carries
+/// the path on the error; this walks the source chain to find it and spells
+/// out the fix.
+fn with_fs_hint<E: std::error::Error + 'static>(e: E) -> anyhow_lite::Error {
+    let mut cur: Option<&(dyn std::error::Error + 'static)> = Some(&e);
+    while let Some(err) = cur {
+        if let Some(st) = err.downcast_ref::<nzbd_state::StateError>() {
+            if st.is_permission_denied() {
+                if let Some(path) = st.path() {
+                    return anyhow_lite::Error::msg(format!(
+                        "{e}\n\
+                         hint: the daemon cannot write {}. Check the owner and mode of that \
+                         path and its parents (a directory created by an earlier `sudo` run \
+                         or by Docker is the usual cause), or set paths.queue_dir to a \
+                         directory this user owns.",
+                        path.display()
+                    ));
+                }
+            }
+        }
+        cur = err.source();
+    }
+    anyhow_lite::Error::msg(e.to_string())
+}
+
 fn run(
     config: Option<PathBuf>,
     bind: Option<String>,
@@ -418,6 +452,15 @@ fn run(
         ..Tuning::default()
     };
 
+    // Log the *resolved* directories before touching them: `~` expansion
+    // and the `<main_dir>/queue` default mean the effective paths are not
+    // always obvious from the config file.
+    tracing::info!(
+        state_dir = %cfg.state_dir().display(),
+        dest_dir = %cfg.dest_dir().display(),
+        "resolved data directories"
+    );
+
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
@@ -436,9 +479,7 @@ fn run(
     );
 
     runtime.block_on(async move {
-        let engine = Engine::spawn(engine_cfg)
-            .await
-            .map_err(|e| anyhow_lite::Error::msg(e.to_string()))?;
+        let engine = Engine::spawn(engine_cfg).await.map_err(with_fs_hint)?;
 
         // Post-processing manager (par verify/repair → unpack → cleanup →
         // scripts), watching the engine's finish events.
@@ -689,7 +730,7 @@ async fn run_cluster(
         pp,
     )
     .await
-    .map_err(|e| anyhow_lite::Error::msg(e.to_string()))?;
+    .map_err(with_fs_hint)?;
 
     let scan_notify = Arc::new(tokio::sync::Notify::new());
     if let Some(watch) = &cfg.paths.nzb_watch_dir {
@@ -843,7 +884,6 @@ fn urlenc(s: &str) -> String {
 mod anyhow_lite {
     pub type Result<T> = std::result::Result<T, Error>;
 
-    #[derive(Debug)]
     pub struct Error(String);
 
     impl Error {
@@ -855,6 +895,16 @@ mod anyhow_lite {
     impl std::fmt::Display for Error {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             write!(f, "{}", self.0)
+        }
+    }
+
+    /// `fn main() -> Result<_, E>` prints `E` with `Debug`, so the derived
+    /// form would render a multi-line hint as literal `\n` escapes inside
+    /// quotes. Delegate to `Display` (same as `anyhow`) and the operator
+    /// gets a readable message.
+    impl std::fmt::Debug for Error {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            std::fmt::Display::fmt(self, f)
         }
     }
 
@@ -914,5 +964,61 @@ mod tests {
         assert_eq!(format!("{e}"), "boom");
         let io: anyhow_lite::Error = std::io::Error::other("disk on fire").into();
         assert!(format!("{io}").contains("disk on fire"));
+        // `main` prints with Debug — it must not quote-and-escape the text.
+        let multi = anyhow_lite::Error::msg("first line\nsecond line");
+        assert_eq!(format!("{multi:?}"), "first line\nsecond line");
+    }
+
+    fn denied(path: &str) -> nzbd_state::StateError {
+        nzbd_state::StateError::Io {
+            op: "create directory",
+            path: PathBuf::from(path),
+            source: std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+        }
+    }
+
+    /// The reported failure: three lines of bare EACCES with no path. The
+    /// message must now carry both the path and what to do about it.
+    #[test]
+    fn startup_permission_error_names_the_path_and_the_fix() {
+        let engine_err = nzbd_engine::EngineError::State(denied("/data/usenet/queue"));
+        let msg = with_fs_hint(engine_err).to_string();
+
+        assert!(msg.contains("/data/usenet/queue"), "{msg}");
+        assert!(msg.contains("hint:"), "{msg}");
+        assert!(msg.contains("paths.queue_dir"), "{msg}");
+    }
+
+    /// The hint has to survive being wrapped by the cluster layer, which
+    /// is where a shared-volume mount most often has the wrong owner.
+    #[test]
+    fn fs_hint_reaches_through_the_cluster_error_chain() {
+        let err = nzbd_cluster::ClusterError::Engine(nzbd_engine::EngineError::State(denied(
+            "/mnt/gluster/nzbd/queue",
+        )));
+        let msg = with_fs_hint(err).to_string();
+        assert!(msg.contains("/mnt/gluster/nzbd/queue"), "{msg}");
+        assert!(msg.contains("hint:"), "{msg}");
+    }
+
+    /// Errors that aren't permission problems pass through unchanged — no
+    /// misleading chmod advice on a corrupt queue.json or a missing file.
+    #[test]
+    fn fs_hint_only_fires_on_permission_errors() {
+        let corrupt = nzbd_engine::EngineError::State(nzbd_state::StateError::Corrupt(
+            "queue.json: trailing comma".into(),
+        ));
+        let msg = with_fs_hint(corrupt).to_string();
+        assert!(msg.contains("trailing comma"), "{msg}");
+        assert!(!msg.contains("hint:"), "{msg}");
+
+        let missing = nzbd_engine::EngineError::State(nzbd_state::StateError::Io {
+            op: "open",
+            path: PathBuf::from("/data/queue/queue.json"),
+            source: std::io::Error::from(std::io::ErrorKind::NotFound),
+        });
+        let msg = with_fs_hint(missing).to_string();
+        assert!(msg.contains("/data/queue/queue.json"), "{msg}");
+        assert!(!msg.contains("hint:"), "{msg}");
     }
 }

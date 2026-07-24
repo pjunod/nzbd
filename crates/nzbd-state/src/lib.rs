@@ -19,22 +19,63 @@
 //!
 //! **History** in SQLite arrives in phase 2 (the trait is defined below).
 
+mod fsx;
 pub mod history;
 
 use nzbd_types::{FileId, Job, JobId};
 use serde::{Deserialize, Serialize};
-use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::fs::File;
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, thiserror::Error)]
 pub enum StateError {
-    #[error("io: {0}")]
-    Io(#[from] std::io::Error),
+    /// A filesystem call failed. `op` is the human verb ("create
+    /// directory", "fsync", …) and `path` is what it was applied to.
+    ///
+    /// A bare `std::io::Error` carries an errno and nothing else, so
+    /// "Permission denied (os error 13)" leaves an operator with no idea
+    /// which file to chmod. Every fs call in this crate goes through
+    /// [`fsx`] so the path is always in the message.
+    #[error("{op} {}: {source}", .path.display())]
+    Io {
+        op: &'static str,
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
     #[error("serialize: {0}")]
     Serde(#[from] serde_json::Error),
     #[error("corrupt state: {0}")]
     Corrupt(String),
+}
+
+impl StateError {
+    /// The path this error is about, when it is a filesystem error.
+    pub fn path(&self) -> Option<&Path> {
+        match self {
+            StateError::Io { path, .. } => Some(path),
+            _ => None,
+        }
+    }
+
+    /// The underlying errno kind, when this is a filesystem error.
+    pub fn io_kind(&self) -> Option<std::io::ErrorKind> {
+        match self {
+            StateError::Io { source, .. } => Some(source.kind()),
+            _ => None,
+        }
+    }
+
+    pub fn is_not_found(&self) -> bool {
+        self.io_kind() == Some(std::io::ErrorKind::NotFound)
+    }
+
+    /// True for EACCES/EPERM — the daemon lacks rights on [`Self::path`].
+    /// The startup path uses this to print an actionable hint.
+    pub fn is_permission_denied(&self) -> bool {
+        matches!(self.io_kind(), Some(std::io::ErrorKind::PermissionDenied))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -65,9 +106,9 @@ pub struct FsJournal {
 
 impl FsJournal {
     pub fn open(dir: &Path) -> Result<FsJournal, StateError> {
-        fs::create_dir_all(dir)?;
+        fsx::create_dir_all(dir)?;
         let path = dir.join("segments.journal");
-        let file = OpenOptions::new().create(true).append(true).open(&path)?;
+        let file = fsx::open_append(&path)?;
         Ok(FsJournal {
             path,
             file,
@@ -78,7 +119,7 @@ impl FsJournal {
     pub fn append(&mut self, rec: &JournalRecord) -> Result<(), StateError> {
         let mut line = serde_json::to_vec(rec)?;
         line.push(b'\n');
-        self.file.write_all(&line)?;
+        fsx::write_all(&mut self.file, &line, &self.path)?;
         self.dirty = true;
         Ok(())
     }
@@ -86,7 +127,7 @@ impl FsJournal {
     /// fsync if anything was appended since the last sync.
     pub fn sync(&mut self) -> Result<(), StateError> {
         if self.dirty {
-            self.file.sync_data()?;
+            fsx::sync_data(&self.file, &self.path)?;
             self.dirty = false;
         }
         Ok(())
@@ -95,14 +136,14 @@ impl FsJournal {
     /// Read every intact record. Stops (without erroring) at the first
     /// corrupt or torn line — everything after it is unusable anyway.
     pub fn replay(&self) -> Result<Vec<JournalRecord>, StateError> {
-        let file = match File::open(&self.path) {
+        let file = match fsx::open(&self.path) {
             Ok(f) => f,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(e) => return Err(e.into()),
+            Err(e) if e.is_not_found() => return Ok(Vec::new()),
+            Err(e) => return Err(e),
         };
         let mut out = Vec::new();
         for line in BufReader::new(file).split(b'\n') {
-            let line = line?;
+            let line = fsx::ctx(line, "read", &self.path)?;
             if line.is_empty() {
                 continue;
             }
@@ -116,8 +157,8 @@ impl FsJournal {
 
     /// Truncate after the records have been folded into a snapshot.
     pub fn compact(&mut self) -> Result<(), StateError> {
-        self.file.set_len(0)?;
-        self.file.sync_data()?;
+        fsx::set_len(&self.file, 0, &self.path)?;
+        fsx::sync_data(&self.file, &self.path)?;
         self.dirty = false;
         Ok(())
     }
@@ -133,18 +174,25 @@ impl FsJournal {
 // cross-node reclaim safe without any shared-file locking.
 // ---------------------------------------------------------------------------
 
+/// An open journal file, paired with the path it was opened from so
+/// write/fsync failures can name it.
+struct OpenJournal {
+    path: PathBuf,
+    file: File,
+}
+
 pub struct JobJournals {
     jobs_dir: PathBuf,
     /// Fencing suffix — the work-lease id, or "local" for single-node.
     suffix: String,
-    open: std::collections::HashMap<u32, File>,
+    open: std::collections::HashMap<u32, OpenJournal>,
     dirty: bool,
 }
 
 impl JobJournals {
     pub fn open(state_dir: &Path, suffix: &str) -> Result<JobJournals, StateError> {
         let jobs_dir = state_dir.join("jobs");
-        fs::create_dir_all(&jobs_dir)?;
+        fsx::create_dir_all(&jobs_dir)?;
         Ok(JobJournals {
             jobs_dir,
             suffix: sanitize_suffix(suffix),
@@ -157,15 +205,13 @@ impl JobJournals {
         &self.jobs_dir
     }
 
-    fn file_for(&mut self, job: JobId) -> Result<&mut File, StateError> {
+    fn file_for(&mut self, job: JobId) -> Result<&mut OpenJournal, StateError> {
         if !self.open.contains_key(&job.0) {
             let dir = self.jobs_dir.join(job.0.to_string());
-            fs::create_dir_all(&dir)?;
-            let f = OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(dir.join(format!("journal.{}", self.suffix)))?;
-            self.open.insert(job.0, f);
+            fsx::create_dir_all(&dir)?;
+            let path = dir.join(format!("journal.{}", self.suffix));
+            let file = fsx::open_append(&path)?;
+            self.open.insert(job.0, OpenJournal { path, file });
         }
         Ok(self.open.get_mut(&job.0).unwrap())
     }
@@ -173,7 +219,8 @@ impl JobJournals {
     pub fn append(&mut self, rec: &JournalRecord) -> Result<(), StateError> {
         let mut line = serde_json::to_vec(rec)?;
         line.push(b'\n');
-        self.file_for(rec.job)?.write_all(&line)?;
+        let j = self.file_for(rec.job)?;
+        fsx::write_all(&mut j.file, &line, &j.path)?;
         self.dirty = true;
         Ok(())
     }
@@ -181,8 +228,8 @@ impl JobJournals {
     /// fsync every journal touched since the last sync.
     pub fn sync(&mut self) -> Result<(), StateError> {
         if self.dirty {
-            for f in self.open.values() {
-                f.sync_data()?;
+            for j in self.open.values() {
+                fsx::sync_data(&j.file, &j.path)?;
             }
             self.dirty = false;
         }
@@ -199,10 +246,10 @@ impl JobJournals {
     pub fn replay_all(state_dir: &Path) -> Result<Vec<JournalRecord>, StateError> {
         let jobs_dir = state_dir.join("jobs");
         let mut out = Vec::new();
-        let entries = match fs::read_dir(&jobs_dir) {
+        let entries = match fsx::read_dir(&jobs_dir) {
             Ok(e) => e,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
-            Err(e) => return Err(e.into()),
+            Err(e) if e.is_not_found() => return Ok(out),
+            Err(e) => return Err(e),
         };
         for entry in entries.flatten() {
             if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
@@ -218,32 +265,32 @@ impl JobJournals {
     pub fn remove_job(&mut self, job: JobId) -> Result<(), StateError> {
         self.open.remove(&job.0);
         let dir = self.jobs_dir.join(job.0.to_string());
-        match fs::remove_dir_all(&dir) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(e.into()),
+        match fsx::remove_dir_all(&dir) {
+            Err(e) if e.is_not_found() => Ok(()),
+            other => other,
         }
     }
 }
 
 fn replay_dir(dir: &Path) -> Result<Vec<JournalRecord>, StateError> {
     let mut out = Vec::new();
-    let entries = match fs::read_dir(dir) {
+    let entries = match fsx::read_dir(dir) {
         Ok(e) => e,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
-        Err(e) => return Err(e.into()),
+        Err(e) if e.is_not_found() => return Ok(out),
+        Err(e) => return Err(e),
     };
     for entry in entries.flatten() {
         let name = entry.file_name();
         if !name.to_string_lossy().starts_with("journal.") {
             continue;
         }
-        let file = match File::open(entry.path()) {
+        let path = entry.path();
+        let file = match fsx::open(&path) {
             Ok(f) => f,
             Err(_) => continue,
         };
         for line in BufReader::new(file).split(b'\n') {
-            let line = line?;
+            let line = fsx::ctx(line, "read", &path)?;
             if line.is_empty() {
                 continue;
             }
@@ -296,7 +343,7 @@ pub struct SnapshotStore {
 
 impl SnapshotStore {
     pub fn open(dir: &Path) -> Result<SnapshotStore, StateError> {
-        fs::create_dir_all(dir)?;
+        fsx::create_dir_all(dir)?;
         Ok(SnapshotStore {
             path: dir.join("queue.json"),
             tmp: dir.join("queue.json.tmp"),
@@ -318,16 +365,28 @@ impl SnapshotStore {
         doc: &QueueSnapshotDoc,
         guard: &dyn Fn() -> bool,
     ) -> Result<(), StateError> {
-        let mut f = File::create(&self.tmp)?;
-        serde_json::to_writer(&mut f, doc)?;
-        f.sync_data()?;
+        let mut f = fsx::create(&self.tmp)?;
+        // A serde failure here is almost always the *disk* (ENOSPC, EDQUOT)
+        // rather than the document, so surface it with the path attached.
+        serde_json::to_writer(&mut f, doc).map_err(|e| {
+            if e.is_io() {
+                StateError::Io {
+                    op: "write",
+                    path: self.tmp.clone(),
+                    source: e.into(),
+                }
+            } else {
+                StateError::Serde(e)
+            }
+        })?;
+        fsx::sync_data(&f, &self.tmp)?;
         drop(f);
         if !guard() {
             return Err(StateError::Corrupt(
                 "fenced: no longer the authority".into(),
             ));
         }
-        fs::rename(&self.tmp, &self.path)?;
+        fsx::rename(&self.tmp, &self.path)?;
         if let Ok(d) = File::open(&self.dir) {
             let _ = d.sync_all(); // best-effort directory fsync
         }
@@ -337,10 +396,10 @@ impl SnapshotStore {
     /// `None` if no snapshot exists yet. A corrupt snapshot is an error —
     /// the operator should decide, not silently lose a queue.
     pub fn load(&self) -> Result<Option<QueueSnapshotDoc>, StateError> {
-        let bytes = match fs::read(&self.path) {
+        let bytes = match fsx::read(&self.path) {
             Ok(b) => b,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => return Err(e.into()),
+            Err(e) if e.is_not_found() => return Ok(None),
+            Err(e) => return Err(e),
         };
         let doc = serde_json::from_slice(&bytes)
             .map_err(|e| StateError::Corrupt(format!("queue.json: {e}")))?;
@@ -370,18 +429,17 @@ impl UncleanMarker {
     pub fn check_and_arm(&self) -> Result<bool, StateError> {
         let was_unclean = self.path.exists();
         if let Some(parent) = self.path.parent() {
-            fs::create_dir_all(parent)?;
+            fsx::create_dir_all(parent)?;
         }
-        fs::write(&self.path, b"")?;
+        fsx::write(&self.path, b"")?;
         Ok(was_unclean)
     }
 
     /// Graceful shutdown: state on disk is consistent.
     pub fn disarm(&self) -> Result<(), StateError> {
-        match fs::remove_file(&self.path) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(e.into()),
+        match fsx::remove_file(&self.path) {
+            Err(e) if e.is_not_found() => Ok(()),
+            other => other,
         }
     }
 }
@@ -445,6 +503,17 @@ pub trait HistoryStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs::OpenOptions;
+    use std::io::Write as _;
+
+    /// `unwrap_err` needs `T: Debug`; the store handles deliberately
+    /// aren't printable, so pull the error out by hand.
+    fn err_of<T>(r: Result<T, StateError>) -> StateError {
+        match r {
+            Ok(_) => panic!("expected a StateError"),
+            Err(e) => e,
+        }
+    }
 
     fn rec(seg: u32) -> JournalRecord {
         JournalRecord {
@@ -587,5 +656,113 @@ mod tests {
         assert!(!m.check_and_arm().unwrap(), "after disarm = clean");
         m.disarm().unwrap();
         m.disarm().unwrap(); // idempotent
+    }
+
+    // -----------------------------------------------------------------
+    // Error reporting. A state error that names only an errno costs an
+    // operator an afternoon; these lock the path into the message.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn error_display_names_op_path_and_cause() {
+        let e = StateError::Io {
+            op: "create directory",
+            path: PathBuf::from("/data/usenet/queue"),
+            source: std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+        };
+        assert!(
+            e.to_string()
+                .starts_with("create directory /data/usenet/queue: "),
+            "{e}"
+        );
+        assert_eq!(e.path(), Some(Path::new("/data/usenet/queue")));
+        assert!(e.is_permission_denied());
+        assert!(!e.is_not_found());
+        // Non-io variants have no path and must not claim one.
+        assert_eq!(StateError::Corrupt("x".into()).path(), None);
+        assert!(!StateError::Corrupt("x".into()).is_permission_denied());
+    }
+
+    /// Every startup entry point must name the directory it choked on.
+    /// A regular file standing where the state dir belongs fails for real
+    /// on every platform, privileged or not.
+    #[test]
+    fn startup_paths_report_the_directory_they_failed_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocked = dir.path().join("queue");
+        std::fs::write(&blocked, b"a file, not a directory").unwrap();
+        let shown = blocked.display().to_string();
+
+        let err = err_of(UncleanMarker::new(&blocked, "local").check_and_arm());
+        assert!(err.to_string().contains(&shown), "unclean marker: {err}");
+
+        let err = err_of(SnapshotStore::open(&blocked));
+        assert!(err.to_string().contains(&shown), "snapshot store: {err}");
+        assert_eq!(err.path(), Some(blocked.as_path()));
+
+        let err = err_of(JobJournals::open(&blocked, "local"));
+        assert!(err.to_string().contains(&shown), "job journals: {err}");
+
+        let err = err_of(FsJournal::open(&blocked));
+        assert!(err.to_string().contains(&shown), "segment journal: {err}");
+    }
+
+    /// The reported bug, reproduced: a state dir the daemon may read but
+    /// not write. Every layer must say which path, not just EACCES.
+    #[cfg(unix)]
+    #[test]
+    fn permission_denied_names_the_unwritable_path() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("queue");
+        std::fs::create_dir(&state).unwrap();
+        std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o500)).unwrap();
+
+        // root ignores mode bits — skip rather than report a false pass.
+        if std::fs::write(state.join(".probe"), b"").is_ok() {
+            eprintln!("skipping permission test: running privileged");
+            return;
+        }
+
+        let marker_path = state.join("unclean.local");
+        let err = err_of(UncleanMarker::new(&state, "local").check_and_arm());
+        assert!(err.is_permission_denied(), "{err}");
+        assert_eq!(err.path(), Some(marker_path.as_path()));
+        assert!(
+            err.to_string().contains(&state.display().to_string()),
+            "operator must be able to see what to chmod: {err}"
+        );
+
+        // Restore so tempdir cleanup can remove it.
+        std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    /// Guard rail for the invariant above: a future `std::fs` call added
+    /// straight into this crate would silently drop the path again.
+    #[test]
+    fn all_filesystem_calls_go_through_fsx() {
+        for (name, src) in [
+            ("lib.rs", include_str!("lib.rs")),
+            ("history.rs", include_str!("history.rs")),
+        ] {
+            // Test fixtures may use std::fs freely.
+            let code = src.split("#[cfg(test)]").next().unwrap();
+            for (i, line) in code.lines().enumerate() {
+                let trimmed = line.trim_start();
+                // Comments and imports are fine; call sites are not.
+                if trimmed.starts_with("//") || trimmed.starts_with("use ") {
+                    continue;
+                }
+                for banned in ["std::fs::", "OpenOptions"] {
+                    assert!(
+                        !line.contains(banned),
+                        "{name}:{} calls the filesystem directly ({banned}) — route it \
+                         through fsx so failures name the path:\n  {line}",
+                        i + 1
+                    );
+                }
+            }
+        }
     }
 }

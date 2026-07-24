@@ -8,7 +8,7 @@ roadmaps in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) §16 and
 Legend: ✅ done (implemented, tested, committed) · 🔶 partial · ⬜ not
 started · 👤 operator action (Paul)
 
-**Snapshot (2026-07-18):** 167 tests · clippy clean · **phases 0–4
+**Snapshot (2026-07-24):** 199 tests · clippy clean · **phases 0–4
 complete incl. RSS feeds, cluster C1+C2 complete, phase 5 partial** —
 every NZBGet user-facing surface exists; what remains is beyond-parity
 performance work and operator actions
@@ -50,6 +50,7 @@ performance work and operator actions
 - ✅ Health-gated completion (Completed vs Failed below critical health)
 - ✅ Token-bucket rate limiter (debt model) + 30×1 s speed meter
 - ✅ Crash safety: append-only journal + atomic snapshots + unclean marker; kill -9 resume proven in e2e (no re-fetch of journaled segments)
+- ✅ Diagnosable state I/O (2026-07-24): every filesystem call in `nzbd-state` goes through `fsx` wrappers that attach the **operation and path** to the error (`StateError::Io { op, path, source }`), so a startup failure reads `state: write /data/queue/unclean.local: Permission denied (os error 13)` instead of a bare errno. Startup logs the resolved `state_dir`/`dest_dir` before touching them, a permission failure appends an actionable hint (walks the source chain, so it survives the cluster wrapper), and `anyhow_lite::Error` prints via `Display` so multi-line hints aren't Debug-escaped. Guard test fails the build if a raw `std::fs` call is added back to the crate
 - ✅ `nzbd-nserv` mock NNTP server: generated posts, 430/CRC/disconnect/latency injection, hit + concurrency gauges
 - ✅ Native API subset: status, jobs add/list/detail, job + queue actions, speed limit
 - ✅ Compat shim: `version`, `status`, `listgroups` in NZBGet's JSON-RPC 1.1 dialect with Lo/Hi/MB triplets

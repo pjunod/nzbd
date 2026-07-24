@@ -8,10 +8,9 @@
 //! O_APPEND interleaving on Gluster is not trustworthy); readers union
 //! all `history*.jsonl` files, deduped by (job, completed_at).
 
-use crate::{HistoryEntry, StateError};
+use crate::{fsx, HistoryEntry, StateError};
 use rusqlite::Connection;
-use std::fs::OpenOptions;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -39,10 +38,10 @@ impl HistoryDb {
         tag: Option<&str>,
     ) -> Result<HistoryDb, StateError> {
         if let Some(parent) = db_path.parent() {
-            std::fs::create_dir_all(parent)?;
+            fsx::create_dir_all(parent)?;
         }
         let conn = Connection::open(db_path)
-            .map_err(|e| StateError::Corrupt(format!("sqlite open: {e}")))?;
+            .map_err(|e| StateError::Corrupt(format!("sqlite open {}: {e}", db_path.display())))?;
         conn.execute_batch(
             "PRAGMA journal_mode=WAL;
              CREATE TABLE IF NOT EXISTS history (
@@ -128,7 +127,7 @@ impl HistoryDb {
         let Some(dir) = own.parent() else {
             return Ok(());
         };
-        let mut files: Vec<PathBuf> = match std::fs::read_dir(dir) {
+        let mut files: Vec<PathBuf> = match fsx::read_dir(dir) {
             Ok(entries) => entries
                 .flatten()
                 .map(|e| e.path())
@@ -137,17 +136,17 @@ impl HistoryDb {
                     n.starts_with("history") && n.ends_with(".jsonl")
                 })
                 .collect(),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(e) => return Err(e.into()),
+            Err(e) if e.is_not_found() => return Ok(()),
+            Err(e) => return Err(e),
         };
         files.sort();
         let mut imported = 0usize;
         for path in files {
-            let Ok(file) = std::fs::File::open(&path) else {
+            let Ok(file) = fsx::open(&path) else {
                 continue;
             };
             for line in BufReader::new(file).split(b'\n') {
-                let line = line?;
+                let line = fsx::ctx(line, "read", &path)?;
                 if line.is_empty() {
                     continue;
                 }
@@ -197,16 +196,7 @@ impl HistoryDb {
             .map_err(|e| StateError::Corrupt(format!("sqlite insert: {e}")))?;
         drop(conn);
         if n > 0 && and_jsonl {
-            if let Some(path) = &self.jsonl {
-                if let Some(parent) = path.parent() {
-                    std::fs::create_dir_all(parent)?;
-                }
-                let mut f = OpenOptions::new().create(true).append(true).open(path)?;
-                let mut line = serde_json::to_vec(entry)?;
-                line.push(b'\n');
-                f.write_all(&line)?;
-                f.sync_data()?;
-            }
+            self.append_jsonl(entry)?;
         }
         Ok(n > 0)
     }
@@ -349,13 +339,13 @@ impl HistoryDb {
     fn append_jsonl(&self, entry: &HistoryEntry) -> Result<(), StateError> {
         if let Some(path) = &self.jsonl {
             if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent)?;
+                fsx::create_dir_all(parent)?;
             }
-            let mut f = OpenOptions::new().create(true).append(true).open(path)?;
+            let mut f = fsx::open_append(path)?;
             let mut line = serde_json::to_vec(entry)?;
             line.push(b'\n');
-            f.write_all(&line)?;
-            f.sync_data()?;
+            fsx::write_all(&mut f, &line, path)?;
+            fsx::sync_data(&f, path)?;
         }
         Ok(())
     }
