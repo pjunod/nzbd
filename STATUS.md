@@ -8,7 +8,7 @@ roadmaps in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) §16 and
 Legend: ✅ done (implemented, tested, committed) · 🔶 partial · ⬜ not
 started · 👤 operator action (Paul)
 
-**Snapshot (2026-07-25):** 216 tests · clippy clean · **phases 0–4
+**Snapshot (2026-07-25):** 221 tests · clippy clean · **phases 0–4
 complete incl. RSS feeds, cluster C1+C2 complete, phase 5 partial** —
 every NZBGet user-facing surface exists; what remains is beyond-parity
 performance work and operator actions
@@ -179,7 +179,7 @@ performance work and operator actions
   - ✅ M2 optimistic actions with revert + toasts — every mutating click applies to the view immediately and is reverted (with the daemon's own error text) if the POST fails or nothing confirms it inside 5 s; honest `live`/`reconnecting`/`unreachable` states, the last with a page-wide banner
   - ✅ M3 delete parks the regenerated NZB to history as `DELETED` + `requeue` action — spool beside the history index (`nzbs/<job>.nzb`, reaped with its entry and swept for orphans on open), `delete` answers `{ok, parked}`, entries carry `can_requeue`; a job still `Fetching` parks its `*URL` instead. Engine untouched
   - ✅ M4 instant undoable delete — one click, the row is gone before your finger lifts, an 8 s `Undo` toast wired to `requeue`; history `forget` is instant, `delete files` (the one irreversible action) arms in place for 3 s; zero `confirm()`/`alert()` calls left, pinned by the DOM test
-  - ⬜ M5 SSE `hb` + `log` events, per-server wire rates
+  - ✅ M5 SSE `hb` + `log` events, per-server wire rates — `hb` fires when an idle tick is deduped >5 s (closing the "idle queue vs dead stream" hole the quiet-stream property creates), `log` batches ride the same 1 Hz loop and report what the 200-line cap skipped, per-server EMAs come off the SAME counters as the header rate and reach the status DTO as named rows
   - ⬜ M6 sparkline, title ticker, server chips, live log tail
   - ⬜ M7 docs sweep (ARCHITECTURE §12 as-built UI, USAGE `requeue`/`parked`)
 

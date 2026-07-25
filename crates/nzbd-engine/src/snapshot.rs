@@ -47,9 +47,17 @@ pub struct JobSummary {
 #[derive(Debug, Clone, Serialize)]
 pub struct ServerVolume {
     pub server: u32,
+    /// Configured display name, so the UI's per-provider chips can say
+    /// "eweka" rather than "#0".
+    pub name: String,
     pub total_bytes: u64,
     pub day_bytes: u64,
     pub month_bytes: u64,
+    /// This server's current share of the wire rate (EMA, bytes/sec),
+    /// computed from the SAME counters as `download_rate_bps` — so the
+    /// per-server rates sum to the header rate instead of to some other
+    /// number that also calls itself throughput.
+    pub rate_bps: u64,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]

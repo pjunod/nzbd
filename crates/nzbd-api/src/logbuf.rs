@@ -87,6 +87,35 @@ impl LogBuffer {
             .collect()
     }
 
+    /// The NEWEST `limit` entries with id > `after`, oldest first, plus how
+    /// many older ones the cap skipped.
+    ///
+    /// A live tail that falls behind should show the most RECENT lines and
+    /// say how much it missed. Handing out the oldest `limit` instead would
+    /// leave the view permanently stuck in the past during a burst — the
+    /// failure mode a naive `take(limit)` produces.
+    pub fn since_capped(&self, after: u64, limit: usize) -> (Vec<LogRecord>, u32) {
+        let ring = self.ring.lock().unwrap();
+        let limit = limit.max(1);
+        let total = ring.iter().filter(|r| r.id > after).count();
+        let skipped = total.saturating_sub(limit);
+        let out = ring
+            .iter()
+            .filter(|r| r.id > after)
+            .skip(skipped)
+            .cloned()
+            .collect();
+        (out, skipped as u32)
+    }
+
+    /// Highest id currently in the ring (0 when empty). A new SSE stream
+    /// starts from here so it tails from "now" instead of replaying the
+    /// whole buffer; the client backfills through the REST endpoint when
+    /// the Logs tab is opened.
+    pub fn newest_id(&self) -> u64 {
+        self.ring.lock().unwrap().back().map(|r| r.id).unwrap_or(0)
+    }
+
     /// The newest `limit` entries, oldest first (NZBGet `log(0, N)`).
     pub fn tail(&self, limit: usize) -> Vec<LogRecord> {
         self.tail_filtered(limit, None, None)

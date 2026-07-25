@@ -26,7 +26,7 @@ mod writer;
 pub use events::Event;
 pub use owner::{MirrorStats, MoveOp};
 pub use queue::clean_job_name;
-pub use snapshot::{new_shared_snapshot, JobSummary, QueueSnapshot, SharedSnapshot};
+pub use snapshot::{new_shared_snapshot, JobSummary, QueueSnapshot, ServerVolume, SharedSnapshot};
 
 use nzbd_nntp::transport::{tls_client_config, TlsClientConfig};
 use nzbd_types::{JobId, ServerDef, TlsMode};

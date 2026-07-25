@@ -318,7 +318,8 @@ async fn stream_body(
                 }
                 Ok((Status::Finished, consumed)) => {
                     conn.consume(consumed);
-                    ctx.meter.add_for(lease.r.job.0, consumed as u64);
+                    ctx.meter
+                        .add_for(lease.r.job.0, ctx.server.id.0, consumed as u64);
                     ctx.limiter.debit(consumed).await;
                     break;
                 }
@@ -327,7 +328,8 @@ async fn stream_body(
                     // protocol sync, then report an article-level failure.
                     let len = chunk.len();
                     conn.consume(len);
-                    ctx.meter.add_for(lease.r.job.0, len as u64);
+                    ctx.meter
+                        .add_for(lease.r.job.0, ctx.server.id.0, len as u64);
                     tracing::debug!(msgid = %lease.message_id, error = %e, "yEnc decode failed");
                     conn.drain_body().await?;
                     fail_leases(ctx, std::slice::from_ref(lease), AttemptOutcome::Other).await;
@@ -336,7 +338,8 @@ async fn stream_body(
             }
         };
         conn.consume(chunk_len);
-        ctx.meter.add_for(lease.r.job.0, chunk_len as u64);
+        ctx.meter
+            .add_for(lease.r.job.0, ctx.server.id.0, chunk_len as u64);
         ctx.limiter.debit(chunk_len).await;
     }
 

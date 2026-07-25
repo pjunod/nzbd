@@ -94,6 +94,12 @@ pub struct SpeedMeter {
     /// two different quantities; the gap is retries/discards, which are
     /// now counted per job instead of silently inflating the header.
     per_job: Mutex<std::collections::HashMap<u32, u64>>,
+    /// The same wire bytes, sliced per SERVER instead of per job. One
+    /// measurement, two attributions — so the per-provider chips in the UI
+    /// and the header rate can be asserted to agree (they are literally the
+    /// same bytes counted twice), which is the invariant the per-job rates
+    /// already keep.
+    per_server: Mutex<std::collections::HashMap<u32, u64>>,
 }
 
 struct Ring {
@@ -119,6 +125,7 @@ impl SpeedMeter {
                 filled: 0,
             }),
             per_job: Mutex::new(std::collections::HashMap::new()),
+            per_server: Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -127,15 +134,23 @@ impl SpeedMeter {
         self.total.fetch_add(n, Ordering::Relaxed);
     }
 
-    /// [`SpeedMeter::add`] plus per-job attribution.
-    pub fn add_for(&self, job: u32, n: u64) {
+    /// [`SpeedMeter::add`] plus per-job and per-server attribution. The
+    /// connection task knows both, so both are recorded at the one read
+    /// site — there is no way for the three numbers to drift apart.
+    pub fn add_for(&self, job: u32, server: u32, n: u64) {
         self.add(n);
         *self.per_job.lock().unwrap().entry(job).or_insert(0) += n;
+        *self.per_server.lock().unwrap().entry(server).or_insert(0) += n;
     }
 
     /// Take and reset the per-job wire counters (owner tick, 1 Hz).
     pub fn drain_jobs(&self) -> std::collections::HashMap<u32, u64> {
         std::mem::take(&mut *self.per_job.lock().unwrap())
+    }
+
+    /// Take and reset the per-server wire counters (owner tick, 1 Hz).
+    pub fn drain_servers(&self) -> std::collections::HashMap<u32, u64> {
+        std::mem::take(&mut *self.per_server.lock().unwrap())
     }
 
     pub fn total(&self) -> u64 {

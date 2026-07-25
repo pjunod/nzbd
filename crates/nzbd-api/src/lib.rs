@@ -289,6 +289,11 @@ pub struct StatusDto {
     pub jobs_queued: u32,
     pub jobs_downloading: u32,
     pub jobs_finished: u32,
+    /// Per-news-server wire rates and volumes. Same counters as
+    /// `download_rate_bps`, so the chips the UI draws from these sum to the
+    /// header tile — two numbers that claim to be the same thing must be
+    /// the same measurement.
+    pub servers: Vec<nzbd_engine::ServerVolume>,
 }
 
 pub fn status_dto(snap: &QueueSnapshot) -> StatusDto {
@@ -314,6 +319,7 @@ pub fn status_dto(snap: &QueueSnapshot) -> StatusDto {
                 JobStatus::Completed | JobStatus::Failed | JobStatus::Deleted
             )
         }),
+        servers: snap.server_volumes.clone(),
     }
 }
 
@@ -904,6 +910,7 @@ async fn sse_events(State(st): State<ApiState>) -> Response {
 
     let events = BroadcastStream::new(st.engine.subscribe());
     let engine = st.engine.clone();
+    let log = st.log.clone();
     let mut shutdown = st.shutdown.clone();
     // Forward engine events into the SSE body, but stop the instant the
     // daemon starts shutting down — an open `/api/v1/events` connection
@@ -914,10 +921,33 @@ async fn sse_events(State(st): State<ApiState>) -> Response {
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut last_tick_payload: Option<String> = None;
+        // Staleness clock for the `hb` event, and the log cursor. A new
+        // stream tails the log from "now": replaying the whole ring on
+        // every connect would flood a page that has not opened the Logs
+        // tab, and the REST endpoint is the backfill for when it does.
+        let mut last_frame = std::time::Instant::now();
+        let mut last_log_id = log.as_ref().map(|l| l.newest_id()).unwrap_or(0);
         loop {
             tokio::select! {
                 _ = wait_shutdown(&mut shutdown) => break,
                 _ = tick.tick() => {
+                    // Log lines ride the same 1 Hz loop: a "tail -f" that
+                    // updates once a second is the right cost/fidelity
+                    // trade, and batching keeps per-connection state to a
+                    // single cursor.
+                    if let Some(buf) = &log {
+                        let (entries, dropped) = buf.since_capped(last_log_id, LOG_BATCH_MAX);
+                        if !entries.is_empty() {
+                            last_log_id = entries.last().map(|r| r.id).unwrap_or(last_log_id);
+                            let payload =
+                                json!({ "entries": entries, "dropped": dropped }).to_string();
+                            let sse = SseEvent::default().event("log").data(payload);
+                            if tx.send(Ok(sse)).await.is_err() {
+                                break;
+                            }
+                            last_frame = std::time::Instant::now();
+                        }
+                    }
                     let payload = tick_payload(&engine.snapshot());
                     if last_tick_payload.as_deref() != Some(payload.as_str()) {
                         let sse = SseEvent::default().event("tick").data(&payload);
@@ -925,6 +955,25 @@ async fn sse_events(State(st): State<ApiState>) -> Response {
                             break; // client hung up
                         }
                         last_tick_payload = Some(payload);
+                        last_frame = std::time::Instant::now();
+                    } else if last_frame.elapsed() >= HEARTBEAT_AFTER {
+                        // The tick was suppressed as a duplicate — correct,
+                        // an idle queue should cost nothing (battery and
+                        // radio on phone PWAs). But that leaves a client
+                        // unable to tell "nothing is happening" from "this
+                        // stream died", which is exactly the state the old
+                        // gray "polling" dot could not distinguish. `hb` is
+                        // that distinction, and only that: it carries no
+                        // read model. Axum's KeepAlive comment lines stay —
+                        // proxies need them, but EventSource cannot see
+                        // them by design.
+                        let sse = SseEvent::default()
+                            .event("hb")
+                            .data(json!({ "now_unix": unix_now() }).to_string());
+                        if tx.send(Ok(sse)).await.is_err() {
+                            break;
+                        }
+                        last_frame = std::time::Instant::now();
                     }
                 }
                 next = events.next() => match next {
@@ -934,12 +983,14 @@ async fn sse_events(State(st): State<ApiState>) -> Response {
                         if tx.send(Ok(sse)).await.is_err() {
                             break; // client hung up
                         }
+                        last_frame = std::time::Instant::now();
                     }
                     Some(Err(BroadcastStreamRecvError::Lagged(n))) => {
                         let sse = SseEvent::default()
                             .event("lagged")
                             .data(json!({ "skipped": n }).to_string());
                         let _ = tx.send(Ok(sse)).await;
+                        last_frame = std::time::Instant::now();
                     }
                     None => break, // broadcast closed (engine gone)
                 },
@@ -949,6 +1000,21 @@ async fn sse_events(State(st): State<ApiState>) -> Response {
     Sse::new(ReceiverStream::new(rx))
         .keep_alive(KeepAlive::default())
         .into_response()
+}
+
+/// How long a silent stream may stay silent before it emits `hb`. Shorter
+/// than the client's 6.5 s staleness threshold, so an idle daemon never
+/// looks disconnected.
+const HEARTBEAT_AFTER: std::time::Duration = std::time::Duration::from_secs(5);
+/// Log lines per `log` frame. A burst above this is reported as `dropped`
+/// rather than paced out over minutes.
+const LOG_BATCH_MAX: usize = 200;
+
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 /// The 1 Hz SSE `tick` body: header status + job rows from one snapshot.
@@ -2120,6 +2186,197 @@ mod tests {
             text.contains("download_rate_bps") && text.contains("tickjob"),
             "tick carries status + job rows: {text:?}"
         );
+        engine.shutdown().await;
+    }
+
+    /// An idle queue deduplicates its ticks on purpose — the quiet-stream
+    /// property is deliberate (battery and radio on phone PWAs). That
+    /// leaves the client unable to tell "nothing is happening" from "this
+    /// stream is dead", which is precisely the hole `hb` closes.
+    #[tokio::test]
+    async fn idle_stream_emits_a_heartbeat_instead_of_going_silent() {
+        use tokio_stream::StreamExt as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = test_engine(&tmp).await;
+        // No jobs: after the first tick every later one is a duplicate.
+        let resp = router(engine.clone())
+            .oneshot(
+                axum::http::Request::get("/api/v1/events")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let mut body = resp.into_body().into_data_stream();
+        let mut text = String::new();
+        let got = tokio::time::timeout(std::time::Duration::from_secs(9), async {
+            while let Some(chunk) = body.next().await {
+                text.push_str(&String::from_utf8_lossy(&chunk.unwrap()));
+                if text.contains("event: hb") {
+                    return true;
+                }
+            }
+            false
+        })
+        .await;
+        assert_eq!(
+            got,
+            Ok(true),
+            "no hb within 9 s of an idle stream: {text:?}"
+        );
+        assert!(
+            text.contains("now_unix"),
+            "hb carries the daemon's clock so the client can measure staleness: {text:?}"
+        );
+        // The heartbeat is a liveness signal, not a second read model.
+        let hb = text.split("event: hb").nth(1).unwrap_or_default();
+        assert!(
+            !hb.contains("download_rate_bps"),
+            "hb must stay tiny — it is not a tick: {hb:?}"
+        );
+        engine.shutdown().await;
+    }
+
+    /// Daemon log lines reach the page over the same stream, batched onto
+    /// the 1 Hz loop. A `tail -f` that updates once a second is the right
+    /// cost/fidelity trade; the alternative is one frame per line.
+    #[tokio::test]
+    async fn sse_stream_carries_log_lines() {
+        use tokio_stream::StreamExt as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = test_engine(&tmp).await;
+        let log = LogBuffer::new(500);
+        let app = router_with(ApiState {
+            engine: engine.clone(),
+            history: None,
+            log: Some(log.clone()),
+            setup: None,
+            clients: None,
+            shutdown: None,
+        });
+        // Pre-existing lines must NOT be replayed: a fresh connection tails
+        // from now, and the REST endpoint is the backfill.
+        log.push("INFO", "ancient history".into());
+        let resp = app
+            .oneshot(
+                axum::http::Request::get("/api/v1/events")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let mut body = resp.into_body().into_data_stream();
+        let mut text = String::new();
+        // Wait for the first frame before logging anything: that is what
+        // proves the stream task has started and taken its log cursor.
+        // Pushing before then would race the cursor, not the feature.
+        let started = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while let Some(chunk) = body.next().await {
+                text.push_str(&String::from_utf8_lossy(&chunk.unwrap()));
+                if text.contains("event: tick") {
+                    return true;
+                }
+            }
+            false
+        })
+        .await;
+        assert_eq!(started, Ok(true), "stream never started: {text:?}");
+        log.push("INFO", "after the connect".into());
+        let got = tokio::time::timeout(std::time::Duration::from_secs(6), async {
+            while let Some(chunk) = body.next().await {
+                text.push_str(&String::from_utf8_lossy(&chunk.unwrap()));
+                if text.contains("event: log") {
+                    return true;
+                }
+            }
+            false
+        })
+        .await;
+        assert_eq!(got, Ok(true), "no log frame within 6 s: {text:?}");
+        assert!(text.contains("after the connect"), "got: {text:?}");
+        assert!(
+            !text.contains("ancient history"),
+            "a new stream must not replay the whole ring: {text:?}"
+        );
+        assert!(text.contains("\"dropped\""), "batches report what they cut");
+        engine.shutdown().await;
+    }
+
+    /// A burst bigger than one frame shows the NEWEST lines and says how
+    /// many it skipped. Showing the oldest instead would wedge the tail in
+    /// the past for as long as the burst lasted.
+    #[test]
+    fn log_batches_cap_and_report_what_they_skipped() {
+        let log = LogBuffer::new(1000);
+        for i in 0..500 {
+            log.push("INFO", format!("line {i}"));
+        }
+        let (batch, dropped) = log.since_capped(0, LOG_BATCH_MAX);
+        assert_eq!(batch.len(), LOG_BATCH_MAX, "the cap holds");
+        assert_eq!(dropped, 300, "…and the remainder is reported, not hidden");
+        assert_eq!(batch[0].text, "line 300", "the newest 200, not the oldest");
+        assert_eq!(batch[199].text, "line 499");
+        // Draining to the end leaves nothing behind and nothing skipped.
+        let (rest, dropped) = log.since_capped(batch[199].id, LOG_BATCH_MAX);
+        assert!(rest.is_empty());
+        assert_eq!(dropped, 0);
+        assert_eq!(
+            log.newest_id(),
+            batch[199].id,
+            "cursor lines up with the ring"
+        );
+    }
+
+    /// Per-server rates are the header rate sliced by provider — the same
+    /// bytes counted twice, never two independently-derived figures. This
+    /// is the same-measurement invariant the per-job rates already keep
+    /// (field report 2026-07-25: a header claiming 93 MiB/s over rows that
+    /// claimed 56).
+    #[test]
+    fn per_server_rates_are_the_same_bytes_as_the_header_rate() {
+        use nzbd_engine::rate::SpeedMeter;
+        let m = SpeedMeter::new();
+        m.add_for(1, 0, 600);
+        m.add_for(2, 0, 400);
+        m.add_for(1, 1, 1000);
+        let per_job = m.drain_jobs();
+        let per_server = m.drain_servers();
+        let job_sum: u64 = per_job.values().sum();
+        let server_sum: u64 = per_server.values().sum();
+        assert_eq!(job_sum, 2000);
+        assert_eq!(server_sum, job_sum, "same bytes, two attributions");
+        assert_eq!(m.tick(), 2000, "…and the same bytes again in the header");
+        assert_eq!(per_server[&0], 1000);
+        assert_eq!(per_server[&1], 1000);
+        assert!(
+            m.drain_servers().is_empty(),
+            "draining resets, so the next second starts clean"
+        );
+    }
+
+    /// The status DTO carries the per-server rows the UI draws its chips
+    /// from, one per configured server even before any bytes move.
+    #[tokio::test]
+    async fn status_carries_named_per_server_rows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = test_engine(&tmp).await;
+        let resp = router(engine.clone())
+            .oneshot(
+                axum::http::Request::get("/api/v1/status")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let v = body_json(resp).await;
+        assert!(
+            v["servers"].is_array(),
+            "status carries per-server rows: {v}"
+        );
+        for row in v["servers"].as_array().unwrap() {
+            assert!(row["name"].is_string(), "each row is named: {row}");
+            assert!(row["rate_bps"].is_number(), "…and carries a rate: {row}");
+        }
         engine.shutdown().await;
     }
 

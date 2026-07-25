@@ -303,6 +303,10 @@ pub(crate) struct Owner {
     /// Wire-byte EMA per job (B/s), fed from the meter's per-job counters
     /// at 1 Hz — the same measurement as the header rate.
     job_wire_ema: HashMap<u32, f64>,
+    /// The same, per server. Same counters, same cadence, same alpha — the
+    /// per-server rates are the header rate sliced by provider, so they sum
+    /// to it instead of to a second, differently-derived figure.
+    server_wire_ema: HashMap<u32, f64>,
     /// Article retries per job (any failed attempt that goes back on the
     /// ladder). Surfaced in the snapshot: this is the gap between wire
     /// throughput and completed bytes, and it must be visible.
@@ -445,6 +449,7 @@ impl Owner {
             mirror: HashMap::new(),
             job_rates: HashMap::new(),
             job_wire_ema: HashMap::new(),
+            server_wire_ema: HashMap::new(),
             retry_counts: HashMap::new(),
             state_dir: state_dir.to_path_buf(),
             journal,
@@ -1788,6 +1793,20 @@ impl Owner {
                 .or_insert_with(|| bytes as f64 * ALPHA);
         }
 
+        // Per-server wire rates: the identical fold over the identical
+        // counters, so "which provider is actually delivering this?" is
+        // answered in the same units as the header tile.
+        let per_server = self.meter.drain_servers();
+        for (server, ema) in self.server_wire_ema.iter_mut() {
+            let inst = per_server.get(server).copied().unwrap_or(0) as f64;
+            *ema += ALPHA * (inst - *ema);
+        }
+        for (server, bytes) in per_server {
+            self.server_wire_ema
+                .entry(server)
+                .or_insert_with(|| bytes as f64 * ALPHA);
+        }
+
         let now = Instant::now();
         let before = self.blocked.len();
         self.blocked.retain(|_, until| *until > now);
@@ -1958,16 +1977,40 @@ impl Owner {
             health_abort: self.tuning.health_abort,
             server_volumes: {
                 let now_day = unix_now().div_euclid(86_400);
-                let mut v: Vec<crate::snapshot::ServerVolume> = self
-                    .volumes
-                    .doc()
-                    .servers
-                    .iter()
-                    .map(|(id, w)| crate::snapshot::ServerVolume {
-                        server: *id,
-                        total_bytes: w.total_bytes,
-                        day_bytes: if w.day_key == now_day { w.day_bytes } else { 0 },
-                        month_bytes: w.month_bytes,
+                let name_of = |id: u32| {
+                    self.servers
+                        .iter()
+                        .find(|s| s.id.0 == id)
+                        .map(|s| s.name.clone())
+                        .unwrap_or_else(|| format!("server {id}"))
+                };
+                // Every configured server appears, even one that has never
+                // moved a byte: "which provider is quiet?" is exactly the
+                // question these rows exist to answer.
+                let mut ids: std::collections::BTreeSet<u32> =
+                    self.servers.iter().map(|s| s.id.0).collect();
+                ids.extend(self.volumes.doc().servers.keys().copied());
+                ids.extend(self.server_wire_ema.keys().copied());
+                let mut v: Vec<crate::snapshot::ServerVolume> = ids
+                    .into_iter()
+                    .map(|id| {
+                        let w = self.volumes.doc().servers.get(&id).cloned();
+                        crate::snapshot::ServerVolume {
+                            server: id,
+                            name: name_of(id),
+                            total_bytes: w.as_ref().map(|w| w.total_bytes).unwrap_or(0),
+                            day_bytes: w
+                                .as_ref()
+                                .filter(|w| w.day_key == now_day)
+                                .map(|w| w.day_bytes)
+                                .unwrap_or(0),
+                            month_bytes: w.as_ref().map(|w| w.month_bytes).unwrap_or(0),
+                            rate_bps: self
+                                .server_wire_ema
+                                .get(&id)
+                                .map(|e| e.max(0.0) as u64)
+                                .unwrap_or(0),
+                        }
                     })
                     .collect();
                 v.sort_by_key(|x| x.server);
