@@ -132,6 +132,11 @@
   .acts button:hover { color: var(--ink); }
   .acts .mv { font-size: 11px; padding: 2px 6px; }
   .acts .del:hover { border-color: var(--bad); color: var(--bad); }
+  /* Armed two-step button: the second click is the destructive one, and it
+     says so where you are already looking. */
+  .acts .del.armed { color: var(--bad); font-weight: 650;
+    border-color: color-mix(in srgb, var(--bad) 60%, transparent);
+    background: color-mix(in srgb, var(--bad) 12%, transparent); }
 
   .cfg-meta { color: var(--muted); font-size: 12px; margin-top: 12px; line-height: 1.5; }
   .cfg-meta code { color: var(--ink2); }
@@ -666,7 +671,9 @@ function toast(o) {
   if (o.action) {
     const b = dom.append(el, dom.create("button", "small"));
     dom.text(b, o.action.label);
-    b.onclick = () => { dismiss(); o.action.fn(); };
+    // Returns the action's own promise so a caller (the CI harness) can
+    // await the work it kicks off.
+    b.onclick = () => { dismiss(); return o.action.fn(); };
   }
   const x = dom.append(el, dom.create("button", "dismiss"));
   dom.text(x, "×");
@@ -956,7 +963,8 @@ function buildJobRow(d) {
   c.down = mk("mv", "move-down", "↓", "move down");
   c.bottom = mk("mv", "move-bottom", "⤓", "move to bottom");
   c.pause = mk("", "pause", "pause", "");
-  c.del = mk("del", "delete", "delete", "remove this job from the queue");
+  c.del = mk("del", "delete", "delete",
+    "Remove this job from the queue. One click — no dialog; you get 8 seconds to undo it.");
   tr.__c = c;
   return tr;
 }
@@ -1306,8 +1314,10 @@ function handoffModel(e) {
 
 function histModel(e) {
   const ho = handoffModel(e);
+  const key = "h" + e.job;
+  const isArmed = armIsSet(key);
   return {
-    key: "h" + e.job, kind: "hist", id: e.job,
+    key, kind: "hist", id: e.job,
     name: e.name, nameTip: e.final_dir || "",
     sub: "#" + e.job + (e.category ? " · " + e.category : ""),
     st: e.status, stCls: "st " + histClass(e.status),
@@ -1319,6 +1329,15 @@ function histModel(e) {
     visTip: e.hidden
       ? "make this visible to clients again — a connected *arr will re-import it on its next poll"
       : "hide from clients (keeps files and record)",
+    // A parked delete can go straight back to the queue, long after the
+    // Undo toast has faded.
+    requeueHidden: !e.can_requeue,
+    // The only destructive action on the page arms first (§ two-step).
+    delLabel: isArmed ? "sure?" : "delete files",
+    delCls: isArmed ? "del armed" : "del",
+    delTip: isArmed
+      ? "click again to delete the downloaded files — this one cannot be undone"
+      : "remove the record AND delete the downloaded files",
   };
 }
 
@@ -1344,6 +1363,8 @@ function buildHistRow(d) {
     d.prop(b, "title", title);
     return b;
   };
+  c.requeue = mk("", "h-requeue", "requeue",
+    "put this job back in the queue from its parked NZB");
   c.vis = mk("", "h-hide", "hide", "");
   c.forget = mk("", "h-delete", "forget", "remove the history record, keep files");
   c.delFiles = mk("del", "h-delete-files", "delete files",
@@ -1371,6 +1392,10 @@ function applyHistRow(tr, m, d) {
   w("visAction", m.visAction, v => d.data(c.vis, "action", v));
   w("visLabel", m.visLabel, v => d.text(c.vis, v));
   w("visTip", m.visTip, v => d.prop(c.vis, "title", v));
+  w("requeueHidden", m.requeueHidden, v => d.prop(c.requeue, "hidden", v));
+  w("delLabel", m.delLabel, v => d.text(c.delFiles, v));
+  w("delCls", m.delCls, v => d.cls(c.delFiles, v));
+  w("delTip", m.delTip, v => d.prop(c.delFiles, "title", v));
 }
 KINDS.hist = { build: buildHistRow, apply: applyHistRow };
 
@@ -1477,7 +1502,11 @@ async function refreshQueue() {
   // than flashing an empty state. The daemon seeds its snapshot before
   // serving, so a successful read is authoritative: empty means empty.
   const r = await jfetch("/api/v1/jobs");
+  if (!r.ok) throw new Error("jobs " + r.status);
   const { jobs } = await r.json();
+  // A body without `jobs` is a truncated or wrong response, not an empty
+  // queue: keep what we have rather than blanking the page over it.
+  if (!Array.isArray(jobs)) throw new Error("jobs: malformed response");
   store.jobs = jobs;
   store.jobsLoaded = true;
   pending.reconcile(jobs);
@@ -1487,13 +1516,18 @@ async function refreshHistory() {
   refreshClients().catch(() => {});
   const r = await jfetch("/api/v1/history?limit=200");
   if (r.status === 501) { store.history = "off"; renderHistory(); return; }
-  store.history = (await r.json()).entries;
+  if (!r.ok) throw new Error("history " + r.status);
+  const { entries } = await r.json();
+  if (!Array.isArray(entries)) throw new Error("history: malformed response");
+  store.history = entries;
   renderHistory();
 }
 async function refreshClients() {
   const r = await jfetch("/api/v1/clients");
   if (!r.ok) return;
-  store.clients = (await r.json()).clients;
+  const { clients } = await r.json();
+  if (!Array.isArray(clients)) return;
+  store.clients = clients;
   renderClients();
 }
 async function refreshLogs() {
@@ -1502,7 +1536,10 @@ async function refreshLogs() {
   const scopes = logScopes();
   const r = await jfetch("/api/v1/logs?limit=300&scope=" + scopes.join(","));
   if (r.status === 501) { store.logs = "off"; renderLogs(); return; }
-  store.logs = (await r.json()).entries;
+  if (!r.ok) throw new Error("logs " + r.status);
+  const { entries } = await r.json();
+  if (!Array.isArray(entries)) throw new Error("logs: malformed response");
+  store.logs = entries;
   renderLogs();
 }
 async function refreshJobDetail() {
@@ -1582,6 +1619,65 @@ const HIST_ACTIONS = {
   "h-hide": "hide", "h-restore": "restore",
   "h-delete": "delete", "h-delete-files": "delete-files",
 };
+
+// ---- delete: one click, gone, undoable ----------------------------------
+// There is no confirmation dialog in this page. A dialog interrupts you
+// BEFORE anything happens and then tells you nothing afterwards; an Undo
+// lets the common case (you meant it) cost one click and makes the rare
+// case (you didn't) cost one more. The server parks the job's regenerated
+// NZB, so Undo is a real requeue and not a re-download.
+const UNDO_MS = 8000;
+async function deleteJob(id, name) {
+  const res = await jobAction(id, "delete", {
+    key: pending.key(id, "delete"), kind: "delete", jobId: id,
+    label: "Deleting “" + name + "”",
+  });
+  if (!res) return; // jobAction already reverted the row and said why
+  if (res.parked) {
+    toast({
+      text: "Deleted “" + name + "”",
+      ttlMs: UNDO_MS,
+      action: { label: "Undo", fn: () => requeueJob(id, name) },
+    });
+  } else {
+    // No history store, or nothing to park: say so rather than offer an
+    // Undo that would fail.
+    toast({ text: "Deleted “" + name + "” — no history store, so this one can't be undone" });
+  }
+}
+/// Put a parked delete back. The job returns with a NEW id and rides in on
+/// the normal `job_added` event, so nothing here has to fake a row.
+async function requeueJob(job, name) {
+  const res = await post("/api/v1/history/" + job + "/actions/requeue");
+  if (!res.ok) {
+    toast({ text: "Couldn't bring “" + name + "” back — " + res.error, kind: "error", ttlMs: 10000 });
+    refreshAll();
+    return;
+  }
+  toast({ text: "“" + name + "” is back in the queue" });
+  refreshAll();
+}
+
+// ---- two-step inline arming ---------------------------------------------
+// One button at a time can be armed, for ARM_MS, and it disarms itself.
+// The armed key lives outside the DOM because the rows are reconciled — an
+// armed button must survive a tick, which is exactly what a `sure?` label
+// written straight onto the node would not.
+const ARM_MS = 3000;
+const armed = { key: null, timer: null };
+const histKey = (job) => "h" + job;
+function armIsSet(key) { return armed.key === key; }
+function armButton(key) {
+  if (armed.timer) clearTimeout(armed.timer);
+  armed.key = key;
+  armed.timer = setTimeout(() => { armed.key = null; armed.timer = null; renderHistory(); }, ARM_MS);
+  renderHistory();
+}
+function disarmButton() {
+  if (armed.timer) clearTimeout(armed.timer);
+  armed.key = null;
+  armed.timer = null;
+}
 document.addEventListener("click", (ev) => {
   const t = ev.target;
   const el = t && t.closest ? t.closest("[data-action]") : null;
@@ -1590,25 +1686,37 @@ document.addEventListener("click", (ev) => {
   const row = el.closest ? el.closest("[data-job-id]") : null;
   const id = Number(el.dataset.job || (row && row.dataset.jobId));
   const scope = row ? row.dataset.scope : "queue";
+  // Any other click disarms a pending two-step button: aiming somewhere
+  // else is as clear a "no" as waiting it out.
+  if (action !== "h-delete-files" && armed.key) { disarmButton(); renderHistory(); }
   if (action === "detail" || action === "detail-close") {
     toggleJob(id);
     return;
   }
   const name = row && row.__prev ? row.__prev.name : "this job";
   if (scope === "history") {
+    if (action === "h-requeue") { requeueJob(id, name); return; }
+    // "delete files" is the one genuinely destructive action in the page,
+    // so it arms in place instead of firing on the first click. Two-step,
+    // but both steps are on the button you already aimed at — no dialog
+    // stealing focus and no "are you sure?" for things that are undoable.
+    if (action === "h-delete-files") {
+      if (!armIsSet(histKey(id))) { armButton(histKey(id)); return; }
+      disarmButton();
+      histAction(id, "delete-files").then(r => {
+        if (r) toast({ text: "Deleted the files of “" + name + "”" });
+      });
+      return;
+    }
     const act = HIST_ACTIONS[action];
     if (!act) return;
-    if (act === "delete" && !confirm("Forget " + name + "? (files stay)")) return;
-    if (act === "delete-files" && !confirm("Delete FILES of " + name + "?")) return;
-    histAction(id, act);
+    histAction(id, act).then(r => {
+      if (r && act === "delete") toast({ text: "Forgot “" + name + "” — files kept" });
+    });
     return;
   }
   if (action === "delete") {
-    if (!confirm("Delete " + name + "?")) return;
-    jobAction(id, "delete", {
-      key: pending.key(id, "delete"), kind: "delete", jobId: id,
-      label: "Deleting " + name,
-    });
+    deleteJob(id, name);
     return;
   }
   if (action === "pause" || action === "resume") {
@@ -2322,7 +2430,9 @@ if (typeof __nzbd_test_enable !== "undefined") {
     histModel, fileModel, statusModels, queueModels, detailModel,
     statusName, healthColor, fmtBytes, fmtRate, fmtEta,
     pending, satisfied, toast, connState, pollResult,
-    PENDING_TTL_MS,
+    PENDING_TTL_MS, UNDO_MS, ARM_MS,
+    armButton, armIsSet, disarmButton, histKey, renderHistory,
+    deleteJob, requeueJob, jobAction, histAction, post,
     setOpenJob: (id) => { openJob = id; },
     conn: () => store.conn,
   };

@@ -108,6 +108,18 @@ function stubEl(id) {
   return t;
 }
 const elCache = new Map();
+// Scripted daemon. `routes` maps a URL substring to {status, body}; the
+// default is a dead daemon, which is what the boot path should survive.
+const routes = new Map();
+const seen = [];
+async function routeFetch(url, init) {
+  seen.push({ url, method: (init && init.method) || "GET" });
+  for (const [frag, res] of routes) {
+    if (String(url).includes(frag))
+      return { ok: res.status < 400, status: res.status, json: async () => res.body, text: async () => "" };
+  }
+  return { ok: false, status: 503, json: async () => ({}), text: async () => "" };
+}
 const sandbox = {
   console,
   __nzbd_test_enable: true,
@@ -125,7 +137,8 @@ const sandbox = {
   navigator: { serviceWorker: { register: () => Promise.resolve() } },
   localStorage: { getItem: () => null, setItem() {}, removeItem() {} },
   location: { reload() {} },
-  fetch: async () => ({ ok: false, status: 503, json: async () => ({}), text: async () => "" }),
+  // Swappable so the action tests can script the daemon's answers.
+  fetch: async (url, init) => routeFetch(url, init),
   EventSource: class { constructor(u) { this.url = u; } addEventListener() {} },
   setInterval: () => 0, clearInterval() {},
   setTimeout: () => 0, clearTimeout() {},
@@ -135,7 +148,10 @@ const sandbox = {
 };
 sandbox.window = sandbox;
 sandbox.globalThis = sandbox;
-process.on("unhandledRejection", () => {});
+process.on("unhandledRejection", (e) => {
+  console.error("UI DOM HARNESS: unhandled rejection: " + (e && e.stack ? e.stack : e));
+  process.exit(1);
+});
 
 vm.createContext(sandbox);
 try {
@@ -344,8 +360,11 @@ const models = (jobs) => jobs.map((j, i) => T.rowModel(j, { idx: i, count: jobs.
   const tbody = node("tbody");
   T.reconcileRows(tbody, [m], fake);
   const acts = tbody.children[0].children[5].children[0];
-  eq(acts.children.length, 3, "hide / forget / delete-files");
-  eq(acts.children[2].dataset.action, "h-delete-files", "destructive action is data-driven");
+  eq(acts.children.length, 4, "requeue / hide / forget / delete-files");
+  eq(acts.children[3].dataset.action, "h-delete-files", "destructive action is data-driven");
+  eq(acts.children[0].hidden, true, "requeue is hidden unless the entry is parked");
+  T.reconcileRows(tbody, [T.histModel(Object.assign({}, e, { status: "DELETED", can_requeue: true }))], fake);
+  eq(acts.children[0].hidden, false, "a parked entry can go back to the queue");
 }
 
 // --- 11. laws #1 and #4 as grep-able properties of the source -------------
@@ -520,10 +539,113 @@ const models = (jobs) => jobs.map((j, i) => T.rowModel(j, { idx: i, count: jobs.
   eq(off.className, "", "banner gone");
 }
 
-if (failures.length) {
-  console.error("UI DOM FAILURES:");
-  for (const f of failures) console.error("  - " + f);
-  process.exit(1);
+// --- 20. no blocking dialogs anywhere in the page ------------------------
+// The acceptance line for M4: a `confirm(` or `alert(` call, anywhere, is a
+// regression. Comments are allowed to talk about them; code is not.
+{
+  const calls = [];
+  scriptMatch[1].split("\n").forEach((line, i) => {
+    const code = line.replace(/^\s*\/\/.*$/, "");
+    if (/(^|[^.\w])(confirm|alert)\s*\(/.test(code)) calls.push(`line ${i + 1}: ${line.trim()}`);
+  });
+  eq(calls.length, 0, `no confirm()/alert() calls remain (${calls.join(" | ")})`);
 }
-console.log(`ui dom ok: ${checks} assertions`);
-process.exit(0);
+
+// --- 21. "delete files" arms in place instead of opening a dialog --------
+{
+  const e = {
+    job: 4, name: "old job", category: "tv", final_dir: "/dest/x", status: "SUCCESS",
+    size: 2048, completed_at_unix: 1000, hidden: false, seen_count: 0,
+    last_seen_at_unix: null, removed_at_unix: null, picked_up_by: null,
+  };
+  T.disarmButton();
+  eq(T.histModel(e).delLabel, "delete files", "unarmed: the plain label");
+  eq(T.histModel(e).delCls, "del", "…and the plain class");
+  T.armButton(T.histKey(4));
+  ok(T.armIsSet(T.histKey(4)), "the button is armed");
+  const armedModel = T.histModel(e);
+  eq(armedModel.delLabel, "sure?", "armed: the button says what the next click does");
+  eq(armedModel.delCls, "del armed", "…and looks like it");
+  ok(armedModel.delTip.includes("cannot be undone"),
+    "the tooltip is explicit that this one is the irreversible action");
+  // Arming lives outside the DOM, so it survives a reconcile — a `sure?`
+  // written straight onto the node would be wiped by the next tick.
+  const tbody = node("tbody");
+  T.reconcileRows(tbody, [T.histModel(e)], fake);
+  const btn = tbody.children[0].children[5].children[0].children[3];
+  eq(btn.textContent, "sure?", "armed state renders");
+  T.reconcileRows(tbody, [T.histModel(e)], fake);
+  eq(btn.textContent, "sure?", "…and survives a re-render");
+  // Arming a different button disarms the first: only one at a time.
+  T.armButton(T.histKey(9));
+  ok(!T.armIsSet(T.histKey(4)), "arming elsewhere disarms the previous button");
+  T.disarmButton();
+  T.reconcileRows(tbody, [T.histModel(e)], fake);
+  eq(btn.textContent, "delete files", "disarming restores the plain label");
+}
+
+// --- 22. the delete -> Undo state machine, end to end -------------------
+// This is the whole point of M4: one click deletes, the toast offers Undo
+// for as long as the server says the job is parked, and Undo requeues it.
+(async () => {
+  const stack = sandbox.document.getElementById("toasts");
+  const reset = () => { stack.children.length = 0; routes.clear(); seen.length = 0; T.pending.clear(); };
+
+  // (a) a parked delete offers Undo
+  reset();
+  T.store.jobs = [job(1, { name: "big movie" })];
+  T.store.jobsLoaded = true;
+  routes.set("/actions/delete", { status: 200, body: { ok: true, parked: true } });
+  await T.deleteJob(1, "big movie");
+  eq(seen.filter(r => r.url.includes("/jobs/1/actions/delete") && r.method === "POST").length, 1,
+    "exactly one delete POST, fired without a dialog");
+  eq(stack.children.length, 1, "the user is told the job is gone");
+  const t = stack.children[0];
+  ok(t.children[0].textContent.includes("big movie"), "…by name");
+  eq(t.children[1].textContent, "Undo", "…with an Undo on offer");
+  eq(T.UNDO_MS, 8000, "Undo stays available for 8 s");
+
+  // (b) Undo requeues it
+  routes.set("/actions/requeue", { status: 200, body: { id: 42 } });
+  await t.children[1].onclick();
+  eq(seen.filter(r => r.url.includes("/history/1/actions/requeue")).length, 1,
+    "Undo goes through the requeue action");
+  ok(stack.children.some(x => x.children[0].textContent.includes("back in the queue")),
+    "…and says so when it worked");
+
+  // (c) nothing parked -> no Undo is promised
+  reset();
+  T.store.jobs = [job(2, { name: "no undo" })];
+  routes.set("/actions/delete", { status: 200, body: { ok: true, parked: false } });
+  await T.deleteJob(2, "no undo");
+  eq(stack.children.length, 1, "still reported");
+  eq(stack.children[0].children.length, 2, "but with no action button — just the dismiss ×");
+  ok(stack.children[0].children[0].textContent.includes("can't be undone"),
+    "…and it says why");
+
+  // (d) a failed delete reverts the row and quotes the daemon
+  reset();
+  T.store.jobs = [job(3, { name: "stubborn" })];
+  routes.set("/actions/delete", { status: 503, body: { error: "engine is shutting down" } });
+  await T.deleteJob(3, "stubborn");
+  eq(T.pending.ops.size, 0, "the optimistic hide is rolled back");
+  eq(T.queueModels().filter(m => m.kind === "job").length, 1, "the row is visible again");
+  ok(stack.children[0].children[0].textContent.includes("engine is shutting down"),
+    "the toast carries the daemon's own words, not 'something went wrong'");
+  ok(stack.children[0].className.includes("bad"), "…and reads as an error");
+
+  // (e) a failed Undo says so instead of pretending
+  reset();
+  routes.set("/actions/requeue", { status: 404, body: { error: "no parked NZB for this entry" } });
+  await T.requeueJob(7, "vanished");
+  ok(stack.children[0].children[0].textContent.includes("no parked NZB"),
+    "a requeue that cannot work says why");
+
+  if (failures.length) {
+    console.error("UI DOM FAILURES:");
+    for (const f of failures) console.error("  - " + f);
+    process.exit(1);
+  }
+  console.log(`ui dom ok: ${checks} assertions`);
+  process.exit(0);
+})();

@@ -178,7 +178,7 @@ performance work and operator actions
   - ✅ M1 keyed in-place renderer — store + `rowModel`/`reconcileRows`/`applyRow`, one delegated click listener, detail panel as a stable subtree; `crates/nzbd/tests/ui_dom.rs` pins the five rendering laws
   - ✅ M2 optimistic actions with revert + toasts — every mutating click applies to the view immediately and is reverted (with the daemon's own error text) if the POST fails or nothing confirms it inside 5 s; honest `live`/`reconnecting`/`unreachable` states, the last with a page-wide banner
   - ✅ M3 delete parks the regenerated NZB to history as `DELETED` + `requeue` action — spool beside the history index (`nzbs/<job>.nzb`, reaped with its entry and swept for orphans on open), `delete` answers `{ok, parked}`, entries carry `can_requeue`; a job still `Fetching` parks its `*URL` instead. Engine untouched
-  - ⬜ M4 instant undoable delete — `confirm()` removed everywhere
+  - ✅ M4 instant undoable delete — one click, the row is gone before your finger lifts, an 8 s `Undo` toast wired to `requeue`; history `forget` is instant, `delete files` (the one irreversible action) arms in place for 3 s; zero `confirm()`/`alert()` calls left, pinned by the DOM test
   - ⬜ M5 SSE `hb` + `log` events, per-server wire rates
   - ⬜ M6 sparkline, title ticker, server chips, live log tail
   - ⬜ M7 docs sweep (ARCHITECTURE §12 as-built UI, USAGE `requeue`/`parked`)

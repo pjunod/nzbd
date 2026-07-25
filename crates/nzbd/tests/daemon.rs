@@ -35,6 +35,27 @@ fn wait_healthy(addr: &str, deadline: Duration) {
     }
 }
 
+/// `http`, but for the window right after a restart. `wait_healthy` can be
+/// answered by the OUTGOING listener a moment before it closes, so the very
+/// next request lands on a socket that RESETs — a real, if narrow, race, and
+/// one a test must not turn into a red build. Retries any transport error
+/// and any non-2xx until the deadline.
+fn http_settled(addr: &str, method: &str, path: &str, deadline: Duration) -> (u16, String) {
+    let start = Instant::now();
+    loop {
+        let last = try_http(addr, method, path, b"", None);
+        if let Some((code, body)) = last.clone() {
+            if (200..300).contains(&code) {
+                return (code, body);
+            }
+        }
+        if start.elapsed() > deadline {
+            panic!("{method} {path} never settled at {addr} (last: {last:?})");
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
 fn free_port() -> u16 {
     std::net::TcpListener::bind("127.0.0.1:0")
         .unwrap()
@@ -434,7 +455,7 @@ scripts_dir = "{scripts}"
 
     // Serving real state again, and the interrupted job survived into the
     // restarted queue (unstamped, so PP will pick it back up).
-    let (code, body) = http(&api_addr, "GET", "/api/v1/jobs", b"");
+    let (code, body) = http_settled(&api_addr, "GET", "/api/v1/jobs", Duration::from_secs(20));
     assert_eq!(code, 200);
     assert!(body.contains("ppjob"), "queue survived the restart: {body}");
 }
