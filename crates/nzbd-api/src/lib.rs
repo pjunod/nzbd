@@ -328,10 +328,39 @@ async fn healthz() -> &'static str {
 /// The embedded web UI (phase 4): one self-contained page, no build step.
 async fn ui_index() -> Response {
     (
-        [(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        [
+            (axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8"),
+            // Revalidate (not no-store): UI updates land on next load, and
+            // the service worker still keeps an offline copy.
+            (axum::http::header::CACHE_CONTROL, "no-cache"),
+        ],
         include_str!("../ui/index.html"),
     )
         .into_response()
+}
+
+/// Default `Cache-Control: no-store` on every response that didn't set its
+/// own policy — i.e. all the live JSON endpoints. Browsers (Safari most
+/// aggressively) heuristically cache same-URL `fetch()` GETs that carry no
+/// cache header, which froze the dashboard's 5 s poll on whatever the
+/// first response said until a full page reload. Live data must never be
+/// served from a browser cache; the PWA assets keep their explicit
+/// long-lived headers.
+async fn no_store_by_default(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let mut resp = next.run(req).await;
+    if !resp
+        .headers()
+        .contains_key(axum::http::header::CACHE_CONTROL)
+    {
+        resp.headers_mut().insert(
+            axum::http::header::CACHE_CONTROL,
+            axum::http::HeaderValue::from_static("no-store"),
+        );
+    }
+    resp
 }
 
 // PWA assets, all compiled into the binary. Cache header keeps phones
@@ -521,11 +550,20 @@ async fn set_speed_limit(State(st): State<ApiState>, Json(body): Json<SpeedLimit
 /// `GET /api/v1/events` — engine events as SSE (`event:` = variant name,
 /// `data:` = JSON payload). Lagged consumers observe a `lagged` event and
 /// should resync from `/api/v1/status`.
+///
+/// On top of the discrete engine events, a `tick` event carries the full
+/// `{status, jobs}` read model at 1 Hz (skipped while nothing changes).
+/// Progress bars, rates and ETAs have no discrete event — without the
+/// tick, a dashboard only moves as fast as its poll fallback, which is
+/// exactly the "page frozen until I hit refresh" field report. Header
+/// stats and per-job rows come from the SAME snapshot, so they can never
+/// disagree the way two separately-cached endpoints did.
 async fn sse_events(State(st): State<ApiState>) -> Response {
     use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
     use tokio_stream::wrappers::{BroadcastStream, ReceiverStream};
 
     let events = BroadcastStream::new(st.engine.subscribe());
+    let engine = st.engine.clone();
     let mut shutdown = st.shutdown.clone();
     // Forward engine events into the SSE body, but stop the instant the
     // daemon starts shutting down — an open `/api/v1/events` connection
@@ -533,9 +571,22 @@ async fn sse_events(State(st): State<ApiState>) -> Response {
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<SseEvent, std::convert::Infallible>>(64);
     tokio::spawn(async move {
         tokio::pin!(events);
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut last_tick_payload: Option<String> = None;
         loop {
             tokio::select! {
                 _ = wait_shutdown(&mut shutdown) => break,
+                _ = tick.tick() => {
+                    let payload = tick_payload(&engine.snapshot());
+                    if last_tick_payload.as_deref() != Some(payload.as_str()) {
+                        let sse = SseEvent::default().event("tick").data(&payload);
+                        if tx.send(Ok(sse)).await.is_err() {
+                            break; // client hung up
+                        }
+                        last_tick_payload = Some(payload);
+                    }
+                }
                 next = events.next() => match next {
                     Some(Ok(ev)) => {
                         let (name, data) = event_wire(&ev);
@@ -558,6 +609,11 @@ async fn sse_events(State(st): State<ApiState>) -> Response {
     Sse::new(ReceiverStream::new(rx))
         .keep_alive(KeepAlive::default())
         .into_response()
+}
+
+/// The 1 Hz SSE `tick` body: header status + job rows from one snapshot.
+fn tick_payload(snap: &QueueSnapshot) -> String {
+    json!({ "status": status_dto(snap), "jobs": snap.jobs }).to_string()
 }
 
 /// Resolve when the daemon is shutting down; pend forever if no shutdown
@@ -602,7 +658,20 @@ fn event_wire(ev: &nzbd_engine::Event) -> (&'static str, String) {
             "server_blocked",
             json!({"server": server.0, "seconds": seconds}).to_string(),
         ),
-        other => ("event", json!({"debug": format!("{other:?}")}).to_string()),
+        // Named wire events, not a `_ => "event"` catch-all: the UI keys
+        // its refresh nudges on these names (a pause emitted as the opaque
+        // "event" was invisible to it — part of the stale-pause report).
+        E::QueuePauseChanged { paused } => {
+            ("queue_pause_changed", json!({"paused": paused}).to_string())
+        }
+        E::SpeedLimitChanged { bytes_per_sec } => (
+            "speed_limit_changed",
+            json!({"bytes_per_sec": bytes_per_sec}).to_string(),
+        ),
+        E::JobAssigned { job, node } => (
+            "job_assigned",
+            json!({"job": job.0, "node": node}).to_string(),
+        ),
     }
 }
 
@@ -1157,6 +1226,7 @@ pub fn router_with(state: ApiState) -> Router {
         .route("/icons/icon-512.png", get(icon_512))
         .route("/icons/icon-maskable-512.png", get(icon_maskable))
         .route("/apple-touch-icon.png", get(apple_touch_icon))
+        .layer(axum::middleware::from_fn(no_store_by_default))
         .with_state(state)
 }
 
@@ -1464,5 +1534,140 @@ mod tests {
         assert!(text.contains("# TYPE nzbd_jobs gauge"));
         assert!(text.contains("nzbd_remaining_bytes 0"));
         engine.shutdown().await;
+    }
+
+    /// Field report 2026-07-25: the dashboard froze until a browser
+    /// reload — Safari served the 5 s poll from its HTTP cache because the
+    /// JSON endpoints sent no Cache-Control at all. Live endpoints must say
+    /// `no-store`; the PWA assets keep their long-lived cache; the shell
+    /// revalidates.
+    #[tokio::test]
+    async fn cache_headers_no_store_on_api_cacheable_assets() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = test_engine(&tmp).await;
+        let app = router(engine.clone());
+
+        let get = |path: &'static str| {
+            let app = app.clone();
+            async move {
+                app.oneshot(
+                    axum::http::Request::get(path)
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+            }
+        };
+
+        for path in ["/api/v1/status", "/api/v1/jobs", "/api/v1/setup"] {
+            let resp = get(path).await;
+            assert_eq!(
+                resp.headers()
+                    .get(axum::http::header::CACHE_CONTROL)
+                    .and_then(|v| v.to_str().ok()),
+                Some("no-store"),
+                "{path} must never be served from a browser cache"
+            );
+        }
+        let resp = get("/icons/icon-192.png").await;
+        assert_eq!(
+            resp.headers()
+                .get(axum::http::header::CACHE_CONTROL)
+                .and_then(|v| v.to_str().ok()),
+            Some("public, max-age=86400"),
+            "icons keep their long-lived cache header"
+        );
+        let resp = get("/").await;
+        assert_eq!(
+            resp.headers()
+                .get(axum::http::header::CACHE_CONTROL)
+                .and_then(|v| v.to_str().ok()),
+            Some("no-cache"),
+            "the shell revalidates so UI updates land on next load"
+        );
+        engine.shutdown().await;
+    }
+
+    /// The SSE stream must carry data by itself — progress/rate have no
+    /// discrete engine event, so without the 1 Hz `tick` a dashboard on a
+    /// quiet-event queue never moves (the "frozen until refresh" report).
+    /// The first frame arrives immediately (interval tick zero).
+    #[tokio::test]
+    async fn sse_stream_sends_tick_with_full_read_model() {
+        use tokio_stream::StreamExt as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = test_engine(&tmp).await;
+
+        // A job in the queue so the tick payload carries a row.
+        let app = router(engine.clone());
+        let resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::post("/api/v1/jobs?name=tickjob")
+                    .body(axum::body::Body::from(NZB))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        let resp = app
+            .oneshot(
+                axum::http::Request::get("/api/v1/events")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(
+            resp.headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|v| v.starts_with("text/event-stream")),
+            "SSE content type"
+        );
+
+        let mut body = resp.into_body().into_data_stream();
+        let mut text = String::new();
+        // Collect frames until the tick shows up (bounded by the timeout).
+        let deadline = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while let Some(chunk) = body.next().await {
+                text.push_str(&String::from_utf8_lossy(&chunk.unwrap()));
+                if text.contains("event: tick") && text.contains("\n\n") {
+                    break;
+                }
+            }
+        })
+        .await;
+        assert!(deadline.is_ok(), "no tick frame within 5 s: {text:?}");
+        assert!(text.contains("event: tick"), "got: {text:?}");
+        assert!(
+            text.contains("download_rate_bps") && text.contains("tickjob"),
+            "tick carries status + job rows: {text:?}"
+        );
+        engine.shutdown().await;
+    }
+
+    /// Every engine event crosses the wire under its own name — the UI
+    /// keys refresh nudges on these (a pause emitted as an opaque "event"
+    /// was invisible to it; part of the stale-pause report).
+    #[test]
+    fn event_wire_names_cover_pause_and_limit() {
+        use nzbd_engine::Event as E;
+        let (name, data) = event_wire(&E::QueuePauseChanged { paused: true });
+        assert_eq!(name, "queue_pause_changed");
+        assert!(data.contains("true"));
+        let (name, data) = event_wire(&E::SpeedLimitChanged {
+            bytes_per_sec: Some(1024),
+        });
+        assert_eq!(name, "speed_limit_changed");
+        assert!(data.contains("1024"));
+        let (name, _) = event_wire(&E::JobAssigned {
+            job: JobId(7),
+            node: Some("n2".into()),
+        });
+        assert_eq!(name, "job_assigned");
     }
 }

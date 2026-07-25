@@ -598,3 +598,111 @@ async fn url_jobs_fetch_then_download() {
     assert_eq!(status, JobStatus::Failed);
     engine.shutdown().await;
 }
+
+/// Field report 2026-07-25: URL jobs restarted mid-fetch sat at
+/// "FETCHING · 0 B of 0 B" forever (the fetch task died with the old
+/// process and recovery never re-spawned it), each showing the raw URL
+/// tail — query junk, API key and all — as its title. This drives the
+/// whole arc: junk-free placeholder name at add time, same-URL re-adds
+/// deduplicated to the in-flight job, a shutdown that doesn't hang on the
+/// stalled fetch, and a restart that re-spawns the fetch and completes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn url_fetch_resumes_after_restart_with_clean_name() {
+    use std::io::{Read as _, Write as _};
+    let data = prng_bytes(33, 50_000);
+    let post = build_post("restartfetch", &[("r.bin", data.clone())], 20_000);
+    let ns = NservBuilder::new().with_post(&post).start().await.unwrap();
+
+    // HTTP server: connection #1 stalls (reads the request, then holds the
+    // socket until the client goes away — the pre-restart fetch);
+    // connection #2 serves the NZB (the post-restart re-fetch).
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let http_port = listener.local_addr().unwrap().port();
+    let nzb = post.nzb.clone();
+    std::thread::spawn(move || {
+        let (mut s, _) = listener.accept().unwrap();
+        let mut buf = [0u8; 2048];
+        let _ = s.read(&mut buf); // request
+        let _ = s.read(&mut buf); // blocks until the fetch task is cancelled
+        drop(s);
+        let (mut s, _) = listener.accept().unwrap();
+        let _ = s.read(&mut buf);
+        let _ = s.write_all(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{nzb}",
+                nzb.len()
+            )
+            .as_bytes(),
+        );
+    });
+
+    // Indexer-style URL with the query glued on after ".nzb" — the exact
+    // shape that used to become the job title verbatim.
+    let url = format!(
+        "http://127.0.0.1:{http_port}/getnzb/af51ab64582e226f4bc8de91b7b757d8067ba8e6.nzb&i=136144&r=secretapikey"
+    );
+
+    let tmp = tempfile::tempdir().unwrap();
+    let engine = spawn_engine(tmp.path(), vec![server_def(1, ns.port(), 0, 4, 2)]).await;
+    let id = engine
+        .add_url("", &url, nzbd_engine::AddOpts::default())
+        .await
+        .unwrap();
+
+    // The Fetching placeholder is named from the URL *without* the glued
+    // query string (which carried the user's API key).
+    let snap = engine.snapshot();
+    let job = snap.jobs.iter().find(|j| j.id == id).unwrap();
+    assert!(matches!(job.status, JobStatus::Fetching));
+    assert_eq!(job.name, "af51ab64582e226f4bc8de91b7b757d8067ba8e6");
+
+    // A client re-adding the same URL while it fetches must not queue a
+    // second copy of the download.
+    let again = engine
+        .add_url("", &url, nzbd_engine::AddOpts::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        again, id,
+        "same-URL add while fetching returns the same job"
+    );
+    assert_eq!(engine.snapshot().jobs.len(), 1);
+
+    // Graceful shutdown with the fetch mid-flight: the cancel-aware fetch
+    // task must abort promptly instead of holding shutdown for its 60 s
+    // hop timeout.
+    tokio::time::timeout(Duration::from_secs(10), engine.shutdown())
+        .await
+        .expect("shutdown must not hang on an in-flight NZB fetch");
+
+    // Restart on the same state: recovery re-spawns the fetch, the NZB
+    // arrives, and the job downloads to completion.
+    let engine = spawn_engine(tmp.path(), vec![server_def(1, ns.port(), 0, 4, 2)]).await;
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let snap = engine.snapshot();
+        let job = snap
+            .jobs
+            .iter()
+            .find(|j| j.id == id)
+            .expect("job survives restart");
+        if matches!(job.status, JobStatus::Completed) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "job did not complete after restart; status: {:?}",
+            job.status
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert_eq!(
+        std::fs::read(
+            tmp.path()
+                .join("dest/af51ab64582e226f4bc8de91b7b757d8067ba8e6/r.bin")
+        )
+        .unwrap(),
+        data
+    );
+    engine.shutdown().await;
+}

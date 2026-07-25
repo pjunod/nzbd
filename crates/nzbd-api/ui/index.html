@@ -64,6 +64,13 @@
   button { background: var(--panel); color: var(--ink); border: 1px solid var(--line);
            border-radius: 7px; padding: 6px 12px; font: inherit; font-size: 13px; cursor: pointer; }
   button:hover { border-color: var(--accent); }
+  button:disabled { opacity: .45; cursor: default; }
+  button:disabled:hover { border-color: var(--line); }
+  /* The queue-state button that is currently in effect (e.g. "Pause
+     queue" while paused): stays visibly latched, not just disabled. */
+  button.active { color: var(--warn); font-weight: 600;
+    border-color: color-mix(in srgb, var(--warn) 55%, transparent);
+    background: color-mix(in srgb, var(--warn) 10%, transparent); opacity: 1; }
   button.small { padding: 2px 9px; font-size: 12px; }
   input[type=number] { width: 90px; background: var(--panel); color: var(--ink);
            border: 1px solid var(--line); border-radius: 7px; padding: 6px 8px; font: inherit; }
@@ -387,6 +394,14 @@
 "use strict";
 const $ = (id) => document.getElementById(id);
 
+// Every data request bypasses the browser's HTTP cache. Some browsers
+// (Safari most aggressively) heuristically cache same-URL fetch() GETs
+// that carry no cache headers — which froze this dashboard on its first
+// response until a full page reload. The server now also sends
+// `Cache-Control: no-store` on the API; this is the client-side belt to
+// that suspender.
+const jfetch = (url, opts) => fetch(url, { cache: "no-store", ...opts });
+
 function fmtBytes(n) {
   if (n == null) return "—";
   const u = ["B", "KiB", "MiB", "GiB", "TiB"];
@@ -445,10 +460,13 @@ function esc(s) {
 
 // ---- status -------------------------------------------------------------
 async function refreshStatus() {
-  const r = await fetch("/api/v1/status");
+  const r = await jfetch("/api/v1/status");
   if (!r.ok) throw new Error("status " + r.status);
-  const s = await r.json();
+  renderStatus(await r.json());
+}
+function renderStatus(s) {
   healthAbortArmed = !!s.health_abort;
+  setPauseButtons(!!s.download_paused);
   $("ver").textContent = "v" + s.version;
   $("s-rate").textContent = fmtRate(s.download_rate_bps);
   $("s-eta").textContent = s.download_paused ? "paused" : fmtEta(s.remaining_bytes, s.download_rate_bps);
@@ -473,6 +491,18 @@ async function refreshStatus() {
     $("limit").value = Math.round(s.speed_limit_bps / 1024);
 }
 
+// The button matching the current state latches (disabled + amber) so the
+// pair reads as a state indicator, and a click flips it before the server
+// even answers — "did anything happen?" must never require a reload.
+function setPauseButtons(paused) {
+  const p = $("btn-pause"), r = $("btn-resume");
+  p.disabled = paused;
+  p.classList.toggle("active", paused);
+  p.title = paused ? "The queue is paused." : "Stop all downloading (jobs stay queued).";
+  r.disabled = !paused;
+  r.title = paused ? "Start downloading again." : "The queue is already running.";
+}
+
 // ---- queue --------------------------------------------------------------
 // Whether the daemon will abort downloads that drop below repair limit
 // ([post] health_action = park/delete). Captured from /status so the
@@ -491,8 +521,11 @@ async function refreshQueue() {
   // "Loading the queue…" placeholder — in place rather than flashing an
   // empty state. The daemon seeds its snapshot before serving, so a
   // successful read is authoritative: empty means genuinely empty.
-  const r = await fetch("/api/v1/jobs");
+  const r = await jfetch("/api/v1/jobs");
   const { jobs } = await r.json();
+  renderQueue(jobs);
+}
+function renderQueue(jobs) {
   const body = $("queue-body");
   if (!jobs.length) {
     body.innerHTML = '<tr><td colspan="6" class="empty">No downloads in the queue.</td></tr>';
@@ -506,7 +539,12 @@ async function refreshQueue() {
     const cls = STATUS_CLASS[st] || "dim";
     const paused = st === "paused";
     const dl = st === "downloading";
-    const detail = [`<b>${fmtBytes(done)}</b> of ${fmtBytes(total)}`];
+    const fetching = st === "fetching";
+    // A URL job has no articles until its NZB arrives — "0 B of 0 B" reads
+    // as broken; say what it is actually doing.
+    const detail = fetching
+      ? ["fetching the NZB from the indexer…"]
+      : [`<b>${fmtBytes(done)}</b> of ${fmtBytes(total)}`];
     if (dl && j.rate_bps > 0) {
       detail.push(fmtRate(j.rate_bps));
       detail.push("~" + fmtEta(Math.max(0, j.remaining_bytes), j.rate_bps));
@@ -517,17 +555,17 @@ async function refreshQueue() {
           <span class="st ${cls} st-inline">${esc(st).toUpperCase()}</span></div></td>
       <td><span class="st ${cls}">${esc(st).toUpperCase()}</span></td>
       <td><div class="meter">
-            <div class="bar"><div class="track"><div class="fill${pct >= 100 ? " done" : ""}" style="width:${pct}%"></div></div><span class="pct">${pct}%</span></div>
+            <div class="bar"><div class="track"><div class="fill${pct >= 100 ? " done" : ""}" style="width:${pct}%"></div></div><span class="pct">${fetching ? "" : pct + "%"}</span></div>
             <div class="detail">${detail.join(" · ")}</div>
           </div></td>
-      <td class="num">${fmtBytes(total)}</td>
-      <td class="num">${healthCell(j, dl)}</td>
+      <td class="num">${fetching ? "—" : fmtBytes(total)}</td>
+      <td class="num">${fetching ? "—" : healthCell(j, dl)}</td>
       <td><div class="acts">
         <button class="mv" title="move to top" onclick="jobAction(${j.id}, 'move-top')" ${idx === 0 ? "disabled" : ""}>⤒</button>
         <button class="mv" title="move up" onclick="jobAction(${j.id}, 'move-up')" ${idx === 0 ? "disabled" : ""}>↑</button>
         <button class="mv" title="move down" onclick="jobAction(${j.id}, 'move-down')" ${idx === jobs.length - 1 ? "disabled" : ""}>↓</button>
         <button class="mv" title="move to bottom" onclick="jobAction(${j.id}, 'move-bottom')" ${idx === jobs.length - 1 ? "disabled" : ""}>⤓</button>
-        <button onclick="jobAction(${j.id}, '${paused ? "resume" : "pause"}')">${paused ? "resume" : "pause"}</button>
+        ${fetching ? "" : `<button onclick="jobAction(${j.id}, '${paused ? "resume" : "pause"}')">${paused ? "resume" : "pause"}</button>`}
         <button class="del" onclick="if(confirm('Delete ${esc(j.name).replace(/'/g, "\\'")}?')) jobAction(${j.id}, 'delete')">delete</button>
       </div></td>
     </tr>`;
@@ -566,7 +604,7 @@ function healthCell(j, downloading) {
   return `<span class="health" style="color:${healthColor(j.health, j.critical_health)}" title="${healthTip(j.health, j.critical_health)}">${(j.health / 10).toFixed(1)}%</span>${note}`;
 }
 async function jobAction(id, action) {
-  await fetch(`/api/v1/jobs/${id}/actions/${action}`, { method: "POST" });
+  await jfetch(`/api/v1/jobs/${id}/actions/${action}`, { method: "POST" });
   refreshAll();
 }
 
@@ -601,7 +639,7 @@ function handoffChip(e) {
 
 async function refreshHistory() {
   refreshClients().catch(() => {});
-  const r = await fetch("/api/v1/history?limit=200");
+  const r = await jfetch("/api/v1/history?limit=200");
   if (r.status === 501) {
     $("history-body").innerHTML = '<tr><td colspan="6" class="empty">history store not configured</td></tr>';
     return;
@@ -629,13 +667,13 @@ async function refreshHistory() {
   </tr>`).join("");
 }
 async function histAction(id, action) {
-  await fetch(`/api/v1/history/${id}/actions/${action}`, { method: "POST" });
+  await jfetch(`/api/v1/history/${id}/actions/${action}`, { method: "POST" });
   refreshHistory().catch(() => {});
 }
 
 // Who is polling us — is the *arr even connected?
 async function refreshClients() {
-  const r = await fetch("/api/v1/clients");
+  const r = await jfetch("/api/v1/clients");
   if (!r.ok) return;
   const { clients } = await r.json();
   const strip = $("clients-strip");
@@ -655,7 +693,7 @@ async function refreshClients() {
 
 // ---- logs ---------------------------------------------------------------
 async function refreshLogs() {
-  const r = await fetch("/api/v1/logs?limit=300");
+  const r = await jfetch("/api/v1/logs?limit=300");
   if (r.status === 501) {
     $("logbox").innerHTML = '<div class="empty">log buffer not configured</div>';
     return;
@@ -670,11 +708,25 @@ async function refreshLogs() {
 }
 
 // ---- controls -----------------------------------------------------------
-$("btn-pause").onclick = async () => { await fetch("/api/v1/queue/actions/pause", { method: "POST" }); refreshAll(); };
-$("btn-resume").onclick = async () => { await fetch("/api/v1/queue/actions/resume", { method: "POST" }); refreshAll(); };
+// Optimistic: flip the visible state the instant the button is clicked
+// (buttons latch, the time-left tile says "paused"), then let the server's
+// answer — the refresh plus the queue_pause_changed SSE event — confirm or
+// correct it.
+$("btn-pause").onclick = async () => {
+  setPauseButtons(true);
+  $("s-eta").textContent = "paused";
+  await jfetch("/api/v1/queue/actions/pause", { method: "POST" });
+  refreshAll();
+};
+$("btn-resume").onclick = async () => {
+  setPauseButtons(false);
+  $("s-eta").textContent = "—";
+  await jfetch("/api/v1/queue/actions/resume", { method: "POST" });
+  refreshAll();
+};
 $("btn-limit").onclick = async () => {
   const kib = parseInt($("limit").value || "0", 10);
-  await fetch("/api/v1/queue/speed-limit", {
+  await jfetch("/api/v1/queue/speed-limit", {
     method: "PUT", headers: { "content-type": "application/json" },
     body: JSON.stringify({ bytes_per_sec: kib > 0 ? kib * 1024 : null })
   });
@@ -690,13 +742,16 @@ document.querySelectorAll("nav.tabs button").forEach(b => b.onclick = () => {
   refreshAll();
 });
 
-// ---- refresh loop: SSE-driven with poll fallback ------------------------
-function refreshAll() {
-  refreshStatus().catch(() => {});
+// ---- refresh loop: SSE tick-driven with poll fallback --------------------
+function refreshTab() {
   if (activeTab === "queue") refreshQueue().catch(() => {});
   if (activeTab === "history") refreshHistory().catch(() => {});
   if (activeTab === "logs") refreshLogs().catch(() => {});
   if (activeTab === "settings") loadSettings().catch(() => {});
+}
+function refreshAll() {
+  refreshStatus().catch(() => {});
+  refreshTab();
 }
 let debounce = null;
 function nudge() { clearTimeout(debounce); debounce = setTimeout(refreshAll, 150); }
@@ -718,12 +773,31 @@ function connState(mode) {
     el.title = "Establishing the live event stream to the daemon.";
   }
 }
+let lastTickAt = 0; // when the SSE stream last delivered a full read model
 function connectSse() {
   const es = new EventSource("/api/v1/events");
   es.onopen = () => connState("live");
   es.onerror = () => connState("poll"); // EventSource retries by itself
-  for (const ev of ["job_added", "job_finished", "job_deleted", "file_finished", "lagged"])
+  // Structural events nudge a refresh; every engine event is wired in so
+  // pause/resume and limit changes from ANY client (another tab, an *arr,
+  // the CLI) land here immediately too.
+  for (const ev of ["job_added", "job_finished", "job_deleted", "file_finished",
+                    "segment_exhausted", "server_blocked", "queue_pause_changed",
+                    "speed_limit_changed", "job_assigned", "lagged"])
     es.addEventListener(ev, nudge);
+  // The 1 Hz tick carries the whole read model (status + job rows from a
+  // single snapshot — header rate and per-job rates can't disagree).
+  // Render it directly: no fetch round-trip, nothing for a browser cache
+  // to wedge, progress moves the moment the daemon publishes.
+  es.addEventListener("tick", (e) => {
+    lastTickAt = Date.now();
+    connState("live");
+    try {
+      const d = JSON.parse(e.data);
+      renderStatus(d.status);
+      if (activeTab === "queue") renderQueue(d.jobs);
+    } catch { /* malformed frame — the poll fallback still corrects */ }
+  });
 }
 
 // ---- settings: a real form over nzbd.toml -------------------------------
@@ -937,7 +1011,7 @@ function showRestartBanner(sections) {
 
 async function loadSettings(force) {
   if (cfgLoaded && !force) return;   // never clobber an open edit on refresh ticks
-  const r = await fetch("/api/v1/config");
+  const r = await jfetch("/api/v1/config");
   if (!r.ok) {
     $("cfg-meta").textContent = r.status === 401
       ? "authentication required" : "settings unavailable (" + r.status + ")";
@@ -965,7 +1039,7 @@ async function saveSettings(body, contentType) {
   msg.className = ""; msg.textContent = "saving…";
   let r;
   try {
-    r = await fetch("/api/v1/config", { method: "PUT",
+    r = await jfetch("/api/v1/config", { method: "PUT",
       headers: { "content-type": contentType }, body });
   } catch (e) { msg.className = "err"; msg.textContent = String(e); return null; }
   if (!r.ok) {
@@ -1006,10 +1080,10 @@ $("btn-restart").onclick = async () => {
   const msg = $("cfg-msg");
   msg.className = ""; msg.textContent = "restarting…";
   $("btn-restart").disabled = true;
-  try { await fetch("/api/v1/restart", { method: "POST" }); } catch { /* listener bouncing */ }
+  try { await jfetch("/api/v1/restart", { method: "POST" }); } catch { /* listener bouncing */ }
   for (let i = 0; i < 60; i++) {
     await new Promise(res => setTimeout(res, 500));
-    try { const h = await fetch("/healthz"); if (h.ok && i > 1) break; } catch { /* down */ }
+    try { const h = await jfetch("/healthz"); if (h.ok && i > 1) break; } catch { /* down */ }
   }
   $("btn-restart").disabled = false;
   msg.className = "ok"; msg.textContent = "restarted";
@@ -1022,7 +1096,7 @@ $("btn-restart").onclick = async () => {
 async function checkSetup() {
   let s;
   try {
-    const r = await fetch("/api/v1/setup");
+    const r = await jfetch("/api/v1/setup");
     if (!r.ok) return false;
     s = await r.json();
   } catch { return false; }
@@ -1046,7 +1120,7 @@ async function checkSetup() {
     api_password: $("su-api-pass").value || null,
     preview: !!preview,
   });
-  const postSetup = (body) => fetch("/api/v1/setup", {
+  const postSetup = (body) => jfetch("/api/v1/setup", {
     method: "POST", headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
   });
@@ -1129,7 +1203,7 @@ async function checkSetup() {
     for (let i = 0; i < 60; i++) {
       await new Promise(res => setTimeout(res, 500));
       try {
-        const r = await fetch("/api/v1/setup");
+        const r = await jfetch("/api/v1/setup");
         if (r.ok) { const j = await r.json(); if (!j.setup_mode) break; }
         if (r.status === 401) break; // auth enabled = new config is live
       } catch { /* still restarting */ }
@@ -1143,7 +1217,17 @@ initTheme();
 (async () => {
   if (await checkSetup()) return;
   connectSse();
-  setInterval(refreshAll, 5000);
+  // Poll fallback: only when SSE ticks go quiet (stream down or the
+  // daemon deduplicated an idle tick). History/logs/settings tabs have no
+  // tick payload, so they refresh on the timer regardless.
+  setInterval(() => {
+    if (Date.now() - lastTickAt > 6500) refreshAll();
+    else if (activeTab !== "queue") refreshTab();
+  }, 5000);
+  // Coming back to the tab: repaint now, not at the next timer.
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden) refreshAll();
+  });
   refreshAll();
 })();
 

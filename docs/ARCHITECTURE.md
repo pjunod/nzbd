@@ -213,6 +213,8 @@ Everything is `serde`-serializable; the journal and API reuse these types. Compa
 
 One task owns `QueueState` (jobs, files, segments, lease table). Inputs: a bounded `mpsc<Command>` (Add, Edit, Pause, SetRate, …, each with an optional `oneshot` reply), completion/failure events from connection tasks, and a 1 Hz tick (journal flush, health/quota checks, `PropagationDelay` re-evaluation). Outputs: leases pushed to per-server pool queues, a debounced `arc_swap::ArcSwap<QueueSnapshot>` for lock-free API reads, and a `broadcast<Event>` stream (job added/progress/completed, server state, log). This replaces nzbget's global mutex + observer web with one serialization point that never blocks readers.
 
+**URL jobs** register instantly as `Fetching` placeholders (named through the same junk-stripper the post-fetch metadata pass uses — never the raw URL tail with its glued query string and API key) while a cancel-aware background task downloads the NZB. Adding a URL that is already `Fetching` returns the existing job instead of a duplicate (clients re-add when a fetch looks stalled). On recovery, jobs found in `Fetching` get their fetch re-spawned — the task died with the old process; without this they sit at "0 B of 0 B" forever — one per unique URL, with same-URL pile-ups failed as duplicates of the survivor (field report 2026-07-25).
+
 ### 8.2 Scheduling and the failover ladder
 
 Selection preserves §3.2 semantics: highest-priority non-paused job → highest-priority file → next pending segment, with force-priority bypassing pause and quota, `PropagationDelay` filtering young files, and (later phase) direct-rename-first article ordering. The ladder is a pure function — `fn next_action(outcome, segment, servers) -> Lease | Retry{server, after} | Escalate | Fail` — table-driven from the C++ behavior (connect-error vs 430-not-found vs CRC-error vs incomplete), unit-tested against scenario fixtures. Server blocking (10 s), group skip, fill-server semantics, and retention pre-fail are all in this function, not scattered across tasks.
@@ -263,7 +265,7 @@ GET  /api/v1/logs?level=…&job=…        ring buffer + per-job
 GET  /metrics                          Prometheus
 ```
 
-SSE events mirror the engine broadcast (progress deltas coalesced to ~4 Hz). Auth: bearer tokens (argon2-hashed at rest) with role scopes replacing the three-tier model; the UI uses a session cookie. TLS via rustls with the same cert options as the compat surface.
+SSE events mirror the engine broadcast — every variant crosses under its own `event:` name (`job_added`, `queue_pause_changed`, `speed_limit_changed`, …), never an opaque catch-all, because UI refresh nudges key on those names. Progress has no discrete event; instead the stream carries a `tick` event at 1 Hz with the full `{status, jobs}` read model serialized from **one** snapshot (header rate and per-job rows can never disagree), deduplicated while the queue is idle so a quiet stream costs nothing but keep-alives. Caching discipline: every live JSON response is `Cache-Control: no-store` (a router-wide default layer — some browsers heuristically cache header-less `fetch()` GETs, which froze the dashboard until a manual reload; field report 2026-07-25), the UI shell is `no-cache` (revalidate), and only the immutable PWA icons carry `max-age`. Auth: bearer tokens (argon2-hashed at rest) with role scopes replacing the three-tier model; the UI uses a session cookie. TLS via rustls with the same cert options as the compat surface.
 
 ### 10.2 Compat shim (`nzbd-compat`)
 

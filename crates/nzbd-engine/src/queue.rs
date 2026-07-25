@@ -316,7 +316,9 @@ pub fn clean_job_name(raw: &str, nzb: &nzbd_nzb::ParsedNzb) -> String {
 }
 
 /// URL tail → name: cut glued query params, drop the extension, decode.
-fn strip_name_junk(raw: &str) -> String {
+/// Also used at `add_url` time so even the `Fetching` placeholder job never
+/// shows raw query junk (or the API key riding in it).
+pub(crate) fn strip_name_junk(raw: &str) -> String {
     let mut name = raw.trim();
     // Full URL? Take the path's last segment.
     if name.starts_with("http://") || name.starts_with("https://") {
@@ -851,6 +853,37 @@ mod tests {
         assert_eq!(sanitize_name("a/b\\c:d"), "a_b_c_d");
         assert_eq!(sanitize_name("  .hidden.  "), "hidden");
         assert_eq!(sanitize_name(""), "unnamed");
+    }
+
+    /// Field report 2026-07-25: URL-added jobs showed the whole glued query
+    /// string as their title ("af51ab….nzb&i=136144&r=<apikey>…"). The
+    /// junk-stripper runs at add time now — these are the exact shapes.
+    #[test]
+    fn strip_name_junk_urls_and_glued_queries() {
+        // dognzb-style: params glued straight onto the filename with '&'.
+        assert_eq!(
+            strip_name_junk(
+                "af51ab64582e226f4bc8de91b7b757d8067ba8e6.nzb&i=136144&r=104c19dfb6da6d2a89b2"
+            ),
+            "af51ab64582e226f4bc8de91b7b757d8067ba8e6"
+        );
+        // Same, but as a full URL (the add_url fallback when no name given).
+        assert_eq!(
+            strip_name_junk(
+                "https://api.indexer.example/getnzb/af51ab64582e226f4bc8de91b7b757d8067ba8e6.nzb&i=136144&r=104c19dfb6da6d2a89b2"
+            ),
+            "af51ab64582e226f4bc8de91b7b757d8067ba8e6"
+        );
+        // Regular '?' query, percent-encoded name.
+        assert_eq!(
+            strip_name_junk("https://x.example/dl/My%20Show%20S01E01.nzb?apikey=secret"),
+            "My Show S01E01"
+        );
+        // A bare '&' inside a real release name survives.
+        assert_eq!(
+            strip_name_junk("Tom & Jerry (2021).nzb"),
+            "Tom & Jerry (2021)"
+        );
     }
 
     #[test]

@@ -52,7 +52,9 @@ pub(crate) enum QueueCommand {
         priority: i32,
         dupe: Option<nzbd_types::DupeInfo>,
         paused: bool,
-        reply: oneshot::Sender<JobId>,
+        /// Replies `(id, created)`. `created == false` means the same URL is
+        /// already fetching — the caller must NOT spawn a second fetch task.
+        reply: oneshot::Sender<(JobId, bool)>,
     },
     CompleteUrlFetch {
         job: JobId,
@@ -622,6 +624,30 @@ impl Owner {
                 paused,
                 reply,
             } => {
+                // Same URL already mid-fetch? Return that job instead of
+                // piling up identical downloads — a client that retries an
+                // add because the fetch looks slow (or a daemon restart hid
+                // its progress) would otherwise queue N copies of the same
+                // 50 GiB download. Failed fetches are NOT matched: re-adding
+                // one is a deliberate retry.
+                let existing = self
+                    .state
+                    .jobs
+                    .iter()
+                    .find(|j| {
+                        matches!(j.status, JobStatus::Fetching)
+                            && j.params.iter().any(|(k, v)| k == "*URL" && *v == url)
+                    })
+                    .map(|j| j.id);
+                if let Some(id) = existing {
+                    tracing::info!(
+                        job = id.0,
+                        %url,
+                        "url add deduplicated: same URL is already fetching"
+                    );
+                    let _ = reply.send((id, false));
+                    return;
+                }
                 let id = self.state.admit_url(name.clone(), &url, category, priority);
                 if let Some(j) = self.state.job_mut(id) {
                     if let Some(dupe) = dupe {
@@ -636,7 +662,7 @@ impl Owner {
                 self.publish_now();
                 self.emit(Event::JobAdded { job: id, name });
                 self.bump_epoch();
-                let _ = reply.send(id);
+                let _ = reply.send((id, true));
             }
             QueueCommand::CompleteUrlFetch { job, parsed, reply } => {
                 let ok = self
@@ -1754,6 +1780,24 @@ impl Owner {
         self.publish_snapshot(0);
     }
 
+    /// URL jobs recovered in `Fetching`: their fetch tasks lived in the
+    /// previous process and died with it, so without a re-spawn they sit at
+    /// "FETCHING · 0 B of 0 B" forever. [`crate::Engine::spawn`] feeds this
+    /// list through [`plan_url_refetches`] right after recovery.
+    pub(crate) fn pending_url_fetches(&self) -> Vec<(JobId, String)> {
+        self.state
+            .jobs
+            .iter()
+            .filter(|j| matches!(j.status, JobStatus::Fetching))
+            .filter_map(|j| {
+                j.params
+                    .iter()
+                    .find(|(k, _)| k == "*URL")
+                    .map(|(_, url)| (j.id, url.clone()))
+            })
+            .collect()
+    }
+
     fn publish_snapshot(&mut self, rate: u64) {
         let jobs = self
             .state
@@ -1959,4 +2003,58 @@ pub(crate) fn unix_now() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+/// A recovered-`Fetching` job that duplicates another job's URL: `job`
+/// should fail as a duplicate of `original`.
+pub(crate) type DupeOf = (JobId, JobId);
+
+/// Split recovered `Fetching` jobs into fetches to re-spawn and duplicates
+/// to fail. The first job (queue order) of each URL refetches; later
+/// same-URL jobs — the pile-up left by clients re-adding while the original
+/// fetch was invisible after a restart — fail as duplicates of it, instead
+/// of N copies of the same download racing to completion.
+pub(crate) fn plan_url_refetches(
+    pending: Vec<(JobId, String)>,
+) -> (Vec<(JobId, String)>, Vec<DupeOf>) {
+    let mut first_for_url: HashMap<String, JobId> = HashMap::new();
+    let mut refetch = Vec::new();
+    let mut duplicates = Vec::new();
+    for (job, url) in pending {
+        match first_for_url.get(&url) {
+            None => {
+                first_for_url.insert(url.clone(), job);
+                refetch.push((job, url));
+            }
+            Some(original) => duplicates.push((job, *original)),
+        }
+    }
+    (refetch, duplicates)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn url_refetch_plan_keeps_first_fails_dupes() {
+        let a = "https://indexer.example/getnzb/aaa.nzb&i=1&r=k".to_string();
+        let b = "https://indexer.example/getnzb/bbb.nzb&i=1&r=k".to_string();
+        let pending = vec![
+            (JobId(4), a.clone()),
+            (JobId(5), a.clone()),
+            (JobId(7), b.clone()),
+            (JobId(9), a.clone()),
+        ];
+        let (refetch, dupes) = plan_url_refetches(pending);
+        assert_eq!(refetch, vec![(JobId(4), a), (JobId(7), b)]);
+        assert_eq!(dupes, vec![(JobId(5), JobId(4)), (JobId(9), JobId(4))]);
+    }
+
+    #[test]
+    fn url_refetch_plan_empty() {
+        let (refetch, dupes) = plan_url_refetches(Vec::new());
+        assert!(refetch.is_empty());
+        assert!(dupes.is_empty());
+    }
 }

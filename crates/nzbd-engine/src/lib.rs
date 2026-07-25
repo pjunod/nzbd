@@ -195,6 +195,11 @@ impl Engine {
         // async run loop's first publish (UI "queue is empty" flash).
         let mut owner = owner;
         owner.seed_snapshot();
+        // Jobs recovered mid-fetch: their fetch tasks died with the old
+        // process — re-spawn one per unique URL below (once the handle
+        // exists) and fail same-URL pile-ups as duplicates.
+        let (refetch, refetch_dupes) =
+            crate::owner::plan_url_refetches(owner.pending_url_fetches());
         tracker.spawn(owner.run(engine_rx));
 
         // Connection tasks: `max_connections` per active server. Tasks are
@@ -222,13 +227,31 @@ impl Engine {
         }
         tracker.close();
 
-        Ok(EngineHandle {
+        let handle = EngineHandle {
             cmd_tx: engine_tx,
             shared,
             events,
             cancel,
             tracker,
-        })
+        };
+
+        for (job, url) in refetch {
+            tracing::info!(job = job.0, %url, "re-spawning NZB fetch for job recovered mid-fetch");
+            handle.spawn_url_fetch(job, url);
+        }
+        for (job, original) in refetch_dupes {
+            let h = handle.clone();
+            handle.tracker.spawn(async move {
+                let _ = h
+                    .fail_url_fetch(
+                        job,
+                        format!("duplicate of job #{} (same URL was re-added)", original.0),
+                    )
+                    .await;
+            });
+        }
+
+        Ok(handle)
     }
 }
 
@@ -278,20 +301,30 @@ impl EngineHandle {
     /// Add a URL job: registered immediately (status `Fetching`), the NZB
     /// is fetched in the background, then the job queues like any other.
     /// A fetch/parse failure fails the job (history: `FAILURE/FETCH`).
+    ///
+    /// Adding a URL that is already `Fetching` returns the existing job's
+    /// id instead of creating a duplicate (clients re-add when a fetch
+    /// looks stalled; each retry must not queue another copy).
     pub async fn add_url(
         &self,
         name: &str,
         url: &str,
         opts: AddOpts,
     ) -> Result<JobId, EngineError> {
-        let name = if name.trim().is_empty() {
-            url.rsplit('/')
-                .next()
-                .unwrap_or("download")
-                .trim_end_matches(".nzb")
-                .to_string()
-        } else {
-            name.trim().trim_end_matches(".nzb").to_string()
+        // Name the placeholder through the same junk-stripper the fetched
+        // NZB's metadata pass uses, not a raw `rsplit('/')`: indexer URLs
+        // glue query params after the filename ("…af51ab….nzb&i=…&r=<key>")
+        // and that used to become the visible job title (field report
+        // 2026-07-25) — with the user's API key in it.
+        let name = {
+            let provided = name.trim();
+            let base = if provided.is_empty() { url } else { provided };
+            let cleaned = crate::queue::strip_name_junk(base);
+            if cleaned.is_empty() {
+                "download".to_string()
+            } else {
+                cleaned
+            }
         };
         let (tx, rx) = oneshot::channel();
         self.send(QueueCommand::AddUrl {
@@ -304,12 +337,24 @@ impl EngineHandle {
             reply: tx,
         })
         .await?;
-        let id = rx.await.map_err(|_| EngineError::Closed)?;
+        let (id, created) = rx.await.map_err(|_| EngineError::Closed)?;
+        if created {
+            self.spawn_url_fetch(id, url.to_string());
+        }
+        Ok(id)
+    }
 
+    /// Background NZB download for a URL job. Shutdown-aware: an in-flight
+    /// fetch aborts on cancel instead of holding graceful shutdown open for
+    /// up to the 60 s hop timeout.
+    fn spawn_url_fetch(&self, id: JobId, url: String) {
         let handle = self.clone();
-        let url = url.to_string();
         self.tracker.spawn(async move {
-            let outcome = match crate::fetch::http_get(&url).await {
+            let fetched = tokio::select! {
+                _ = handle.cancel.cancelled() => return, // shutting down
+                r = crate::fetch::http_get(&url) => r,
+            };
+            let outcome = match fetched {
                 Ok(bytes) => match nzbd_nzb::parse(&bytes) {
                     Ok(parsed) => Ok(parsed),
                     Err(e) => Err(format!("nzb parse: {e}")),
@@ -329,19 +374,21 @@ impl EngineHandle {
                     let _ = rx.await;
                 }
                 Err(error) => {
-                    let (tx, rx) = oneshot::channel();
-                    let _ = handle
-                        .send(QueueCommand::FailUrlFetch {
-                            job: id,
-                            error,
-                            reply: tx,
-                        })
-                        .await;
-                    let _ = rx.await;
+                    let _ = handle.fail_url_fetch(id, error).await;
                 }
             }
         });
-        Ok(id)
+    }
+
+    async fn fail_url_fetch(&self, job: JobId, error: String) -> Result<(), EngineError> {
+        let (tx, rx) = oneshot::channel();
+        self.send(QueueCommand::FailUrlFetch {
+            job,
+            error,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| EngineError::Closed)
     }
 
     /// [`EngineHandle::add_nzb`] with the full option set (dupe metadata,

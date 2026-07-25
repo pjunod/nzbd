@@ -12,35 +12,22 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 fn http(addr: &str, method: &str, path: &str, body: &[u8]) -> (u16, String) {
-    let mut sock = TcpStream::connect(addr).expect("connect");
-    sock.set_read_timeout(Some(Duration::from_secs(10)))
-        .unwrap();
-    let req = format!(
-        "{method} {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n",
-        body.len()
-    );
-    sock.write_all(req.as_bytes()).unwrap();
-    sock.write_all(body).unwrap();
-    let mut resp = Vec::new();
-    sock.read_to_end(&mut resp).unwrap();
-    let text = String::from_utf8_lossy(&resp).into_owned();
-    let status = text.split_whitespace().nth(1).unwrap().parse().unwrap();
-    let payload = text
-        .split_once("\r\n\r\n")
-        .map(|(_, b)| b.trim().to_string())
-        .unwrap_or_default();
-    (status, payload)
+    try_http(addr, method, path, body, None)
+        .unwrap_or_else(|| panic!("http {method} {path} against {addr} failed"))
 }
 
+/// A daemon mid-restart legitimately RESETs in-flight connections while
+/// its listener bounces — this poller must treat any socket error as "not
+/// yet", not panic (it flaked exactly that way: connect landed on the
+/// dying listener, then the read hit ECONNRESET).
 fn wait_healthy(addr: &str, deadline: Duration) {
     let start = Instant::now();
     loop {
         if start.elapsed() > deadline {
             panic!("daemon did not become healthy at {addr}");
         }
-        if TcpStream::connect(addr).is_ok() {
-            let (code, body) = http(addr, "GET", "/healthz", b"");
-            if code == 200 && body == "ok" {
+        if let Some((200, body)) = try_http(addr, "GET", "/healthz", b"", None) {
+            if body == "ok" {
                 return;
             }
         }
