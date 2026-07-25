@@ -611,10 +611,28 @@ fn run(
             }
         }
 
+        // Subsystem teardown is BOUNDED. This sequence runs between "the
+        // listener is down" and "the listener is back" — every second here
+        // is user-visible dead air on a restart. A PP job or feed poll that
+        // outlives its cancel must not hold the daemon offline (field
+        // report 2026-07-25: a restart hung for minutes behind one PP job;
+        // the page never came back). Stragglers die with this pass's
+        // runtime; PP is crash-safe and re-runs on the next pass.
         feed_cancel.cancel();
-        feed_tracker.wait().await;
         pp_cancel.cancel();
-        pp_tracker.wait().await;
+        let subsystems = async {
+            feed_tracker.wait().await;
+            pp_tracker.wait().await;
+        };
+        if tokio::time::timeout(Duration::from_secs(10), subsystems)
+            .await
+            .is_err()
+        {
+            tracing::warn!(
+                "feed/post-processing tasks ignored shutdown for 10s — restarting anyway \
+                 (an interrupted PP job re-runs on the next pass)"
+            );
+        }
         engine.shutdown().await;
         let reload = setup
             .as_ref()

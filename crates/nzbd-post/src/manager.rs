@@ -184,7 +184,7 @@ async fn manager_task(
         tokio::select! {
             _ = cancel.cancelled() => break,
             _ = rescan.tick() => {
-                scan_queue(&tracker, &engine, &cfg, &history, &dest_dir, &gate, &sem, &mut queued).await;
+                scan_queue(&tracker, &engine, &cfg, &history, &dest_dir, &gate, &sem, &cancel, &mut queued).await;
             }
             ev = rx.recv() => match ev {
                 Ok(Event::JobFinished { job, status, name, health }) => match status {
@@ -198,6 +198,7 @@ async fn manager_task(
                                     &history,
                                     &dest_dir,
                                     &sem,
+                                    &cancel,
                                     job,
                                     gate.is_none(),
                                 );
@@ -278,6 +279,7 @@ async fn scan_queue(
     dest_dir: &Path,
     gate: &PpGate,
     sem: &Arc<tokio::sync::Semaphore>,
+    cancel: &CancellationToken,
     queued: &mut HashSet<JobId>,
 ) {
     let claim = |job: JobId| gate.as_ref().map(|f| f(job)).unwrap_or(true);
@@ -306,6 +308,7 @@ async fn scan_queue(
                 history,
                 dest_dir,
                 sem,
+                cancel,
                 j.id,
                 gate.is_none(),
             );
@@ -321,6 +324,7 @@ fn spawn_job(
     history: &Arc<HistoryDb>,
     dest_dir: &Path,
     sem: &Arc<tokio::sync::Semaphore>,
+    cancel: &CancellationToken,
     job: JobId,
     retire_local: bool,
 ) {
@@ -329,11 +333,35 @@ fn spawn_job(
     let history = history.clone();
     let dest = dest_dir.to_path_buf();
     let sem = sem.clone();
+    let cancel = cancel.clone();
     tracker.spawn(async move {
-        let Ok(_permit) = sem.acquire().await else {
-            return;
+        // Cancel-aware at both await points. Without this, one PP job —
+        // a par2 repair, an unpack, an extension script — kept the PP
+        // tracker's shutdown wait (and with it the whole daemon restart)
+        // hostage until it finished: "clicked restart, page never came
+        // back" (field report 2026-07-25, second of the day). Aborting is
+        // safe by the pipeline's own crash model: no `*PP:done` stamp has
+        // been written, subprocesses are kill-on-drop, and the next pass's
+        // rescan re-runs the job from scratch.
+        let permit = tokio::select! {
+            _ = cancel.cancelled() => return, // never START work mid-shutdown
+            p = sem.acquire() => match p {
+                Ok(p) => p,
+                Err(_) => return,
+            },
         };
-        match process_job(&engine, &cfg, &history, &dest, job).await {
+        let _permit = permit;
+        let outcome = tokio::select! {
+            _ = cancel.cancelled() => {
+                tracing::info!(
+                    job = job.0,
+                    "post-processing aborted by shutdown/restart; it will re-run on the next pass"
+                );
+                return;
+            }
+            r = process_job(&engine, &cfg, &history, &dest, job) => r,
+        };
+        match outcome {
             Ok(outcome) => {
                 tracing::info!(
                     job = job.0,

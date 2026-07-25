@@ -331,6 +331,114 @@ fn restart_completes_with_an_open_sse_stream() {
     wait_healthy(&addr, Duration::from_secs(10));
 }
 
+/// Regression (field report 2026-07-25, #2 of the day): a restart clicked
+/// while post-processing was running never finished — teardown waited
+/// unboundedly on the PP tracker while one job's work ran on (here: an
+/// extension script; in the field report the same held for minutes), the
+/// engine stayed alive behind it, and the listener never came back. PP
+/// job tasks now abort on cancel (crash-safe: no `*PP:done` stamp was
+/// written, so the next pass's rescan re-runs them) and the daemon bounds
+/// the subsystem drain as a belt.
+#[test]
+fn restart_completes_while_post_processing_runs() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let data = prng_bytes(6, 60_000);
+    let post = build_post("ppjob", &[("p.bin", data.clone())], 20_000);
+    let ns = rt.block_on(async { NservBuilder::new().with_post(&post).start().await.unwrap() });
+
+    let tmp = tempfile::tempdir().unwrap();
+    let api_port = free_port();
+    let api_addr = format!("127.0.0.1:{api_port}");
+
+    // An extension script that sleeps far longer than the whole test: the
+    // restart must NOT wait for it.
+    let scripts = tmp.path().join("scripts");
+    std::fs::create_dir_all(&scripts).unwrap();
+    let script = scripts.join("slow.sh");
+    std::fs::write(
+        &script,
+        "#!/bin/sh\n### NZBGET POST-PROCESSING SCRIPT ###\nsleep 600\n",
+    )
+    .unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    let config = format!(
+        r#"
+[paths]
+main_dir = "{main}"
+dest_dir = "{dest}"
+
+[[server]]
+name = "mock"
+host = "127.0.0.1"
+port = {nntp_port}
+tls = false
+connections = 4
+pipeline_depth = 2
+
+[api]
+bind = "{api_addr}"
+
+[post]
+scripts_dir = "{scripts}"
+"#,
+        main = tmp.path().join("main").display(),
+        dest = tmp.path().join("dest").display(),
+        nntp_port = ns.port(),
+        scripts = scripts.display(),
+    );
+    let cfg_path = tmp.path().join("nzbd.toml");
+    std::fs::write(&cfg_path, config).unwrap();
+
+    let bin = env!("CARGO_BIN_EXE_nzbd");
+    let child = Command::new(bin)
+        .args(["run", "--config"])
+        .arg(&cfg_path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn nzbd");
+    let _child = KillOnDrop(child);
+    wait_healthy(&api_addr, Duration::from_secs(15));
+
+    let (code, _) = http(
+        &api_addr,
+        "POST",
+        "/api/v1/jobs?name=ppjob",
+        post.nzb.as_bytes(),
+    );
+    assert_eq!(code, 201);
+
+    // Wait for the download to finish and PP to reach the sleeping script.
+    let start = Instant::now();
+    loop {
+        assert!(
+            start.elapsed() < Duration::from_secs(30),
+            "job never reached the script stage"
+        );
+        let (code, body) = http(&api_addr, "GET", "/api/v1/jobs", b"");
+        if code == 200 && body.contains("\"stage\":\"script\"") {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(150));
+    }
+
+    // Restart with the script mid-sleep. Before the fix this hung until
+    // the script finished (10 minutes here); the page just never loaded.
+    let (code, _) = http(&api_addr, "POST", "/api/v1/restart", b"");
+    assert_eq!(code, 200);
+    wait_healthy(&api_addr, Duration::from_secs(20));
+
+    // Serving real state again, and the interrupted job survived into the
+    // restarted queue (unstamped, so PP will pick it back up).
+    let (code, body) = http(&api_addr, "GET", "/api/v1/jobs", b"");
+    assert_eq!(code, 200);
+    assert!(body.contains("ppjob"), "queue survived the restart: {body}");
+}
+
 /// Settings round-trip with the new contract: a speed-limit change
 /// applies LIVE (no restart); other sections mark restart-required;
 /// POST /api/v1/restart bounces the daemon; secrets survive throughout.
