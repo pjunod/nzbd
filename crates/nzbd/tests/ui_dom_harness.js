@@ -584,6 +584,93 @@ const models = (jobs) => jobs.map((j, i) => T.rowModel(j, { idx: i, count: jobs.
   eq(btn.textContent, "delete files", "disarming restores the plain label");
 }
 
+// --- 23. rate ring: three minutes, wrapping correctly --------------------
+{
+  T.spark.n = 0;
+  T.spark.buf.fill(0);
+  eq(T.rateSeries().length, 0, "empty until something ticks");
+  for (let i = 1; i <= 5; i++) T.pushRate(i * 100);
+  eq(T.rateSeries().join(","), "100,200,300,400,500", "oldest first while filling");
+  // Overflow: the ring must keep the NEWEST SPARK_N, in order.
+  for (let i = 6; i <= 250; i++) T.pushRate(i * 100);
+  const s = T.rateSeries();
+  eq(s.length, T.SPARK_N, "capped at the window size");
+  eq(s[0], (250 - T.SPARK_N + 1) * 100, "…starting at the oldest surviving sample");
+  eq(s[s.length - 1], 25000, "…ending at the newest");
+  ok(s.every((v, i) => i === 0 || v > s[i - 1]), "and in order across the wrap");
+  T.spark.n = 0;
+  T.spark.buf.fill(0);
+}
+
+// --- 24. title ticker ----------------------------------------------------
+{
+  eq(T.titleFor(null), "nzbd", "no status yet: a plain title");
+  eq(T.titleFor({ download_paused: true, download_rate_bps: 0 }), "⏸ paused — nzbd",
+    "paused says so");
+  const busy = T.titleFor({ download_paused: false, download_rate_bps: 1048576, remaining_bytes: 10485760 });
+  ok(busy.startsWith("▼ 1.0 MiB/s"), `rate leads the title (got ${busy})`);
+  ok(busy.endsWith("— nzbd"), "…and the app name still ends it");
+  ok(busy.includes("10s"), "…with the time left, which is the other half of the question");
+  eq(T.titleFor({ download_paused: false, download_rate_bps: 0 }), "nzbd",
+    "idle resets — no stale number left in the tab");
+}
+
+// --- 25. per-server chips ------------------------------------------------
+{
+  const s = {
+    blocked_servers: [1],
+    servers: [
+      { server: 0, name: "eweka", rate_bps: 2048, day_bytes: 100, total_bytes: 900 },
+      { server: 1, name: "blocknews", rate_bps: 0, day_bytes: 0, total_bytes: 5 },
+      { server: 2, name: "idle-fill", rate_bps: 0, day_bytes: 0, total_bytes: 0 },
+    ],
+  };
+  const chips = T.serverChipModels(s);
+  eq(chips.length, 3, "one chip per configured server, including the quiet one");
+  eq(chips[0].name, "eweka", "named, not numbered");
+  eq(chips[0].rate, " 2.0 KiB/s", "carrying its share of the wire rate");
+  ok(chips[0].cls.includes("live"), "a delivering server reads as live");
+  eq(chips[1].rate, " blocked", "a blocked server says so instead of showing 0");
+  ok(chips[1].cls.includes("on-bad"), "…and reads as a problem");
+  ok(!chips[2].cls.includes("live"), "a quiet server is not marked live");
+  ok(chips[0].tip.includes("add up to it"),
+    "the tooltip states the same-measurement invariant these numbers rely on");
+}
+
+// --- 26. the log ring: bounded, and honest about what it missed ----------
+{
+  const rec = (id, scope, text) => ({ id, scope, kind: "INFO", time_unix: 1, text });
+  T.store.logs = [];
+  T.appendLogs([rec(1, "system", "boot"), rec(2, "job", "added")], 0);
+  eq(T.store.logs.length, 2, "entries append");
+  T.appendLogs([rec(3, "job", "finished")], 7);
+  eq(T.store.logs.length, 4, "a skipped-lines marker is inserted with the batch");
+  eq(T.store.logs[2].skipped, 7, "…carrying the count the server reported");
+  // Filtering happens client-side; markers are never filtered away, because
+  // "you are missing lines" is true regardless of which scopes you picked.
+  ok(!T.logMatches(rec(9, "file", "x"), ["system", "job"]), "per-file lines filter out");
+  ok(T.logMatches(rec(9, "file", "x"), ["system", "job", "file"]), "…and back in when ticked");
+  ok(T.logMatches({ id: "s1", skipped: 3 }, []), "a skipped marker survives every filter");
+  // Bounded: an all-night download must not grow the ring without limit.
+  T.store.logs = [];
+  for (let i = 0; i < T.LOG_RING_MAX + 250; i++) T.appendLogs([rec(i, "job", "line " + i)], 0);
+  eq(T.store.logs.length, T.LOG_RING_MAX, "the ring is capped");
+  eq(T.store.logs[T.store.logs.length - 1].text, "line " + (T.LOG_RING_MAX + 249),
+    "…dropping the oldest, keeping the tail");
+  // And it renders, marker and all.
+  T.store.logs = [rec(1, "system", "hello"), { id: "s2", skipped: 4 }, rec(2, "system", "world")];
+  for (const s of ["system", "job", "file"])
+    sandbox.document.getElementById("lg-" + s).checked = true;
+  const box = sandbox.document.getElementById("logbox");
+  box.children.length = 0;
+  delete box.__rows;
+  T.renderLogs();
+  eq(box.children.length, 3, "every line rendered");
+  ok(box.children[1].textContent.includes("4 lines skipped"),
+    "the gap is stated in the log itself, where it happened");
+  T.store.logs = [];
+}
+
 // --- 22. the delete -> Undo state machine, end to end -------------------
 // This is the whole point of M4: one click deletes, the toast offers Undo
 // for as long as the server says the job is parked, and Undo requeues it.

@@ -59,6 +59,13 @@
            border-radius: 999px; padding: 2px 9px; color: var(--ink2); }
   .badge.on-warn { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 50%, transparent); }
   .badge.on-bad  { color: var(--bad);  border-color: color-mix(in srgb, var(--bad) 50%, transparent); }
+  /* Per-provider chips: which server is actually delivering this? */
+  .badge.srv { font-weight: 550; font-variant-numeric: tabular-nums; }
+  .badge.srv b { color: var(--ink); font-weight: 650; }
+  .badge.srv.live { border-color: color-mix(in srgb, var(--ok) 45%, transparent); }
+  /* The rate tile carries three minutes of history under the number. */
+  .stat.rate-tile { position: relative; overflow: hidden; }
+  #spark { display: block; width: 100%; height: 26px; margin-top: 2px; }
 
   .controls { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin: 6px 0 14px; }
   button { background: var(--panel); color: var(--ink); border: 1px solid var(--line);
@@ -315,6 +322,7 @@
     <h1>nzbd</h1>
     <span class="ver" id="ver"></span>
     <span class="spacer"></span>
+    <span class="badges" id="srv-chips"></span>
     <span class="badges" id="badges"></span>
   </header>
 
@@ -383,7 +391,9 @@
   <div id="offline"></div>
 
   <div class="stats">
-    <div class="stat"><div class="v" id="s-rate">—</div><div class="l">download rate</div></div>
+    <div class="stat rate-tile"><div class="v" id="s-rate">—</div><div class="l">download rate</div>
+      <canvas id="spark" height="26" aria-hidden="true"
+        title="The last three minutes of throughput, one point per second."></canvas></div>
     <div class="stat"><div class="v" id="s-eta">—</div><div class="l">time left</div></div>
     <div class="stat"><div class="v" id="s-remaining">—</div><div class="l">remaining</div></div>
     <div class="stat"><div class="v" id="s-session">—</div><div class="l">this session</div></div>
@@ -1239,6 +1249,115 @@ function statusModels(s) {
   return out;
 }
 
+// ---- rate history: three minutes under the number -----------------------
+// A ring of the last SPARK_N tick rates. A single number tells you what is
+// happening right now; the shape next to it tells you whether that is
+// normal — a provider that dies for ten seconds every minute is invisible
+// in the first and obvious in the second.
+const SPARK_N = 180;
+const spark = { buf: new Array(SPARK_N).fill(0), n: 0, drawnAt: 0 };
+function pushRate(bps) {
+  spark.buf[spark.n % SPARK_N] = Math.max(0, bps || 0);
+  spark.n++;
+}
+/// Oldest first, at most SPARK_N samples.
+function rateSeries() {
+  const len = Math.min(spark.n, SPARK_N);
+  const out = new Array(len);
+  const start = spark.n - len;
+  for (let i = 0; i < len; i++) out[i] = spark.buf[(start + i) % SPARK_N];
+  return out;
+}
+function drawSparkline() {
+  const cv = $("spark");
+  if (!cv || !cv.getContext) return;
+  if (document.hidden) return;              // nothing to see; don't burn a frame
+  const now = Date.now();
+  if (now - spark.drawnAt < 900) return;    // at most once a second
+  spark.drawnAt = now;
+  const dpr = window.devicePixelRatio || 1;
+  const w = Math.max(1, Math.round((cv.clientWidth || 140) * dpr));
+  const h = Math.max(1, Math.round((cv.clientHeight || 26) * dpr));
+  if (cv.width !== w || cv.height !== h) { cv.width = w; cv.height = h; }
+  const ctx = cv.getContext("2d");
+  ctx.clearRect(0, 0, w, h);
+  const series = rateSeries();
+  if (series.length < 2) return;
+  const peak = Math.max(...series, 1);
+  const step = w / (SPARK_N - 1);
+  const y = (v) => h - 1 - (v / peak) * (h - 2);
+  const x = (i) => (i + (SPARK_N - series.length)) * step;
+  const accent = getComputedStyle(document.documentElement)
+    .getPropertyValue("--accent").trim() || "#4a8fe0";
+  ctx.beginPath();
+  ctx.moveTo(x(0), h);
+  for (let i = 0; i < series.length; i++) ctx.lineTo(x(i), y(series[i]));
+  ctx.lineTo(x(series.length - 1), h);
+  ctx.closePath();
+  ctx.fillStyle = accent;
+  ctx.globalAlpha = 0.16;
+  ctx.fill();
+  ctx.globalAlpha = 1;
+  ctx.beginPath();
+  for (let i = 0; i < series.length; i++) {
+    const px = x(i), py = y(series[i]);
+    if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+  }
+  ctx.strokeStyle = accent;
+  ctx.lineWidth = Math.max(1, dpr);
+  ctx.stroke();
+}
+
+// ---- title ticker -------------------------------------------------------
+// The answer to "is it still going?" without switching to the tab.
+function titleFor(s) {
+  if (!s) return "nzbd";
+  if (s.download_paused) return "⏸ paused — nzbd";
+  if (s.download_rate_bps > 0)
+    return "▼ " + fmtRate(s.download_rate_bps) + " · " +
+           fmtEta(s.remaining_bytes, s.download_rate_bps) + " — nzbd";
+  return "nzbd";  // idle: back to a plain title, no stale number left behind
+}
+function updateTitle() {
+  const t = titleFor(store.status);
+  if (document.title !== t) document.title = t;
+}
+
+// ---- per-server chips ---------------------------------------------------
+function buildSrvChip(d) {
+  const s = d.create("span", "badge srv");
+  const c = { name: d.append(s, d.create("b")), rate: d.append(s, d.create("span")) };
+  s.__c = c;
+  return s;
+}
+function applySrvChip(node, m, d) {
+  d = d || dom;
+  const c = node.__c, w = differ(node);
+  w("name", m.name, v => d.text(c.name, v));
+  w("rate", m.rate, v => d.text(c.rate, v));
+  w("cls", m.cls, v => d.cls(node, v));
+  w("tip", m.tip, v => d.prop(node, "title", v));
+}
+KINDS.srv = { build: buildSrvChip, apply: applySrvChip };
+
+function serverChipModels(s) {
+  const blocked = new Set(s.blocked_servers || []);
+  return (s.servers || []).map(v => {
+    const isBlocked = blocked.has(v.server);
+    return {
+      key: "s" + v.server, kind: "srv",
+      name: v.name,
+      rate: isBlocked ? " blocked" : " " + fmtRate(v.rate_bps),
+      cls: "badge srv" + (isBlocked ? " on-bad" : v.rate_bps > 0 ? " live" : ""),
+      tip: isBlocked
+        ? v.name + " is blocked after connection failures — retrying automatically"
+        : v.name + " — " + fmtBytes(v.day_bytes) + " today, " +
+          fmtBytes(v.total_bytes) + " all time. These rates come from the same " +
+          "byte counters as the header tile, so they add up to it.",
+    };
+  });
+}
+
 function renderStatus() {
   const s = store.status;
   if (!s) return;
@@ -1264,6 +1383,9 @@ function renderStatus() {
   setClass(hold, holds.length ? "show" : "");
   if (s.speed_limit_bps && !$("limit").matches(":focus"))
     $("limit").value = Math.round(s.speed_limit_bps / 1024);
+  reconcileRows($("srv-chips"), serverChipModels(s), dom);
+  drawSparkline();
+  updateTitle();
 }
 // Scalar tiles get the same "only write when it changed" treatment as rows.
 function setText(el, v) { if (el && el.__t !== v) { el.__t = v; el.textContent = v; } }
@@ -1461,23 +1583,56 @@ KINDS.log = { build: buildLogRow, apply: applyLogRow };
 function logScopes() {
   return ["system", "job", "file"].filter(s => $("lg-" + s).checked);
 }
+
+// A client-side ring, fed by the `log` SSE events. The REST endpoint is
+// only the backfill when the tab is opened; after that this behaves like
+// `tail -f`. Scope filtering happens HERE, not on the server: the daemon
+// would otherwise have to keep per-connection filter state, and toggling
+// "per-file" on would cost a round trip instead of a re-render.
+const LOG_RING_MAX = 500;
+/// Append a batch, keeping the ring bounded and marking anything the
+/// server's own cap skipped — "the tail is complete" is a claim the UI
+/// should only make when it is true.
+function appendLogs(entries, dropped) {
+  if (!Array.isArray(store.logs)) store.logs = [];
+  if (dropped > 0 && entries.length)
+    store.logs.push({ id: "skip-" + entries[0].id, skipped: dropped });
+  for (const e of entries) store.logs.push(e);
+  if (store.logs.length > LOG_RING_MAX)
+    store.logs.splice(0, store.logs.length - LOG_RING_MAX);
+  return store.logs;
+}
+function logMatches(e, scopes) {
+  if (e.skipped) return true;               // markers are never filtered out
+  return scopes.includes(e.scope);
+}
 function renderLogs() {
   const box = $("logbox");
   const l = store.logs;
+  const scopes = logScopes();
   let models;
   if (l === "off") models = [{ key: "__off", kind: "note", text: "log buffer not configured" }];
   else if (l == null) models = [{ key: "__loading", kind: "note", text: "loading…" }];
-  else if (!l.length)
-    models = [{
-      key: "__empty", kind: "note",
-      text: logScopes().length ? "no log entries" : "all scopes hidden — tick one above",
-    }];
-  else
-    models = l.map(e => ({
-      key: "l" + e.id, kind: "log", cls: "lg k-" + e.kind,
-      text: new Date(e.time_unix * 1000).toLocaleTimeString() + "  " +
-            e.kind.padEnd(7) + " " + e.text,
-    }));
+  else {
+    const shown = l.filter(e => logMatches(e, scopes));
+    if (!shown.length)
+      models = [{
+        key: "__empty", kind: "note",
+        text: scopes.length ? "no log entries" : "all scopes hidden — tick one above",
+      }];
+    else
+      models = shown.map(e => e.skipped
+        ? {
+            key: "l" + e.id, kind: "log", cls: "lg k-DETAIL",
+            text: "… " + e.skipped + " line" + (e.skipped === 1 ? "" : "s") +
+                  " skipped (the daemon was logging faster than this stream carries)",
+          }
+        : {
+            key: "l" + e.id, kind: "log", cls: "lg k-" + e.kind,
+            text: new Date(e.time_unix * 1000).toLocaleTimeString() + "  " +
+                  e.kind.padEnd(7) + " " + e.text,
+          });
+  }
   // Keep the view pinned to the tail only when it already was — a reader
   // scrolled up stays where they are.
   const stick = box.scrollTop + box.clientHeight >= box.scrollHeight - 8;
@@ -1530,11 +1685,10 @@ async function refreshClients() {
   store.clients = clients;
   renderClients();
 }
+/// Backfill only. All three scopes are fetched — the toggles filter what is
+/// already in hand, so flipping "per-file" on is a re-render, not a fetch.
 async function refreshLogs() {
-  // Scope filters: per-file lines are hundreds-per-job and drown the
-  // interesting ones, so they're opt-in; system + job are the default.
-  const scopes = logScopes();
-  const r = await jfetch("/api/v1/logs?limit=300&scope=" + scopes.join(","));
+  const r = await jfetch("/api/v1/logs?limit=300&scope=system,job,file");
   if (r.status === 501) { store.logs = "off"; renderLogs(); return; }
   if (!r.ok) throw new Error("logs " + r.status);
   const { entries } = await r.json();
@@ -1773,7 +1927,7 @@ $("btn-limit").onclick = async () => {
   refreshAll();
 };
 for (const s of ["system", "job", "file"])
-  $("lg-" + s).onchange = () => refreshLogs().catch(() => {});
+  $("lg-" + s).onchange = () => renderLogs();
 
 // ---- add NZBs from disk ---------------------------------------------------
 $("btn-addnzb").onclick = () => $("nzb-file").click();
@@ -1911,9 +2065,35 @@ function connectSse() {
       store.jobs = d.jobs;
       store.jobsLoaded = true;
       pending.reconcile(d.jobs);
+      pushRate(d.status.download_rate_bps);
       renderStatus();
       if (activeTab === "queue") renderQueue();
     } catch { /* malformed frame — the poll fallback still corrects */ }
+  });
+  // An idle queue deduplicates its ticks, so silence is normal. `hb` is how
+  // the daemon says "still here" without shipping a read model — it is the
+  // difference between a quiet queue and a dead stream.
+  es.addEventListener("hb", () => {
+    lastTickAt = Date.now();
+    connState("live");
+  });
+  // Live log tail. Everything lands in the client ring regardless of the
+  // scope toggles (they filter at render time) and the open job's activity
+  // panel feeds off the same stream.
+  es.addEventListener("log", (e) => {
+    try {
+      const d = JSON.parse(e.data);
+      if (!Array.isArray(d.entries) || !d.entries.length) return;
+      if (store.logs !== "off") appendLogs(d.entries, d.dropped || 0);
+      if (activeTab === "logs") renderLogs();
+      if (openJob != null && store.jobLogs && store.jobLogs.job === openJob) {
+        const mine = d.entries.filter(x => x.job === openJob);
+        if (mine.length) {
+          store.jobLogs.entries = store.jobLogs.entries.concat(mine).slice(-200);
+          if (activeTab === "queue") renderQueue();
+        }
+      }
+    } catch { /* malformed frame — the backfill poll still corrects */ }
   });
 }
 
@@ -2433,6 +2613,8 @@ if (typeof __nzbd_test_enable !== "undefined") {
     PENDING_TTL_MS, UNDO_MS, ARM_MS,
     armButton, armIsSet, disarmButton, histKey, renderHistory,
     deleteJob, requeueJob, jobAction, histAction, post,
+    pushRate, rateSeries, spark, SPARK_N, titleFor,
+    appendLogs, logMatches, renderLogs, serverChipModels, LOG_RING_MAX,
     setOpenJob: (id) => { openJob = id; },
     conn: () => store.conn,
   };
