@@ -18,6 +18,10 @@ use std::time::{Duration, Instant};
 pub struct HistoryDb {
     conn: Mutex<Connection>,
     jsonl: Option<PathBuf>,
+    /// Local spool for the regenerated NZBs of deleted jobs (`nzbs/<job>.nzb`
+    /// beside the SQLite index). Local, not shared: it is a convenience for
+    /// undoing a delete on the node that served the click, not cluster state.
+    spool: Option<PathBuf>,
     last_refresh: Mutex<Option<Instant>>,
 }
 
@@ -96,9 +100,11 @@ impl HistoryDb {
         let db = HistoryDb {
             conn: Mutex::new(conn),
             jsonl,
+            spool: db_path.parent().map(|d| d.join("nzbs")),
             last_refresh: Mutex::new(None),
         };
         db.rebuild_from_jsonl(false)?;
+        db.sweep_spool();
         Ok(db)
     }
 
@@ -366,11 +372,93 @@ impl HistoryDb {
     }
 
     pub fn delete(&self, job: crate::JobId) -> Result<bool, StateError> {
-        let conn = self.conn.lock().unwrap();
-        let n = conn
-            .execute("DELETE FROM history WHERE job_id = ?1", [job.0])
-            .map_err(|e| StateError::Corrupt(e.to_string()))?;
+        let n = {
+            let conn = self.conn.lock().unwrap();
+            conn.execute("DELETE FROM history WHERE job_id = ?1", [job.0])
+                .map_err(|e| StateError::Corrupt(e.to_string()))?
+        };
+        // The record and its spooled NZB live and die together: an entry
+        // nobody can see must not leave a file behind.
+        self.drop_spool(job);
         Ok(n > 0)
+    }
+
+    // -----------------------------------------------------------------
+    // NZB spool: deleting a queued job parks its regenerated NZB here so
+    // the delete can be undone (ADR: a misclick on a 60 GiB job must not
+    // cost a full re-download). Single-digit MB each and reaped with their
+    // history entry, so no quota is needed.
+    // -----------------------------------------------------------------
+
+    fn spool_path(&self, job: crate::JobId) -> Option<PathBuf> {
+        self.spool
+            .as_ref()
+            .map(|d| d.join(format!("{}.nzb", job.0)))
+    }
+
+    /// Park `bytes` as this job's requeue source. Overwrites any previous
+    /// spool for the same id (job ids are reused only after a restart, and
+    /// the newer job is the one worth keeping).
+    pub fn spool_nzb(&self, job: crate::JobId, bytes: &[u8]) -> Result<(), StateError> {
+        let Some(path) = self.spool_path(job) else {
+            return Ok(());
+        };
+        if let Some(parent) = path.parent() {
+            fsx::create_dir_all(parent)?;
+        }
+        fsx::write(&path, bytes)?;
+        Ok(())
+    }
+
+    /// The spooled NZB for a parked job, if it is still on this node.
+    pub fn read_spool(&self, job: crate::JobId) -> Option<Vec<u8>> {
+        let path = self.spool_path(job)?;
+        fsx::read(&path).ok()
+    }
+
+    /// Can this entry be put back in the queue from local state?
+    pub fn has_spool(&self, job: crate::JobId) -> bool {
+        self.spool_path(job).is_some_and(|p| p.is_file())
+    }
+
+    pub fn drop_spool(&self, job: crate::JobId) {
+        if let Some(path) = self.spool_path(job) {
+            let _ = fsx::remove_file(&path);
+        }
+    }
+
+    /// Reap spooled NZBs whose history entry is gone — an index wiped out
+    /// from under us, or a crash between the two writes.
+    fn sweep_spool(&self) {
+        let Some(dir) = &self.spool else { return };
+        let Ok(entries) = fsx::read_dir(dir) else {
+            return; // nothing spooled yet
+        };
+        let known: std::collections::HashSet<u32> = self
+            .list_filtered(100_000, true)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|e| e.job.0)
+            .collect();
+        let mut reaped = 0usize;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let id = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .and_then(|s| s.parse::<u32>().ok());
+            match id {
+                Some(id) if known.contains(&id) => {}
+                _ => {
+                    if fsx::remove_file(&path).is_ok() {
+                        reaped += 1;
+                    }
+                }
+            }
+        }
+        if reaped > 0 {
+            tracing::info!(reaped, "history: reaped orphaned parked NZBs");
+        }
     }
 }
 
@@ -424,5 +512,50 @@ mod tests {
             2,
             "rebuilt from JSONL (incl. deleted-locally row)"
         );
+    }
+
+    #[test]
+    fn parked_nzb_lives_and_dies_with_its_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("local/history.sqlite");
+        let db = HistoryDb::open(&db_path, None).unwrap();
+
+        assert!(!db.has_spool(crate::JobId(1)), "nothing parked yet");
+        db.spool_nzb(crate::JobId(1), b"<nzb/>").unwrap();
+        db.record(&entry(1, 100)).unwrap();
+        assert!(db.has_spool(crate::JobId(1)));
+        assert_eq!(
+            db.read_spool(crate::JobId(1)).as_deref(),
+            Some(&b"<nzb/>"[..])
+        );
+
+        // Forgetting the entry takes the spool with it — a file nobody can
+        // reach through the UI must not survive on disk.
+        assert!(db.delete(crate::JobId(1)).unwrap());
+        assert!(
+            !db.has_spool(crate::JobId(1)),
+            "spool reaped with the record"
+        );
+        assert!(db.read_spool(crate::JobId(1)).is_none());
+    }
+
+    #[test]
+    fn orphaned_spools_are_swept_on_open() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("local/history.sqlite");
+        {
+            let db = HistoryDb::open(&db_path, None).unwrap();
+            db.record(&entry(1, 100)).unwrap();
+            db.spool_nzb(crate::JobId(1), b"keep").unwrap();
+            db.spool_nzb(crate::JobId(2), b"orphan").unwrap(); // no entry
+        }
+        // A crash between spool and record, or an index wiped from under
+        // us, must not leak NZBs forever.
+        let db = HistoryDb::open(&db_path, None).unwrap();
+        assert!(
+            db.has_spool(crate::JobId(1)),
+            "the parked entry keeps its NZB"
+        );
+        assert!(!db.has_spool(crate::JobId(2)), "the orphan is reaped");
     }
 }

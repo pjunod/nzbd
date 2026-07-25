@@ -899,6 +899,151 @@ extern "C" {
     fn libc_kill(pid: i32, sig: i32) -> i32;
 }
 
+/// Deleting a queued job parks it: the regenerated NZB is spooled, a
+/// `DELETED` history entry appears, and `requeue` puts the job back. This
+/// is what makes a one-click delete safe enough to need no confirmation
+/// dialog — a misclick on a 60 GiB job costs an Undo, not a re-download.
+#[test]
+fn delete_parks_the_job_and_requeue_brings_it_back() {
+    let tmp = tempfile::tempdir().unwrap();
+    let api_port = free_port();
+    let api_addr = format!("127.0.0.1:{api_port}");
+    let state_dir = tmp.path().join("main/queue");
+
+    // No provider needed: the job is added paused, so nothing dials out.
+    let config = format!(
+        r#"
+[paths]
+main_dir = "{main}"
+dest_dir = "{dest}"
+
+[[server]]
+name = "unused"
+host = "127.0.0.1"
+port = {dead_port}
+tls = false
+connections = 1
+
+[api]
+bind = "{api_addr}"
+"#,
+        main = tmp.path().join("main").display(),
+        dest = tmp.path().join("dest").display(),
+        dead_port = free_port(),
+    );
+    let cfg_path = tmp.path().join("nzbd.toml");
+    std::fs::write(&cfg_path, config).unwrap();
+
+    let post = build_post("park me", &[("payload.bin", prng_bytes(9, 40_000))], 20_000);
+    let bin = env!("CARGO_BIN_EXE_nzbd");
+    let child = Command::new(bin)
+        .args(["run", "--config"])
+        .arg(&cfg_path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn nzbd");
+    let _child = KillOnDrop(child);
+    wait_healthy(&api_addr, Duration::from_secs(15));
+
+    let (code, body) = http(
+        &api_addr,
+        "POST",
+        "/api/v1/jobs?name=park%20me&category=tv&paused=true",
+        post.nzb.as_bytes(),
+    );
+    assert_eq!(code, 201, "{body}");
+    let id = serde_json::from_str::<serde_json::Value>(&body).unwrap()["id"]
+        .as_u64()
+        .expect("job id");
+
+    // Delete: the response says whether an Undo is on offer.
+    let (code, body) = http(
+        &api_addr,
+        "POST",
+        &format!("/api/v1/jobs/{id}/actions/delete"),
+        b"",
+    );
+    assert_eq!(code, 200, "{body}");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["ok"], true);
+    assert_eq!(v["parked"], true, "a deleted queued job must be undoable");
+
+    // Gone from the queue…
+    let (_, body) = http(&api_addr, "GET", "/api/v1/jobs", b"");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert!(
+        v["jobs"].as_array().unwrap().is_empty(),
+        "the job is really gone from the queue: {body}"
+    );
+    // …the NZB is on disk where requeue will look for it…
+    let spool = state_dir.join(format!("nzbs/{id}.nzb"));
+    assert!(
+        spool.is_file(),
+        "spooled NZB missing at {}",
+        spool.display()
+    );
+
+    // …and it is parked in history as DELETED, flagged requeueable.
+    let (code, body) = http(&api_addr, "GET", "/api/v1/history", b"");
+    assert_eq!(code, 200);
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let entry = v["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["job"] == id)
+        .unwrap_or_else(|| panic!("no history entry for the deleted job: {body}"))
+        .clone();
+    assert_eq!(entry["status"], "DELETED");
+    assert_eq!(entry["can_requeue"], true);
+    assert_eq!(entry["category"], "tv");
+    assert_eq!(entry["name"], "park me");
+
+    // Undo.
+    let (code, body) = http(
+        &api_addr,
+        "POST",
+        &format!("/api/v1/history/{id}/actions/requeue"),
+        b"",
+    );
+    assert_eq!(code, 200, "{body}");
+    let new_id = serde_json::from_str::<serde_json::Value>(&body).unwrap()["id"]
+        .as_u64()
+        .expect("requeued job id");
+
+    let (_, body) = http(&api_addr, "GET", "/api/v1/jobs", b"");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let jobs = v["jobs"].as_array().unwrap();
+    assert_eq!(jobs.len(), 1, "the job is back in the queue: {body}");
+    assert_eq!(jobs[0]["id"], new_id);
+    assert_eq!(jobs[0]["name"], "park me");
+    assert_eq!(jobs[0]["category"], "tv");
+
+    // The parked record and its spool are gone: the job is queued again, so
+    // a DELETED entry for it would be a lie.
+    let (_, body) = http(&api_addr, "GET", "/api/v1/history", b"");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert!(
+        !v["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["job"] == id),
+        "the parked entry is consumed by the requeue: {body}"
+    );
+    assert!(!spool.is_file(), "the spooled NZB is reaped with its entry");
+
+    // Requeueing something that was never parked is a 404, not a 500.
+    let (code, _) = http(
+        &api_addr,
+        "POST",
+        "/api/v1/history/99999/actions/requeue",
+        b"",
+    );
+    assert_eq!(code, 404);
+}
+
 fn jsonrpc(addr: &str, body: serde_json::Value) -> serde_json::Value {
     let (code, text) = http(addr, "POST", "/jsonrpc", body.to_string().as_bytes());
     assert_eq!(code, 200, "{text}");

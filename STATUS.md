@@ -8,7 +8,7 @@ roadmaps in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) §16 and
 Legend: ✅ done (implemented, tested, committed) · 🔶 partial · ⬜ not
 started · 👤 operator action (Paul)
 
-**Snapshot (2026-07-25):** 212 tests · clippy clean · **phases 0–4
+**Snapshot (2026-07-25):** 216 tests · clippy clean · **phases 0–4
 complete incl. RSS feeds, cluster C1+C2 complete, phase 5 partial** —
 every NZBGet user-facing surface exists; what remains is beyond-parity
 performance work and operator actions
@@ -177,7 +177,7 @@ performance work and operator actions
   - ⬜ M0 👤 redeploy nuc3 on a post-`9df6b7d` image (and add the missing `./config:/etc/nzbd` bind first) — kills the stale-cache half of the report before any v2 code lands
   - ✅ M1 keyed in-place renderer — store + `rowModel`/`reconcileRows`/`applyRow`, one delegated click listener, detail panel as a stable subtree; `crates/nzbd/tests/ui_dom.rs` pins the five rendering laws
   - ✅ M2 optimistic actions with revert + toasts — every mutating click applies to the view immediately and is reverted (with the daemon's own error text) if the POST fails or nothing confirms it inside 5 s; honest `live`/`reconnecting`/`unreachable` states, the last with a page-wide banner
-  - ⬜ M3 delete parks the regenerated NZB to history as `DELETED` + `requeue` action
+  - ✅ M3 delete parks the regenerated NZB to history as `DELETED` + `requeue` action — spool beside the history index (`nzbs/<job>.nzb`, reaped with its entry and swept for orphans on open), `delete` answers `{ok, parked}`, entries carry `can_requeue`; a job still `Fetching` parks its `*URL` instead. Engine untouched
   - ⬜ M4 instant undoable delete — `confirm()` removed everywhere
   - ⬜ M5 SSE `hb` + `log` events, per-server wire rates
   - ⬜ M6 sparkline, title ticker, server chips, live log tail

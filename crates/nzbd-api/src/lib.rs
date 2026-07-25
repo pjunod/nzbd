@@ -619,17 +619,125 @@ async fn add_job(
     }
 }
 
+/// Everything needed to put a deleted job back, captured before the engine
+/// forgets it. Either the regenerated NZB (a queued/downloading job) or the
+/// source URL (a job still fetching its NZB, which has no articles yet).
+struct Parked {
+    entry: nzbd_state::HistoryEntry,
+    nzb: Option<Vec<u8>>,
+}
+
+/// Snapshot a job for parking. Runs BEFORE the delete, while the queue
+/// still has it; the caller only writes the record if the delete succeeded.
+async fn park_snapshot(st: &ApiState, job: JobId) -> Option<Parked> {
+    st.history.as_ref()?;
+    let j = st.engine.export_job(job).await.ok().flatten()?;
+    let url = j
+        .params
+        .iter()
+        .find(|(k, _)| k == "*URL")
+        .map(|(_, v)| v.clone());
+    // A `Fetching` job has no articles to export — park its URL instead.
+    let nzb = if j.files.is_empty() {
+        None
+    } else {
+        Some(job_to_nzb(&j).into_bytes())
+    };
+    if nzb.is_none() && url.is_none() {
+        return None; // nothing to put back: don't promise an undo
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let mut params = j.params.clone();
+    if nzb.is_some() {
+        // The URL is only the requeue source when there is no NZB; keeping
+        // both would make the choice ambiguous on the way back.
+        params.retain(|(k, _)| k != "*URL");
+    }
+    Some(Parked {
+        entry: nzbd_state::HistoryEntry {
+            job,
+            name: j.name.clone(),
+            category: j.category.clone(),
+            final_dir: None,
+            status: "DELETED".into(),
+            size: j.totals.size,
+            health: nzbd_types::Health::calc(&j.totals).0,
+            params,
+            dupe_key: j.dupe.key.clone(),
+            dupe_score: j.dupe.score,
+            completed_at_unix: now,
+            hidden: false,
+            first_seen_at_unix: None,
+            last_seen_at_unix: None,
+            seen_count: 0,
+            removed_at_unix: None,
+            picked_up_by: None,
+        },
+        nzb,
+    })
+}
+
+/// Write the parked record + spool. Called only after the engine confirmed
+/// the delete, so history can never claim a job that is still queued.
+async fn park_write(st: &ApiState, parked: Parked) -> bool {
+    let Some(db) = st.history.clone() else {
+        return false;
+    };
+    let job = parked.entry.job;
+    tokio::task::spawn_blocking(move || {
+        if let Some(bytes) = &parked.nzb {
+            if let Err(e) = db.spool_nzb(job, bytes) {
+                tracing::warn!(job = job.0, error = %e, "could not park the deleted job's NZB");
+                return false;
+            }
+        }
+        match db.record(&parked.entry) {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::warn!(job = job.0, error = %e, "could not write the DELETED history entry");
+                db.drop_spool(job);
+                false
+            }
+        }
+    })
+    .await
+    .unwrap_or(false)
+}
+
 async fn job_action(
     State(st): State<ApiState>,
     Path((id, action)): Path<(u32, String)>,
 ) -> Response {
     let engine = &st.engine;
     let job = JobId(id);
+    // Delete parks. The job's regenerated NZB (or its source URL) is
+    // captured first, the engine deletes exactly as it always did, and only
+    // a CONFIRMED delete writes the `DELETED` history entry the UI offers
+    // Undo on. Export-then-delete is a benign race: if the job finishes in
+    // between, the delete answers Ok(false) -> 404 and the next tick
+    // reconciles the UI. No locking — `delete_job`'s single-writer
+    // semantics are not renegotiated by a UI feature.
+    if action == "delete" || action == "delete-files" {
+        let files = action == "delete-files";
+        let snapshot = park_snapshot(&st, job).await;
+        return match engine.delete_job(job, files).await {
+            Ok(true) => {
+                let mut parked = false;
+                if let Some(s) = snapshot {
+                    parked = park_write(&st, s).await;
+                }
+                Json(json!({ "ok": true, "parked": parked })).into_response()
+            }
+            Ok(false) => not_found(),
+            Err(e) => error(StatusCode::SERVICE_UNAVAILABLE, &e.to_string()),
+        };
+    }
     let result = match action.as_str() {
         "pause" => engine.pause_job(job).await,
         "resume" => engine.resume_job(job).await,
-        "delete" => engine.delete_job(job, false).await,
-        "delete-files" => engine.delete_job(job, true).await,
         "move-top" => engine.move_job(job, nzbd_engine::MoveOp::Top).await,
         "move-up" => engine.move_job(job, nzbd_engine::MoveOp::Up).await,
         "move-down" => engine.move_job(job, nzbd_engine::MoveOp::Down).await,
@@ -640,6 +748,7 @@ async fn job_action(
                 "unknown action (pause|resume|delete|delete-files|move-top|move-up|move-down|move-bottom)",
             )
         }
+        // delete / delete-files are handled above (they park first).
     };
     match result {
         Ok(true) => Json(json!({ "ok": true })).into_response(),
@@ -1017,7 +1126,22 @@ async fn get_history(State(st): State<ApiState>, Query(q): Query<HistoryQuery>) 
     let limit = q.limit.unwrap_or(200).min(10_000);
     let entries = tokio::task::spawn_blocking(move || {
         let _ = db.refresh(); // pick up other nodes' appends (throttled)
-        db.list_filtered(limit, true)
+        db.list_filtered(limit, true).map(|entries| {
+            // `can_requeue` is derived, not stored: it answers "is the
+            // requeue source still on this node?", which only a look at the
+            // spool (or the parked `*URL`) can honestly say.
+            entries
+                .into_iter()
+                .map(|e| {
+                    let can = db.has_spool(e.job) || e.params.iter().any(|(k, _)| k == "*URL");
+                    let mut v = serde_json::to_value(&e).unwrap_or_else(|_| json!({}));
+                    if let Some(o) = v.as_object_mut() {
+                        o.insert("can_requeue".into(), json!(can));
+                    }
+                    v
+                })
+                .collect::<Vec<_>>()
+        })
     })
     .await;
     match entries {
@@ -1049,13 +1173,14 @@ async fn openapi() -> Response {
                           ] }
             },
             "/api/v1/jobs/{id}": { "get": { "summary": "Job detail" } },
-            "/api/v1/jobs/{id}/actions/{action}": { "post": { "summary": "pause|resume|delete|delete-files" } },
+            "/api/v1/jobs/{id}/actions/{action}": { "post": { "summary": "pause|resume|delete|delete-files|move-*; delete answers {ok, parked}" } },
             "/api/v1/queue/actions/{action}": { "post": { "summary": "pause|resume" } },
             "/api/v1/queue/speed-limit": { "put": { "summary": "Set speed limit (bytes_per_sec)" } },
             "/api/v1/servers/test": { "post": { "summary": "Live news-server connectivity probe (connect + greeting + AUTHINFO)" } },
             "/api/v1/jobs/{id}/files": { "get": { "summary": "Per-file detail (segments done/failed, sizes, paused, par2)" } },
             "/api/v1/jobs/{id}/nzb": { "get": { "summary": "Download the job's NZB (regenerated from queue state)" } },
-            "/api/v1/history": { "get": { "summary": "Finished jobs" } },
+            "/api/v1/history": { "get": { "summary": "Finished and deleted jobs (entries carry can_requeue)" } },
+            "/api/v1/history/{id}/actions/{action}": { "post": { "summary": "restore|hide|delete|delete-files|requeue" } },
             "/api/v1/logs": { "get": { "summary": "Recent daemon log entries" } },
             "/api/v1/events": { "get": { "summary": "Engine events (SSE)" } },
             "/metrics": { "get": { "summary": "Prometheus exposition" } },
@@ -1399,10 +1524,66 @@ async fn get_clients(State(st): State<ApiState>) -> Response {
     Json(json!({ "clients": list })).into_response()
 }
 
+/// Put a parked (`DELETED`) entry back in the queue — the server half of
+/// the delete-with-Undo the UI offers. The requeue source is the spooled
+/// NZB, or the `*URL` param when the job was still fetching when it was
+/// deleted. On success the history entry and its spool are removed: the
+/// job is queued again, so a `DELETED` record for it would be a lie.
+async fn history_requeue(st: &ApiState, db: Arc<HistoryDb>, job: JobId) -> Response {
+    let lookup = db.clone();
+    let found = tokio::task::spawn_blocking(move || {
+        let entry = lookup
+            .list_filtered(10_000, true)
+            .ok()?
+            .into_iter()
+            .find(|e| e.job == job)?;
+        let nzb = lookup.read_spool(job);
+        Some((entry, nzb))
+    })
+    .await;
+    let Ok(Some((entry, nzb))) = found else {
+        return not_found();
+    };
+    let url = entry
+        .params
+        .iter()
+        .find(|(k, _)| k == "*URL")
+        .map(|(_, v)| v.clone());
+    let opts = nzbd_engine::AddOpts {
+        category: entry.category.clone(),
+        priority: 0,
+        dupe: (!entry.dupe_key.is_empty()).then(|| nzbd_types::DupeInfo {
+            key: entry.dupe_key.clone(),
+            score: entry.dupe_score,
+            mode: None,
+        }),
+        paused: false,
+    };
+    let added = match (&nzb, &url) {
+        (Some(bytes), _) => st.engine.add_nzb_opts(&entry.name, bytes, opts).await,
+        (None, Some(u)) => st.engine.add_url(&entry.name, u, opts).await,
+        (None, None) => {
+            return error(
+                StatusCode::NOT_FOUND,
+                "no parked NZB for this entry — nothing to requeue",
+            )
+        }
+    };
+    match added {
+        Ok(new_id) => {
+            // `delete` drops the spool with the record.
+            let _ = tokio::task::spawn_blocking(move || db.delete(job)).await;
+            tracing::info!(from = job.0, to = new_id.0, "history entry requeued");
+            Json(json!({ "id": new_id.0 })).into_response()
+        }
+        Err(e) => error(StatusCode::UNPROCESSABLE_ENTITY, &e.to_string()),
+    }
+}
+
 /// Manual handoff controls. `restore` un-hides an entry so a connected
 /// *arr sees it again on its next poll and re-imports; `hide` does the
 /// reverse; `delete` removes the record; `delete-files` also removes the
-/// job's final directory from disk.
+/// job's final directory from disk; `requeue` puts a parked delete back.
 async fn history_action(
     State(st): State<ApiState>,
     Path((id, action)): Path<(u32, String)>,
@@ -1411,6 +1592,9 @@ async fn history_action(
         return error(StatusCode::NOT_IMPLEMENTED, "history store not configured");
     };
     let job = JobId(id);
+    if action == "requeue" {
+        return history_requeue(&st, db, job).await;
+    }
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
@@ -1443,7 +1627,7 @@ async fn history_action(
             "restore" | "hide" | "delete" | "delete-files" => not_found(),
             _ => error(
                 StatusCode::BAD_REQUEST,
-                "unknown action (restore|hide|delete|delete-files)",
+                "unknown action (restore|hide|delete|delete-files|requeue)",
             ),
         },
         _ => error(StatusCode::INTERNAL_SERVER_ERROR, "history store error"),
@@ -1519,6 +1703,39 @@ mod tests {
     async fn body_json(resp: axum::response::Response) -> serde_json::Value {
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
         serde_json::from_slice(&bytes).unwrap()
+    }
+
+    /// With no history store there is nowhere to park, so delete says so
+    /// rather than promising an Undo that cannot work. (`nzbd run` always
+    /// configures history; a bare router — the cluster proxy — does not.)
+    #[tokio::test]
+    async fn delete_without_a_history_store_reports_parked_false() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = test_engine(&tmp).await;
+        let app = router(engine.clone());
+        let resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::post("/api/v1/jobs?name=nohist")
+                    .body(axum::body::Body::from(NZB))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let id = body_json(resp).await["id"].as_u64().unwrap();
+
+        let resp = app
+            .oneshot(
+                axum::http::Request::post(format!("/api/v1/jobs/{id}/actions/delete"))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = body_json(resp).await;
+        assert_eq!(v["ok"], true, "the delete itself still works");
+        assert_eq!(v["parked"], false, "…but there is no Undo to offer");
     }
 
     #[tokio::test]
