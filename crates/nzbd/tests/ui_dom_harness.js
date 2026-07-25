@@ -466,14 +466,55 @@ const models = (jobs) => jobs.map((j, i) => T.rowModel(j, { idx: i, count: jobs.
   eq(stack.children.length, 1, "…and the user is told");
   ok(stack.children[0].children[0].textContent.includes("didn't take"),
     "the message names the failure, not a generic error");
-  // An op whose POST is still in flight is NOT swept out from under it.
+  // An op whose POST is still in flight is NOT swept out from under it…
   const op2 = T.pending.apply({ key: T.pending.key(1, "pause"), kind: "pause", jobId: 1 });
   op2.inflight = true;
   op2.at = Date.now() - (T.PENDING_TTL_MS + 1000);
   T.pending.sweep();
   eq(T.pending.ops.size, 1, "a POST still in flight is given its time");
+  // …but it gets a longer leash, not an exemption. A daemon that accepts
+  // the connection and then never answers must not leave a row invisible
+  // until the page is reloaded.
+  op2.at = Date.now() - (T.PENDING_HARD_MS + 1000);
+  T.pending.sweep();
+  eq(T.pending.ops.size, 0, "even an in-flight op is eventually reverted");
   T.pending.clear();
   stack.children.length = 0;
+}
+
+// --- 15b. logs are a live tail, not a poll ------------------------------
+// Re-polling over a healthy stream would replace the ring every 5 s,
+// discarding the lines the stream just delivered (and any skipped-line
+// markers) and re-downloading 300 entries to do it.
+{
+  const logPolls = () => seen.filter(r => r.url.includes("/api/v1/logs")).length;
+  routes.clear();
+  seen.length = 0;
+  routes.set("/api/v1/logs", { status: 200, body: { entries: [] } });
+  T.setActiveTab("logs");
+
+  // Nothing loaded yet: backfill, whatever the stream is doing.
+  T.store.logs = null;
+  T.connState("live");
+  T.refreshTab();
+  eq(logPolls(), 1, "an empty Logs tab backfills once");
+
+  // Loaded and the stream is healthy: the tail carries it, no poll.
+  seen.length = 0;
+  T.store.logs = [{ id: 1, scope: "system", kind: "INFO", time_unix: 1, text: "live line" }];
+  T.refreshTab();
+  T.refreshTab();
+  eq(logPolls(), 0, "a live stream is not second-guessed every 5 s");
+
+  // Stream down: the poll is the only thing carrying the page, so it runs.
+  T.connState("reconnecting");
+  T.refreshTab();
+  eq(logPolls(), 1, "…but a dropped stream falls back to polling");
+
+  T.setActiveTab("queue");
+  T.connState("live");
+  routes.clear();
+  seen.length = 0;
 }
 
 // --- 16. pending overlay: explicit revert on a failed POST ---------------

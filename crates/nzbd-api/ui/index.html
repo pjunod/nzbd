@@ -713,6 +713,10 @@ function toast(o) {
 // forgetting the op IS the revert. The moment it is dropped the next render
 // shows exactly what the server says.
 const PENDING_TTL_MS = 5000;
+/// The ceiling for an op whose POST has not come back at all. Longer than
+/// `post()`'s own abort timeout, so in practice the abort wins and this
+/// only fires if even that fails.
+const PENDING_HARD_MS = 30000;
 const pending = {
   ops: new Map(),
   key(jobId, kind) { return jobId + ":" + kind; },
@@ -778,10 +782,18 @@ const pending = {
   },
   /// Nothing confirmed it and the grace period is up. Runs at 1 Hz so a
   /// dead stream still un-sticks the view.
+  ///
+  /// An op whose POST is still in flight gets a longer leash rather than
+  /// an exemption: a daemon that accepts the connection and then never
+  /// answers would otherwise leave the row hidden until the page is
+  /// reloaded. `post()` aborts on its own timeout too — this is the belt
+  /// to that suspender, and the reason it exists is that a row you cannot
+  /// see is worse than one that reappears.
   sweep() {
     const now = Date.now();
     for (const [key, op] of [...this.ops]) {
-      if (op.inflight || now - op.at <= PENDING_TTL_MS) continue;
+      const age = now - op.at;
+      if (age <= (op.inflight ? PENDING_HARD_MS : PENDING_TTL_MS)) continue;
       this.ops.delete(key);
       toast({
         text: (op.label || "that action") + " didn't take — the daemon never confirmed it",
@@ -1716,12 +1728,23 @@ async function refreshJobDetail() {
 // 503 and a success were the same event as far as the page was concerned —
 // which is how "I clicked delete and nothing happened" could be true in two
 // completely different ways at once.
+// A mutating call must always settle. A daemon that accepts the connection
+// and then never answers would otherwise leave its pending op in flight
+// forever — and an in-flight delete means a row you cannot see.
+const POST_TIMEOUT_MS = 20000;
 async function post(url, init) {
   let r;
+  const ctrl = typeof AbortController !== "undefined" ? new AbortController() : null;
+  const timer = ctrl ? setTimeout(() => ctrl.abort(), POST_TIMEOUT_MS) : null;
   try {
-    r = await jfetch(url, Object.assign({ method: "POST", headers: CLIENT_HDRS }, init || {}));
+    r = await jfetch(url, Object.assign(
+      { method: "POST", headers: CLIENT_HDRS, signal: ctrl ? ctrl.signal : undefined },
+      init || {}));
   } catch (e) {
-    return { ok: false, error: String(e && e.message ? e.message : e) };
+    const msg = String(e && e.message ? e.message : e);
+    return { ok: false, error: /abort/i.test(msg) ? "the daemon never answered" : msg };
+  } finally {
+    if (timer) clearTimeout(timer);
   }
   const body = await r.json().catch(() => ({}));
   if (r.ok) return { ok: true, body };
@@ -1975,7 +1998,13 @@ document.querySelectorAll("nav.tabs button").forEach(b => b.onclick = () => {
 function refreshTab() {
   if (activeTab === "queue") refreshQueue().catch(() => {});
   if (activeTab === "history") refreshHistory().catch(() => {});
-  if (activeTab === "logs") refreshLogs().catch(() => {});
+  // Logs are a live tail now. Re-polling over a healthy stream would
+  // replace the ring every 5 s — discarding the lines the stream just
+  // delivered along with any "N skipped" markers, and re-downloading 300
+  // entries to do it. Backfill only: on tab open, or when the stream is
+  // not carrying us.
+  if (activeTab === "logs" && (store.logs == null || store.conn !== "live"))
+    refreshLogs().catch(() => {});
   if (activeTab === "settings") loadSettings().catch(() => {});
 }
 function refreshAll() {
@@ -2610,12 +2639,13 @@ if (typeof __nzbd_test_enable !== "undefined") {
     histModel, fileModel, statusModels, queueModels, detailModel,
     statusName, healthColor, fmtBytes, fmtRate, fmtEta,
     pending, satisfied, toast, connState, pollResult,
-    PENDING_TTL_MS, UNDO_MS, ARM_MS,
+    PENDING_TTL_MS, PENDING_HARD_MS, UNDO_MS, ARM_MS, refreshTab,
     armButton, armIsSet, disarmButton, histKey, renderHistory,
     deleteJob, requeueJob, jobAction, histAction, post,
     pushRate, rateSeries, spark, SPARK_N, titleFor,
     appendLogs, logMatches, renderLogs, serverChipModels, LOG_RING_MAX,
     setOpenJob: (id) => { openJob = id; },
+    setActiveTab: (t) => { activeTab = t; },
     conn: () => store.conn,
   };
 }
