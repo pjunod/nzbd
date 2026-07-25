@@ -103,9 +103,13 @@ pub(crate) enum QueueCommand {
         reply: oneshot::Sender<bool>,
     },
     PauseAll {
+        /// Requesting client (UA / "web-ui") — logged and carried on the
+        /// event so pause flapping is attributable.
+        source: String,
         reply: oneshot::Sender<()>,
     },
     ResumeAll {
+        source: String,
         reply: oneshot::Sender<()>,
     },
     SetSpeedLimit {
@@ -143,10 +147,7 @@ pub(crate) enum QueueCommand {
         reply: oneshot::Sender<bool>,
     },
     /// Overlay remote progress counters onto a delegated job's summary.
-    MirrorProgress {
-        job: JobId,
-        stats: MirrorStats,
-    },
+    MirrorProgress { job: JobId, stats: MirrorStats },
     /// Union-fold the job's shared journal files into local state (reclaim
     /// after a worker died, or adoption after taking office).
     FoldJobJournals {
@@ -162,9 +163,7 @@ pub(crate) enum QueueCommand {
     /// Become the queue authority: load the shared snapshot (local jobs
     /// win on conflict — the executor copy is fresher), fold all journals,
     /// enable persistence.
-    AdoptAuthority {
-        reply: oneshot::Sender<()>,
-    },
+    AdoptAuthority { reply: oneshot::Sender<()> },
     /// Crash-only demotion: drop authority persistence and every job not
     /// in `keep` (the leases this node still executes).
     RetainJobs {
@@ -301,6 +300,13 @@ pub(crate) struct Owner {
     /// Per-job download-rate EMA, fed from downloaded-byte deltas at
     /// snapshot time (job id → meter).
     job_rates: HashMap<u32, JobRateMeter>,
+    /// Wire-byte EMA per job (B/s), fed from the meter's per-job counters
+    /// at 1 Hz — the same measurement as the header rate.
+    job_wire_ema: HashMap<u32, f64>,
+    /// Article retries per job (any failed attempt that goes back on the
+    /// ladder). Surfaced in the snapshot: this is the gap between wire
+    /// throughput and completed bytes, and it must be visible.
+    retry_counts: HashMap<u32, u32>,
 
     state_dir: PathBuf,
     journal: JobJournals,
@@ -438,6 +444,8 @@ impl Owner {
             delegated: HashMap::new(),
             mirror: HashMap::new(),
             job_rates: HashMap::new(),
+            job_wire_ema: HashMap::new(),
+            retry_counts: HashMap::new(),
             state_dir: state_dir.to_path_buf(),
             journal,
             snap_store,
@@ -815,17 +823,36 @@ impl Owner {
                 let ok = self.move_job(job, op);
                 let _ = reply.send(ok);
             }
-            QueueCommand::PauseAll { reply } => {
+            QueueCommand::PauseAll { source, reply } => {
+                // Always log WHO, at info: "the queue keeps unpausing
+                // itself" is always some client sending these — make the
+                // culprit readable straight from `docker logs`.
+                tracing::info!(
+                    %source,
+                    was_paused = self.state.download_paused,
+                    "queue pause requested"
+                );
                 self.state.download_paused = true;
                 self.dirty = true;
-                self.emit(Event::QueuePauseChanged { paused: true });
+                self.emit(Event::QueuePauseChanged {
+                    paused: true,
+                    source,
+                });
                 self.publish_now();
                 let _ = reply.send(());
             }
-            QueueCommand::ResumeAll { reply } => {
+            QueueCommand::ResumeAll { source, reply } => {
+                tracing::info!(
+                    %source,
+                    was_paused = self.state.download_paused,
+                    "queue resume requested"
+                );
                 self.state.download_paused = false;
                 self.dirty = true;
-                self.emit(Event::QueuePauseChanged { paused: false });
+                self.emit(Event::QueuePauseChanged {
+                    paused: false,
+                    source,
+                });
                 self.bump_epoch();
                 self.publish_now();
                 let _ = reply.send(());
@@ -1222,6 +1249,10 @@ impl Owner {
     }
 
     fn on_segment_failed(&mut self, r: SegRef, server: ServerId, outcome: AttemptOutcome) {
+        // Every failed attempt is a retry the wire pays for again — count
+        // it per job so "header rate ≫ row progress" is explained on the
+        // dashboard instead of looking like a stale page.
+        *self.retry_counts.entry(r.job.0).or_insert(0) += 1;
         let servers = self.servers.clone();
         let ladder = Ladder::new(&servers);
         let att = self
@@ -1742,6 +1773,21 @@ impl Owner {
         }
         let rate = self.meter.tick();
 
+        // Per-job wire rates: fold this second's attributed bytes into a
+        // ~5 s EMA (same cadence as the tick). Jobs with no bytes this
+        // second decay toward zero instead of freezing at their last rate.
+        let per_job = self.meter.drain_jobs();
+        const ALPHA: f64 = 1.0 / 5.0;
+        for (job, ema) in self.job_wire_ema.iter_mut() {
+            let inst = per_job.get(job).copied().unwrap_or(0) as f64;
+            *ema += ALPHA * (inst - *ema);
+        }
+        for (job, bytes) in per_job {
+            self.job_wire_ema
+                .entry(job)
+                .or_insert_with(|| bytes as f64 * ALPHA);
+        }
+
         let now = Instant::now();
         let before = self.blocked.len();
         self.blocked.retain(|_, until| *until > now);
@@ -1838,6 +1884,7 @@ impl Owner {
                     dupe_key: j.dupe.key.clone(),
                     dupe_score: j.dupe.score,
                     rate_bps: 0,
+                    retried_articles: 0,
                 };
                 // Delegated jobs progress remotely; overlay heartbeat stats.
                 if let Some(m) = self.mirror.get(&j.id) {
@@ -1868,16 +1915,30 @@ impl Owner {
                         ema_bps: 0.0,
                     });
                 summary.rate_bps = if summary.status == JobStatus::Downloading {
-                    meter.update(summary.downloaded_bytes)
+                    // Local jobs: wire-fed EMA — the SAME bytes the header
+                    // meter counts, attributed per job, so the row rate and
+                    // the header rate can never structurally disagree
+                    // (completed-article deltas lag the wire by whatever is
+                    // being retried, which read as a stale, slower row).
+                    // Delegated jobs have no local wire; their heartbeat
+                    // byte deltas keep using the completed-bytes meter.
+                    match self.job_wire_ema.get(&summary.id.0) {
+                        Some(ema) if summary.assigned_node.is_none() => ema.max(0.0) as u64,
+                        _ => meter.update(summary.downloaded_bytes),
+                    }
                 } else {
                     // Reset the baseline so a resume doesn't spike.
                     meter.last_bytes = summary.downloaded_bytes;
                     meter.ema_bps = 0.0;
                     0
                 };
+                summary.retried_articles =
+                    self.retry_counts.get(&summary.id.0).copied().unwrap_or(0);
             }
             let live: HashSet<u32> = jobs.iter().map(|s| s.id.0).collect();
             self.job_rates.retain(|id, _| live.contains(id));
+            self.job_wire_ema.retain(|id, _| live.contains(id));
+            self.retry_counts.retain(|id, _| live.contains(id));
             jobs
         };
         let now_block = Instant::now();

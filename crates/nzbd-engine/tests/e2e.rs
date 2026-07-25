@@ -392,7 +392,7 @@ async fn pause_resume_and_delete() {
     let ns = NservBuilder::new().with_post(&post).start().await.unwrap();
 
     let engine = spawn_engine(tmp.path(), vec![server_def(1, ns.port(), 0, 2, 2)]).await;
-    engine.pause_all().await.unwrap();
+    engine.pause_all("test").await.unwrap();
 
     let mut rx = engine.subscribe();
     let job = engine
@@ -404,9 +404,21 @@ async fn pause_resume_and_delete() {
     assert_eq!(ns.total_hits(), 0, "paused queue must not download");
     assert!(engine.snapshot().download_paused);
 
-    engine.resume_all().await.unwrap();
+    // The pause invariant behind the 2026-07-25 "it unpauses itself"
+    // report: the engine NEVER flips this flag on its own — not on a
+    // tick, not on a guard pass, not on a snapshot save. Only a client
+    // command moves it. (The field flapping was another API client
+    // re-asserting its own state; attribution now names it.)
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert!(
+        engine.snapshot().download_paused,
+        "pause must hold across owner ticks until a client resumes"
+    );
+
+    engine.resume_all("test").await.unwrap();
     let (status, _) = wait_finished(&mut rx, job, 30).await;
     assert_eq!(status, JobStatus::Completed);
+    assert!(!engine.snapshot().download_paused);
 
     // Delete with files.
     assert!(engine.delete_job(job, true).await.unwrap());

@@ -37,6 +37,11 @@ pub enum Event {
     },
     QueuePauseChanged {
         paused: bool,
+        /// Who asked (client UA / "web-ui" / "cli") — surfaced in the UI
+        /// and logs so a queue that keeps (un)pausing itself is a
+        /// one-glance diagnosis instead of whack-a-mole: SOME client sent
+        /// this; the engine never flips the flag on its own.
+        source: String,
     },
     SpeedLimitChanged {
         bytes_per_sec: Option<u64>,

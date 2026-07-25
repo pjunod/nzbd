@@ -445,6 +445,132 @@ async fn get_job(State(st): State<ApiState>, Path(id): Path<u32>) -> Response {
     }
 }
 
+/// `GET /api/v1/jobs/{id}/files` — per-file detail for the job panel:
+/// name, size, segment progress, pause/par2 flags, assembled state.
+async fn get_job_files(State(st): State<ApiState>, Path(id): Path<u32>) -> Response {
+    use nzbd_types::SegmentState;
+    match st.engine.export_job(JobId(id)).await {
+        Ok(Some(job)) => {
+            let files: Vec<serde_json::Value> = job
+                .files
+                .iter()
+                .map(|f| {
+                    let mut done = 0u32;
+                    let mut failed = 0u32;
+                    let mut done_bytes = 0u64;
+                    let size: u64 = f.segments.iter().map(|s| s.size as u64).sum();
+                    for s in &f.segments {
+                        match s.state {
+                            SegmentState::Done { len, .. } => {
+                                done += 1;
+                                done_bytes += len as u64;
+                            }
+                            SegmentState::Failed => failed += 1,
+                            _ => {}
+                        }
+                    }
+                    json!({
+                        "id": f.id.0,
+                        "filename": f.filename,
+                        "size_bytes": size,
+                        "downloaded_bytes": done_bytes,
+                        "total_segments": f.segments.len() as u32,
+                        "done_segments": done,
+                        "failed_segments": failed,
+                        "paused": f.paused,
+                        "is_par2": f.is_par2,
+                        "assembled": f.finalized,
+                    })
+                })
+                .collect();
+            Json(json!({ "job": job.id.0, "name": job.name, "files": files })).into_response()
+        }
+        Ok(None) => not_found(),
+        Err(e) => error(StatusCode::SERVICE_UNAVAILABLE, &e.to_string()),
+    }
+}
+
+/// `GET /api/v1/jobs/{id}/nzb` — the job's NZB, regenerated from queue
+/// state (subjects, groups, message-ids, sizes — everything the daemon
+/// needed to download is everything an NZB contains). Downloadable from
+/// the job panel; the original upload is not retained, so this IS the
+/// canonical export.
+async fn get_job_nzb(State(st): State<ApiState>, Path(id): Path<u32>) -> Response {
+    match st.engine.export_job(JobId(id)).await {
+        Ok(Some(job)) => {
+            let xml = job_to_nzb(&job);
+            let fname = nzbd_engine::queue::sanitize_name(&job.name);
+            (
+                [
+                    (
+                        axum::http::header::CONTENT_TYPE,
+                        "application/x-nzb; charset=utf-8".to_string(),
+                    ),
+                    (
+                        axum::http::header::CONTENT_DISPOSITION,
+                        format!("attachment; filename=\"{}.nzb\"", fname.replace('"', "_")),
+                    ),
+                ],
+                xml,
+            )
+                .into_response()
+        }
+        Ok(None) => not_found(),
+        Err(e) => error(StatusCode::SERVICE_UNAVAILABLE, &e.to_string()),
+    }
+}
+
+fn job_to_nzb(job: &nzbd_types::Job) -> String {
+    use std::fmt::Write as _;
+    let esc = |s: &str| {
+        s.replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+            .replace('"', "&quot;")
+    };
+    let mut x = String::from(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<nzb xmlns=\"http://www.newzbin.com/DTD/2003/nzb\">\n",
+    );
+    let _ = writeln!(x, "  <head>");
+    let _ = writeln!(x, "    <meta type=\"title\">{}</meta>", esc(&job.name));
+    if let Some(c) = &job.category {
+        let _ = writeln!(x, "    <meta type=\"category\">{}</meta>", esc(c));
+    }
+    let _ = writeln!(x, "  </head>");
+    for f in &job.files {
+        let subject = if f.subject.trim().is_empty() {
+            &f.filename
+        } else {
+            &f.subject
+        };
+        let _ = writeln!(
+            x,
+            "  <file poster=\"nzbd\" date=\"{}\" subject=\"{}\">",
+            f.date.unwrap_or(0),
+            esc(subject)
+        );
+        let _ = writeln!(x, "    <groups>");
+        for g in &f.groups {
+            let _ = writeln!(x, "      <group>{}</group>", esc(g));
+        }
+        let _ = writeln!(x, "    </groups>");
+        let _ = writeln!(x, "    <segments>");
+        for s in &f.segments {
+            let _ = writeln!(
+                x,
+                "      <segment bytes=\"{}\" number=\"{}\">{}</segment>",
+                s.size,
+                s.number,
+                esc(&s.message_id)
+            );
+        }
+        let _ = writeln!(x, "    </segments>");
+        let _ = writeln!(x, "  </file>");
+    }
+    x.push_str("</nzb>\n");
+    x
+}
+
 #[derive(Debug, Deserialize)]
 struct AddJobQuery {
     name: Option<String>,
@@ -522,17 +648,44 @@ async fn job_action(
     }
 }
 
-async fn queue_action(State(st): State<ApiState>, Path(action): Path<String>) -> Response {
+async fn queue_action(
+    State(st): State<ApiState>,
+    Path(action): Path<String>,
+    headers: axum::http::HeaderMap,
+) -> Response {
     let engine = &st.engine;
+    let source = client_source(&headers);
     let result = match action.as_str() {
-        "pause" => engine.pause_all().await,
-        "resume" => engine.resume_all().await,
+        "pause" => engine.pause_all(&source).await,
+        "resume" => engine.resume_all(&source).await,
         _ => return error(StatusCode::BAD_REQUEST, "unknown action (pause|resume)"),
     };
     match result {
         Ok(()) => Json(json!({ "ok": true })).into_response(),
         Err(e) => error(StatusCode::SERVICE_UNAVAILABLE, &e.to_string()),
     }
+}
+
+/// Attribution for state-changing calls: the UI names itself via
+/// `X-Nzbd-Client`; anything else is identified by User-Agent (browsers
+/// get compacted to their first token — "Mozilla/5.0" tells us enough).
+fn client_source(headers: &axum::http::HeaderMap) -> String {
+    if let Some(v) = headers.get("x-nzbd-client").and_then(|v| v.to_str().ok()) {
+        if !v.trim().is_empty() {
+            return v.trim().chars().take(60).collect();
+        }
+    }
+    headers
+        .get(axum::http::header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .map(|ua| {
+            ua.split_whitespace()
+                .next()
+                .unwrap_or("unknown")
+                .to_string()
+        })
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "unknown".into())
 }
 
 #[derive(Debug, Deserialize)]
@@ -739,9 +892,10 @@ fn event_wire(ev: &nzbd_engine::Event) -> (&'static str, String) {
         // Named wire events, not a `_ => "event"` catch-all: the UI keys
         // its refresh nudges on these names (a pause emitted as the opaque
         // "event" was invisible to it — part of the stale-pause report).
-        E::QueuePauseChanged { paused } => {
-            ("queue_pause_changed", json!({"paused": paused}).to_string())
-        }
+        E::QueuePauseChanged { paused, source } => (
+            "queue_pause_changed",
+            json!({"paused": paused, "source": source}).to_string(),
+        ),
         E::SpeedLimitChanged { bytes_per_sec } => (
             "speed_limit_changed",
             json!({"bytes_per_sec": bytes_per_sec}).to_string(),
@@ -815,6 +969,13 @@ async fn metrics(State(st): State<ApiState>) -> Response {
 struct LogsQuery {
     after: Option<u64>,
     limit: Option<usize>,
+    /// Comma-separated scopes to include: `system`, `job`, `file`.
+    /// Default: everything. The UI defaults to `system,job` — per-file
+    /// lines are two orders of magnitude noisier and drown the rest.
+    scope: Option<String>,
+    /// Only lines about this job (its job- and file-scoped records) —
+    /// powers the per-job activity tail in the job detail panel.
+    job: Option<u32>,
 }
 
 /// `GET /api/v1/logs` — recent daemon log entries from the in-memory ring.
@@ -823,9 +984,20 @@ async fn get_logs(State(st): State<ApiState>, Query(q): Query<LogsQuery>) -> Res
         return error(StatusCode::NOT_IMPLEMENTED, "log buffer not configured");
     };
     let limit = q.limit.unwrap_or(200).min(2000);
+    let scopes: Option<Vec<logbuf::LogScope>> = q.scope.as_deref().map(|s| {
+        s.split(',')
+            .filter_map(|part| match part.trim() {
+                "system" => Some(logbuf::LogScope::System),
+                "job" => Some(logbuf::LogScope::Job),
+                "file" => Some(logbuf::LogScope::File),
+                _ => None,
+            })
+            .collect()
+    });
     let entries = match q.after {
+        // `after` paging is the compat loadlog path — unfiltered.
         Some(after) => buf.since(after, limit),
-        None => buf.tail(limit),
+        None => buf.tail_filtered(limit, scopes.as_deref(), q.job),
     };
     Json(json!({ "entries": entries })).into_response()
 }
@@ -881,6 +1053,8 @@ async fn openapi() -> Response {
             "/api/v1/queue/actions/{action}": { "post": { "summary": "pause|resume" } },
             "/api/v1/queue/speed-limit": { "put": { "summary": "Set speed limit (bytes_per_sec)" } },
             "/api/v1/servers/test": { "post": { "summary": "Live news-server connectivity probe (connect + greeting + AUTHINFO)" } },
+            "/api/v1/jobs/{id}/files": { "get": { "summary": "Per-file detail (segments done/failed, sizes, paused, par2)" } },
+            "/api/v1/jobs/{id}/nzb": { "get": { "summary": "Download the job's NZB (regenerated from queue state)" } },
             "/api/v1/history": { "get": { "summary": "Finished jobs" } },
             "/api/v1/logs": { "get": { "summary": "Recent daemon log entries" } },
             "/api/v1/events": { "get": { "summary": "Engine events (SSE)" } },
@@ -1281,6 +1455,8 @@ pub fn router_with(state: ApiState) -> Router {
         .route("/api/v1/status", get(get_status))
         .route("/api/v1/jobs", get(list_jobs).post(add_job))
         .route("/api/v1/jobs/{id}", get(get_job))
+        .route("/api/v1/jobs/{id}/files", get(get_job_files))
+        .route("/api/v1/jobs/{id}/nzb", get(get_job_nzb))
         .route("/api/v1/jobs/{id}/actions/{action}", post(job_action))
         .route("/api/v1/queue/actions/{action}", post(queue_action))
         .route("/api/v1/queue/speed-limit", put(set_speed_limit))
@@ -1846,15 +2022,96 @@ mod tests {
         engine.shutdown().await;
     }
 
+    /// Job detail surfaces: per-file listing and the regenerated NZB.
+    /// The NZB must round-trip through the real parser — a download of
+    /// the export re-added anywhere must describe the same articles.
+    #[tokio::test]
+    async fn job_files_and_nzb_export() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = test_engine(&tmp).await;
+        let app = router(engine.clone());
+
+        let resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::post("/api/v1/jobs?name=exportme")
+                    .body(axum::body::Body::from(NZB))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let id = body_json(resp).await["id"].as_u64().unwrap();
+
+        // Per-file detail.
+        let resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::get(format!("/api/v1/jobs/{id}/files"))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = body_json(resp).await;
+        assert_eq!(v["files"].as_array().unwrap().len(), 1);
+        assert_eq!(v["files"][0]["filename"], "f.bin");
+        assert_eq!(v["files"][0]["total_segments"], 1);
+        assert_eq!(v["files"][0]["size_bytes"], 1000);
+
+        // NZB export: correct headers, parses, same segment ids.
+        let resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::get(format!("/api/v1/jobs/{id}/nzb"))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(resp
+            .headers()
+            .get(axum::http::header::CONTENT_DISPOSITION)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.contains("exportme.nzb")));
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let parsed = nzbd_nzb::parse(&bytes).expect("regenerated NZB parses");
+        assert_eq!(parsed.files.len(), 1);
+        assert_eq!(parsed.files[0].segments.len(), 1);
+        assert_eq!(parsed.files[0].segments[0].message_id, "m1@x");
+        assert_eq!(parsed.meta.title.as_deref(), Some("exportme"));
+
+        // Unknown job: 404s, not a panic.
+        let resp = app
+            .oneshot(
+                axum::http::Request::get("/api/v1/jobs/9999/nzb")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        engine.shutdown().await;
+    }
+
     /// Every engine event crosses the wire under its own name — the UI
     /// keys refresh nudges on these (a pause emitted as an opaque "event"
     /// was invisible to it; part of the stale-pause report).
     #[test]
     fn event_wire_names_cover_pause_and_limit() {
         use nzbd_engine::Event as E;
-        let (name, data) = event_wire(&E::QueuePauseChanged { paused: true });
+        let (name, data) = event_wire(&E::QueuePauseChanged {
+            paused: true,
+            source: "monarr/1.0".into(),
+        });
         assert_eq!(name, "queue_pause_changed");
         assert!(data.contains("true"));
+        assert!(
+            data.contains("monarr/1.0"),
+            "pause events carry their source: {data}"
+        );
         let (name, data) = event_wire(&E::SpeedLimitChanged {
             bytes_per_sec: Some(1024),
         });

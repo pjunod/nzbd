@@ -28,8 +28,13 @@ pub struct JobSummary {
     pub health: u16,
     pub critical_health: u16,
     /// This job's current download rate (EMA, bytes/sec; 0 unless
-    /// actively downloading).
+    /// actively downloading). For local jobs this is WIRE bytes — the
+    /// same measurement as the queue-wide rate, so the two never
+    /// structurally disagree.
     pub rate_bps: u64,
+    /// Article download attempts that failed and were retried — the gap
+    /// between wire throughput and completed bytes, made visible.
+    pub retried_articles: u32,
     /// Cluster: node currently executing this job remotely (None = local).
     pub assigned_node: Option<String>,
     /// Post-processing already finished (the `*PP:done` stamp is present).

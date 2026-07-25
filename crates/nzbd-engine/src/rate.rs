@@ -87,6 +87,13 @@ pub struct SpeedMeter {
     current_second: AtomicU64,
     total: AtomicU64,
     ring: Mutex<Ring>,
+    /// Wire bytes per job since the last owner tick. Fed alongside the
+    /// global counter so per-job rates are the SAME measurement as the
+    /// header rate — the header showing 93 MiB/s while the row claimed 56
+    /// (field report 2026-07-25) was wire rate vs completed-article rate,
+    /// two different quantities; the gap is retries/discards, which are
+    /// now counted per job instead of silently inflating the header.
+    per_job: Mutex<std::collections::HashMap<u32, u64>>,
 }
 
 struct Ring {
@@ -111,12 +118,24 @@ impl SpeedMeter {
                 next: 0,
                 filled: 0,
             }),
+            per_job: Mutex::new(std::collections::HashMap::new()),
         }
     }
 
     pub fn add(&self, n: u64) {
         self.current_second.fetch_add(n, Ordering::Relaxed);
         self.total.fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// [`SpeedMeter::add`] plus per-job attribution.
+    pub fn add_for(&self, job: u32, n: u64) {
+        self.add(n);
+        *self.per_job.lock().unwrap().entry(job).or_insert(0) += n;
+    }
+
+    /// Take and reset the per-job wire counters (owner tick, 1 Hz).
+    pub fn drain_jobs(&self) -> std::collections::HashMap<u32, u64> {
+        std::mem::take(&mut *self.per_job.lock().unwrap())
     }
 
     pub fn total(&self) -> u64 {

@@ -391,10 +391,12 @@ pub async fn dispatch(
             }
         }
         "pausedownload" | "pausedownload2" => {
-            Ok(Value::Bool(state.engine.pause_all().await.is_ok()))
+            let source = current_client(state);
+            Ok(Value::Bool(state.engine.pause_all(&source).await.is_ok()))
         }
         "resumedownload" | "resumedownload2" => {
-            Ok(Value::Bool(state.engine.resume_all().await.is_ok()))
+            let source = current_client(state);
+            Ok(Value::Bool(state.engine.resume_all(&source).await.is_ok()))
         }
         "writelog" => {
             // writelog(Kind, Text) — scripts and clients inject log lines.
@@ -1047,6 +1049,42 @@ pub fn note_client(state: &CompatState, headers: &axum::http::HeaderMap, method:
             .unwrap_or(0);
         reg.note(ua, method, now);
     }
+    // State-changing compat calls are logged with their caller. The
+    // polling reads (status/listgroups/history/…) fire every second and
+    // stay quiet; anything that CHANGES daemon state must be attributable
+    // from the log alone — "the queue keeps unpausing" is always some
+    // client issuing these (field report 2026-07-25).
+    if matches!(
+        method,
+        "pausedownload"
+            | "pausedownload2"
+            | "resumedownload"
+            | "resumedownload2"
+            | "pausepost"
+            | "resumepost"
+            | "pausescan"
+            | "resumescan"
+            | "rate"
+            | "shutdown"
+            | "reload"
+            | "scheduleresume"
+    ) {
+        let ua = headers
+            .get(axum::http::header::USER_AGENT)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("unknown");
+        tracing::info!(%method, client = %ua, "compat state-changing call");
+    }
+}
+
+/// The UA of the client behind the current compat request, for command
+/// attribution (best effort — the registry stamps it per request).
+fn current_client(state: &CompatState) -> String {
+    state
+        .clients
+        .as_ref()
+        .and_then(|c| c.current())
+        .unwrap_or_else(|| "compat client".into())
 }
 
 pub fn router(state: CompatState) -> Router {

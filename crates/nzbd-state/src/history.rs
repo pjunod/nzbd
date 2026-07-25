@@ -98,7 +98,7 @@ impl HistoryDb {
             jsonl,
             last_refresh: Mutex::new(None),
         };
-        db.rebuild_from_jsonl()?;
+        db.rebuild_from_jsonl(false)?;
         Ok(db)
     }
 
@@ -113,14 +113,20 @@ impl HistoryDb {
             }
             *last = Some(Instant::now());
         }
-        self.rebuild_from_jsonl()
+        self.rebuild_from_jsonl(true)
     }
 
     /// Import any JSONL rows the index doesn't have (fresh index after a
     /// leader failover, a wiped local disk, or another node's appends).
     /// Unions every `history*.jsonl` in the directory — duplicates are
     /// dropped by the (job, completed_at) unique index.
-    fn rebuild_from_jsonl(&self) -> Result<(), StateError> {
+    ///
+    /// `quiet` marks the routine poll-path refresh: the upsert reports
+    /// conflict-updates as affected rows, so counting THOSE made every
+    /// 5 s history poll log "index rebuilt imported=57" forever (field
+    /// report 2026-07-25). New-row counts come from a real before/after
+    /// row count; the poll path logs at debug even then.
+    fn rebuild_from_jsonl(&self, quiet: bool) -> Result<(), StateError> {
         let Some(own) = &self.jsonl else {
             return Ok(());
         };
@@ -140,7 +146,7 @@ impl HistoryDb {
             Err(e) => return Err(e),
         };
         files.sort();
-        let mut imported = 0usize;
+        let before = self.row_count()?;
         for path in files {
             let Ok(file) = fsx::open(&path) else {
                 continue;
@@ -153,15 +159,24 @@ impl HistoryDb {
                 let Ok(entry) = serde_json::from_slice::<HistoryEntry>(&line) else {
                     continue; // torn tail / old format
                 };
-                if self.insert(&entry, false)? {
-                    imported += 1;
-                }
+                self.insert(&entry, false)?;
             }
         }
+        let imported = self.row_count()?.saturating_sub(before);
         if imported > 0 {
-            tracing::info!(imported, "history index rebuilt from JSONL");
+            if quiet {
+                tracing::debug!(imported, "history index picked up new JSONL rows");
+            } else {
+                tracing::info!(imported, "history index rebuilt from JSONL");
+            }
         }
         Ok(())
+    }
+
+    fn row_count(&self) -> Result<u64, StateError> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row("SELECT COUNT(*) FROM history", [], |r| r.get::<_, u64>(0))
+            .map_err(|e| StateError::Corrupt(format!("sqlite count: {e}")))
     }
 
     fn insert(&self, entry: &HistoryEntry, and_jsonl: bool) -> Result<bool, StateError> {

@@ -450,13 +450,20 @@ impl EngineHandle {
             .await
     }
 
-    pub async fn pause_all(&self) -> Result<(), EngineError> {
-        self.roundtrip_unit(|reply| QueueCommand::PauseAll { reply })
+    /// Pause all downloading. `source` names the requesting client (UA /
+    /// "web-ui" / "cli") — it is logged and carried on the
+    /// `queue_pause_changed` event, because a queue that keeps flipping
+    /// pause state is ALWAYS some client sending these commands and the
+    /// operator needs to see which one.
+    pub async fn pause_all(&self, source: &str) -> Result<(), EngineError> {
+        let source = source.to_string();
+        self.roundtrip_unit(|reply| QueueCommand::PauseAll { source, reply })
             .await
     }
 
-    pub async fn resume_all(&self) -> Result<(), EngineError> {
-        self.roundtrip_unit(|reply| QueueCommand::ResumeAll { reply })
+    pub async fn resume_all(&self, source: &str) -> Result<(), EngineError> {
+        let source = source.to_string();
+        self.roundtrip_unit(|reply| QueueCommand::ResumeAll { source, reply })
             .await
     }
 

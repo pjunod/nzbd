@@ -844,6 +844,7 @@ dependencies = [
  "nzbd-engine",
  "nzbd-nntp",
  "nzbd-nserv",
+ "nzbd-nzb",
  "nzbd-state",
  "nzbd-types",
  "serde",

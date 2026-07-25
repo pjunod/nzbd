@@ -163,6 +163,29 @@
   .test-out { font-size: 12px; color: var(--muted); word-break: break-word; }
   .test-out.ok { color: var(--ok); }
   .test-out.bad { color: var(--bad); }
+  /* job detail panel (expands under the clicked queue row) */
+  #tab-queue td .name { cursor: pointer; }
+  #tab-queue td .name:hover { text-decoration: underline; text-decoration-color: var(--muted); }
+  tr.detail-tr > td { background: color-mix(in srgb, var(--accent) 4%, transparent); }
+  .jobdetail { padding: 4px 2px 8px; }
+  .jd-head { display: flex; gap: 8px; align-items: center; font-size: 12.5px;
+             color: var(--ink2); flex-wrap: wrap; }
+  .jd-head b { color: var(--ink); }
+  .btnlike { border: 1px solid var(--line); border-radius: 7px; padding: 2px 9px;
+             color: var(--ink2); text-decoration: none; font-size: 12px; background: var(--panel); }
+  .btnlike:hover { border-color: var(--accent); color: var(--ink); }
+  table.subtable { margin-top: 8px; border: 1px solid var(--line); }
+  table.subtable th, table.subtable td { padding: 4px 8px; font-size: 12px; }
+  .jd-logs { margin-top: 8px; max-height: 170px; overflow-y: auto;
+             font: 11px/1.55 ui-monospace, SFMono-Regular, Menlo, monospace;
+             border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; }
+  .jd-logs .lg { white-space: pre-wrap; word-break: break-word; }
+  .chk-inline { display: inline-flex; align-items: center; gap: 5px; font-size: 12px;
+                color: var(--ink2); }
+  .chk-inline input { accent-color: var(--accent); }
+  #addnzb-msg { font-size: 12px; color: var(--muted); }
+  #addnzb-msg.ok { color: var(--ok); }
+  #addnzb-msg.bad { color: var(--bad); }
   .cfg-add { margin: 2px 0 8px; }
   #restart-banner { display: flex; align-items: center; gap: 12px; margin-top: 12px;
     padding: 9px 12px; border-radius: 8px; font-size: 12.5px; font-weight: 550;
@@ -339,6 +362,9 @@
   <div class="controls">
     <button id="btn-pause">Pause queue</button>
     <button id="btn-resume">Resume queue</button>
+    <button id="btn-addnzb" title="Upload .nzb files straight into the queue.">+ add nzb</button>
+    <input type="file" id="nzb-file" accept=".nzb,application/x-nzb" multiple hidden>
+    <span id="addnzb-msg"></span>
     <label>Limit <input type="number" id="limit" min="0" step="128" placeholder="KiB/s">
       <button class="small" id="btn-limit">set</button></label>
     <span class="spacer" style="flex:1"></span>
@@ -371,6 +397,14 @@
   </section>
 
   <section id="tab-logs" hidden>
+    <div class="controls" style="margin: 12px 0 0">
+      <label class="chk-inline" title="Daemon lifecycle: boot, config, listeners, servers.">
+        <input type="checkbox" id="lg-system" checked> system</label>
+      <label class="chk-inline" title="One line per job event: added, queued, finished, post-processing.">
+        <input type="checkbox" id="lg-job" checked> jobs</label>
+      <label class="chk-inline" title="One line per finished FILE — hundreds per job; off by default because they drown everything else.">
+        <input type="checkbox" id="lg-file"> per-file</label>
+    </div>
     <div id="logbox"><div class="empty">loading…</div></div>
   </section>
 
@@ -410,6 +444,9 @@ const $ = (id) => document.getElementById(id);
 // `Cache-Control: no-store` on the API; this is the client-side belt to
 // that suspender.
 const jfetch = (url, opts) => fetch(url, { cache: "no-store", ...opts });
+// Identifies this page's state-changing calls in the daemon's logs and
+// pause-attribution ("paused · by web-ui" vs. by some other client).
+const CLIENT_HDRS = { "X-Nzbd-Client": "web-ui" };
 
 function fmtBytes(n) {
   if (n == null) return "—";
@@ -483,7 +520,9 @@ function renderStatus(s) {
   $("s-session").textContent = fmtBytes(s.session_downloaded_bytes);
   $("s-active").textContent = s.jobs_downloading + " / " + s.jobs_queued;
   const badges = [];
-  if (s.download_paused) badges.push('<span class="badge on-warn">paused</span>');
+  if (s.download_paused)
+    badges.push('<span class="badge on-warn" title="Every pause/resume is a client command — the daemon never flips this itself. The name here is whoever sent the last one.">paused' +
+      (lastPauseSource ? " · by " + esc(lastPauseSource) : "") + "</span>");
   if (s.speed_limit_bps) badges.push('<span class="badge">limit ' + fmtRate(s.speed_limit_bps) + "</span>");
   $("badges").innerHTML = badges.join("");
   // Why is nothing downloading? Say so instead of sitting silently.
@@ -521,8 +560,17 @@ const STATUS_CLASS = {
   downloading: "ok", queued: "dim", paused: "warn", fetching: "dim",
   completed: "ok", failed: "bad", post_queued: "warn"
 };
+// Post-processing stages in words a human tracks at a glance — the
+// activity view: never wonder what a job is doing.
+const STAGE_LABEL = {
+  par_rename: "renaming", par_verify: "checking integrity", par_repair: "repairing",
+  rar_rename: "renaming", unpack: "extracting", cleanup: "cleaning up",
+  move: "moving", post_unpack_rename: "renaming", script: "running scripts",
+};
 function statusName(st) {
-  return typeof st === "string" ? st : ("post: " + (st.post ? st.post.stage : "…"));
+  if (typeof st === "string") return st;
+  const stage = st.post ? st.post.stage : null;
+  return (stage && STAGE_LABEL[stage]) || ("post: " + (stage || "…"));
 }
 async function refreshQueue() {
   // A failed fetch (daemon bouncing during a restart) throws here and is
@@ -537,15 +585,16 @@ async function refreshQueue() {
 function renderQueue(jobs) {
   const body = $("queue-body");
   if (!jobs.length) {
-    body.innerHTML = '<tr><td colspan="6" class="empty">No downloads in the queue.</td></tr>';
+    body.innerHTML = '<tr><td colspan="6" class="empty">No downloads in the queue. Drop one in with “+ add nzb”.</td></tr>';
     return;
   }
-  body.innerHTML = jobs.map((j, idx) => {
+  const rows = jobs.map((j, idx) => {
     const total = j.size_bytes || 0;
     const done = Math.min(j.downloaded_bytes || 0, total);
     const pct = total ? Math.floor(done * 100 / total) : 0;
+    const isPost = typeof j.status !== "string";
     const st = statusName(j.status);
-    const cls = STATUS_CLASS[st] || "dim";
+    const cls = isPost ? "warn" : (STATUS_CLASS[st] || "dim");
     const paused = st === "paused";
     const dl = st === "downloading";
     const fetching = st === "fetching";
@@ -558,8 +607,11 @@ function renderQueue(jobs) {
       detail.push(fmtRate(j.rate_bps));
       detail.push("~" + fmtEta(Math.max(0, j.remaining_bytes), j.rate_bps));
     }
+    if (isPost) detail.push(esc(st) + "…");
+    if (j.retried_articles > 0)
+      detail.push(`<span title="Articles that failed and were re-downloaded — this is bandwidth the header rate spends that never lands in the file. A high count means a flaky server or an aging post.">${j.retried_articles} retries</span>`);
     return `<tr>
-      <td><div class="name" title="${esc(j.name)}">${esc(j.name)}</div>
+      <td><div class="name" title="${esc(j.name)} — click for details" onclick="toggleJob(${j.id})">${esc(j.name)}</div>
           <div class="sub">#${j.id}${j.category ? " · " + esc(j.category) : ""}${j.assigned_node ? " · on " + esc(j.assigned_node) : ""}
           <span class="st ${cls} st-inline">${esc(st).toUpperCase()}</span></div></td>
       <td><span class="st ${cls}">${esc(st).toUpperCase()}</span></td>
@@ -578,7 +630,67 @@ function renderQueue(jobs) {
         <button class="del" onclick="if(confirm('Delete ${esc(j.name).replace(/'/g, "\\'")}?')) jobAction(${j.id}, 'delete')">delete</button>
       </div></td>
     </tr>`;
-  }).join("");
+  });
+  // Detail panel stays attached under its row across 1 Hz re-renders.
+  const openIdx = jobs.findIndex(j => j.id === openJob);
+  if (openIdx >= 0) rows.splice(openIdx + 1, 0, detailRow(jobs[openIdx]));
+  body.innerHTML = rows.join("");
+}
+
+// ---- job detail panel ----------------------------------------------------
+let openJob = null, openJobFiles = null, openJobLogs = null;
+function toggleJob(id) {
+  if (openJob === id) { openJob = null; refreshQueue().catch(() => {}); return; }
+  openJob = id; openJobFiles = null; openJobLogs = null;
+  refreshQueue().catch(() => {});
+  refreshJobDetail();
+}
+async function refreshJobDetail() {
+  if (openJob == null) return;
+  const id = openJob;
+  try {
+    const [fr, lr] = await Promise.all([
+      jfetch(`/api/v1/jobs/${id}/files`),
+      jfetch(`/api/v1/logs?job=${id}&limit=50`),
+    ]);
+    if (openJob !== id) return; // switched away while loading
+    if (fr.ok) openJobFiles = await fr.json();
+    if (lr.ok) openJobLogs = (await lr.json()).entries;
+  } catch { /* next cycle retries */ }
+  if (activeTab === "queue") refreshQueue().catch(() => {});
+}
+function detailRow(j) {
+  const f = openJobFiles;
+  const filesHtml = !f
+    ? '<div class="empty" style="padding:10px">loading files…</div>'
+    : `<table class="subtable"><thead><tr><th>File</th><th class="num">Size</th><th class="num">Segments</th><th></th></tr></thead><tbody>` +
+      f.files.map(x => `<tr>
+        <td><div class="name" style="cursor:default">${esc(x.filename)}</div></td>
+        <td class="num">${fmtBytes(x.size_bytes)}</td>
+        <td class="num">${x.done_segments}/${x.total_segments}${x.failed_segments ? ` <span style="color:var(--bad)">· ${x.failed_segments} failed</span>` : ""}</td>
+        <td>${x.assembled ? '<span class="st ok">DONE</span>'
+             : x.paused ? '<span class="st dim">PAUSED</span>'
+             : x.is_par2 ? '<span class="st dim">PAR2</span>' : ""}</td>
+      </tr>`).join("") + "</tbody></table>";
+  const logs = openJobLogs;
+  const logsHtml = logs == null ? ""
+    : `<div class="jd-logs">` + (logs.length
+        ? logs.map(e => `<div class="lg k-${e.kind}">${new Date(e.time_unix * 1000).toLocaleTimeString()}  ${esc(e.text)}</div>`).join("")
+        : '<div class="empty" style="padding:6px">no activity recorded for this job yet</div>') + "</div>";
+  return `<tr class="detail-tr"><td colspan="6"><div class="jobdetail">
+    <div class="jd-head">
+      <b>#${j.id}</b>
+      <span class="st ${typeof j.status !== "string" ? "warn" : (STATUS_CLASS[statusName(j.status)] || "dim")}">${esc(statusName(j.status)).toUpperCase()}</span>
+      <span>articles ${j.done_articles}/${j.total_articles}${j.failed_articles ? ` · <span style="color:var(--bad)">${j.failed_articles} failed</span>` : ""}${j.retried_articles ? ` · ${j.retried_articles} retried` : ""}</span>
+      <span>health ${(j.health / 10).toFixed(1)}%</span>
+      ${j.dupe_key ? `<span title="duplicate-detection key">dupe: ${esc(j.dupe_key)}</span>` : ""}
+      <span class="spacer" style="flex:1"></span>
+      <a class="btnlike" href="/api/v1/jobs/${j.id}/nzb" download title="Download this job's NZB (regenerated from queue state — everything needed to re-add it anywhere).">download nzb</a>
+      <button class="small" onclick="toggleJob(${j.id})">close</button>
+    </div>
+    ${filesHtml}
+    ${logsHtml}
+  </div></td></tr>`;
 }
 
 // Health color: green at 100% fading to red at the par-repair limit
@@ -613,7 +725,7 @@ function healthCell(j, downloading) {
   return `<span class="health" style="color:${healthColor(j.health, j.critical_health)}" title="${healthTip(j.health, j.critical_health)}">${(j.health / 10).toFixed(1)}%</span>${note}`;
 }
 async function jobAction(id, action) {
-  await jfetch(`/api/v1/jobs/${id}/actions/${action}`, { method: "POST" });
+  await jfetch(`/api/v1/jobs/${id}/actions/${action}`, { method: "POST", headers: CLIENT_HDRS });
   refreshAll();
 }
 
@@ -702,7 +814,10 @@ async function refreshClients() {
 
 // ---- logs ---------------------------------------------------------------
 async function refreshLogs() {
-  const r = await jfetch("/api/v1/logs?limit=300");
+  // Scope filters: per-file lines are hundreds-per-job and drown the
+  // interesting ones, so they're opt-in; system + job are the default.
+  const scopes = ["system", "job", "file"].filter(s => $("lg-" + s).checked);
+  const r = await jfetch(`/api/v1/logs?limit=300&scope=${scopes.join(",")}`);
   if (r.status === 501) {
     $("logbox").innerHTML = '<div class="empty">log buffer not configured</div>';
     return;
@@ -712,9 +827,12 @@ async function refreshLogs() {
   const stick = box.scrollTop + box.clientHeight >= box.scrollHeight - 8;
   box.innerHTML = entries.map(e =>
     `<div class="lg k-${e.kind}">${new Date(e.time_unix * 1000).toLocaleTimeString()}  ${e.kind.padEnd(7)} ${esc(e.text)}</div>`
-  ).join("") || '<div class="empty">no log entries</div>';
+  ).join("") || (scopes.length ? '<div class="empty">no log entries</div>'
+                               : '<div class="empty">all scopes hidden — tick one above</div>');
   if (stick) box.scrollTop = box.scrollHeight;
 }
+for (const s of ["system", "job", "file"])
+  $("lg-" + s).onchange = () => refreshLogs().catch(() => {});
 
 // ---- controls -----------------------------------------------------------
 // Optimistic: flip the visible state the instant the button is clicked
@@ -724,21 +842,55 @@ async function refreshLogs() {
 $("btn-pause").onclick = async () => {
   setPauseButtons(true);
   $("s-eta").textContent = "paused";
-  await jfetch("/api/v1/queue/actions/pause", { method: "POST" });
+  lastPauseSource = "web-ui";
+  await jfetch("/api/v1/queue/actions/pause", { method: "POST", headers: CLIENT_HDRS });
   refreshAll();
 };
 $("btn-resume").onclick = async () => {
   setPauseButtons(false);
   $("s-eta").textContent = "—";
-  await jfetch("/api/v1/queue/actions/resume", { method: "POST" });
+  await jfetch("/api/v1/queue/actions/resume", { method: "POST", headers: CLIENT_HDRS });
   refreshAll();
 };
 $("btn-limit").onclick = async () => {
   const kib = parseInt($("limit").value || "0", 10);
   await jfetch("/api/v1/queue/speed-limit", {
-    method: "PUT", headers: { "content-type": "application/json" },
+    method: "PUT", headers: { "content-type": "application/json", ...CLIENT_HDRS },
     body: JSON.stringify({ bytes_per_sec: kib > 0 ? kib * 1024 : null })
   });
+  refreshAll();
+};
+
+// ---- add NZBs from disk ---------------------------------------------------
+$("btn-addnzb").onclick = () => $("nzb-file").click();
+$("nzb-file").onchange = async () => {
+  const files = [...($("nzb-file").files || [])];
+  if (!files.length) return;
+  const msg = $("addnzb-msg");
+  let added = 0, failed = 0;
+  for (const f of files) {
+    msg.className = ""; msg.textContent = `uploading ${esc(f.name)}…`;
+    try {
+      const name = f.name.replace(/\.nzb$/i, "");
+      const r = await jfetch("/api/v1/jobs?name=" + encodeURIComponent(name), {
+        method: "POST",
+        headers: { "content-type": "application/x-nzb", ...CLIENT_HDRS },
+        body: await f.arrayBuffer(),
+      });
+      if (r.ok) { added++; } else {
+        failed++;
+        const e = await r.json().catch(() => ({}));
+        msg.className = "bad";
+        msg.textContent = `✗ ${f.name}: ${e.error || r.status}`;
+      }
+    } catch (e) { failed++; msg.className = "bad"; msg.textContent = `✗ ${f.name}: ${e}`; }
+  }
+  if (!failed) {
+    msg.className = "ok";
+    msg.textContent = `✓ added ${added} job${added === 1 ? "" : "s"}`;
+    setTimeout(() => { if (msg.className === "ok") msg.textContent = ""; }, 4000);
+  }
+  $("nzb-file").value = "";
   refreshAll();
 };
 
@@ -783,6 +935,7 @@ function connState(mode) {
   }
 }
 let lastTickAt = 0; // when the SSE stream last delivered a full read model
+let lastPauseSource = null; // who last (un)paused the queue, from the event
 function connectSse() {
   const es = new EventSource("/api/v1/events");
   es.onopen = () => connState("live");
@@ -791,9 +944,15 @@ function connectSse() {
   // pause/resume and limit changes from ANY client (another tab, an *arr,
   // the CLI) land here immediately too.
   for (const ev of ["job_added", "job_finished", "job_deleted", "file_finished",
-                    "segment_exhausted", "server_blocked", "queue_pause_changed",
+                    "segment_exhausted", "server_blocked",
                     "speed_limit_changed", "job_assigned", "lagged"])
     es.addEventListener(ev, nudge);
+  // Pause changes carry WHO — the answer to "it keeps unpausing itself"
+  // is always a client name, shown right on the paused badge.
+  es.addEventListener("queue_pause_changed", (e) => {
+    try { lastPauseSource = JSON.parse(e.data).source || null; } catch {}
+    nudge();
+  });
   // The 1 Hz tick carries the whole read model (status + job rows from a
   // single snapshot — header rate and per-job rates can't disagree).
   // Render it directly: no fetch round-trip, nothing for a browser cache
@@ -1297,6 +1456,7 @@ initTheme();
   setInterval(() => {
     if (Date.now() - lastTickAt > 6500) refreshAll();
     else if (activeTab !== "queue") refreshTab();
+    if (openJob != null) refreshJobDetail();
   }, 5000);
   // Coming back to the tab: repaint now, not at the next timer.
   document.addEventListener("visibilitychange", () => {
