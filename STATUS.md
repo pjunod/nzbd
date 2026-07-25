@@ -176,7 +176,7 @@ performance work and operator actions
 - 🔶 UI v2 — live-by-construction dashboard (field report 2026-07-25 #6: innerHTML-per-tick rendering eats clicks; confirm() on delete; silent action failures). Decisions locked with Paul 2026-07-25; plan + wire contracts in [docs/UI_V2_PLAN.md](docs/UI_V2_PLAN.md), one commit per milestone:
   - ⬜ M0 👤 redeploy nuc3 on a post-`9df6b7d` image (and add the missing `./config:/etc/nzbd` bind first) — kills the stale-cache half of the report before any v2 code lands
   - ✅ M1 keyed in-place renderer — store + `rowModel`/`reconcileRows`/`applyRow`, one delegated click listener, detail panel as a stable subtree; `crates/nzbd/tests/ui_dom.rs` pins the five rendering laws
-  - ⬜ M2 optimistic actions with revert + toasts; honest `live`/`reconnecting`/`unreachable` connection states
+  - ✅ M2 optimistic actions with revert + toasts — every mutating click applies to the view immediately and is reverted (with the daemon's own error text) if the POST fails or nothing confirms it inside 5 s; honest `live`/`reconnecting`/`unreachable` states, the last with a page-wide banner
   - ⬜ M3 delete parks the regenerated NZB to history as `DELETED` + `requeue` action
   - ⬜ M4 instant undoable delete — `confirm()` removed everywhere
   - ⬜ M5 SSE `hb` + `log` events, per-server wire rates

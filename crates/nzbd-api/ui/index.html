@@ -227,6 +227,32 @@
   #logbox .k-INFO { color: var(--ink); } #logbox .k-DETAIL { color: var(--muted); }
   .empty { color: var(--muted); padding: 22px; text-align: center; }
   footer { color: var(--muted); font-size: 11.5px; margin-top: 22px; }
+  /* Toasts: the replacement for both confirm() and silence. Every action
+     that changed something says so; every action that failed says THAT,
+     with the daemon's own error text. */
+  #toasts { position: fixed; right: 14px; bottom: 14px; z-index: 50;
+            display: flex; flex-direction: column; gap: 8px; align-items: stretch;
+            width: min(420px, calc(100vw - 28px)); pointer-events: none; }
+  .toast { display: flex; align-items: center; gap: 10px; pointer-events: auto;
+           background: var(--panel); border: 1px solid var(--line); border-radius: 9px;
+           padding: 8px 8px 8px 12px; font-size: 12.5px;
+           box-shadow: 0 6px 22px rgba(0,0,0,.28); }
+  .toast .msg { flex: 1; word-break: break-word; }
+  .toast.bad { color: var(--bad);
+               border-color: color-mix(in srgb, var(--bad) 55%, transparent);
+               background: color-mix(in srgb, var(--bad) 8%, var(--panel)); }
+  .toast button { padding: 2px 9px; font-size: 12px; }
+  .toast .dismiss { border: none; background: none; color: var(--muted);
+                    padding: 2px 5px; font-size: 14px; line-height: 1; }
+  /* The daemon is not answering at all — a gray dot is not enough. */
+  #offline { display: none; margin: 12px 0 0; padding: 9px 12px; border-radius: 8px;
+             font-size: 12.5px; font-weight: 600; color: var(--bad);
+             background: color-mix(in srgb, var(--bad) 10%, transparent);
+             border: 1px solid color-mix(in srgb, var(--bad) 40%, transparent); }
+  #offline.show { display: block; }
+  #conn.bad { color: var(--bad); }
+  /* A row with an unconfirmed action on it reads as in-flight. */
+  tr.pending td { opacity: .55; }
   /* first-run setup */
   #setup { max-width: 560px; margin: 30px auto; }
   #setup h2 { margin: 0 0 4px; }
@@ -349,6 +375,8 @@
     </form>
   </section>
 
+  <div id="offline"></div>
+
   <div class="stats">
     <div class="stat"><div class="v" id="s-rate">—</div><div class="l">download rate</div></div>
     <div class="stat"><div class="v" id="s-eta">—</div><div class="l">time left</div></div>
@@ -432,6 +460,7 @@
 
   <footer>nzbd — NZBGet-compatible usenet daemon · <a href="/api/v1/openapi.json" style="color:var(--muted)">API</a> · <a href="/metrics" style="color:var(--muted)">metrics</a></footer>
 </div>
+<div id="toasts" aria-live="polite" role="status"></div>
 
 <script>
 "use strict";
@@ -617,6 +646,145 @@ function differ(node) {
   };
 }
 
+// ---- toasts -------------------------------------------------------------
+// One fixed bottom-right stack, at most three at a time. This is what
+// replaces BOTH halves of the old delete UX: the confirm() dialog that
+// interrupted you before anything happened, and the silence afterwards
+// when it didn't. An action that worked says so and offers Undo; an action
+// that failed says so in the daemon's own words.
+const TOAST_MAX = 3;
+function toast(o) {
+  const stack = $("toasts");
+  const el = dom.create("div", "toast" + (o.kind === "error" ? " bad" : ""));
+  const msg = dom.append(el, dom.create("span", "msg"));
+  dom.text(msg, o.text);
+  let timer = null;
+  const dismiss = () => {
+    if (timer) { clearTimeout(timer); timer = null; }
+    if (el.parentNode) el.parentNode.removeChild(el);
+  };
+  if (o.action) {
+    const b = dom.append(el, dom.create("button", "small"));
+    dom.text(b, o.action.label);
+    b.onclick = () => { dismiss(); o.action.fn(); };
+  }
+  const x = dom.append(el, dom.create("button", "dismiss"));
+  dom.text(x, "×");
+  dom.prop(x, "title", "dismiss");
+  x.onclick = dismiss;
+  stack.appendChild(el);
+  while (stack.children.length > TOAST_MAX) stack.removeChild(stack.firstChild);
+  timer = setTimeout(dismiss, o.ttlMs || 5000);
+  return { dismiss, el };
+}
+
+// ---- pending-op overlay -------------------------------------------------
+// Every mutating click registers an op and applies its effect to the VIEW
+// immediately — the row vanishes, the chip flips, the job moves — while the
+// POST is still in flight. Resolution, in order:
+//
+//   1. server state reflects the intent (a tick or an event) -> drop the op
+//   2. the POST answers !r.ok or throws -> revert now, error toast carrying
+//      the daemon's `error` string
+//   3. the op is older than PENDING_TTL_MS and nothing confirmed it ->
+//      revert, "…didn't take"
+//
+// Because `queueModels()` consults the overlay on every render, a tick
+// landing mid-flight cannot flash the old state back.
+//
+// Note there is no per-op `revert()` body: these overlays are view-only, so
+// forgetting the op IS the revert. The moment it is dropped the next render
+// shows exactly what the server says.
+const PENDING_TTL_MS = 5000;
+const pending = {
+  ops: new Map(),
+  key(jobId, kind) { return jobId + ":" + kind; },
+  apply(op) {
+    op.at = Date.now();
+    this.ops.set(op.key, op);
+    renderQueue();
+    return op;
+  },
+  has(key) { return this.ops.has(key); },
+  drop(key) {
+    if (!this.ops.delete(key)) return false;
+    renderQueue();
+    return true;
+  },
+  revert(key, why) {
+    const op = this.ops.get(key);
+    if (!op) return;
+    this.ops.delete(key);
+    if (typeof op.revert === "function") op.revert();
+    if (why) toast({ text: why, kind: "error", ttlMs: 10000 });
+    renderQueue();
+  },
+  clear() { this.ops.clear(); },
+
+  // --- view overrides the reconciler asks for -----------------------------
+  hidden(jobId) { return this.ops.has(this.key(jobId, "delete")); },
+  status(jobId) {
+    if (this.ops.has(this.key(jobId, "pause"))) return "paused";
+    if (this.ops.has(this.key(jobId, "resume"))) return "queued";
+    return null;
+  },
+  busy(jobId) {
+    for (const op of this.ops.values()) if (op.jobId === jobId) return true;
+    return false;
+  },
+  /// Local reorder for in-flight move ops, so the row is where the user put
+  /// it before the daemon has answered.
+  order(jobs) {
+    let out = jobs;
+    for (const op of this.ops.values()) {
+      if (op.kind !== "move") continue;
+      const from = out.findIndex(j => j.id === op.jobId);
+      if (from < 0) continue;
+      if (out === jobs) out = jobs.slice();
+      const [j] = out.splice(from, 1);
+      out.splice(Math.max(0, Math.min(out.length, op.wantIdx)), 0, j);
+    }
+    return out;
+  },
+
+  // --- resolution ---------------------------------------------------------
+  /// Fresh authoritative job list: drop every op the server has now made
+  /// true. Called from the SSE tick and from the poll fallback.
+  reconcile(jobs) {
+    if (!this.ops.size) return;
+    const byId = new Map(jobs.map(j => [j.id, j]));
+    let changed = false;
+    for (const [key, op] of [...this.ops]) {
+      if (satisfied(op, byId)) { this.ops.delete(key); changed = true; }
+    }
+    if (changed) renderQueue();
+  },
+  /// Nothing confirmed it and the grace period is up. Runs at 1 Hz so a
+  /// dead stream still un-sticks the view.
+  sweep() {
+    const now = Date.now();
+    for (const [key, op] of [...this.ops]) {
+      if (op.inflight || now - op.at <= PENDING_TTL_MS) continue;
+      this.ops.delete(key);
+      toast({
+        text: (op.label || "that action") + " didn't take — the daemon never confirmed it",
+        kind: "error", ttlMs: 10000,
+      });
+      renderQueue();
+    }
+  },
+};
+
+function satisfied(op, byId) {
+  const j = byId.get(op.jobId);
+  if (op.kind === "delete") return j === undefined;
+  if (!j) return true; // the job left the queue some other way: stop overriding
+  if (op.kind === "pause") return statusName(j.status) === "paused";
+  if (op.kind === "resume") return statusName(j.status) !== "paused";
+  if (op.kind === "move") return [...byId.keys()].indexOf(op.jobId) === op.wantIdx;
+  return true;
+}
+
 // ---- queue rows ---------------------------------------------------------
 // Post-processing stages in words a human tracks at a glance — the activity
 // view: never wonder what a job is doing.
@@ -665,7 +833,8 @@ function rowModel(j, ctx) {
   const dl = st === "downloading";
   const fetching = st === "fetching";
   const pend = ctx.pendingOps || null;
-  const over = pend && pend.status ? pend.status(j.id) : null; // M2 overlay
+  const over = pend ? pend.status(j.id) : null;  // unconfirmed pause/resume
+  const busy = pend ? pend.busy(j.id) : false;   // an action is in flight
 
   // A URL job has no articles until its NZB arrives — "0 B of 0 B" reads as
   // broken; say what it is actually doing instead.
@@ -704,6 +873,7 @@ function rowModel(j, ctx) {
     key: "j" + j.id,
     kind: "job",
     id: j.id,
+    rowCls: busy ? "pending" : "",
     name: j.name,
     nameTip: j.name + " — click for details",
     sub: "#" + j.id + (j.category ? " · " + j.category : "") +
@@ -797,6 +967,7 @@ function applyRow(tr, m, d) {
   d = d || dom;
   const c = tr.__c, w = differ(tr);
   w("id", m.id, v => d.data(tr, "jobId", String(v)));
+  w("rowCls", m.rowCls, v => d.cls(tr, v));
   w("name", m.name, v => d.text(c.name, v));
   w("nameTip", m.nameTip, v => d.prop(c.name, "title", v));
   w("job", m.id, v => d.data(c.name, "job", String(v)));
@@ -1006,7 +1177,10 @@ KINDS.note = { build: buildNote, apply: applyNote };
 function queueModels() {
   if (!store.jobsLoaded)
     return [{ key: "__loading", kind: "empty", span: 6, text: "Loading the queue…" }];
-  const jobs = store.jobs;
+  // The overlay is consulted HERE, on every render — which is why a 1 Hz
+  // tick cannot flash a deleted row back into view before the daemon has
+  // caught up with the click.
+  const jobs = pending.order(store.jobs).filter(j => !pending.hidden(j.id));
   if (!jobs.length)
     return [{
       key: "__empty", kind: "empty", span: 6,
@@ -1017,7 +1191,7 @@ function queueModels() {
     out.push(rowModel(j, {
       idx, count: jobs.length,
       healthAbortArmed: store.healthAbort,
-      pendingOps: typeof pending !== "undefined" ? pending : null,
+      pendingOps: pending,
     }));
     if (j.id === openJob) out.push(detailModel(j));
   });
@@ -1288,8 +1462,12 @@ function renderLogs() {
 
 // ---- data fetches: they write the store, they never render ---------------
 async function refreshStatus() {
-  const r = await jfetch("/api/v1/status");
-  if (!r.ok) throw new Error("status " + r.status);
+  let r;
+  try {
+    r = await jfetch("/api/v1/status");
+  } catch (e) { pollResult(false); throw e; }
+  if (!r.ok) { pollResult(false); throw new Error("status " + r.status); }
+  pollResult(true);
   store.status = await r.json();
   renderStatus();
 }
@@ -1302,6 +1480,7 @@ async function refreshQueue() {
   const { jobs } = await r.json();
   store.jobs = jobs;
   store.jobsLoaded = true;
+  pending.reconcile(jobs);
   renderQueue();
 }
 async function refreshHistory() {
@@ -1341,15 +1520,48 @@ async function refreshJobDetail() {
   if (activeTab === "queue") renderQueue();
 }
 
-// ---- actions ------------------------------------------------------------
-async function jobAction(id, action) {
-  await jfetch("/api/v1/jobs/" + id + "/actions/" + action,
-    { method: "POST", headers: CLIENT_HDRS });
+// ---- actions: every POST is checked, every failure is said out loud ------
+// The old `jobAction` awaited the response and threw it away, so a 404, a
+// 503 and a success were the same event as far as the page was concerned —
+// which is how "I clicked delete and nothing happened" could be true in two
+// completely different ways at once.
+async function post(url, init) {
+  let r;
+  try {
+    r = await jfetch(url, Object.assign({ method: "POST", headers: CLIENT_HDRS }, init || {}));
+  } catch (e) {
+    return { ok: false, error: String(e && e.message ? e.message : e) };
+  }
+  const body = await r.json().catch(() => ({}));
+  if (r.ok) return { ok: true, body };
+  return { ok: false, status: r.status, error: body.error || ("HTTP " + r.status) };
+}
+
+/// `op` (optional) is the pending-op overlay entry to apply now and revert
+/// if the POST fails. Returns the parsed body on success, null on failure.
+async function jobAction(id, action, op) {
+  if (op) { op.inflight = true; pending.apply(op); }
+  const res = await post("/api/v1/jobs/" + id + "/actions/" + action);
+  if (op) op.inflight = false;
+  if (!res.ok) {
+    const why = (op && op.label ? op.label : action) + " failed — " + res.error;
+    if (op) pending.revert(op.key, why);
+    else toast({ text: why, kind: "error", ttlMs: 10000 });
+    refreshAll();
+    return null;
+  }
+  if (op) op.at = Date.now(); // the TTL clock starts when the server agreed
   refreshAll();
+  return res.body || {};
 }
 async function histAction(id, action) {
-  await jfetch("/api/v1/history/" + id + "/actions/" + action, { method: "POST" });
+  const res = await post("/api/v1/history/" + id + "/actions/" + action);
+  if (!res.ok) {
+    toast({ text: action + " failed — " + res.error, kind: "error", ttlMs: 10000 });
+    return null;
+  }
   refreshHistory().catch(() => {});
+  return res.body || {};
 }
 function toggleJob(id) {
   if (openJob === id) { openJob = null; renderQueue(); return; }
@@ -1382,49 +1594,74 @@ document.addEventListener("click", (ev) => {
     toggleJob(id);
     return;
   }
+  const name = row && row.__prev ? row.__prev.name : "this job";
   if (scope === "history") {
     const act = HIST_ACTIONS[action];
     if (!act) return;
-    const name = row.__prev ? row.__prev.name : "this entry";
     if (act === "delete" && !confirm("Forget " + name + "? (files stay)")) return;
     if (act === "delete-files" && !confirm("Delete FILES of " + name + "?")) return;
     histAction(id, act);
     return;
   }
   if (action === "delete") {
-    const name = row && row.__prev ? row.__prev.name : "this job";
     if (!confirm("Delete " + name + "?")) return;
-    jobAction(id, "delete");
+    jobAction(id, "delete", {
+      key: pending.key(id, "delete"), kind: "delete", jobId: id,
+      label: "Deleting " + name,
+    });
     return;
   }
-  if (["pause", "resume", "move-top", "move-up", "move-down", "move-bottom"].includes(action))
-    jobAction(id, action);
+  if (action === "pause" || action === "resume") {
+    jobAction(id, action, {
+      key: pending.key(id, action), kind: action, jobId: id,
+      label: (action === "pause" ? "Pausing " : "Resuming ") + name,
+    });
+    return;
+  }
+  if (MOVES[action] !== undefined) {
+    const list = pending.order(store.jobs).filter(j => !pending.hidden(j.id));
+    const at = list.findIndex(j => j.id === id);
+    if (at < 0) return;
+    jobAction(id, action, {
+      key: pending.key(id, "move"), kind: "move", jobId: id,
+      wantIdx: MOVES[action](at, list.length),
+      label: "Moving " + name,
+    });
+  }
 });
+const MOVES = {
+  "move-top": () => 0,
+  "move-up": (at) => Math.max(0, at - 1),
+  "move-down": (at, n) => Math.min(n - 1, at + 1),
+  "move-bottom": (at, n) => n - 1,
+};
 
 // ---- controls -----------------------------------------------------------
 // Optimistic: flip the visible state the instant the button is clicked
 // (buttons latch, the time-left tile says "paused"), then let the server's
 // answer — the refresh plus the queue_pause_changed SSE event — confirm or
 // correct it.
-$("btn-pause").onclick = async () => {
-  setPauseButtons(true);
-  setText($("s-eta"), "paused");
-  store.pauseSource = "web-ui";
-  await jfetch("/api/v1/queue/actions/pause", { method: "POST", headers: CLIENT_HDRS });
+async function queueAction(action, paused) {
+  setPauseButtons(paused);
+  setText($("s-eta"), paused ? "paused" : "—");
+  if (paused) store.pauseSource = "web-ui";
+  const res = await post("/api/v1/queue/actions/" + action);
+  if (!res.ok) {
+    setPauseButtons(!paused); // the server never agreed — put it back
+    toast({ text: action + " queue failed — " + res.error, kind: "error", ttlMs: 10000 });
+  }
   refreshAll();
-};
-$("btn-resume").onclick = async () => {
-  setPauseButtons(false);
-  setText($("s-eta"), "—");
-  await jfetch("/api/v1/queue/actions/resume", { method: "POST", headers: CLIENT_HDRS });
-  refreshAll();
-};
+}
+$("btn-pause").onclick = () => queueAction("pause", true);
+$("btn-resume").onclick = () => queueAction("resume", false);
 $("btn-limit").onclick = async () => {
   const kib = parseInt($("limit").value || "0", 10);
-  await jfetch("/api/v1/queue/speed-limit", {
+  const res = await post("/api/v1/queue/speed-limit", {
     method: "PUT", headers: { "content-type": "application/json", ...CLIENT_HDRS },
     body: JSON.stringify({ bytes_per_sec: kib > 0 ? kib * 1024 : null }),
   });
+  if (!res.ok) toast({ text: "speed limit failed — " + res.error, kind: "error", ttlMs: 10000 });
+  else toast({ text: kib > 0 ? "Speed limit set to " + kib + " KiB/s" : "Speed limit removed" });
   refreshAll();
 };
 for (const s of ["system", "job", "file"])
@@ -1486,10 +1723,21 @@ function refreshAll() {
 let debounce = null;
 function nudge() { clearTimeout(debounce); debounce = setTimeout(refreshAll, 150); }
 
-// Connection indicator: what the page's data feed is doing right now.
+// Connection honesty. Three states, and the page must be able to tell them
+// apart — an idle queue and a silently dead stream look identical otherwise,
+// because the daemon deduplicates idle ticks on purpose (that quiet-stream
+// property is deliberate: battery and radio on phone PWAs).
+//
+//   live          a tick arrived recently
+//   reconnecting  EventSource errored; it retries itself, polls carry us
+//   unreachable   the polls are failing too — say so across the whole page,
+//                 not with a gray dot in the corner
+let pollFails = 0;
 function connState(mode) {
+  if (store.conn === mode) return;
   store.conn = mode;
   const el = $("conn");
+  const off = $("offline");
   if (mode === "live") {
     el.className = "conn ok";
     el.textContent = "● live updates";
@@ -1498,11 +1746,31 @@ function connState(mode) {
     el.className = "conn warn";
     el.textContent = "◌ polling — reconnecting…";
     el.title = "Lost the daemon's event stream; refreshing every 5 s while reconnecting. Data may lag a few seconds.";
+  } else if (mode === "unreachable") {
+    el.className = "conn bad";
+    el.textContent = "✕ no connection";
+    el.title = "The daemon is not answering. Everything below is the last state we saw.";
   } else {
     el.className = "conn dim";
     el.textContent = "○ connecting…";
     el.title = "Establishing the live event stream to the daemon.";
   }
+  setText(off, mode === "unreachable"
+    ? "⚠ Can't reach the daemon — the numbers below are the last state we saw. Retrying every 5 s."
+    : "");
+  setClass(off, mode === "unreachable" ? "show" : "");
+}
+/// Every poll reports whether it got an answer. Two misses in a row is the
+/// difference between "one request lost the race with a restart" and "the
+/// daemon is gone".
+function pollResult(ok) {
+  if (ok) {
+    pollFails = 0;
+    if (store.conn === "unreachable")
+      connState(Date.now() - lastTickAt < 6500 ? "live" : "reconnecting");
+    return;
+  }
+  if (++pollFails >= 2) connState("unreachable");
 }
 let lastTickAt = 0; // when the SSE stream last delivered a full read model
 function connectSse() {
@@ -1534,6 +1802,7 @@ function connectSse() {
       store.status = d.status;
       store.jobs = d.jobs;
       store.jobsLoaded = true;
+      pending.reconcile(d.jobs);
       renderStatus();
       if (activeTab === "queue") renderQueue();
     } catch { /* malformed frame — the poll fallback still corrects */ }
@@ -2026,10 +2295,15 @@ initTheme();
   // daemon deduplicated an idle tick). History/logs/settings tabs have no
   // tick payload, so they refresh on the timer regardless.
   setInterval(() => {
-    if (Date.now() - lastTickAt > 6500) refreshAll();
-    else if (activeTab !== "queue") refreshTab();
+    if (Date.now() - lastTickAt > 6500) {
+      if (store.conn === "live") connState("reconnecting");
+      refreshAll();
+    } else if (activeTab !== "queue") refreshTab();
     if (openJob != null) refreshJobDetail();
   }, 5000);
+  // The pending-op grace period has to expire even when nothing is arriving
+  // — a dead stream must never leave a row invisible forever.
+  setInterval(() => pending.sweep(), 1000);
   // Coming back to the tab: repaint now, not at the next timer.
   document.addEventListener("visibilitychange", () => {
     if (!document.hidden) refreshAll();
@@ -2047,7 +2321,10 @@ if (typeof __nzbd_test_enable !== "undefined") {
     rowModel, reconcileRows, applyRow, differ, KINDS, store,
     histModel, fileModel, statusModels, queueModels, detailModel,
     statusName, healthColor, fmtBytes, fmtRate, fmtEta,
+    pending, satisfied, toast, connState, pollResult,
+    PENDING_TTL_MS,
     setOpenJob: (id) => { openJob = id; },
+    conn: () => store.conn,
   };
 }
 

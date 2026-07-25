@@ -72,31 +72,50 @@ const fake = {
 // Minimal sandbox: enough for the page script to reach its own bottom, where
 // it publishes `window.__nzbd_test`.
 // ---------------------------------------------------------------------------
+// Elements the page reaches by id are a mini-DOM (real child lists), so the
+// live renderer can run end to end against them — that is how the toast
+// stack and the pending overlay get exercised for real.
 const failures = [];
 const ids = new Set([...html.matchAll(/id="([^"]+)"/g)].map((m) => m[1]));
 function stubEl(id) {
   const t = {
-    id, style: {}, dataset: {}, hidden: false, disabled: false,
+    id, style: {}, dataset: {}, attrs: {}, hidden: false, disabled: false,
     value: "", textContent: "", innerHTML: "", className: "", title: "",
     checked: false, scrollTop: 0, clientHeight: 0, scrollHeight: 0,
+    children: [], parentNode: null,
     classList: { toggle() {}, add() {}, remove() {} },
     querySelectorAll: () => [], querySelector: () => null,
-    addEventListener() {}, appendChild() {}, replaceWith() {},
-    insertBefore() {}, removeChild() {}, firstChild: null,
+    addEventListener() {}, replaceWith() {},
+    appendChild(n) { if (n.parentNode) n.parentNode.removeChild(n); t.children.push(n); n.parentNode = t; return n; },
+    removeChild(n) { const i = t.children.indexOf(n); if (i >= 0) t.children.splice(i, 1); n.parentNode = null; },
+    insertBefore(n, ref) {
+      if (n.parentNode) n.parentNode.removeChild(n);
+      const at = ref ? t.children.indexOf(ref) : -1;
+      if (at >= 0) t.children.splice(at, 0, n); else t.children.push(n);
+      n.parentNode = t;
+    },
+    get firstChild() { return t.children[0] || null; },
+    get nextSibling() {
+      if (!t.parentNode) return null;
+      const s = t.parentNode.children;
+      return s[s.indexOf(t) + 1] || null;
+    },
     select() {}, click() {}, focus() {}, matches: () => false,
     reportValidity: () => true,
-    setAttribute() {}, removeAttribute() {}, getAttribute: () => null,
+    setAttribute(k, v) { t.attrs[k] = v; }, removeAttribute() {}, getAttribute: () => null,
     closest: () => null,
   };
-  return new Proxy(t, { get: (o, k) => (k in o ? o[k] : undefined), set: (o, k, v) => ((o[k] = v), true) });
+  return t;
 }
+const elCache = new Map();
 const sandbox = {
   console,
   __nzbd_test_enable: true,
   document: {
     getElementById(id) {
       if (!ids.has(id)) failures.push(`$("${id}") — no element with that id in the markup`);
-      return stubEl(id);
+      if (!elCache.has(id)) elCache.set(id, stubEl(id));
+      return elCache.get(id);
     },
     querySelectorAll: () => [],
     createElement: (t) => stubEl("_" + t),
@@ -348,6 +367,157 @@ const models = (jobs) => jobs.map((j, i) => T.rowModel(j, { idx: i, count: jobs.
   for (const container of ["queue-body", "history-body", "logbox", "badges", "clients-strip"])
     ok(!new RegExp(`\\$\\("${container}"\\)\\.innerHTML`).test(src),
       `#${container} is never rebuilt with innerHTML`);
+}
+
+// --- 12. toasts: stack, cap, dismiss, action ------------------------------
+{
+  const stack = sandbox.document.getElementById("toasts");
+  stack.children.length = 0;
+  const t1 = T.toast({ text: "one" });
+  eq(stack.children.length, 1, "a toast lands in the stack");
+  eq(t1.el.children[0].textContent, "one", "…carrying its message");
+  T.toast({ text: "two", kind: "error" });
+  ok(stack.children[1].className.includes("bad"), "an error toast is styled as one");
+  T.toast({ text: "three" });
+  T.toast({ text: "four" });
+  eq(stack.children.length, 3, "the stack is capped at three");
+  eq(stack.children[0].children[0].textContent, "two", "the oldest is the one dropped");
+  let ran = 0;
+  const t5 = T.toast({ text: "undo me", action: { label: "Undo", fn: () => ran++ } });
+  const undoBtn = t5.el.children[1];
+  eq(undoBtn.textContent, "Undo", "the action button carries its label");
+  undoBtn.onclick();
+  eq(ran, 1, "clicking the action runs it");
+  ok(!stack.children.includes(t5.el), "…and dismisses the toast");
+  const t6 = T.toast({ text: "bye" });
+  t6.el.children[1].onclick(); // the × button
+  ok(!stack.children.includes(t6.el), "the dismiss button removes the toast");
+  stack.children.length = 0;
+}
+
+// --- 13. pending overlay: apply hides the row, confirm drops the op -------
+{
+  const jobs = [job(1), job(2)];
+  T.store.jobs = jobs;
+  T.store.jobsLoaded = true;
+  T.pending.clear();
+  eq(T.queueModels().filter(m => m.kind === "job").length, 2, "both jobs visible");
+  T.pending.apply({ key: T.pending.key(1, "delete"), kind: "delete", jobId: 1, label: "Deleting job 1" });
+  const after = T.queueModels().filter(m => m.kind === "job");
+  eq(after.length, 1, "the deleted row is gone before the server answers");
+  eq(after[0].id, 2, "…and it is the right one");
+  // The tick that still lists job 1 must NOT flash it back.
+  T.pending.reconcile(jobs);
+  eq(T.queueModels().filter(m => m.kind === "job").length, 1,
+    "a tick mid-flight cannot flash the deleted row back");
+  // Now the server agrees it is gone: the op retires.
+  T.pending.reconcile([jobs[1]]);
+  eq(T.pending.ops.size, 0, "server state matching the intent drops the op");
+  T.store.jobs = [jobs[1]];
+  eq(T.queueModels().filter(m => m.kind === "job").length, 1, "and the view agrees");
+}
+
+// --- 14. pending overlay: pause overrides the chip, then retires ----------
+{
+  const j = job(1, { status: "downloading" });
+  T.store.jobs = [j];
+  T.pending.clear();
+  T.pending.apply({ key: T.pending.key(1, "pause"), kind: "pause", jobId: 1, label: "Pausing job 1" });
+  const m = T.queueModels().find(x => x.kind === "job");
+  eq(m.st, "PAUSED", "the chip flips the instant the button is clicked");
+  eq(m.pauseLabel, "resume", "…and the button offers the opposite action");
+  eq(m.rowCls, "pending", "the row reads as in-flight");
+  T.pending.reconcile([j]); // server still says downloading
+  eq(T.pending.ops.size, 1, "an unconfirmed pause stays applied");
+  T.pending.reconcile([job(1, { status: "paused" })]);
+  eq(T.pending.ops.size, 0, "the server agreeing retires the op");
+}
+
+// --- 15. pending overlay: timeout reverts and says so --------------------
+{
+  const stack = sandbox.document.getElementById("toasts");
+  stack.children.length = 0;
+  T.store.jobs = [job(1)];
+  T.pending.clear();
+  const op = T.pending.apply({ key: T.pending.key(1, "delete"), kind: "delete", jobId: 1, label: "Deleting job 1" });
+  op.at = Date.now() - (T.PENDING_TTL_MS + 1000);
+  T.pending.sweep();
+  eq(T.pending.ops.size, 0, "an op nothing ever confirmed is dropped");
+  eq(T.queueModels().filter(m => m.kind === "job").length, 1, "the row springs back");
+  eq(stack.children.length, 1, "…and the user is told");
+  ok(stack.children[0].children[0].textContent.includes("didn't take"),
+    "the message names the failure, not a generic error");
+  // An op whose POST is still in flight is NOT swept out from under it.
+  const op2 = T.pending.apply({ key: T.pending.key(1, "pause"), kind: "pause", jobId: 1 });
+  op2.inflight = true;
+  op2.at = Date.now() - (T.PENDING_TTL_MS + 1000);
+  T.pending.sweep();
+  eq(T.pending.ops.size, 1, "a POST still in flight is given its time");
+  T.pending.clear();
+  stack.children.length = 0;
+}
+
+// --- 16. pending overlay: explicit revert on a failed POST ---------------
+{
+  const stack = sandbox.document.getElementById("toasts");
+  stack.children.length = 0;
+  T.store.jobs = [job(1)];
+  T.pending.clear();
+  T.pending.apply({ key: T.pending.key(1, "delete"), kind: "delete", jobId: 1, label: "Deleting job 1" });
+  T.pending.revert(T.pending.key(1, "delete"), "Deleting job 1 failed — job not found");
+  eq(T.pending.ops.size, 0, "revert drops the op");
+  eq(T.queueModels().filter(m => m.kind === "job").length, 1, "the row is back immediately");
+  eq(stack.children[0].children[0].textContent, "Deleting job 1 failed — job not found",
+    "the toast carries the daemon's own error string");
+  stack.children.length = 0;
+}
+
+// --- 17. move ops reorder locally, and retire on the server's order ------
+{
+  const jobs = [job(1), job(2), job(3)];
+  T.store.jobs = jobs;
+  T.pending.clear();
+  T.pending.apply({ key: T.pending.key(3, "move"), kind: "move", jobId: 3, wantIdx: 0, label: "Moving job 3" });
+  const ids2 = T.queueModels().filter(m => m.kind === "job").map(m => m.id);
+  eq(ids2.join(","), "3,1,2", "the row is where the user put it, immediately");
+  T.pending.reconcile(jobs);
+  eq(T.pending.ops.size, 1, "the old order does not satisfy the move");
+  T.pending.reconcile([jobs[2], jobs[0], jobs[1]]);
+  eq(T.pending.ops.size, 0, "the server's new order retires the move");
+  T.pending.clear();
+}
+
+// --- 18. satisfied() is the whole resolution rule, in one place ----------
+{
+  const byId = new Map([[1, job(1, { status: "paused" })]]);
+  ok(T.satisfied({ kind: "pause", jobId: 1 }, byId), "paused satisfies a pause");
+  ok(!T.satisfied({ kind: "resume", jobId: 1 }, byId), "paused does not satisfy a resume");
+  ok(!T.satisfied({ kind: "delete", jobId: 1 }, byId), "a present job does not satisfy a delete");
+  ok(T.satisfied({ kind: "delete", jobId: 9 }, byId), "an absent job does");
+  ok(T.satisfied({ kind: "pause", jobId: 9 }, byId),
+    "a job that left the queue stops being overridden");
+}
+
+// --- 19. connection states, including the one the old UI could not see ---
+{
+  const conn = sandbox.document.getElementById("conn");
+  const off = sandbox.document.getElementById("offline");
+  T.connState("live");
+  eq(T.conn(), "live", "live is live");
+  eq(off.className, "", "no banner while connected");
+  T.connState("reconnecting");
+  ok(conn.className.includes("warn"), "reconnecting reads as a warning");
+  eq(off.className, "", "…but still no page-wide banner: polls are carrying us");
+  // One failed poll is a race with a restart; two is a dead daemon.
+  T.pollResult(false);
+  ok(T.conn() !== "unreachable", "a single miss is not a verdict");
+  T.pollResult(false);
+  eq(T.conn(), "unreachable", "two misses in a row is");
+  eq(off.className, "show", "…and that gets a banner, not a gray dot");
+  ok(off.textContent.includes("Can't reach the daemon"), "the banner says what is wrong");
+  T.pollResult(true);
+  ok(T.conn() !== "unreachable", "an answered poll clears it");
+  eq(off.className, "", "banner gone");
 }
 
 if (failures.length) {
