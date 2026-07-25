@@ -36,11 +36,17 @@ brew install par2 p7zip
 Images are published to GHCR on every release tag:
 
 ```sh
+mkdir -p config && sudo chown -R 1000:1000 config /data/usenet
 docker run -d --name nzbd -p 6789:6789 \
   -v /data/usenet:/data \
-  -v $PWD/nzbd.toml:/etc/nzbd/nzbd.toml:ro \
+  -v $PWD/config:/etc/nzbd \
   ghcr.io/pjunod/nzbd:latest
 ```
+
+Mount the config *directory*, read-write: an empty one lets the first-run
+setup UI write `nzbd.toml` for you, and the Settings tab can save later.
+A read-only mount (`:ro`, a compose `configs:` entry, a ConfigMap) makes
+every save fail — see [DEPLOY.md](DEPLOY.md) for that shape.
 
 The image bundles `par2`, `unrar-free` and `7z`, runs unprivileged as UID
 1000 under `tini`, exposes `6789`, and expects its config at

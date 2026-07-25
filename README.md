@@ -52,10 +52,12 @@ Optionally runs as a **multi-node cluster** over a shared work volume.
 ## Quickstart
 
 ```sh
-# Docker
+# Docker — mount the config DIRECTORY read-write (empty is fine: the
+# first-run wizard writes nzbd.toml into it)
+mkdir -p config && sudo chown -R 1000:1000 config
 docker run -d --name nzbd -p 6789:6789 \
   -v /data/usenet:/data \
-  -v $PWD/nzbd.toml:/etc/nzbd/nzbd.toml:ro \
+  -v $PWD/config:/etc/nzbd \
   ghcr.io/pjunod/nzbd:latest
 
 # …or a release binary / source build (see docs/INSTALL.md)

@@ -48,8 +48,10 @@ Where the wizard's write actually lands, by deployment shape:
   filesystem layer and works fine *until the container is recreated*
   (`docker rm` / image update), which silently starts setup over. Fine
   for kicking the tires, not for keeps.
-- **Read-only config (`:ro` bind, Kubernetes ConfigMap)** — the daemon
-  can't write at all. The setup page detects this at boot and says so;
+- **Read-only config (`:ro` bind, compose `configs:`, Kubernetes
+  ConfigMap)** — the daemon can't write at all: the wizard *and* the
+  Settings tab both fail their save with `Read-only file system
+  (os error 30)`. The setup page detects this at boot and says so;
   fill the form anyway and use **Show config** to copy or download the
   generated `nzbd.toml`, place it yourself, and restart. (The same
   button works in every deployment if you'd rather manage the file by
@@ -99,10 +101,11 @@ Or fully declarative, config-first:
 
 ```sh
 # 1. Host directories
-sudo mkdir -p /data/usenet/complete /opt/nzbd
+sudo mkdir -p /data/usenet/complete /opt/nzbd/config
+sudo chown -R 1000:1000 /data/usenet /opt/nzbd/config
 
 # 2. Config
-sudo tee /opt/nzbd/nzbd.toml >/dev/null <<'EOF'
+sudo tee /opt/nzbd/config/nzbd.toml >/dev/null <<'EOF'
 [paths]
 main_dir = "/data"
 dest_dir = "/data/complete"
@@ -133,7 +136,7 @@ docker run -d \
   --restart unless-stopped \
   -p 6789:6789 \
   -v /data/usenet:/data \
-  -v /opt/nzbd/nzbd.toml:/etc/nzbd/nzbd.toml:ro \
+  -v /opt/nzbd/config:/etc/nzbd \
   -e TZ=Etc/UTC \
   ghcr.io/pjunod/nzbd:latest
 
@@ -146,13 +149,14 @@ curl -s localhost:6789/healthz # -> ok
 The host volume is owned by the container's UID 1000; if your host dir
 belongs to someone else: `sudo chown -R 1000:1000 /data/usenet`.
 
-**Mind the order:** create the config file *before* the first
-`docker run`. Docker turns a missing bind-mount source into an empty
-*directory*, and the daemon will refuse to start with a "config path is
-a DIRECTORY" error — remove the accidental directory on the host
-(`rmdir /opt/nzbd/nzbd.toml`), write the file, and recreate the
-container. (The Compose deployments are immune: they use compose
-`configs`, which fail fast when the file is missing.)
+**Mount the directory, not the file.** Bind-mounting
+`/opt/nzbd/nzbd.toml` directly is the classic trap: if the host file
+doesn't exist yet Docker invents an empty *directory* in its place, and
+the daemon refuses to start with a "config path is a DIRECTORY" error
+(fix: `rmdir` it, write the file, recreate the container). Mounting
+`/opt/nzbd/config` at `/etc/nzbd` sidesteps that entirely — a missing
+config just means the first-run wizard writes one. Keep the mount
+read-write, or the Settings tab can never save.
 
 Useful lifecycle commands:
 
@@ -182,8 +186,9 @@ config to copy:
 ```sh
 git clone https://github.com/pjunod/nzbd.git
 cd nzbd/examples/docker-compose
-cp nzbd.toml.example nzbd.toml
-$EDITOR nzbd.toml            # server credentials + [api] password
+mkdir -p config && sudo chown -R 1000:1000 config
+cp nzbd.toml.example config/nzbd.toml
+$EDITOR config/nzbd.toml     # server credentials + [api] password
 
 docker compose up -d
 docker compose logs -f nzbd
@@ -191,7 +196,12 @@ curl -s localhost:6789/healthz   # -> ok
 ```
 
 Edit the `volumes:` in the compose file if your downloads live somewhere
-other than `/data/usenet`.
+other than `/data/usenet`. `config/` is bind-mounted read-write, so the
+Settings tab writes straight back to `config/nzbd.toml`; skip the `cp`
+and the first-run wizard creates it instead.
+
+Compose applies a config-file change on `docker compose up -d`, not on
+`restart`.
 
 ## Kubernetes
 
@@ -209,6 +219,10 @@ kubectl -n nzbd get pods
 kubectl -n nzbd port-forward svc/nzbd 6789:6789
 # http://localhost:6789/ — in-cluster clients use nzbd.nzbd.svc:6789
 ```
+
+The config arrives as a Secret mounted read-only, so the Settings tab is
+view-and-copy there: edit `secret.yaml` and re-apply, or use **Show
+config** to copy what the UI would have written.
 
 Keep `replicas: 1` — the queue journal lives on the RWO volume. Scaling
 out means nzbd clustering (next section), not more replicas; the

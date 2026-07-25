@@ -8,7 +8,7 @@ roadmaps in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) §16 and
 Legend: ✅ done (implemented, tested, committed) · 🔶 partial · ⬜ not
 started · 👤 operator action (Paul)
 
-**Snapshot (2026-07-24):** 199 tests · clippy clean · **phases 0–4
+**Snapshot (2026-07-25):** 200 tests · clippy clean · **phases 0–4
 complete incl. RSS feeds, cluster C1+C2 complete, phase 5 partial** —
 every NZBGet user-facing surface exists; what remains is beyond-parity
 performance work and operator actions
@@ -93,6 +93,7 @@ performance work and operator actions
 ## Docs ✅
 
 - ✅ Operator documentation (2026-07-18): reworked `README` (accurate status, quickstart, doc index) + `docs/INSTALL.md` (binaries/Docker/Homebrew/source/musl), `docs/CONFIGURATION.md` (full annotated `nzbd.toml` reference), `docs/USAGE.md` (CLI, UI, *arr hookup, feed filter language, scripts, deobfuscation), `docs/DEPLOY.md` (copy-paste recipes: Docker by hand incl. volume map + lifecycle, Compose, Kubernetes, systemd, multi-node cluster)
+- ✅ Docker config mount fixed (2026-07-25): the shipped Compose recipe delivered the config through a Compose `configs:` entry — always mounted **read-only** — so every settings-editor save failed with `Read-only file system (os error 30)`; `docs/INSTALL.md`, `docs/DEPLOY.md` and the README used `:ro` config binds for the same net effect. All four now bind the config **directory** read-write (`./config:/etc/nzbd`), which also sidesteps the Docker-invents-a-directory trap for a missing config file and lets the first-run wizard write one. `dev/docker-compose.yml`'s ownership hint corrected to `chown -R 1000:1000` (the container runs as UID 1000; `$USER` only works if you happen to be 1000). Guard test `shipped_compose_files_mount_the_config_writable` fails the build if a shipped compose file goes read-only again; Kubernetes stays deliberately read-only and DEPLOY.md now says the editor is view-and-copy there
 - ✅ Deployable examples under `examples/`: `docker-compose/` (compose + `nzbd.toml.example`), `kubernetes/` (namespace/secret/PVC/deployment/service/kustomization + README incl. RWX cluster shape), `systemd/` (hardened unit)
 - ✅ `dev/` local-build compose (image from the repo Dockerfile, `compose watch` rebuilds, throwaway `dev/data/`, gitignored dev config) + root `.dockerignore` (target/ was going into every build context); example configs are parse-tested against the real validator (`nzbd-config/tests/examples.rs`)
 

@@ -1,8 +1,13 @@
 # nzbd — single-node Docker Compose deployment.
 #
 #   cd examples/docker-compose
-#   cp nzbd.toml.example nzbd.toml   # then edit: server credentials, paths
+#   mkdir -p config
+#   sudo chown -R 1000:1000 config     # the container runs as UID 1000
+#   cp nzbd.toml.example config/nzbd.toml   # then edit: credentials, paths
 #   docker compose up -d
+#
+# Or skip the copy entirely: leave config/ empty and the first-run wizard
+# at http://localhost:6789/ writes config/nzbd.toml for you.
 #
 # Web UI on http://localhost:6789/ — point Sonarr/Radarr at the same
 # host/port as an "NZBGet" download client.
@@ -20,12 +25,13 @@ services:
       # Downloads + state. paths.main_dir/dest_dir in nzbd.toml must live
       # under /data for the *arr apps to see the same paths you map here.
       - /data/usenet:/data
-    # The config goes in as a compose `config`, not a bind mount: if
-    # ./nzbd.toml is missing, `docker compose up` fails immediately with a
-    # clear error instead of Docker inventing a directory in its place.
-    configs:
-      - source: nzbd_toml
-        target: /etc/nzbd/nzbd.toml
+      # The config DIRECTORY, read-write — the Settings tab saves here, and
+      # an empty config/ lets the first-run wizard create nzbd.toml itself.
+      # Mount the directory, never the file: Docker turns a missing
+      # bind-mount source file into a directory and the daemon won't start.
+      # (A compose `configs:` entry would be read-only, which makes every
+      # save in the settings editor fail with EROFS.)
+      - ./config:/etc/nzbd
     environment:
       - TZ=Etc/UTC
       # - RUST_LOG=info
@@ -54,6 +60,3 @@ services:
   #     - PGID=1000
   #     - TZ=Etc/UTC
 
-configs:
-  nzbd_toml:
-    file: ./nzbd.toml            # cp nzbd.toml.example nzbd.toml first

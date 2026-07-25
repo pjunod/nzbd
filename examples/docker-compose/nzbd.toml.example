@@ -1,5 +1,6 @@
 # nzbd example configuration for the Compose deployment.
-# Copy to nzbd.toml, set your news-server credentials and passwords.
+# Copy to config/nzbd.toml, set your news-server credentials and passwords.
+# (Or leave config/ empty and let the first-run wizard write it.)
 # Full reference: docs/CONFIGURATION.md
 
 [paths]

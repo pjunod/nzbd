@@ -6,7 +6,11 @@
 #   mkdir -p config data              # BEFORE up: if compose creates these
 #                                     # bind-mount dirs for you they're owned
 #                                     # by root, and the setup UI can't write
-#                                     # config/nzbd.toml (chown -R $USER fixes)
+#                                     # config/nzbd.toml. The container runs
+#                                     # as UID 1000, so the fix is
+#                                     # `sudo chown -R 1000:1000 config data`
+#                                     # — chowning to $USER only works if you
+#                                     # happen to be UID 1000.
 #   docker compose up --build         # build + run (foreground, logs)
 #   # → http://localhost:6789/ serves the first-run setup UI, which
 #   #   writes config/nzbd.toml and restarts the daemon with it.
