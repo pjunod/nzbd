@@ -28,8 +28,48 @@ let a feed rule accept items ([CONFIGURATION.md](CONFIGURATION.md)
 
 Open `http://<host>:6789/`. One embedded page (no separate frontend to
 deploy): live queue with per-job and per-file actions, pause/resume,
-speed limit control, history, log tail, dark/light. It refreshes over
-SSE, so state changes appear without polling.
+speed limit control, history, log tail, settings, dark/light. It updates
+over SSE at 1 Hz — progress bars, rates and the sparkline move without
+you touching anything.
+
+**Deleting is one click, and undoable.** There is no confirmation dialog
+anywhere in this UI. Click *delete* and the row is gone immediately; a
+toast in the corner offers **Undo** for 8 seconds. That works because the
+daemon *parks* the job rather than dropping it: it regenerates the NZB
+from queue state, spools it beside the history index, and writes a
+`DELETED` history entry. Undo re-queues from that spool, so a misclick on
+a 60 GiB download costs one more click instead of a re-download. The
+parked entry stays in History with a **requeue** button long after the
+toast has faded — until you forget it or delete its files.
+
+Two things are *not* undoable, and behave differently on purpose:
+
+- **delete files** in History removes the downloaded files from disk. It
+  arms in place — the button becomes `sure?` for three seconds, and
+  clicking anywhere else cancels it. Two clicks, both on the button you
+  already aimed at.
+- Deleting when no history store is configured. The toast says so rather
+  than offering an Undo that would fail.
+
+**How to read the header.** The connection indicator is the thing to
+check first when the page looks stuck: `● live updates` means the event
+stream is delivering; `◌ polling — reconnecting…` means the stream
+dropped and 5-second polls are carrying the page; a red banner across the
+top means the daemon is not answering at all and every number below it is
+the last state seen. The rate tile's sparkline is the last three minutes,
+one point per second — a provider that dies for ten seconds a minute is
+invisible in the number and obvious in the shape. The chips beside the
+badges are your news servers with their current share of the wire rate;
+they add up to the header rate because they are the same bytes counted
+per server, and one turns red when that server is blocked after
+connection failures. The browser tab title tickers
+`▼ 93 MiB/s · 12m — nzbd` while downloading, so you can watch it from
+another tab.
+
+**If an action fails, the page says so** — with the daemon's own error
+text — and the row springs back to where it was. An action that gets no
+answer within five seconds reverts the same way. Nothing is ever shown as
+done merely because the click happened.
 
 ## On your phone (PWA)
 
@@ -126,10 +166,13 @@ GET  /api/v1/status                 queue totals, rate, health
 GET  /api/v1/jobs                   the queue
 POST /api/v1/jobs                   add a job (NZB content or URL)
 GET  /api/v1/jobs/{id}
-POST /api/v1/jobs/{id}/actions/{action}     pause|resume|delete|…
+GET  /api/v1/jobs/{id}/files        per-file segment progress
+GET  /api/v1/jobs/{id}/nzb          the job's NZB, regenerated from queue state
+POST /api/v1/jobs/{id}/actions/{action}     pause|resume|delete|delete-files|move-*
 POST /api/v1/queue/actions/{action}
 PUT  /api/v1/queue/speed-limit
 GET  /api/v1/history
+POST /api/v1/history/{id}/actions/{action}  hide|restore|delete|delete-files|requeue
 GET  /api/v1/events                 SSE stream of queue changes
 GET  /api/v1/logs                   recent daemon log
 GET  /metrics                       Prometheus metrics
@@ -138,6 +181,29 @@ GET  /healthz                       liveness (always unauthenticated)
 
 With `[api] password` set, authenticate with HTTP Basic or
 `Authorization: Bearer <token>`.
+
+**Delete and requeue.** `actions/delete` answers
+`{"ok":true,"parked":true|false}`. When `parked` is true the daemon has
+spooled the job's regenerated NZB and written a `DELETED` history entry,
+and `POST /api/v1/history/{id}/actions/requeue` will put it back —
+`200 {"id":<new job id>}` on success, `404` if the entry or its spooled
+NZB is gone, `501` with no history store configured. A successful requeue
+consumes the entry and its spool: the job is queued again, so a `DELETED`
+record for it would be a lie. Entries in `GET /api/v1/history` carry
+`can_requeue`, which is derived at read time rather than stored — it
+answers "is the requeue source still on *this* node?", and the spool is
+local, not shared cluster state.
+
+**The event stream** (`/api/v1/events`) carries every engine event under
+its own `event:` name, plus three of its own: `tick` (`{status, jobs}` at
+1 Hz, the whole read model from one snapshot, suppressed while nothing
+changes); `hb` (`{now_unix}`, sent when a tick was suppressed and nothing
+has gone out for 5 s — that is how a client tells an idle queue from a
+dead stream, since `EventSource` cannot see keep-alive comments); and
+`log` (`{entries, dropped}` at 1 Hz, capped at 200 lines per frame, with
+`dropped` reporting what the cap cut). A new connection tails the log
+from the newest id rather than replaying the ring — use `GET
+/api/v1/logs` for backfill.
 
 ## RSS feeds and the filter language
 

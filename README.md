@@ -38,8 +38,12 @@ Optionally runs as a **multi-node cluster** over a shared work volume.
 - **RSS/Atom feeds** with the NZBGet filter language
   (`Accept`/`Reject`/`Require`, wildcards, size/age windows, per-rule
   category/priority/dupe options).
-- **Embedded web UI** at `/` — live queue, history, log tail, speed
-  controls, SSE refresh, dark/light, first-run setup wizard. One
+- **Embedded web UI** at `/` — live queue, history, live log tail, speed
+  controls, rate sparkline, per-provider chips, dark/light, first-run
+  setup wizard. Rendered in place from a 1 Hz SSE stream, so clicking,
+  selecting and scrolling survive updates; every action applies instantly
+  and reverts — loudly — if the daemon disagrees; delete is one click
+  with an 8-second Undo and **no confirmation dialogs anywhere**. One
   self-contained page, zero build toolchain — and an **installable PWA**
   on phones, with built-in HTTPS (`[api] tls = true` self-generates a
   persistent certificate) to make browsers treat it as a secure origin.
