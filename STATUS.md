@@ -173,6 +173,7 @@ performance work and operator actions
 - ⬜ Cluster C3: segment-split downloads, weighted scheduling, budget rebalancing — the lease protocol carries a `kind` field so a `Segment` lease slots in without wire changes
 - ✅ RSS feeds + filter language — shipped (see phase 4)
 - ⬜ `rapidyenc-sys` FFI + differential fuzzing — scalar decoder saturates typical line rates today
+- ⬜ UI v2 — live-by-construction dashboard (field report 2026-07-25 #6: innerHTML-per-tick rendering eats clicks; confirm() on delete; silent action failures): keyed in-place renderer, optimistic actions with revert + toasts, instant undoable delete (parks regenerated NZB to history as DELETED + `requeue` action), SSE `hb`/`log` events, per-server rates, sparkline/title-ticker/server-chips/live-log-tail — decisions locked with Paul 2026-07-25; plan + wire contracts in docs/UI_V2_PLAN.md (M1–M7, one commit each)
 
 ## Operator checklist 👤
 
