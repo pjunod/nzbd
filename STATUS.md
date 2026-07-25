@@ -8,7 +8,7 @@ roadmaps in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) §16 and
 Legend: ✅ done (implemented, tested, committed) · 🔶 partial · ⬜ not
 started · 👤 operator action (Paul)
 
-**Snapshot (2026-07-25):** 211 tests · clippy clean · **phases 0–4
+**Snapshot (2026-07-25):** 212 tests · clippy clean · **phases 0–4
 complete incl. RSS feeds, cluster C1+C2 complete, phase 5 partial** —
 every NZBGet user-facing surface exists; what remains is beyond-parity
 performance work and operator actions
@@ -173,7 +173,15 @@ performance work and operator actions
 - ⬜ Cluster C3: segment-split downloads, weighted scheduling, budget rebalancing — the lease protocol carries a `kind` field so a `Segment` lease slots in without wire changes
 - ✅ RSS feeds + filter language — shipped (see phase 4)
 - ⬜ `rapidyenc-sys` FFI + differential fuzzing — scalar decoder saturates typical line rates today
-- ⬜ UI v2 — live-by-construction dashboard (field report 2026-07-25 #6: innerHTML-per-tick rendering eats clicks; confirm() on delete; silent action failures): keyed in-place renderer, optimistic actions with revert + toasts, instant undoable delete (parks regenerated NZB to history as DELETED + `requeue` action), SSE `hb`/`log` events, per-server rates, sparkline/title-ticker/server-chips/live-log-tail — decisions locked with Paul 2026-07-25; plan + wire contracts in docs/UI_V2_PLAN.md (M1–M7, one commit each)
+- 🔶 UI v2 — live-by-construction dashboard (field report 2026-07-25 #6: innerHTML-per-tick rendering eats clicks; confirm() on delete; silent action failures). Decisions locked with Paul 2026-07-25; plan + wire contracts in [docs/UI_V2_PLAN.md](docs/UI_V2_PLAN.md), one commit per milestone:
+  - ⬜ M0 👤 redeploy nuc3 on a post-`9df6b7d` image (and add the missing `./config:/etc/nzbd` bind first) — kills the stale-cache half of the report before any v2 code lands
+  - ✅ M1 keyed in-place renderer — store + `rowModel`/`reconcileRows`/`applyRow`, one delegated click listener, detail panel as a stable subtree; `crates/nzbd/tests/ui_dom.rs` pins the five rendering laws
+  - ⬜ M2 optimistic actions with revert + toasts; honest `live`/`reconnecting`/`unreachable` connection states
+  - ⬜ M3 delete parks the regenerated NZB to history as `DELETED` + `requeue` action
+  - ⬜ M4 instant undoable delete — `confirm()` removed everywhere
+  - ⬜ M5 SSE `hb` + `log` events, per-server wire rates
+  - ⬜ M6 sparkline, title ticker, server chips, live log tail
+  - ⬜ M7 docs sweep (ARCHITECTURE §12 as-built UI, USAGE `requeue`/`parked`)
 
 ## Operator checklist 👤
 

@@ -504,27 +504,572 @@ function esc(s) {
   return String(s).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 }
 
-// ---- status -------------------------------------------------------------
-async function refreshStatus() {
-  const r = await jfetch("/api/v1/status");
-  if (!r.ok) throw new Error("status " + r.status);
-  renderStatus(await r.json());
+// ---- the store ----------------------------------------------------------
+// One plain object, written ONLY by the SSE handlers, the poll fallback and
+// (from M2) pending-op reconciliation. Render never fetches; fetch never
+// renders. The old code interleaved both freely — which is how a POST that
+// failed became indistinguishable from one that worked.
+const store = {
+  status: null,        // StatusDto (from /api/v1/status or the SSE tick)
+  jobs: [],            // JobSummary[] — the queue, in queue order
+  jobsLoaded: false,   // false until the first authoritative read
+  history: null,       // HistoryEntry[] | null (not loaded) | "off" (501)
+  clients: null,       // ClientInfo[] | null
+  logs: null,          // LogRecord[] | null (not loaded) | "off" (501)
+  jobFiles: null,      // open job's file list
+  jobLogs: null,       // open job's activity tail
+  conn: "connecting",  // connecting | live | reconnecting | unreachable
+  pauseSource: null,   // who last (un)paused the queue (from the event)
+  healthAbort: false,  // [post] health_action arms the critical-health abort
+};
+
+// ---- rendering core: keyed, in place, minimal writes ---------------------
+// THE LAW this file is organised around: after boot we never assign
+// innerHTML to a container that holds live rows. Rows are built once out of
+// createElement and then mutated cell by cell, so an untouched job keeps the
+// SAME DOM node across ticks. That single property is what makes clicks,
+// hover, text selection, scroll position and CSS transitions survive a 1 Hz
+// update.
+//
+// Why it matters (field report 2026-07-25): the previous renderer assigned
+// `tbody.innerHTML` every second. A tick landing between mousedown and
+// mouseup destroyed the pressed button, so the browser never fired `click` —
+// the "first delete click does nothing" coin flip. It also reset the detail
+// panel's scroll, restarted every progress transition, and made selecting a
+// job name impossible.
+//
+// `dom` is the ONLY DOM surface the reconciler and the row builders may
+// touch. Keeping it that narrow is what lets the CI harness
+// (crates/nzbd/tests/ui_dom_harness.js) swap in an ~80-line fake and count
+// every write.
+const dom = {
+  create(tag, cls) {
+    const n = document.createElement(tag);
+    if (cls) n.className = cls;
+    return n;
+  },
+  append(parent, node) { parent.appendChild(node); return node; },
+  insertBefore(parent, node, ref) { parent.insertBefore(node, ref || null); },
+  remove(parent, node) { parent.removeChild(node); },
+  first(parent) { return parent.firstChild; },
+  next(node) { return node.nextSibling; },
+  text(node, s) { node.textContent = s; },
+  cls(node, s) { node.className = s; },
+  toggle(node, c, on) { node.classList.toggle(c, !!on); },
+  style(node, k, v) { node.style[k] = v; },
+  prop(node, k, v) { node[k] = v; },
+  attr(node, k, v) { node.setAttribute(k, v); },
+  data(node, k, v) { node.dataset[k] = v; },
+};
+
+// Every row kind: how to build its skeleton once, how to update it after.
+// `applyRow` (the queue row) is the reference implementation of law #3 —
+// a cell is written only when its rendered value actually changed.
+const KINDS = {};
+
+/// Keyed reconcile of `parent`'s children against `models`.
+/// add = insert at position · update = mutate in place · remove = drop node ·
+/// reorder = insertBefore of the EXISTING node. Identity is `model.key`.
+function reconcileRows(parent, models, d) {
+  d = d || dom;
+  const index = parent.__rows || (parent.__rows = new Map());
+  const want = new Set();
+  for (const m of models) want.add(m.key);
+  // Gone from the model: drop the node.
+  for (const [k, node] of [...index]) {
+    if (!want.has(k)) { d.remove(parent, node); index.delete(k); }
+  }
+  // Anything we did not build (the boot-time "loading…" markup) is foreign
+  // and goes on the first pass; after that this loop finds nothing.
+  const own = new Set(index.values());
+  for (let n = d.first(parent); n; ) {
+    const nx = d.next(n);
+    if (!own.has(n)) d.remove(parent, n);
+    n = nx;
+  }
+  let cursor = d.first(parent);
+  for (const m of models) {
+    let node = index.get(m.key);
+    if (!node) {
+      node = KINDS[m.kind].build(d, m);
+      node.__kind = m.kind;
+      index.set(m.key, node);
+      d.insertBefore(parent, node, cursor);
+    } else if (node === cursor) {
+      cursor = d.next(node);
+    } else {
+      d.insertBefore(parent, node, cursor); // reorder: same node, new slot
+    }
+    KINDS[m.kind].apply(node, m, d);
+  }
+  return index;
 }
-function renderStatus(s) {
-  healthAbortArmed = !!s.health_abort;
-  setPauseButtons(!!s.download_paused);
-  $("ver").textContent = "v" + s.version;
-  $("s-rate").textContent = fmtRate(s.download_rate_bps);
-  $("s-eta").textContent = s.download_paused ? "paused" : fmtEta(s.remaining_bytes, s.download_rate_bps);
-  $("s-remaining").textContent = fmtBytes(s.remaining_bytes);
-  $("s-session").textContent = fmtBytes(s.session_downloaded_bytes);
-  $("s-active").textContent = s.jobs_downloading + " / " + s.jobs_queued;
-  const badges = [];
+
+/// Per-cell diff helper: `w("pct", v => d.text(c.pct, v))` writes only when
+/// the rendered value changed since the last tick.
+function differ(node) {
+  const prev = node.__prev || (node.__prev = {});
+  return (key, value, write) => {
+    if (prev[key] === value) return false;
+    prev[key] = value;
+    write(value);
+    return true;
+  };
+}
+
+// ---- queue rows ---------------------------------------------------------
+// Post-processing stages in words a human tracks at a glance — the activity
+// view: never wonder what a job is doing.
+const STATUS_CLASS = {
+  downloading: "ok", queued: "dim", paused: "warn", fetching: "dim",
+  completed: "ok", failed: "bad", post_queued: "warn",
+};
+const STAGE_LABEL = {
+  par_rename: "renaming", par_verify: "checking integrity", par_repair: "repairing",
+  rar_rename: "renaming", unpack: "extracting", cleanup: "cleaning up",
+  move: "moving", post_unpack_rename: "renaming", script: "running scripts",
+};
+function statusName(st) {
+  if (typeof st === "string") return st;
+  const stage = st && st.post ? st.post.stage : null;
+  return (stage && STAGE_LABEL[stage]) || ("post: " + (stage || "…"));
+}
+
+// Health color: green at 100% fading to red at the par-repair limit
+// (critical health). Below it the job is unrepairable — full red.
+function healthColor(health, critical) {
+  const crit = Math.min(critical || 850, 999);
+  const t = Math.max(0, Math.min(1, (health - crit) / (1000 - crit)));
+  const hue = 4 + t * 136; // red 4deg -> green 140deg
+  return "hsl(" + hue.toFixed(0) + " 62% 46%)";
+}
+function healthTip(health, critical) {
+  const crit = ((critical || 850) / 10).toFixed(1);
+  return health < (critical || 850)
+    ? "below the par2 repair limit (" + crit + "%) — unrepairable even with all par2"
+    : "repairable down to " + crit + "% with the set's par2 blocks";
+}
+
+/// Pure: JobSummary + context -> a FLAT view model (strings and flags only,
+/// no DOM). Flat on purpose — `applyRow` diffs it field by field against the
+/// row's cached previous model, and nested objects would never compare equal.
+function rowModel(j, ctx) {
+  ctx = ctx || {};
+  const total = j.size_bytes || 0;
+  const done = Math.min(j.downloaded_bytes || 0, total);
+  const pct = total ? Math.floor(done * 100 / total) : 0;
+  const isPost = typeof j.status !== "string";
+  const st = statusName(j.status);
+  const cls = isPost ? "warn" : (STATUS_CLASS[st] || "dim");
+  const paused = st === "paused";
+  const dl = st === "downloading";
+  const fetching = st === "fetching";
+  const pend = ctx.pendingOps || null;
+  const over = pend && pend.status ? pend.status(j.id) : null; // M2 overlay
+
+  // A URL job has no articles until its NZB arrives — "0 B of 0 B" reads as
+  // broken; say what it is actually doing instead.
+  const rest = [];
+  if (!fetching) rest.push(" of " + fmtBytes(total));
+  if (dl && j.rate_bps > 0) {
+    rest.push(" · " + fmtRate(j.rate_bps));
+    rest.push(" · ~" + fmtEta(Math.max(0, j.remaining_bytes), j.rate_bps));
+  }
+  if (isPost) rest.push(" · " + st + "…");
+
+  const crit = j.critical_health || 850;
+  const doomed = j.health < crit;
+  const critPct = (crit / 10).toFixed(0);
+  let hNote = "repair limit " + critPct + "%";
+  let hNoteCls = "sub hnote";
+  let hNoteTip = "";
+  if (doomed && dl) {
+    if (ctx.healthAbortArmed) {
+      hNote = "unrepairable · aborting";
+      hNoteCls = "ho bad";
+      hNoteTip = "health is below the par2 repair limit — the daemon is aborting this download";
+    } else {
+      hNote = "unrepairable · will fail at end";
+      hNoteCls = "ho warn";
+      hNoteTip = "below the par2 repair limit — it can't be repaired, but health-abort is off so it will keep downloading and fail the par-check at the end. Enable it in Settings → Post-processing (‘unrepairable downloads’ → park).";
+    }
+  } else if (doomed) {
+    hNote = "was unrepairable (limit " + critPct + "%)";
+    hNoteCls = "sub hnote bad";
+  }
+
+  const shownSt = over || st;
+  const shownCls = over ? (STATUS_CLASS[over] || "dim") : cls;
+  return {
+    key: "j" + j.id,
+    kind: "job",
+    id: j.id,
+    name: j.name,
+    nameTip: j.name + " — click for details",
+    sub: "#" + j.id + (j.category ? " · " + j.category : "") +
+         (j.assigned_node ? " · on " + j.assigned_node : "") + " ",
+    st: shownSt.toUpperCase(),
+    stCls: "st " + shownCls,
+    stInlineCls: "st st-inline " + shownCls,
+    pct: fetching ? "" : pct + "%",
+    fill: pct + "%",
+    fillCls: pct >= 100 ? "fill done" : "fill",
+    dBold: fetching ? "" : fmtBytes(done),
+    dRest: fetching ? "fetching the NZB from the indexer…" : rest.join(""),
+    dRetry: j.retried_articles > 0
+      ? " · " + j.retried_articles + " retries" : "",
+    dRetryTip: j.retried_articles > 0
+      ? "Articles that failed and were re-downloaded — this is bandwidth the header rate spends that never lands in the file. A high count means a flaky server or an aging post."
+      : "",
+    size: fetching ? "—" : fmtBytes(total),
+    health: fetching ? "—" : (j.health / 10).toFixed(1) + "%",
+    healthColor: fetching ? "" : healthColor(j.health, j.critical_health),
+    healthTip: fetching ? "" : healthTip(j.health, j.critical_health),
+    hNote: fetching ? "" : hNote,
+    hNoteCls: fetching ? "hnote" : hNoteCls,
+    hNoteTip: hNoteTip,
+    upDisabled: ctx.idx === 0,
+    downDisabled: ctx.idx === (ctx.count || 0) - 1,
+    pauseHidden: fetching,
+    pauseLabel: (over || st) === "paused" ? "resume" : "pause",
+    pauseAction: (over || st) === "paused" ? "resume" : "pause",
+    // `detail` is the joined line the row shows; kept as one string for
+    // readability and for the DOM test's assertions.
+    detail: (fetching ? "fetching the NZB from the indexer…"
+                      : fmtBytes(done) + rest.join("")),
+  };
+}
+
+function buildJobRow(d) {
+  const tr = d.create("tr");
+  d.data(tr, "scope", "queue");
+  const c = {};
+
+  const td1 = d.append(tr, d.create("td"));
+  c.name = d.append(td1, d.create("div", "name"));
+  d.data(c.name, "action", "detail");
+  const sub = d.append(td1, d.create("div", "sub"));
+  c.sub = d.append(sub, d.create("span"));
+  c.stInline = d.append(sub, d.create("span", "st st-inline"));
+
+  const td2 = d.append(tr, d.create("td"));
+  c.st = d.append(td2, d.create("span", "st"));
+
+  const td3 = d.append(tr, d.create("td"));
+  const meter = d.append(td3, d.create("div", "meter"));
+  const bar = d.append(meter, d.create("div", "bar"));
+  const track = d.append(bar, d.create("div", "track"));
+  c.fill = d.append(track, d.create("div", "fill"));
+  c.pct = d.append(bar, d.create("span", "pct"));
+  const det = d.append(meter, d.create("div", "detail"));
+  c.dBold = d.append(det, d.create("b"));
+  c.dRest = d.append(det, d.create("span"));
+  c.dRetry = d.append(det, d.create("span"));
+
+  c.size = d.append(tr, d.create("td", "num"));
+
+  const td5 = d.append(tr, d.create("td", "num"));
+  c.health = d.append(td5, d.create("span", "health"));
+  c.hNote = d.append(td5, d.create("div", "hnote"));
+
+  const td6 = d.append(tr, d.create("td"));
+  const acts = d.append(td6, d.create("div", "acts"));
+  const mk = (cls, action, label, title) => {
+    const b = d.append(acts, d.create("button", cls));
+    d.data(b, "action", action);
+    d.text(b, label);
+    d.prop(b, "title", title);
+    return b;
+  };
+  c.top = mk("mv", "move-top", "⤒", "move to top");
+  c.up = mk("mv", "move-up", "↑", "move up");
+  c.down = mk("mv", "move-down", "↓", "move down");
+  c.bottom = mk("mv", "move-bottom", "⤓", "move to bottom");
+  c.pause = mk("", "pause", "pause", "");
+  c.del = mk("del", "delete", "delete", "remove this job from the queue");
+  tr.__c = c;
+  return tr;
+}
+
+/// Per-cell diff against `tr.__prev`. At 1 Hz on a downloading job this
+/// writes the two or three cells that actually moved, not all six.
+function applyRow(tr, m, d) {
+  d = d || dom;
+  const c = tr.__c, w = differ(tr);
+  w("id", m.id, v => d.data(tr, "jobId", String(v)));
+  w("name", m.name, v => d.text(c.name, v));
+  w("nameTip", m.nameTip, v => d.prop(c.name, "title", v));
+  w("job", m.id, v => d.data(c.name, "job", String(v)));
+  w("sub", m.sub, v => d.text(c.sub, v));
+  w("st", m.st, v => { d.text(c.st, v); d.text(c.stInline, v); });
+  w("stCls", m.stCls, v => d.cls(c.st, v));
+  w("stInlineCls", m.stInlineCls, v => d.cls(c.stInline, v));
+  w("pct", m.pct, v => d.text(c.pct, v));
+  w("fill", m.fill, v => d.style(c.fill, "width", v));
+  w("fillCls", m.fillCls, v => d.cls(c.fill, v));
+  w("dBold", m.dBold, v => d.text(c.dBold, v));
+  w("dRest", m.dRest, v => d.text(c.dRest, v));
+  w("dRetry", m.dRetry, v => d.text(c.dRetry, v));
+  w("dRetryTip", m.dRetryTip, v => d.prop(c.dRetry, "title", v));
+  w("size", m.size, v => d.text(c.size, v));
+  w("health", m.health, v => d.text(c.health, v));
+  w("healthColor", m.healthColor, v => d.style(c.health, "color", v));
+  w("healthTip", m.healthTip, v => d.prop(c.health, "title", v));
+  w("hNote", m.hNote, v => d.text(c.hNote, v));
+  w("hNoteCls", m.hNoteCls, v => d.cls(c.hNote, v));
+  w("hNoteTip", m.hNoteTip, v => d.prop(c.hNote, "title", v));
+  w("upDisabled", m.upDisabled, v => {
+    d.prop(c.top, "disabled", v); d.prop(c.up, "disabled", v);
+  });
+  w("downDisabled", m.downDisabled, v => {
+    d.prop(c.down, "disabled", v); d.prop(c.bottom, "disabled", v);
+  });
+  w("pauseHidden", m.pauseHidden, v => d.prop(c.pause, "hidden", v));
+  w("pauseLabel", m.pauseLabel, v => d.text(c.pause, v));
+  w("pauseAction", m.pauseAction, v => d.data(c.pause, "action", v));
+}
+KINDS.job = { build: buildJobRow, apply: applyRow };
+
+// ---- the "nothing here" placeholder row ---------------------------------
+// The one sanctioned exception to law #1 is swapping to and from this row —
+// and even that goes through the reconciler, so it is just another key.
+function buildEmptyRow(d, m) {
+  const tr = d.create("tr");
+  const td = d.append(tr, d.create("td", "empty"));
+  d.attr(td, "colspan", String(m.span || 6));
+  tr.__c = { td };
+  return tr;
+}
+function applyEmptyRow(tr, m, d) {
+  d = d || dom;
+  differ(tr)("text", m.text, v => d.text(tr.__c.td, v));
+}
+KINDS.empty = { build: buildEmptyRow, apply: applyEmptyRow };
+
+// ---- job detail panel ---------------------------------------------------
+// A stable subtree: the files table is reconciled by file id, the activity
+// tail is appended incrementally, and the scroll position is never reset by
+// an update (law #5). The old panel was re-created from a template string
+// every second, which is why it scrolled itself back to the top while you
+// were reading it.
+let openJob = null;
+
+function buildDetailRow(d) {
+  const tr = d.create("tr", "detail-tr");
+  const td = d.append(tr, d.create("td"));
+  d.attr(td, "colspan", "6");
+  const wrap = d.append(td, d.create("div", "jobdetail"));
+  const head = d.append(wrap, d.create("div", "jd-head"));
+  const c = {};
+  c.id = d.append(head, d.create("b"));
+  c.st = d.append(head, d.create("span", "st"));
+  c.articles = d.append(head, d.create("span"));
+  c.health = d.append(head, d.create("span"));
+  c.dupe = d.append(head, d.create("span"));
+  const spacer = d.append(head, d.create("span", "spacer"));
+  d.style(spacer, "flex", "1");
+  c.nzb = d.append(head, d.create("a", "btnlike"));
+  d.attr(c.nzb, "download", "");
+  d.text(c.nzb, "download nzb");
+  d.prop(c.nzb, "title", "Download this job's NZB (regenerated from queue state — everything needed to re-add it anywhere).");
+  c.close = d.append(head, d.create("button", "small"));
+  d.data(c.close, "action", "detail-close");
+  d.text(c.close, "close");
+
+  c.filesTable = d.append(wrap, d.create("table", "subtable"));
+  const thead = d.append(c.filesTable, d.create("thead"));
+  const htr = d.append(thead, d.create("tr"));
+  for (const [label, cls] of [["File", ""], ["Size", "num"], ["Segments", "num"], ["", ""]]) {
+    const th = d.append(htr, d.create("th", cls));
+    d.text(th, label);
+  }
+  c.files = d.append(c.filesTable, d.create("tbody"));
+  c.logs = d.append(wrap, d.create("div", "jd-logs"));
+  tr.__c = c;
+  return tr;
+}
+
+function detailModel(j) {
+  const st = statusName(j.status);
+  const cls = typeof j.status !== "string" ? "warn" : (STATUS_CLASS[st] || "dim");
+  const files = store.jobFiles && store.jobFiles.job === j.id ? store.jobFiles.files : null;
+  const logs = store.jobLogs && store.jobLogs.job === j.id ? store.jobLogs.entries : null;
+  return {
+    key: "__detail", kind: "detail", id: j.id,
+    st: st.toUpperCase(), stCls: "st " + cls,
+    articles: "articles " + j.done_articles + "/" + j.total_articles +
+      (j.failed_articles ? " · " + j.failed_articles + " failed" : "") +
+      (j.retried_articles ? " · " + j.retried_articles + " retried" : ""),
+    health: "health " + (j.health / 10).toFixed(1) + "%",
+    dupe: j.dupe_key ? "dupe: " + j.dupe_key : "",
+    nzbHref: "/api/v1/jobs/" + j.id + "/nzb",
+    files: files,
+    logs: logs,
+  };
+}
+
+function buildFileRow(d) {
+  const tr = d.create("tr");
+  const c = {};
+  const td1 = d.append(tr, d.create("td"));
+  c.name = d.append(td1, d.create("div", "name"));
+  d.style(c.name, "cursor", "default");
+  c.size = d.append(tr, d.create("td", "num"));
+  const td3 = d.append(tr, d.create("td", "num"));
+  c.seg = d.append(td3, d.create("span"));
+  c.failed = d.append(td3, d.create("span"));
+  d.style(c.failed, "color", "var(--bad)");
+  const td4 = d.append(tr, d.create("td"));
+  c.state = d.append(td4, d.create("span", "st"));
+  tr.__c = c;
+  return tr;
+}
+function applyFileRow(tr, m, d) {
+  d = d || dom;
+  const c = tr.__c, w = differ(tr);
+  w("name", m.name, v => d.text(c.name, v));
+  w("size", m.size, v => d.text(c.size, v));
+  w("seg", m.seg, v => d.text(c.seg, v));
+  w("failed", m.failed, v => d.text(c.failed, v));
+  w("state", m.state, v => d.text(c.state, v));
+  w("stateCls", m.stateCls, v => d.cls(c.state, v));
+}
+KINDS.file = { build: buildFileRow, apply: applyFileRow };
+
+function fileModel(x) {
+  return {
+    key: "f" + x.id, kind: "file",
+    name: x.filename,
+    size: fmtBytes(x.size_bytes),
+    seg: x.done_segments + "/" + x.total_segments,
+    failed: x.failed_segments ? " · " + x.failed_segments + " failed" : "",
+    state: x.assembled ? "DONE" : x.paused ? "PAUSED" : x.is_par2 ? "PAR2" : "",
+    stateCls: "st " + (x.assembled ? "ok" : "dim"),
+  };
+}
+
+function buildActivityRow(d) {
+  return d.create("div", "lg");
+}
+function applyActivityRow(div, m, d) {
+  d = d || dom;
+  const w = differ(div);
+  w("text", m.text, v => d.text(div, v));
+  w("cls", m.cls, v => d.cls(div, v));
+}
+KINDS.activity = { build: buildActivityRow, apply: applyActivityRow };
+
+function applyDetail(tr, m, d) {
+  d = d || dom;
+  const c = tr.__c, w = differ(tr);
+  w("id", m.id, v => {
+    d.text(c.id, "#" + v);
+    d.data(c.close, "job", String(v));
+  });
+  w("st", m.st, v => d.text(c.st, v));
+  w("stCls", m.stCls, v => d.cls(c.st, v));
+  w("articles", m.articles, v => d.text(c.articles, v));
+  w("health", m.health, v => d.text(c.health, v));
+  w("dupe", m.dupe, v => d.text(c.dupe, v));
+  w("nzbHref", m.nzbHref, v => d.attr(c.nzb, "href", v));
+  // Files: keyed by file id, so a file that only gained segments keeps its
+  // node — and the table does not jump under the pointer.
+  const fileModels = m.files
+    ? (m.files.length
+        ? m.files.map(fileModel)
+        : [{ key: "__nofiles", kind: "empty", span: 4, text: "no files yet" }])
+    : [{ key: "__loading", kind: "empty", span: 4, text: "loading files…" }];
+  reconcileRows(c.files, fileModels, d);
+  // Activity tail: appended incrementally, keyed by the log record's own
+  // monotonic id. Scroll position survives because nothing is re-created.
+  const logModels = m.logs
+    ? (m.logs.length
+        ? m.logs.map(e => ({
+            key: "a" + e.id, kind: "activity",
+            cls: "lg k-" + e.kind,
+            text: new Date(e.time_unix * 1000).toLocaleTimeString() + "  " + e.text,
+          }))
+        : [{ key: "__nolog", kind: "note", text: "no activity recorded for this job yet" }])
+    : [];
+  reconcileRows(c.logs, logModels, d);
+}
+KINDS.detail = { build: buildDetailRow, apply: applyDetail };
+
+function buildNote(d) { return d.create("div", "empty"); }
+function applyNote(node, m, d) {
+  d = d || dom;
+  differ(node)("text", m.text, v => d.text(node, v));
+}
+KINDS.note = { build: buildNote, apply: applyNote };
+
+// ---- queue render -------------------------------------------------------
+function queueModels() {
+  if (!store.jobsLoaded)
+    return [{ key: "__loading", kind: "empty", span: 6, text: "Loading the queue…" }];
+  const jobs = store.jobs;
+  if (!jobs.length)
+    return [{
+      key: "__empty", kind: "empty", span: 6,
+      text: "No downloads in the queue. Drop one in with “+ add nzb”.",
+    }];
+  const out = [];
+  jobs.forEach((j, idx) => {
+    out.push(rowModel(j, {
+      idx, count: jobs.length,
+      healthAbortArmed: store.healthAbort,
+      pendingOps: typeof pending !== "undefined" ? pending : null,
+    }));
+    if (j.id === openJob) out.push(detailModel(j));
+  });
+  return out;
+}
+function renderQueue() {
+  reconcileRows($("queue-body"), queueModels(), dom);
+}
+
+// ---- status tiles + badges ----------------------------------------------
+function buildBadge(d) {
+  const s = d.create("span", "badge");
+  return s;
+}
+function applyBadge(node, m, d) {
+  d = d || dom;
+  const w = differ(node);
+  w("text", m.text, v => d.text(node, v));
+  w("cls", m.cls, v => d.cls(node, v));
+  w("tip", m.tip || "", v => d.prop(node, "title", v));
+}
+KINDS.badge = { build: buildBadge, apply: applyBadge };
+
+function statusModels(s) {
+  const out = [];
   if (s.download_paused)
-    badges.push('<span class="badge on-warn" title="Every pause/resume is a client command — the daemon never flips this itself. The name here is whoever sent the last one.">paused' +
-      (lastPauseSource ? " · by " + esc(lastPauseSource) : "") + "</span>");
-  if (s.speed_limit_bps) badges.push('<span class="badge">limit ' + fmtRate(s.speed_limit_bps) + "</span>");
-  $("badges").innerHTML = badges.join("");
+    out.push({
+      key: "paused", kind: "badge", cls: "badge on-warn",
+      text: "paused" + (store.pauseSource ? " · by " + store.pauseSource : ""),
+      tip: "Every pause/resume is a client command — the daemon never flips this itself. The name here is whoever sent the last one.",
+    });
+  if (s.speed_limit_bps)
+    out.push({
+      key: "limit", kind: "badge", cls: "badge",
+      text: "limit " + fmtRate(s.speed_limit_bps),
+    });
+  return out;
+}
+
+function renderStatus() {
+  const s = store.status;
+  if (!s) return;
+  store.healthAbort = !!s.health_abort;
+  setPauseButtons(!!s.download_paused);
+  setText($("ver"), "v" + s.version);
+  setText($("s-rate"), fmtRate(s.download_rate_bps));
+  setText($("s-eta"), s.download_paused ? "paused"
+    : fmtEta(s.remaining_bytes, s.download_rate_bps));
+  setText($("s-remaining"), fmtBytes(s.remaining_bytes));
+  setText($("s-session"), fmtBytes(s.session_downloaded_bytes));
+  setText($("s-active"), s.jobs_downloading + " / " + s.jobs_queued);
+  reconcileRows($("badges"), statusModels(s), dom);
   // Why is nothing downloading? Say so instead of sitting silently.
   const holds = [];
   if (s.disk_low) holds.push("low disk space on the destination volume — downloads held until space is freed");
@@ -533,11 +1078,14 @@ function renderStatus(s) {
     holds.push("news server " + s.blocked_servers.map(x => "#" + x).join(", ") +
                " blocked after connection failures — retrying automatically");
   const hold = $("hold");
-  hold.textContent = holds.length ? "⚠ " + holds.join(" · ") : "";
-  hold.className = holds.length ? "show" : "";
+  setText(hold, holds.length ? "⚠ " + holds.join(" · ") : "");
+  setClass(hold, holds.length ? "show" : "");
   if (s.speed_limit_bps && !$("limit").matches(":focus"))
     $("limit").value = Math.round(s.speed_limit_bps / 1024);
 }
+// Scalar tiles get the same "only write when it changed" treatment as rows.
+function setText(el, v) { if (el && el.__t !== v) { el.__t = v; el.textContent = v; } }
+function setClass(el, v) { if (el && el.__c !== v) { el.__c = v; el.className = v; } }
 
 // The button matching the current state latches (disabled + amber) so the
 // pair reads as a state indicator, and a click flips it before the server
@@ -549,184 +1097,6 @@ function setPauseButtons(paused) {
   p.title = paused ? "The queue is paused." : "Stop all downloading (jobs stay queued).";
   r.disabled = !paused;
   r.title = paused ? "Start downloading again." : "The queue is already running.";
-}
-
-// ---- queue --------------------------------------------------------------
-// Whether the daemon will abort downloads that drop below repair limit
-// ([post] health_action = park/delete). Captured from /status so the
-// queue can say whether a doomed job gets cut off or runs to the end.
-let healthAbortArmed = false;
-const STATUS_CLASS = {
-  downloading: "ok", queued: "dim", paused: "warn", fetching: "dim",
-  completed: "ok", failed: "bad", post_queued: "warn"
-};
-// Post-processing stages in words a human tracks at a glance — the
-// activity view: never wonder what a job is doing.
-const STAGE_LABEL = {
-  par_rename: "renaming", par_verify: "checking integrity", par_repair: "repairing",
-  rar_rename: "renaming", unpack: "extracting", cleanup: "cleaning up",
-  move: "moving", post_unpack_rename: "renaming", script: "running scripts",
-};
-function statusName(st) {
-  if (typeof st === "string") return st;
-  const stage = st.post ? st.post.stage : null;
-  return (stage && STAGE_LABEL[stage]) || ("post: " + (stage || "…"));
-}
-async function refreshQueue() {
-  // A failed fetch (daemon bouncing during a restart) throws here and is
-  // swallowed by refreshAll's catch, leaving the last render — or the
-  // "Loading the queue…" placeholder — in place rather than flashing an
-  // empty state. The daemon seeds its snapshot before serving, so a
-  // successful read is authoritative: empty means genuinely empty.
-  const r = await jfetch("/api/v1/jobs");
-  const { jobs } = await r.json();
-  renderQueue(jobs);
-}
-function renderQueue(jobs) {
-  const body = $("queue-body");
-  if (!jobs.length) {
-    body.innerHTML = '<tr><td colspan="6" class="empty">No downloads in the queue. Drop one in with “+ add nzb”.</td></tr>';
-    return;
-  }
-  const rows = jobs.map((j, idx) => {
-    const total = j.size_bytes || 0;
-    const done = Math.min(j.downloaded_bytes || 0, total);
-    const pct = total ? Math.floor(done * 100 / total) : 0;
-    const isPost = typeof j.status !== "string";
-    const st = statusName(j.status);
-    const cls = isPost ? "warn" : (STATUS_CLASS[st] || "dim");
-    const paused = st === "paused";
-    const dl = st === "downloading";
-    const fetching = st === "fetching";
-    // A URL job has no articles until its NZB arrives — "0 B of 0 B" reads
-    // as broken; say what it is actually doing.
-    const detail = fetching
-      ? ["fetching the NZB from the indexer…"]
-      : [`<b>${fmtBytes(done)}</b> of ${fmtBytes(total)}`];
-    if (dl && j.rate_bps > 0) {
-      detail.push(fmtRate(j.rate_bps));
-      detail.push("~" + fmtEta(Math.max(0, j.remaining_bytes), j.rate_bps));
-    }
-    if (isPost) detail.push(esc(st) + "…");
-    if (j.retried_articles > 0)
-      detail.push(`<span title="Articles that failed and were re-downloaded — this is bandwidth the header rate spends that never lands in the file. A high count means a flaky server or an aging post.">${j.retried_articles} retries</span>`);
-    return `<tr>
-      <td><div class="name" title="${esc(j.name)} — click for details" onclick="toggleJob(${j.id})">${esc(j.name)}</div>
-          <div class="sub">#${j.id}${j.category ? " · " + esc(j.category) : ""}${j.assigned_node ? " · on " + esc(j.assigned_node) : ""}
-          <span class="st ${cls} st-inline">${esc(st).toUpperCase()}</span></div></td>
-      <td><span class="st ${cls}">${esc(st).toUpperCase()}</span></td>
-      <td><div class="meter">
-            <div class="bar"><div class="track"><div class="fill${pct >= 100 ? " done" : ""}" style="width:${pct}%"></div></div><span class="pct">${fetching ? "" : pct + "%"}</span></div>
-            <div class="detail">${detail.join(" · ")}</div>
-          </div></td>
-      <td class="num">${fetching ? "—" : fmtBytes(total)}</td>
-      <td class="num">${fetching ? "—" : healthCell(j, dl)}</td>
-      <td><div class="acts">
-        <button class="mv" title="move to top" onclick="jobAction(${j.id}, 'move-top')" ${idx === 0 ? "disabled" : ""}>⤒</button>
-        <button class="mv" title="move up" onclick="jobAction(${j.id}, 'move-up')" ${idx === 0 ? "disabled" : ""}>↑</button>
-        <button class="mv" title="move down" onclick="jobAction(${j.id}, 'move-down')" ${idx === jobs.length - 1 ? "disabled" : ""}>↓</button>
-        <button class="mv" title="move to bottom" onclick="jobAction(${j.id}, 'move-bottom')" ${idx === jobs.length - 1 ? "disabled" : ""}>⤓</button>
-        ${fetching ? "" : `<button onclick="jobAction(${j.id}, '${paused ? "resume" : "pause"}')">${paused ? "resume" : "pause"}</button>`}
-        <button class="del" onclick="if(confirm('Delete ${esc(j.name).replace(/'/g, "\\'")}?')) jobAction(${j.id}, 'delete')">delete</button>
-      </div></td>
-    </tr>`;
-  });
-  // Detail panel stays attached under its row across 1 Hz re-renders.
-  const openIdx = jobs.findIndex(j => j.id === openJob);
-  if (openIdx >= 0) rows.splice(openIdx + 1, 0, detailRow(jobs[openIdx]));
-  body.innerHTML = rows.join("");
-}
-
-// ---- job detail panel ----------------------------------------------------
-let openJob = null, openJobFiles = null, openJobLogs = null;
-function toggleJob(id) {
-  if (openJob === id) { openJob = null; refreshQueue().catch(() => {}); return; }
-  openJob = id; openJobFiles = null; openJobLogs = null;
-  refreshQueue().catch(() => {});
-  refreshJobDetail();
-}
-async function refreshJobDetail() {
-  if (openJob == null) return;
-  const id = openJob;
-  try {
-    const [fr, lr] = await Promise.all([
-      jfetch(`/api/v1/jobs/${id}/files`),
-      jfetch(`/api/v1/logs?job=${id}&limit=50`),
-    ]);
-    if (openJob !== id) return; // switched away while loading
-    if (fr.ok) openJobFiles = await fr.json();
-    if (lr.ok) openJobLogs = (await lr.json()).entries;
-  } catch { /* next cycle retries */ }
-  if (activeTab === "queue") refreshQueue().catch(() => {});
-}
-function detailRow(j) {
-  const f = openJobFiles;
-  const filesHtml = !f
-    ? '<div class="empty" style="padding:10px">loading files…</div>'
-    : `<table class="subtable"><thead><tr><th>File</th><th class="num">Size</th><th class="num">Segments</th><th></th></tr></thead><tbody>` +
-      f.files.map(x => `<tr>
-        <td><div class="name" style="cursor:default">${esc(x.filename)}</div></td>
-        <td class="num">${fmtBytes(x.size_bytes)}</td>
-        <td class="num">${x.done_segments}/${x.total_segments}${x.failed_segments ? ` <span style="color:var(--bad)">· ${x.failed_segments} failed</span>` : ""}</td>
-        <td>${x.assembled ? '<span class="st ok">DONE</span>'
-             : x.paused ? '<span class="st dim">PAUSED</span>'
-             : x.is_par2 ? '<span class="st dim">PAR2</span>' : ""}</td>
-      </tr>`).join("") + "</tbody></table>";
-  const logs = openJobLogs;
-  const logsHtml = logs == null ? ""
-    : `<div class="jd-logs">` + (logs.length
-        ? logs.map(e => `<div class="lg k-${e.kind}">${new Date(e.time_unix * 1000).toLocaleTimeString()}  ${esc(e.text)}</div>`).join("")
-        : '<div class="empty" style="padding:6px">no activity recorded for this job yet</div>') + "</div>";
-  return `<tr class="detail-tr"><td colspan="6"><div class="jobdetail">
-    <div class="jd-head">
-      <b>#${j.id}</b>
-      <span class="st ${typeof j.status !== "string" ? "warn" : (STATUS_CLASS[statusName(j.status)] || "dim")}">${esc(statusName(j.status)).toUpperCase()}</span>
-      <span>articles ${j.done_articles}/${j.total_articles}${j.failed_articles ? ` · <span style="color:var(--bad)">${j.failed_articles} failed</span>` : ""}${j.retried_articles ? ` · ${j.retried_articles} retried` : ""}</span>
-      <span>health ${(j.health / 10).toFixed(1)}%</span>
-      ${j.dupe_key ? `<span title="duplicate-detection key">dupe: ${esc(j.dupe_key)}</span>` : ""}
-      <span class="spacer" style="flex:1"></span>
-      <a class="btnlike" href="/api/v1/jobs/${j.id}/nzb" download title="Download this job's NZB (regenerated from queue state — everything needed to re-add it anywhere).">download nzb</a>
-      <button class="small" onclick="toggleJob(${j.id})">close</button>
-    </div>
-    ${filesHtml}
-    ${logsHtml}
-  </div></td></tr>`;
-}
-
-// Health color: green at 100% fading to red at the par-repair limit
-// (critical health). Below it the job is unrepairable — full red.
-function healthColor(health, critical) {
-  const crit = Math.min(critical || 850, 999);
-  const t = Math.max(0, Math.min(1, (health - crit) / (1000 - crit)));
-  const hue = 4 + t * 136; // red 4° -> green 140°
-  return `hsl(${hue.toFixed(0)} 62% 46%)`;
-}
-function healthTip(health, critical) {
-  const crit = ((critical || 850) / 10).toFixed(1);
-  return health < (critical || 850)
-    ? `below the par2 repair limit (${crit}%) — unrepairable even with all par2`
-    : `repairable down to ${crit}% with the set's par2 blocks`;
-}
-// Health cell: the % (color-graded), the repair limit beneath it, and —
-// for a still-running job that has already dropped below that limit — an
-// explicit note on whether it will be cut off or run to the end.
-function healthCell(j, downloading) {
-  const crit = j.critical_health || 850;
-  const critPct = (crit / 10).toFixed(0);
-  const doomed = j.health < crit;
-  let note = `<div class="sub" style="font-size:10.5px">repair limit ${critPct}%</div>`;
-  if (doomed && downloading) {
-    note = healthAbortArmed
-      ? `<div class="ho bad" title="health is below the par2 repair limit — the daemon is aborting this download">unrepairable · aborting</div>`
-      : `<div class="ho warn" title="below the par2 repair limit — it can't be repaired, but health-abort is off so it will keep downloading and fail the par-check at the end. Enable it in Settings → Post-processing (‘unrepairable downloads’ → park).">unrepairable · will fail at end</div>`;
-  } else if (doomed) {
-    note = `<div class="sub" style="font-size:10.5px;color:var(--bad)">was unrepairable (limit ${critPct}%)</div>`;
-  }
-  return `<span class="health" style="color:${healthColor(j.health, j.critical_health)}" title="${healthTip(j.health, j.critical_health)}">${(j.health / 10).toFixed(1)}%</span>${note}`;
-}
-async function jobAction(id, action) {
-  await jfetch(`/api/v1/jobs/${id}/actions/${action}`, { method: "POST", headers: CLIENT_HDRS });
-  refreshAll();
 }
 
 // ---- history ------------------------------------------------------------
@@ -745,94 +1115,291 @@ function fmtAgo(unix) {
   return Math.round(s / 86400) + "d ago";
 }
 
-// The *arr handoff is a PULL: clients poll our history, import, then
-// delete the entry. Each stage is observed and shown here.
-function handoffChip(e) {
-  const who = e.picked_up_by ? esc(e.picked_up_by.split("/")[0]) : "client";
+// The *arr handoff is a PULL: clients poll our history, import, then delete
+// the entry. Each stage is observed and reported here.
+function handoffModel(e) {
+  const who = e.picked_up_by ? e.picked_up_by.split("/")[0] : "client";
   if (e.hidden && e.removed_at_unix)
-    return `<span class="ho done" title="the client deleted this entry after importing — files were picked up">✓ imported by ${who} ${fmtAgo(e.removed_at_unix)}</span>`;
-  if (e.hidden)
-    return `<span class="ho na">hidden</span>`;
+    return { cls: "ho done", text: "✓ imported by " + who + " " + fmtAgo(e.removed_at_unix),
+             tip: "the client deleted this entry after importing — files were picked up" };
+  if (e.hidden) return { cls: "ho na", text: "hidden", tip: "" };
   if (e.last_seen_at_unix)
-    return `<span class="ho seen" title="a client's history poll listed this entry ${e.seen_count}× — it knows; import/removal not yet observed">seen by ${who} ${fmtAgo(e.last_seen_at_unix)} ×${e.seen_count}</span>`;
-  return `<span class="ho wait" title="no client has polled history since this finished — if your *arr is down, it will pick this up when it returns">⏳ awaiting pickup ${fmtAgo(e.completed_at_unix)}</span>`;
+    return { cls: "ho seen", text: "seen by " + who + " " + fmtAgo(e.last_seen_at_unix) + " ×" + e.seen_count,
+             tip: "a client's history poll listed this entry " + e.seen_count + "× — it knows; import/removal not yet observed" };
+  return { cls: "ho wait", text: "⏳ awaiting pickup " + fmtAgo(e.completed_at_unix),
+           tip: "no client has polled history since this finished — if your *arr is down, it will pick this up when it returns" };
 }
 
-async function refreshHistory() {
-  refreshClients().catch(() => {});
-  const r = await jfetch("/api/v1/history?limit=200");
-  if (r.status === 501) {
-    $("history-body").innerHTML = '<tr><td colspan="6" class="empty">history store not configured</td></tr>';
-    return;
-  }
-  const { entries } = await r.json();
-  const body = $("history-body");
-  if (!entries.length) {
-    body.innerHTML = '<tr><td colspan="6" class="empty">no finished jobs yet</td></tr>';
-    return;
-  }
-  body.innerHTML = entries.map(e => `<tr class="${e.hidden ? "hidden-row" : ""}">
-    <td><div class="name" title="${esc(e.final_dir || "")}">${esc(e.name)}</div>
-        <div class="sub">#${e.job}${e.category ? " · " + esc(e.category) : ""}</div></td>
-    <td><span class="st ${histClass(e.status)}">${esc(e.status)}</span></td>
-    <td>${handoffChip(e)}</td>
-    <td class="num">${fmtBytes(e.size)}</td>
-    <td>${fmtTime(e.completed_at_unix)}</td>
-    <td><div class="acts">
-      ${e.hidden
-        ? `<button title="make this visible to clients again — a connected *arr will re-import it on its next poll" onclick="histAction(${e.job}, 'restore')">restore</button>`
-        : `<button title="hide from clients (keeps files and record)" onclick="histAction(${e.job}, 'hide')">hide</button>`}
-      <button title="remove the history record, keep files" onclick="if(confirm('Forget ${esc(e.name).replace(/'/g, "\\'")}? (files stay)')) histAction(${e.job}, 'delete')">forget</button>
-      <button class="del" title="remove the record AND delete the downloaded files" onclick="if(confirm('Delete FILES of ${esc(e.name).replace(/'/g, "\\'")}?')) histAction(${e.job}, 'delete-files')">delete files</button>
-    </div></td>
-  </tr>`).join("");
+function histModel(e) {
+  const ho = handoffModel(e);
+  return {
+    key: "h" + e.job, kind: "hist", id: e.job,
+    name: e.name, nameTip: e.final_dir || "",
+    sub: "#" + e.job + (e.category ? " · " + e.category : ""),
+    st: e.status, stCls: "st " + histClass(e.status),
+    hoText: ho.text, hoCls: ho.cls, hoTip: ho.tip,
+    size: fmtBytes(e.size), finished: fmtTime(e.completed_at_unix),
+    rowCls: e.hidden ? "hidden-row" : "",
+    visAction: e.hidden ? "h-restore" : "h-hide",
+    visLabel: e.hidden ? "restore" : "hide",
+    visTip: e.hidden
+      ? "make this visible to clients again — a connected *arr will re-import it on its next poll"
+      : "hide from clients (keeps files and record)",
+  };
 }
-async function histAction(id, action) {
-  await jfetch(`/api/v1/history/${id}/actions/${action}`, { method: "POST" });
-  refreshHistory().catch(() => {});
+
+function buildHistRow(d) {
+  const tr = d.create("tr");
+  d.data(tr, "scope", "history");
+  const c = {};
+  const td1 = d.append(tr, d.create("td"));
+  c.name = d.append(td1, d.create("div", "name"));
+  c.sub = d.append(td1, d.create("div", "sub"));
+  const td2 = d.append(tr, d.create("td"));
+  c.st = d.append(td2, d.create("span", "st"));
+  const td3 = d.append(tr, d.create("td"));
+  c.ho = d.append(td3, d.create("span", "ho"));
+  c.size = d.append(tr, d.create("td", "num"));
+  c.finished = d.append(tr, d.create("td"));
+  const td6 = d.append(tr, d.create("td"));
+  const acts = d.append(td6, d.create("div", "acts"));
+  const mk = (cls, action, label, title) => {
+    const b = d.append(acts, d.create("button", cls));
+    d.data(b, "action", action);
+    d.text(b, label);
+    d.prop(b, "title", title);
+    return b;
+  };
+  c.vis = mk("", "h-hide", "hide", "");
+  c.forget = mk("", "h-delete", "forget", "remove the history record, keep files");
+  c.delFiles = mk("del", "h-delete-files", "delete files",
+    "remove the record AND delete the downloaded files");
+  tr.__c = c;
+  return tr;
+}
+function applyHistRow(tr, m, d) {
+  d = d || dom;
+  const c = tr.__c, w = differ(tr);
+  w("id", m.id, v => {
+    d.data(tr, "jobId", String(v));
+  });
+  w("rowCls", m.rowCls, v => d.cls(tr, v));
+  w("name", m.name, v => d.text(c.name, v));
+  w("nameTip", m.nameTip, v => d.prop(c.name, "title", v));
+  w("sub", m.sub, v => d.text(c.sub, v));
+  w("st", m.st, v => d.text(c.st, v));
+  w("stCls", m.stCls, v => d.cls(c.st, v));
+  w("hoText", m.hoText, v => d.text(c.ho, v));
+  w("hoCls", m.hoCls, v => d.cls(c.ho, v));
+  w("hoTip", m.hoTip, v => d.prop(c.ho, "title", v));
+  w("size", m.size, v => d.text(c.size, v));
+  w("finished", m.finished, v => d.text(c.finished, v));
+  w("visAction", m.visAction, v => d.data(c.vis, "action", v));
+  w("visLabel", m.visLabel, v => d.text(c.vis, v));
+  w("visTip", m.visTip, v => d.prop(c.vis, "title", v));
+}
+KINDS.hist = { build: buildHistRow, apply: applyHistRow };
+
+function renderHistory() {
+  const h = store.history;
+  let models;
+  if (h === "off")
+    models = [{ key: "__off", kind: "empty", span: 6, text: "history store not configured" }];
+  else if (h == null)
+    models = [{ key: "__loading", kind: "empty", span: 6, text: "loading…" }];
+  else if (!h.length)
+    models = [{ key: "__empty", kind: "empty", span: 6, text: "no finished jobs yet" }];
+  else models = h.map(histModel);
+  reconcileRows($("history-body"), models, dom);
+  renderClients();
 }
 
 // Who is polling us — is the *arr even connected?
-async function refreshClients() {
-  const r = await jfetch("/api/v1/clients");
-  if (!r.ok) return;
-  const { clients } = await r.json();
+function buildChip(d) { return d.create("span", "cl"); }
+function applyChip(node, m, d) {
+  d = d || dom;
+  const w = differ(node);
+  w("text", m.text, v => d.text(node, v));
+  w("cls", m.cls, v => d.cls(node, v));
+  w("tip", m.tip || "", v => d.prop(node, "title", v));
+}
+KINDS.chip = { build: buildChip, apply: applyChip };
+
+function renderClients() {
+  const cl = store.clients;
+  if (cl == null) return;
   const strip = $("clients-strip");
-  if (!clients.length) {
-    strip.hidden = false;
-    strip.innerHTML = '<span class="cl">no API clients seen yet — a connected Sonarr/Radarr polls every ~30 s</span>';
+  strip.hidden = false;
+  if (!cl.length) {
+    reconcileRows(strip, [{
+      key: "__none", kind: "chip", cls: "cl",
+      text: "no API clients seen yet — a connected Sonarr/Radarr polls every ~30 s",
+    }], dom);
     return;
   }
-  strip.hidden = false;
   const now = Date.now() / 1000;
-  strip.innerHTML = "connected clients:" + clients.map(c => {
+  reconcileRows(strip, cl.map(c => {
     const live = now - c.last_seen_unix < 120;
-    return `<span class="cl ${live ? "live" : ""}" title="${c.calls} calls since ${fmtTime(c.first_seen_unix)} — last: ${esc(c.last_method)}">` +
-      `<b>${esc(c.user_agent)}</b> · ${live ? "polling" : "quiet"} · ${fmtAgo(c.last_seen_unix)}</span>`;
-  }).join("");
+    return {
+      key: "c" + c.user_agent, kind: "chip",
+      cls: "cl" + (live ? " live" : ""),
+      text: c.user_agent + " · " + (live ? "polling" : "quiet") + " · " + fmtAgo(c.last_seen_unix),
+      tip: c.calls + " calls since " + fmtTime(c.first_seen_unix) + " — last: " + c.last_method,
+    };
+  }), dom);
 }
 
 // ---- logs ---------------------------------------------------------------
+function buildLogRow(d) { return d.create("div", "lg"); }
+function applyLogRow(node, m, d) {
+  d = d || dom;
+  const w = differ(node);
+  w("text", m.text, v => d.text(node, v));
+  w("cls", m.cls, v => d.cls(node, v));
+}
+KINDS.log = { build: buildLogRow, apply: applyLogRow };
+
+function logScopes() {
+  return ["system", "job", "file"].filter(s => $("lg-" + s).checked);
+}
+function renderLogs() {
+  const box = $("logbox");
+  const l = store.logs;
+  let models;
+  if (l === "off") models = [{ key: "__off", kind: "note", text: "log buffer not configured" }];
+  else if (l == null) models = [{ key: "__loading", kind: "note", text: "loading…" }];
+  else if (!l.length)
+    models = [{
+      key: "__empty", kind: "note",
+      text: logScopes().length ? "no log entries" : "all scopes hidden — tick one above",
+    }];
+  else
+    models = l.map(e => ({
+      key: "l" + e.id, kind: "log", cls: "lg k-" + e.kind,
+      text: new Date(e.time_unix * 1000).toLocaleTimeString() + "  " +
+            e.kind.padEnd(7) + " " + e.text,
+    }));
+  // Keep the view pinned to the tail only when it already was — a reader
+  // scrolled up stays where they are.
+  const stick = box.scrollTop + box.clientHeight >= box.scrollHeight - 8;
+  reconcileRows(box, models, dom);
+  if (stick) box.scrollTop = box.scrollHeight;
+}
+
+// ---- data fetches: they write the store, they never render ---------------
+async function refreshStatus() {
+  const r = await jfetch("/api/v1/status");
+  if (!r.ok) throw new Error("status " + r.status);
+  store.status = await r.json();
+  renderStatus();
+}
+async function refreshQueue() {
+  // A failed fetch (daemon bouncing during a restart) throws here and is
+  // swallowed by refreshAll's catch, leaving the last render in place rather
+  // than flashing an empty state. The daemon seeds its snapshot before
+  // serving, so a successful read is authoritative: empty means empty.
+  const r = await jfetch("/api/v1/jobs");
+  const { jobs } = await r.json();
+  store.jobs = jobs;
+  store.jobsLoaded = true;
+  renderQueue();
+}
+async function refreshHistory() {
+  refreshClients().catch(() => {});
+  const r = await jfetch("/api/v1/history?limit=200");
+  if (r.status === 501) { store.history = "off"; renderHistory(); return; }
+  store.history = (await r.json()).entries;
+  renderHistory();
+}
+async function refreshClients() {
+  const r = await jfetch("/api/v1/clients");
+  if (!r.ok) return;
+  store.clients = (await r.json()).clients;
+  renderClients();
+}
 async function refreshLogs() {
   // Scope filters: per-file lines are hundreds-per-job and drown the
   // interesting ones, so they're opt-in; system + job are the default.
-  const scopes = ["system", "job", "file"].filter(s => $("lg-" + s).checked);
-  const r = await jfetch(`/api/v1/logs?limit=300&scope=${scopes.join(",")}`);
-  if (r.status === 501) {
-    $("logbox").innerHTML = '<div class="empty">log buffer not configured</div>';
+  const scopes = logScopes();
+  const r = await jfetch("/api/v1/logs?limit=300&scope=" + scopes.join(","));
+  if (r.status === 501) { store.logs = "off"; renderLogs(); return; }
+  store.logs = (await r.json()).entries;
+  renderLogs();
+}
+async function refreshJobDetail() {
+  if (openJob == null) return;
+  const id = openJob;
+  try {
+    const [fr, lr] = await Promise.all([
+      jfetch("/api/v1/jobs/" + id + "/files"),
+      jfetch("/api/v1/logs?job=" + id + "&limit=50"),
+    ]);
+    if (openJob !== id) return; // switched away while loading
+    if (fr.ok) { const j = await fr.json(); store.jobFiles = { job: id, files: j.files }; }
+    if (lr.ok) { const j = await lr.json(); store.jobLogs = { job: id, entries: j.entries }; }
+  } catch { /* next cycle retries */ }
+  if (activeTab === "queue") renderQueue();
+}
+
+// ---- actions ------------------------------------------------------------
+async function jobAction(id, action) {
+  await jfetch("/api/v1/jobs/" + id + "/actions/" + action,
+    { method: "POST", headers: CLIENT_HDRS });
+  refreshAll();
+}
+async function histAction(id, action) {
+  await jfetch("/api/v1/history/" + id + "/actions/" + action, { method: "POST" });
+  refreshHistory().catch(() => {});
+}
+function toggleJob(id) {
+  if (openJob === id) { openJob = null; renderQueue(); return; }
+  openJob = id;
+  store.jobFiles = null;
+  store.jobLogs = null;
+  renderQueue();
+  refreshJobDetail();
+}
+
+// ---- one delegated click listener ---------------------------------------
+// Every actionable element carries `data-action` (plus `data-job` or a
+// `data-job-id` row), so no markup is generated with an inline `onclick`
+// string. That kills a whole class of bug at the source: the old renderer
+// interpolated job NAMES into JavaScript source and had to escape quotes to
+// do it.
+const HIST_ACTIONS = {
+  "h-hide": "hide", "h-restore": "restore",
+  "h-delete": "delete", "h-delete-files": "delete-files",
+};
+document.addEventListener("click", (ev) => {
+  const t = ev.target;
+  const el = t && t.closest ? t.closest("[data-action]") : null;
+  if (!el) return;
+  const action = el.dataset.action;
+  const row = el.closest ? el.closest("[data-job-id]") : null;
+  const id = Number(el.dataset.job || (row && row.dataset.jobId));
+  const scope = row ? row.dataset.scope : "queue";
+  if (action === "detail" || action === "detail-close") {
+    toggleJob(id);
     return;
   }
-  const { entries } = await r.json();
-  const box = $("logbox");
-  const stick = box.scrollTop + box.clientHeight >= box.scrollHeight - 8;
-  box.innerHTML = entries.map(e =>
-    `<div class="lg k-${e.kind}">${new Date(e.time_unix * 1000).toLocaleTimeString()}  ${e.kind.padEnd(7)} ${esc(e.text)}</div>`
-  ).join("") || (scopes.length ? '<div class="empty">no log entries</div>'
-                               : '<div class="empty">all scopes hidden — tick one above</div>');
-  if (stick) box.scrollTop = box.scrollHeight;
-}
-for (const s of ["system", "job", "file"])
-  $("lg-" + s).onchange = () => refreshLogs().catch(() => {});
+  if (scope === "history") {
+    const act = HIST_ACTIONS[action];
+    if (!act) return;
+    const name = row.__prev ? row.__prev.name : "this entry";
+    if (act === "delete" && !confirm("Forget " + name + "? (files stay)")) return;
+    if (act === "delete-files" && !confirm("Delete FILES of " + name + "?")) return;
+    histAction(id, act);
+    return;
+  }
+  if (action === "delete") {
+    const name = row && row.__prev ? row.__prev.name : "this job";
+    if (!confirm("Delete " + name + "?")) return;
+    jobAction(id, "delete");
+    return;
+  }
+  if (["pause", "resume", "move-top", "move-up", "move-down", "move-bottom"].includes(action))
+    jobAction(id, action);
+});
 
 // ---- controls -----------------------------------------------------------
 // Optimistic: flip the visible state the instant the button is clicked
@@ -841,14 +1408,14 @@ for (const s of ["system", "job", "file"])
 // correct it.
 $("btn-pause").onclick = async () => {
   setPauseButtons(true);
-  $("s-eta").textContent = "paused";
-  lastPauseSource = "web-ui";
+  setText($("s-eta"), "paused");
+  store.pauseSource = "web-ui";
   await jfetch("/api/v1/queue/actions/pause", { method: "POST", headers: CLIENT_HDRS });
   refreshAll();
 };
 $("btn-resume").onclick = async () => {
   setPauseButtons(false);
-  $("s-eta").textContent = "—";
+  setText($("s-eta"), "—");
   await jfetch("/api/v1/queue/actions/resume", { method: "POST", headers: CLIENT_HDRS });
   refreshAll();
 };
@@ -856,10 +1423,12 @@ $("btn-limit").onclick = async () => {
   const kib = parseInt($("limit").value || "0", 10);
   await jfetch("/api/v1/queue/speed-limit", {
     method: "PUT", headers: { "content-type": "application/json", ...CLIENT_HDRS },
-    body: JSON.stringify({ bytes_per_sec: kib > 0 ? kib * 1024 : null })
+    body: JSON.stringify({ bytes_per_sec: kib > 0 ? kib * 1024 : null }),
   });
   refreshAll();
 };
+for (const s of ["system", "job", "file"])
+  $("lg-" + s).onchange = () => refreshLogs().catch(() => {});
 
 // ---- add NZBs from disk ---------------------------------------------------
 $("btn-addnzb").onclick = () => $("nzb-file").click();
@@ -869,7 +1438,7 @@ $("nzb-file").onchange = async () => {
   const msg = $("addnzb-msg");
   let added = 0, failed = 0;
   for (const f of files) {
-    msg.className = ""; msg.textContent = `uploading ${esc(f.name)}…`;
+    msg.className = ""; msg.textContent = "uploading " + f.name + "…";
     try {
       const name = f.name.replace(/\.nzb$/i, "");
       const r = await jfetch("/api/v1/jobs?name=" + encodeURIComponent(name), {
@@ -881,13 +1450,13 @@ $("nzb-file").onchange = async () => {
         failed++;
         const e = await r.json().catch(() => ({}));
         msg.className = "bad";
-        msg.textContent = `✗ ${f.name}: ${e.error || r.status}`;
+        msg.textContent = "✗ " + f.name + ": " + (e.error || r.status);
       }
-    } catch (e) { failed++; msg.className = "bad"; msg.textContent = `✗ ${f.name}: ${e}`; }
+    } catch (e) { failed++; msg.className = "bad"; msg.textContent = "✗ " + f.name + ": " + e; }
   }
   if (!failed) {
     msg.className = "ok";
-    msg.textContent = `✓ added ${added} job${added === 1 ? "" : "s"}`;
+    msg.textContent = "✓ added " + added + " job" + (added === 1 ? "" : "s");
     setTimeout(() => { if (msg.className === "ok") msg.textContent = ""; }, 4000);
   }
   $("nzb-file").value = "";
@@ -919,12 +1488,13 @@ function nudge() { clearTimeout(debounce); debounce = setTimeout(refreshAll, 150
 
 // Connection indicator: what the page's data feed is doing right now.
 function connState(mode) {
+  store.conn = mode;
   const el = $("conn");
   if (mode === "live") {
     el.className = "conn ok";
     el.textContent = "● live updates";
     el.title = "Connected to the daemon's event stream — changes appear the moment they happen.";
-  } else if (mode === "poll") {
+  } else if (mode === "reconnecting") {
     el.className = "conn warn";
     el.textContent = "◌ polling — reconnecting…";
     el.title = "Lost the daemon's event stream; refreshing every 5 s while reconnecting. Data may lag a few seconds.";
@@ -935,11 +1505,10 @@ function connState(mode) {
   }
 }
 let lastTickAt = 0; // when the SSE stream last delivered a full read model
-let lastPauseSource = null; // who last (un)paused the queue, from the event
 function connectSse() {
   const es = new EventSource("/api/v1/events");
   es.onopen = () => connState("live");
-  es.onerror = () => connState("poll"); // EventSource retries by itself
+  es.onerror = () => connState("reconnecting"); // EventSource retries by itself
   // Structural events nudge a refresh; every engine event is wired in so
   // pause/resume and limit changes from ANY client (another tab, an *arr,
   // the CLI) land here immediately too.
@@ -947,23 +1516,26 @@ function connectSse() {
                     "segment_exhausted", "server_blocked",
                     "speed_limit_changed", "job_assigned", "lagged"])
     es.addEventListener(ev, nudge);
-  // Pause changes carry WHO — the answer to "it keeps unpausing itself"
-  // is always a client name, shown right on the paused badge.
+  // Pause changes carry WHO — the answer to "it keeps unpausing itself" is
+  // always a client name, shown right on the paused badge.
   es.addEventListener("queue_pause_changed", (e) => {
-    try { lastPauseSource = JSON.parse(e.data).source || null; } catch {}
+    try { store.pauseSource = JSON.parse(e.data).source || null; } catch {}
     nudge();
   });
   // The 1 Hz tick carries the whole read model (status + job rows from a
-  // single snapshot — header rate and per-job rates can't disagree).
-  // Render it directly: no fetch round-trip, nothing for a browser cache
-  // to wedge, progress moves the moment the daemon publishes.
+  // single snapshot — header rate and per-job rates can't disagree). Render
+  // it directly: no fetch round-trip, nothing for a browser cache to wedge,
+  // progress moves the moment the daemon publishes.
   es.addEventListener("tick", (e) => {
     lastTickAt = Date.now();
     connState("live");
     try {
       const d = JSON.parse(e.data);
-      renderStatus(d.status);
-      if (activeTab === "queue") renderQueue(d.jobs);
+      store.status = d.status;
+      store.jobs = d.jobs;
+      store.jobsLoaded = true;
+      renderStatus();
+      if (activeTab === "queue") renderQueue();
     } catch { /* malformed frame — the poll fallback still corrects */ }
   });
 }
@@ -1464,6 +2036,20 @@ initTheme();
   });
   refreshAll();
 })();
+
+// ---- test hook -----------------------------------------------------------
+// The CI DOM harness (crates/nzbd/tests/ui_dom_harness.js) drives the pure
+// pieces of the renderer against a fake `dom` adapter. It is exposed only
+// when the harness defines `__nzbd_test_enable` in the sandbox, so a real
+// browser never sees it.
+if (typeof __nzbd_test_enable !== "undefined") {
+  window.__nzbd_test = {
+    rowModel, reconcileRows, applyRow, differ, KINDS, store,
+    histModel, fileModel, statusModels, queueModels, detailModel,
+    statusName, healthColor, fmtBytes, fmtRate, fmtEta,
+    setOpenJob: (id) => { openJob = id; },
+  };
+}
 
 // PWA app-shell worker. Browsers only expose serviceWorker in secure
 // contexts (HTTPS or localhost) — on plain LAN HTTP this quietly skips
