@@ -9,6 +9,7 @@ license.workspace = true
 nzbd-types = { workspace = true }
 nzbd-config = { workspace = true }
 nzbd-engine = { workspace = true }
+nzbd-nntp = { workspace = true }
 nzbd-state = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
@@ -24,3 +25,4 @@ tokio = { workspace = true, features = ["test-util"] }
 tower = { version = "0.5", features = ["util"] }
 tempfile = { workspace = true }
 http-body-util = "0.1"
+nzbd-nserv = { workspace = true }

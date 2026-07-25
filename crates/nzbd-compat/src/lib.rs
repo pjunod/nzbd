@@ -853,61 +853,30 @@ async fn editqueue(state: &CompatState, params: &Value) -> Result<Value, (i64, &
 /// `testserver(Host, Port, Username, Password, Encryption, Cipher,
 /// Timeout)` — live connect + greeting + optional AUTHINFO against a news
 /// server; returns the greeting text or the error string (NZBGet shape).
+/// Same probe as the native `/api/v1/servers/test` endpoint.
 async fn testserver(params: &Value) -> Result<Value, (i64, &'static str)> {
     let host = p_str(params, 0);
-    if host.is_empty() {
-        return Ok(Value::String("no host given".into()));
-    }
     let port = p_i64(params, 1).clamp(1, 65535) as u16;
     let user = p_str(params, 2);
     let pass = p_str(params, 3);
     let tls = p_bool(params, 4);
     let timeout = std::time::Duration::from_secs(p_i64(params, 6).clamp(2, 60) as u64);
 
-    let def = nzbd_types::ServerDef {
-        id: nzbd_types::ServerId(0),
-        name: "testserver".into(),
-        host,
+    let outcome = nzbd_nntp::transport::probe_server(
+        &host,
         port,
-        tls: if tls {
-            nzbd_types::TlsMode::Tls
-        } else {
-            nzbd_types::TlsMode::None
-        },
-        username: None,
-        password: None,
-        active: true,
-        tier: 0,
-        group: 0,
-        fill: false,
-        max_connections: 1,
-        pipeline_depth: 1,
-        retention_days: 0,
-        cert_verification: nzbd_types::CertLevel::Strict,
-    };
-    let tls_cfg = if tls {
-        match nzbd_nntp::transport::tls_client_config(nzbd_types::CertLevel::Strict) {
-            Ok(c) => Some(c),
-            Err(e) => return Ok(Value::String(format!("TLS setup failed: {e}"))),
-        }
-    } else {
-        None
-    };
-    match nzbd_nntp::transport::NntpConnection::connect(&def, tls_cfg, timeout, timeout).await {
-        Ok((mut conn, greeting)) => {
-            if !user.is_empty() {
-                if let Err(e) = conn.authenticate(&user, &pass).await {
-                    return Ok(Value::String(format!("connected, but login failed: {e}")));
-                }
-            }
-            conn.quit().await;
-            Ok(Value::String(format!(
-                "Connection to {}:{} established: {}",
-                def.host, def.port, greeting.text
-            )))
-        }
-        Err(e) => Ok(Value::String(format!("Connection failed: {e}"))),
-    }
+        tls,
+        nzbd_types::CertLevel::Strict,
+        (!user.is_empty()).then_some(user.as_str()),
+        Some(pass.as_str()),
+        timeout,
+    )
+    .await;
+    // NZBGet's shape: always a string, success and failure alike.
+    Ok(Value::String(match outcome {
+        Ok(msg) => msg,
+        Err(msg) => msg,
+    }))
 }
 
 /// `listfiles(IDFrom, IDTo, NZBID)` — the files of one queued group

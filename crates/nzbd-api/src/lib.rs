@@ -547,6 +547,84 @@ async fn set_speed_limit(State(st): State<ApiState>, Json(body): Json<SpeedLimit
     }
 }
 
+/// `POST /api/v1/servers/test` — live connectivity probe for a news
+/// server, exactly as the form describes it (saved or not): connect,
+/// greeting, optional AUTHINFO, through the production NNTP transport.
+/// Backs the "test connection" buttons in Settings and the first-run
+/// wizard. Always answers 200 with `{ok, message}` — an unreachable host
+/// is a probe *result*, not an API error.
+#[derive(Debug, Deserialize)]
+struct TestServerBody {
+    host: String,
+    /// Defaults to the NNTP convention for the chosen transport:
+    /// 563 with TLS, 119 without.
+    #[serde(default)]
+    port: Option<u16>,
+    #[serde(default)]
+    tls: bool,
+    #[serde(default)]
+    username: Option<String>,
+    #[serde(default)]
+    password: Option<String>,
+    /// "strict" (default) | "minimal" | "none".
+    #[serde(default)]
+    cert_verification: Option<String>,
+    /// Index into the saved `[[server]]` list. The settings form only ever
+    /// holds the mask for a stored password — this lets the daemon swap in
+    /// the real secret so "test" works without retyping it.
+    #[serde(default)]
+    server_index: Option<usize>,
+}
+
+async fn test_server(State(st): State<ApiState>, Json(body): Json<TestServerBody>) -> Response {
+    let port = body.port.unwrap_or(if body.tls { 563 } else { 119 });
+    let cert = match body.cert_verification.as_deref() {
+        None | Some("") | Some("strict") => nzbd_types::CertLevel::Strict,
+        Some("minimal") => nzbd_types::CertLevel::Minimal,
+        Some("none") => nzbd_types::CertLevel::None,
+        Some(other) => {
+            return error(
+                StatusCode::BAD_REQUEST,
+                &format!("unknown cert_verification '{other}' (strict|minimal|none)"),
+            )
+        }
+    };
+    let mut password = body.password;
+    if password.as_deref() == Some(nzbd_config::SECRET_MASK) {
+        let stored = st.setup.as_ref().and_then(|s| {
+            let cfg = s.current.lock().unwrap();
+            body.server_index
+                .and_then(|i| cfg.servers.get(i))
+                .and_then(|srv| srv.password.clone())
+        });
+        match stored {
+            Some(p) => password = Some(p),
+            None => {
+                return Json(json!({
+                    "ok": false,
+                    "message": "stored password not available here — retype it to test"
+                }))
+                .into_response()
+            }
+        }
+    }
+    let outcome = nzbd_nntp::transport::probe_server(
+        &body.host,
+        port,
+        body.tls,
+        cert,
+        body.username.as_deref().filter(|u| !u.trim().is_empty()),
+        password.as_deref(),
+        std::time::Duration::from_secs(10),
+    )
+    .await;
+    let (ok, message) = match outcome {
+        Ok(m) => (true, m),
+        Err(m) => (false, m),
+    };
+    Json(json!({ "ok": ok, "message": message })).into_response()
+}
+
 /// `GET /api/v1/events` — engine events as SSE (`event:` = variant name,
 /// `data:` = JSON payload). Lagged consumers observe a `lagged` event and
 /// should resync from `/api/v1/status`.
@@ -802,6 +880,7 @@ async fn openapi() -> Response {
             "/api/v1/jobs/{id}/actions/{action}": { "post": { "summary": "pause|resume|delete|delete-files" } },
             "/api/v1/queue/actions/{action}": { "post": { "summary": "pause|resume" } },
             "/api/v1/queue/speed-limit": { "put": { "summary": "Set speed limit (bytes_per_sec)" } },
+            "/api/v1/servers/test": { "post": { "summary": "Live news-server connectivity probe (connect + greeting + AUTHINFO)" } },
             "/api/v1/history": { "get": { "summary": "Finished jobs" } },
             "/api/v1/logs": { "get": { "summary": "Recent daemon log entries" } },
             "/api/v1/events": { "get": { "summary": "Engine events (SSE)" } },
@@ -1205,6 +1284,7 @@ pub fn router_with(state: ApiState) -> Router {
         .route("/api/v1/jobs/{id}/actions/{action}", post(job_action))
         .route("/api/v1/queue/actions/{action}", post(queue_action))
         .route("/api/v1/queue/speed-limit", put(set_speed_limit))
+        .route("/api/v1/servers/test", post(test_server))
         .route("/api/v1/history", get(get_history))
         .route(
             "/api/v1/history/{id}/actions/{action}",
@@ -1647,6 +1727,122 @@ mod tests {
             text.contains("download_rate_bps") && text.contains("tickjob"),
             "tick carries status + job rows: {text:?}"
         );
+        engine.shutdown().await;
+    }
+
+    /// The "test connection" endpoint: live probe against a real (mock)
+    /// NNTP server through the production transport — greeting + auth,
+    /// wrong-password and dead-port shapes, and stored-password resolution
+    /// via the config mask (the browser never holds real secrets).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn server_test_endpoint_probes_and_resolves_masked_password() {
+        let ns = nzbd_nserv::NservBuilder::new()
+            .credentials("alice", "s3cret")
+            .start()
+            .await
+            .unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = test_engine(&tmp).await;
+
+        // Router WITH a running-mode setup handle: server 0 has a stored
+        // password the form only ever sees as the mask.
+        let mut cfg = nzbd_config::Config::default();
+        cfg.servers.push(nzbd_config::ServerConfig {
+            host: "127.0.0.1".into(),
+            port: ns.port(),
+            tls: false,
+            username: Some("alice".into()),
+            password: Some("s3cret".into()),
+            ..Default::default()
+        });
+        let app = router_with(ApiState {
+            engine: engine.clone(),
+            history: None,
+            log: None,
+            setup: Some(Arc::new(SetupHandle::for_running(
+                None,
+                "127.0.0.1:0".into(),
+                cfg,
+            ))),
+            clients: None,
+            shutdown: None,
+        });
+
+        let probe = |app: Router, body: serde_json::Value| async move {
+            let resp = app
+                .oneshot(
+                    axum::http::Request::post("/api/v1/servers/test")
+                        .header("content-type", "application/json")
+                        .body(axum::body::Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            body_json(resp).await
+        };
+
+        // Real credentials: greeting + AUTHINFO succeed.
+        let v = probe(
+            app.clone(),
+            json!({ "host": "127.0.0.1", "port": ns.port(), "tls": false,
+                    "username": "alice", "password": "s3cret" }),
+        )
+        .await;
+        assert_eq!(v["ok"], true, "{v}");
+        assert!(v["message"].as_str().unwrap().contains("established"));
+
+        // Wrong password: connected but login fails.
+        let v = probe(
+            app.clone(),
+            json!({ "host": "127.0.0.1", "port": ns.port(), "tls": false,
+                    "username": "alice", "password": "wrong" }),
+        )
+        .await;
+        assert_eq!(v["ok"], false);
+        assert!(v["message"].as_str().unwrap().contains("login failed"));
+
+        // Masked password + server_index: the daemon swaps in the stored
+        // secret — testing a saved server needs no retyping.
+        let v = probe(
+            app.clone(),
+            json!({ "host": "127.0.0.1", "port": ns.port(), "tls": false,
+                    "username": "alice", "password": nzbd_config::SECRET_MASK,
+                    "server_index": 0 }),
+        )
+        .await;
+        assert_eq!(v["ok"], true, "mask resolves against config: {v}");
+
+        // Dead port: a probe result, not an API error.
+        let v = probe(
+            app.clone(),
+            json!({ "host": "127.0.0.1", "port": 1, "tls": false }),
+        )
+        .await;
+        assert_eq!(v["ok"], false);
+        assert!(v["message"].as_str().unwrap().contains("Connection failed"));
+
+        // Mask with nothing to resolve against (bare router, no setup
+        // handle): explicit "retype it" instead of probing with the
+        // literal mask string as the password.
+        let bare = router(engine.clone());
+        let resp = bare
+            .oneshot(
+                axum::http::Request::post("/api/v1/servers/test")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        json!({ "host": "127.0.0.1", "port": ns.port(), "tls": false,
+                                "username": "alice", "password": nzbd_config::SECRET_MASK })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let v = body_json(resp).await;
+        assert_eq!(v["ok"], false);
+        assert!(v["message"].as_str().unwrap().contains("retype"));
+
         engine.shutdown().await;
     }
 

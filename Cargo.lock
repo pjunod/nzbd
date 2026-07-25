@@ -842,6 +842,8 @@ dependencies = [
  "http-body-util",
  "nzbd-config",
  "nzbd-engine",
+ "nzbd-nntp",
+ "nzbd-nserv",
  "nzbd-state",
  "nzbd-types",
  "serde",

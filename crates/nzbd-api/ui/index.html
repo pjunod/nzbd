@@ -159,6 +159,10 @@
   .cfg-sub .sub-head { display: flex; align-items: center; margin-bottom: 8px; }
   .cfg-sub .sub-head b { font-size: 12.5px; }
   .cfg-sub .sub-head button { margin-left: auto; }
+  .test-row { display: flex; align-items: center; gap: 10px; margin: 2px 0 8px; }
+  .test-out { font-size: 12px; color: var(--muted); word-break: break-word; }
+  .test-out.ok { color: var(--ok); }
+  .test-out.bad { color: var(--bad); }
   .cfg-add { margin: 2px 0 8px; }
   #restart-banner { display: flex; align-items: center; gap: 12px; margin-top: 12px;
     padding: 9px 12px; border-radius: 8px; font-size: 12.5px; font-weight: 550;
@@ -291,6 +295,11 @@
           <label>username <input type="text" id="su-user" autocomplete="off"></label>
           <label>password <input type="password" id="su-pass" autocomplete="new-password"></label>
           <label style="flex:0 0 110px">connections <input type="number" id="su-conn" value="8" min="1" max="100"></label>
+        </div>
+        <div class="test-row">
+          <button type="button" class="small" id="su-test"
+            title="Connect to the server as entered above (greeting + login) before saving anything.">test connection</button>
+          <span class="test-out" id="su-test-out"></span>
         </div>
       </fieldset>
       <fieldset>
@@ -907,7 +916,46 @@ function serverCard(sIdx) {
       ${fieldControl(p("fill"), "fill server", "check")}
       ${fieldControl(p("retention_days"), "retention days (0 = ∞)", "num")}
     </div>
+    <div class="test-row">
+      <button type="button" class="small" id="srv-test-btn-${sIdx}"
+        title="Connect to this server now (greeting + login) through the same NNTP stack downloads use — tests the form as it stands, unsaved edits included."
+        onclick="testServerCard(${sIdx})">test connection</button>
+      <span class="test-out" id="srv-test-out-${sIdx}"></span>
+    </div>
   </div>`;
+}
+
+// Probe the server exactly as the card currently describes it (including
+// unsaved edits). A stored password the browser only knows as the mask is
+// resolved server-side via server_index — no retyping to test.
+async function testServerCard(i) {
+  const cfg = collectSettingsForm();
+  const s = (cfg.server || [])[i];
+  if (!s) return;
+  const btn = $("srv-test-btn-" + i), out = $("srv-test-out-" + i);
+  btn.disabled = true;
+  out.className = "test-out"; out.textContent = "testing…";
+  try {
+    const r = await jfetch("/api/v1/servers/test", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        host: s.host || "",
+        port: (s.port > 0 && s.port < 65536) ? s.port : null,
+        tls: !!s.tls,
+        username: s.username || null,
+        password: s.password || null,
+        cert_verification: s.cert_verification || "strict",
+        server_index: i,
+      }),
+    });
+    const j = await r.json();
+    out.className = "test-out " + (j.ok ? "ok" : "bad");
+    out.textContent = (j.ok ? "✓ " : "✗ ") + j.message;
+  } catch (e) {
+    out.className = "test-out bad";
+    out.textContent = "✗ " + e;
+  }
+  btn.disabled = false;
 }
 
 function categoryCard(cIdx) {
@@ -1124,6 +1172,32 @@ async function checkSetup() {
     method: "POST", headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
   });
+  // Verify the news server before anything is saved — same live probe the
+  // Settings tab uses.
+  $("su-test").onclick = async () => {
+    const btn = $("su-test"), out = $("su-test-out");
+    btn.disabled = true;
+    out.className = "test-out"; out.textContent = "testing…";
+    try {
+      const r = await jfetch("/api/v1/servers/test", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          host: $("su-host").value,
+          port: Number($("su-port").value) || null,
+          tls: $("su-tls").checked,
+          username: $("su-user").value || null,
+          password: $("su-pass").value || null,
+        }),
+      });
+      const j = await r.json();
+      out.className = "test-out " + (j.ok ? "ok" : "bad");
+      out.textContent = (j.ok ? "✓ " : "✗ ") + j.message;
+    } catch (e) {
+      out.className = "test-out bad";
+      out.textContent = "✗ " + e;
+    }
+    btn.disabled = false;
+  };
   // Manual fallback: the rendered TOML, copyable even where the daemon
   // can't write it itself (read-only mount, ConfigMap, ephemeral layer).
   const showToml = (toml, hint) => {

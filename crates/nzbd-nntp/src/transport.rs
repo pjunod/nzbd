@@ -319,6 +319,66 @@ impl TerminatorScanner {
     }
 }
 
+/// One-shot connectivity probe: connect, read the greeting, optionally
+/// AUTHINFO, QUIT. Human-readable outcome either way — this backs the
+/// "test connection" buttons (settings + first-run wizard) and the compat
+/// `testserver` RPC, all through the production transport, so a probe
+/// that passes here is the same code path real downloads use.
+pub async fn probe_server(
+    host: &str,
+    port: u16,
+    tls: bool,
+    cert: CertLevel,
+    username: Option<&str>,
+    password: Option<&str>,
+    timeout: Duration,
+) -> Result<String, String> {
+    if host.trim().is_empty() {
+        return Err("no host given".into());
+    }
+    let def = ServerDef {
+        id: nzbd_types::ServerId(0),
+        name: "probe".into(),
+        host: host.trim().to_string(),
+        port,
+        tls: if tls { TlsMode::Tls } else { TlsMode::None },
+        username: None,
+        password: None,
+        active: true,
+        tier: 0,
+        group: 0,
+        fill: false,
+        max_connections: 1,
+        pipeline_depth: 1,
+        retention_days: 0,
+        cert_verification: cert,
+    };
+    let tls_cfg = if tls {
+        match tls_client_config(cert) {
+            Ok(c) => Some(c),
+            Err(e) => return Err(format!("TLS setup failed: {e}")),
+        }
+    } else {
+        None
+    };
+    match NntpConnection::connect(&def, tls_cfg, timeout, timeout).await {
+        Ok((mut conn, greeting)) => {
+            let user = username.unwrap_or("").trim();
+            if !user.is_empty() {
+                if let Err(e) = conn.authenticate(user, password.unwrap_or("")).await {
+                    return Err(format!("connected, but login failed: {e}"));
+                }
+            }
+            conn.quit().await;
+            Ok(format!(
+                "Connection to {}:{} established: {}",
+                def.host, def.port, greeting.text
+            ))
+        }
+        Err(e) => Err(format!("Connection failed: {e}")),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // TLS client configs for the three CertVerification levels
 // ---------------------------------------------------------------------------
