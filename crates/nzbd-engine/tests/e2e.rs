@@ -616,14 +616,30 @@ async fn url_fetch_resumes_after_restart_with_clean_name() {
     // HTTP server: connection #1 stalls (reads the request, then holds the
     // socket until the client goes away — the pre-restart fetch);
     // connection #2 serves the NZB (the post-restart re-fetch).
+    //
+    // `ready_tx` fires once connection #1 has delivered its request: the
+    // test MUST NOT shut engine A down before then, or the cancel races
+    // the fetch's connect — and if cancel wins, the pre-restart fetch
+    // never dials, connection #1 goes to the POST-restart fetch instead,
+    // which then hangs forever in the stall slot (caught on Paul's
+    // machine: "did not complete after restart; status: Fetching").
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let http_port = listener.local_addr().unwrap().port();
     let nzb = post.nzb.clone();
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
     std::thread::spawn(move || {
         let (mut s, _) = listener.accept().unwrap();
         let mut buf = [0u8; 2048];
-        let _ = s.read(&mut buf); // request
-        let _ = s.read(&mut buf); // blocks until the fetch task is cancelled
+        let _ = s.read(&mut buf); // request head
+        let _ = ready_tx.send(()); // pre-restart fetch is pinned on this socket
+                                   // Drain until EOF — hyper may split writes, and a non-zero read
+                                   // must not be mistaken for the close.
+        loop {
+            match s.read(&mut buf) {
+                Ok(0) | Err(_) => break, // fetch task cancelled → socket gone
+                Ok(_) => {}
+            }
+        }
         drop(s);
         let (mut s, _) = listener.accept().unwrap();
         let _ = s.read(&mut buf);
@@ -667,6 +683,14 @@ async fn url_fetch_resumes_after_restart_with_clean_name() {
         "same-URL add while fetching returns the same job"
     );
     assert_eq!(engine.snapshot().jobs.len(), 1);
+
+    // Only shut down once the fetch is provably mid-flight on the stall
+    // socket (see the listener comment: shutdown racing the connect flips
+    // which fetch lands in the stall slot).
+    tokio::task::spawn_blocking(move || ready_rx.recv_timeout(Duration::from_secs(10)))
+        .await
+        .unwrap()
+        .expect("pre-restart fetch never reached the HTTP listener");
 
     // Graceful shutdown with the fetch mid-flight: the cancel-aware fetch
     // task must abort promptly instead of holding shutdown for its 60 s
