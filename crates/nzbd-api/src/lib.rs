@@ -1873,13 +1873,36 @@ async fn put_config(
             Err(e) => return error(StatusCode::UNPROCESSABLE_ENTITY, &e.to_string()),
         }
     } else {
-        match nzbd_config::Config::from_toml(&body) {
+        // Unvalidated on purpose: what the editor sends still has
+        // SECRET_MASK where the secrets go, and validation rejects the
+        // mask. Merge first, validate immediately after — see below.
+        match nzbd_config::Config::parse_toml_unvalidated(&body) {
             Ok(c) => c,
             Err(e) => return error(StatusCode::UNPROCESSABLE_ENTITY, &e.to_string()),
         }
     };
     let old_cfg = { h.current.lock().unwrap().clone() };
-    nzbd_config::merge_masked_secrets(&mut new_cfg, &old_cfg);
+    // A mask we cannot resolve is a password we would be DELETING. It used
+    // to become None and the save reported success (field report
+    // 2026-07-26). Refuse, and name the field the operator has to retype.
+    let unresolved = nzbd_config::merge_masked_secrets(&mut new_cfg, &old_cfg);
+    if !unresolved.is_empty() {
+        return error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            &format!(
+                "{} still reads {} and there is no saved value to restore it from \
+                 (a renamed or newly added server has no previous secret). Type the \
+                 real value in before saving — saving as-is would delete it.",
+                unresolved.join(", "),
+                nzbd_config::SECRET_MASK,
+            ),
+        );
+    }
+    // Now that the secrets are real, hold the whole thing to the strict
+    // validator — the TOML path skipped it above.
+    if let Err(e) = new_cfg.validate() {
+        return error(StatusCode::UNPROCESSABLE_ENTITY, &e.to_string());
+    }
     let (live, restart) = nzbd_config::diff_sections(&old_cfg, &new_cfg);
     let toml_text = match nzbd_config::to_toml(&new_cfg) {
         Ok(t) => t,

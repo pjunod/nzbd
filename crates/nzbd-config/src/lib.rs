@@ -363,9 +363,21 @@ pub fn expand_home(p: &std::path::Path) -> PathBuf {
 
 impl Config {
     pub fn from_toml(s: &str) -> Result<Config, ConfigError> {
-        let cfg: Config = toml::from_str(s)?;
+        let cfg = Config::parse_toml_unvalidated(s)?;
         cfg.validate()?;
         Ok(cfg)
+    }
+
+    /// Parse without validating.
+    ///
+    /// Exactly one caller should want this: the settings editor, which
+    /// receives a config whose secrets are still [`SECRET_MASK`] and has
+    /// to parse it *before* [`merge_masked_secrets`] can put the real
+    /// ones back. Validation rejects the mask (see [`Config::validate`]),
+    /// so the normal `from_toml` cannot be used there. Everything else —
+    /// boot, imports, round-trip checks — must keep using `from_toml`.
+    pub fn parse_toml_unvalidated(s: &str) -> Result<Config, ConfigError> {
+        Ok(toml::from_str(s)?)
     }
 
     /// Journal + queue snapshots directory (NZBGet `QueueDir` equivalent):
@@ -387,6 +399,37 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
+        // A secret that is still the display mask is not a secret. The
+        // settings editor shows every password as SECRET_MASK, so the TOML
+        // you copy out of it is NOT a backup — and a config restored from
+        // that copy used to be accepted verbatim, leaving the daemon
+        // authenticating with the literal string "***unchanged***" against
+        // a provider account that was perfectly fine (field report
+        // 2026-07-26: "it imported the config file but lost my password").
+        // Refuse it, and say which field and why.
+        let masked = |v: &Option<String>| v.as_deref() == Some(SECRET_MASK);
+        let mask_hit = |field: String| -> Result<(), ConfigError> {
+            Err(ConfigError::Invalid(format!(
+                "{field} is still the placeholder {SECRET_MASK:?} — this config was \
+                 copied from the settings editor, which masks every secret. The \
+                 masked text is a display, not a backup: put the real value back \
+                 (or delete the line to run without one)."
+            )))
+        };
+        for s in &self.servers {
+            if masked(&s.password) {
+                mask_hit(format!("server '{}' password", s.name))?;
+            }
+        }
+        if masked(&self.api.password) {
+            mask_hit("[api] password".into())?;
+        }
+        if masked(&self.api.token) {
+            mask_hit("[api] token".into())?;
+        }
+        if masked(&self.cluster.secret) {
+            mask_hit("[cluster] secret".into())?;
+        }
         for s in &self.servers {
             if s.host.is_empty() {
                 return Err(ConfigError::Invalid(format!(
@@ -1368,8 +1411,19 @@ pub fn mask_secrets(cfg: &Config) -> Config {
 /// Replace [`SECRET_MASK`] values in an edited config with the secrets
 /// from the previous config, so a masked display round-trips without the
 /// user retyping passwords. Servers are matched by name, then by index.
-pub fn merge_masked_secrets(new: &mut Config, old: &Config) {
+/// Returns the fields whose mask could NOT be resolved — an empty vec
+/// means every secret came back.
+///
+/// The old version wrote `prev.and_then(...)` straight into the field, so
+/// a mask with no previous value to restore from (a renamed server, a
+/// newly added one, a running config that never had a password) silently
+/// became `None`: the password was deleted and the save reported success.
+/// Unresolvable masks are now LEFT IN PLACE, which makes `validate()`
+/// reject the config and forces the caller to say so out loud.
+#[must_use]
+pub fn merge_masked_secrets(new: &mut Config, old: &Config) -> Vec<String> {
     let is_mask = |v: &Option<String>| v.as_deref() == Some(SECRET_MASK);
+    let mut unresolved = Vec::new();
     for (i, s) in new.servers.iter_mut().enumerate() {
         if is_mask(&s.password) {
             let prev = old
@@ -1377,18 +1431,28 @@ pub fn merge_masked_secrets(new: &mut Config, old: &Config) {
                 .iter()
                 .find(|o| !o.name.is_empty() && o.name == s.name)
                 .or_else(|| old.servers.get(i));
-            s.password = prev.and_then(|p| p.password.clone());
+            match prev.and_then(|p| p.password.clone()) {
+                Some(pw) => s.password = Some(pw),
+                None => unresolved.push(format!("server '{}' password", s.name)),
+            }
         }
     }
-    if is_mask(&new.api.password) {
-        new.api.password = old.api.password.clone();
-    }
-    if is_mask(&new.api.token) {
-        new.api.token = old.api.token.clone();
-    }
-    if is_mask(&new.cluster.secret) {
-        new.cluster.secret = old.cluster.secret.clone();
-    }
+    let mut restore = |cur: &mut Option<String>, prev: &Option<String>, what: &str| {
+        if is_mask(cur) {
+            match prev {
+                Some(v) => *cur = Some(v.clone()),
+                None => unresolved.push(what.to_string()),
+            }
+        }
+    };
+    restore(&mut new.api.password, &old.api.password, "[api] password");
+    restore(&mut new.api.token, &old.api.token, "[api] token");
+    restore(
+        &mut new.cluster.secret,
+        &old.cluster.secret,
+        "[cluster] secret",
+    );
+    unresolved
 }
 
 #[cfg(test)]
@@ -1423,21 +1487,100 @@ secret = "cluster-secret"
         assert!(shown.contains(SECRET_MASK));
 
         // User edits something unrelated and saves the masked text back.
+        // The editor's own path parses WITHOUT validating (the mask is not
+        // a legal secret) and merges the real values back in.
         let edited = shown.replace("main_dir = \"/data\"", "main_dir = \"/mnt/big\"");
-        let mut new_cfg = Config::from_toml(&edited).unwrap();
-        merge_masked_secrets(&mut new_cfg, &cfg);
+        let mut new_cfg = Config::parse_toml_unvalidated(&edited).unwrap();
+        assert!(merge_masked_secrets(&mut new_cfg, &cfg).is_empty());
         assert_eq!(new_cfg.servers[0].password.as_deref(), Some("real-secret"));
         assert_eq!(new_cfg.api.password.as_deref(), Some("api-secret"));
         assert_eq!(new_cfg.cluster.secret.as_deref(), Some("cluster-secret"));
         assert_eq!(new_cfg.paths.main_dir, PathBuf::from("/mnt/big"));
+        // …and the merged result is a config the strict validator accepts.
+        new_cfg.validate().unwrap();
 
         // Typing a NEW password replaces rather than restores.
         let repw = edited.replace(
             &format!("password = \"{SECRET_MASK}\""),
             "password = \"fresh\"",
         );
-        let mut new_cfg = Config::from_toml(&repw).unwrap();
-        merge_masked_secrets(&mut new_cfg, &cfg);
+        let mut new_cfg = Config::parse_toml_unvalidated(&repw).unwrap();
+        assert!(merge_masked_secrets(&mut new_cfg, &cfg).is_empty());
         assert_eq!(new_cfg.servers[0].password.as_deref(), Some("fresh"));
+    }
+
+    /// The masked text is a DISPLAY, not a backup.
+    ///
+    /// Field report 2026-07-26: "it imported the config file but lost my
+    /// password" — a config restored from a copy taken out of the settings
+    /// editor carried `password = "***unchanged***"`, and nothing on the
+    /// boot path objected, so the daemon authenticated with that literal
+    /// string against a provider account that was perfectly healthy. The
+    /// symptom (connection failures) pointed at the provider; the cause was
+    /// three days earlier in a text editor.
+    #[test]
+    fn a_masked_config_is_refused_on_the_boot_path() {
+        let masked = format!(
+            "[paths]\nmain_dir = \"/data\"\ndest_dir = \"/data/complete\"\n\n\
+             [[server]]\nname = \"prime\"\nhost = \"news.example.com\"\n\
+             password = \"{SECRET_MASK}\"\n"
+        );
+        let err = Config::from_toml(&masked).expect_err("the mask must not boot");
+        let msg = err.to_string();
+        assert!(msg.contains("prime"), "names the server: {msg}");
+        assert!(
+            msg.contains("settings editor"),
+            "explains where it came from: {msg}"
+        );
+        assert!(
+            msg.contains("not a backup"),
+            "and that the copy was not a backup: {msg}"
+        );
+
+        // Every other masked secret is caught the same way.
+        for (section, body) in [
+            (
+                "[api] password",
+                format!("[api]\npassword = \"{SECRET_MASK}\"\n"),
+            ),
+            ("[api] token", format!("[api]\ntoken = \"{SECRET_MASK}\"\n")),
+        ] {
+            let e = Config::from_toml(&body).expect_err("must reject");
+            assert!(e.to_string().contains(section), "{section}: {e}");
+        }
+
+        // A real secret still parses — the check is exact, not fuzzy.
+        let real = masked.replace(SECRET_MASK, "***unchanged***-but-mine");
+        Config::from_toml(&real).expect("a real password that merely looks similar is fine");
+    }
+
+    /// A mask with nothing behind it must not silently delete a password.
+    #[test]
+    fn an_unresolvable_mask_is_reported_not_blanked() {
+        let old = Config::from_toml(
+            "[paths]\nmain_dir = \"/data\"\ndest_dir = \"/d\"\n\n\
+             [[server]]\nname = \"prime\"\nhost = \"h\"\npassword = \"real\"\n",
+        )
+        .unwrap();
+
+        // The operator renames the server AND leaves the mask in place, so
+        // neither the name nor the index finds a previous secret.
+        let mut renamed = Config::parse_toml_unvalidated(&format!(
+            "[paths]\nmain_dir = \"/data\"\ndest_dir = \"/d\"\n\n\
+             [[server]]\nname = \"second\"\nhost = \"h2\"\npassword = \"{SECRET_MASK}\"\n\n\
+             [[server]]\nname = \"third\"\nhost = \"h3\"\npassword = \"{SECRET_MASK}\"\n"
+        ))
+        .unwrap();
+        let unresolved = merge_masked_secrets(&mut renamed, &old);
+
+        // Server 1 falls back to the index and recovers. Server 2 has
+        // nothing behind it at all.
+        assert_eq!(renamed.servers[0].password.as_deref(), Some("real"));
+        assert_eq!(unresolved, vec!["server 'third' password".to_string()]);
+        // The mask is LEFT IN PLACE — the old code wrote None here, which
+        // is how a save could delete a password and report success.
+        assert_eq!(renamed.servers[1].password.as_deref(), Some(SECRET_MASK));
+        // …so the strict validator refuses it too, belt and braces.
+        assert!(renamed.validate().is_err());
     }
 }

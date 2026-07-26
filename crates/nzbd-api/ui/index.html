@@ -510,6 +510,12 @@
     <form id="cfg-form" onsubmit="return false"></form>
     <details id="cfg-advanced">
       <summary>Advanced: edit the raw nzbd.toml (feeds &amp; cluster live here)</summary>
+      <p class="sub" id="adv-masked-note" hidden style="color: var(--warn)">Secrets are
+        shown as <code>***unchanged***</code>, not their real values. <b>This text is a
+        display, not a backup</b> — saving it back here restores your secrets, but a copy
+        of it dropped in as <code>nzbd.toml</code> would carry the placeholder instead of
+        your password. The daemon now refuses such a file at boot rather than trying to
+        log in with it.</p>
       <textarea id="adv-toml" spellcheck="false"></textarea>
       <div class="cfg-bar">
         <button id="adv-save" class="small">Save TOML</button>
@@ -2615,6 +2621,7 @@ async function loadSettings(force) {
   const c = await r.json();
   cfgInfo = c; cfgModel = c.config; cfgLoaded = true; cfgDirty = false;
   $("adv-toml").value = c.toml;
+  $("adv-masked-note").hidden = !$("adv-toml").value.includes(MASK);
   renderSettingsForm();
   $("cfg-save").disabled = true;
   showRestartBanner(c.pending_restart);
@@ -2666,10 +2673,28 @@ $("adv-save").onclick = async () => {
   showRestartBanner(res.restart_required);
   await loadSettings(true);
 };
+// A download named nzbd.toml is a file people put back. When the text
+// still carries SECRET_MASK it is NOT that file, and shipping it under
+// that name is how a password gets "lost" three days later — so the
+// masked copy gets a different name and a header that says why.
+const MASK = "***unchanged***";
+function advDownloadFile(text) {
+  if (!text.includes(MASK)) return { name: "nzbd.toml", body: text };
+  return {
+    name: "nzbd-masked.toml",
+    body:
+      "# NOT A USABLE CONFIG — every secret below reads " + MASK + ", which is\n" +
+      "# what the settings editor displays instead of your real passwords.\n" +
+      "# Replace each one with the real value before using this as nzbd.toml;\n" +
+      "# nzbd refuses to start on a config that still contains the placeholder.\n" +
+      text,
+  };
+}
 $("adv-download").onclick = () => {
+  const f = advDownloadFile($("adv-toml").value);
   const a = document.createElement("a");
-  a.href = URL.createObjectURL(new Blob([$("adv-toml").value], { type: "text/plain" }));
-  a.download = "nzbd.toml"; a.click(); URL.revokeObjectURL(a.href);
+  a.href = URL.createObjectURL(new Blob([f.body], { type: "text/plain" }));
+  a.download = f.name; a.click(); URL.revokeObjectURL(a.href);
 };
 $("btn-restart").onclick = async () => {
   const msg = $("cfg-msg");
@@ -2946,7 +2971,7 @@ if (typeof __nzbd_test_enable !== "undefined") {
     appendLogs, logMatches, renderLogs, serverChipModels, LOG_RING_MAX,
     pageSlice, setPage, setPageSize, renderPager, PAGE_SIZES, PAGE_SIZE_DEFAULT,
     pageState: () => ({ page, pageSize }),
-    hideAppForSetup, SETUP_KEEP, showConfigDurability,
+    hideAppForSetup, SETUP_KEEP, showConfigDurability, advDownloadFile,
     setOpenJob: (id) => { openJob = id; },
     setActiveTab: (t) => { activeTab = t; },
     conn: () => store.conn,

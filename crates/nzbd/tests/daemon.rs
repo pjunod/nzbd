@@ -565,6 +565,38 @@ fn settings_live_apply_restart_flow_keeps_secrets() {
     let (code, _) = try_http(&addr, "PUT", "/api/v1/config", b"{\"nope\": 1}", auth).unwrap();
     assert_eq!(code, 422);
 
+    // 2b) A mask with nothing behind it must be REFUSED, not silently
+    // turned into "no password". Field report 2026-07-26: "it imported the
+    // config file but lost my password" — the merge wrote None when it
+    // could not resolve the placeholder, and the save reported success.
+    // Adding a second server whose password is still the mask is exactly
+    // that case: no name match, no index match, nothing to restore from.
+    let mut renamed = c["config"].clone();
+    let mut extra = renamed["server"][0].clone();
+    extra["name"] = serde_json::json!("brand-new");
+    extra["host"] = serde_json::json!("news2.example.com");
+    extra["password"] = serde_json::json!("***unchanged***");
+    renamed["server"] = serde_json::json!([renamed["server"][0].clone(), extra]);
+    let (code, body) = try_http(
+        &addr,
+        "PUT",
+        "/api/v1/config",
+        renamed.to_string().as_bytes(),
+        auth,
+    )
+    .unwrap();
+    assert_eq!(code, 422, "an unresolvable mask must not save: {body}");
+    assert!(
+        body.contains("brand-new"),
+        "the error names the secret to retype: {body}"
+    );
+    // …and the config on disk still has the real password.
+    let on_disk = std::fs::read_to_string(&cfg_path).unwrap();
+    assert!(
+        on_disk.contains("srv-secret"),
+        "the refused save left the real secret alone"
+    );
+
     // 3) Restart button: daemon bounces, pending clears, auth persists.
     let (code, _) = try_http(&addr, "POST", "/api/v1/restart", b"", auth).unwrap();
     assert_eq!(code, 200);

@@ -1102,6 +1102,24 @@ const models = (jobs) => jobs.map((j, i) => T.rowModel(j, { idx: i, count: jobs.
   ok(warn.innerHTML.includes("/data/queue/nzbd.toml.saved"), "…from where");
   ok(warn.innerHTML.includes("./config:/etc/nzbd"), "…and still shows the mount to add");
 
+  // --- 25. the masked TOML must not masquerade as a backup ---------------
+  // Field report 2026-07-26: "it imported the config file but lost my
+  // password". The settings editor shows every secret as ***unchanged***,
+  // and its Download button handed that text back named `nzbd.toml` — the
+  // exact filename you drop into /etc/nzbd. Restored later, the daemon
+  // authenticated with the placeholder and the provider looked broken.
+  const plain = "[api]\nbind = \"0.0.0.0:6789\"\n";
+  const dPlain = T.advDownloadFile(plain);
+  eq(dPlain.name, "nzbd.toml", "a config with no secrets downloads as the real thing");
+  eq(dPlain.body, plain, "…unaltered");
+
+  const maskedToml = "[[server]]\nhost = \"news\"\npassword = \"***unchanged***\"\n";
+  const dMasked = T.advDownloadFile(maskedToml);
+  eq(dMasked.name, "nzbd-masked.toml", "a masked config does NOT download as nzbd.toml");
+  ok(dMasked.body.startsWith("# NOT A USABLE CONFIG"), "…and says so on line one");
+  ok(dMasked.body.includes("refuses to start"), "…naming what happens if you use it anyway");
+  ok(dMasked.body.includes(maskedToml), "…while still containing the config itself");
+
   if (failures.length) {
     console.error("UI DOM FAILURES:");
     for (const f of failures) console.error("  - " + f);

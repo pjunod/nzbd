@@ -126,6 +126,15 @@ tls = false                 # true = serve HTTPS (NZBGet SecureControl).
 compat_version = "26.2"     # version string the NZBGet shim reports
 username = "nzbd"           # HTTP Basic user (compat ControlUsername)
 # password = "secret"       # setting a password ENABLES auth everywhere
+#
+# Secrets and the settings editor: the web UI never shows a real password —
+# it displays `***unchanged***` and swaps the real value back in when you
+# save. That means the TOML you see (or Download) in the Settings tab is a
+# DISPLAY, NOT A BACKUP. A file restored from that copy would carry the
+# placeholder as your password; nzbd refuses to start on such a config and
+# tells you which field to fix, and the Download button names the masked
+# copy `nzbd-masked.toml` so it cannot be mistaken for the real file. For a
+# real backup, copy `nzbd.toml` off the config volume itself.
 # token = "long-random"     # optional Bearer token alternative
 allow_legacy_default_credentials = false   # opt-in nzbget/tegbzn migration aid
 ```
