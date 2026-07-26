@@ -405,6 +405,26 @@ fn a_finished_download_announces_its_stages_its_final_dir_and_its_history_row() 
         "history and the event must agree on where the files are"
     );
 
+    // ---- N7: the stream is measurable ---------------------------------
+    // "Is the pipeline still pushing, and is anything listening" must be
+    // answerable from a dashboard — a silently-stopped stream otherwise
+    // looks exactly like an idle one.
+    let (code, metrics) = request(&d.addr, "GET", "/metrics", b"", &[]);
+    assert_eq!(code, 200);
+    for line in [
+        "nzbd_events_emitted_total{event=\"job_pp_finished\"} 1",
+        "nzbd_pp_stage_seconds_count{stage=\"par_rename\"}",
+    ] {
+        assert!(
+            metrics.contains(line),
+            "missing {line:?} from /metrics:\n{metrics}"
+        );
+    }
+    assert!(
+        metrics.contains("nzbd_sse_clients 1"),
+        "the open subscription must be visible as a gauge:\n{metrics}"
+    );
+
     // The compat surface agrees too: an *arr path-mapping off `DestDir`
     // and a consumer reading `final_dir` must not be sent to two places.
     let (code, body) = request(

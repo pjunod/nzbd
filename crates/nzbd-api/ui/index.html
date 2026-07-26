@@ -1691,18 +1691,29 @@ function renderClients() {
   if (!cl.length) {
     reconcileRows(strip, [{
       key: "__none", kind: "chip", cls: "cl",
-      text: "no API clients seen yet — a connected Sonarr/Radarr polls every ~30 s",
+      text: "no API clients seen yet — a connected Sonarr/Radarr polls every ~30 s, a subscriber holds /api/v1/events open",
     }], dom);
     return;
   }
   const now = Date.now() / 1000;
   reconcileRows(strip, cl.map(c => {
-    const live = now - c.last_seen_unix < 120;
+    // A subscriber holding an open event stream is attached whether or
+    // not it has called anything lately — push consumers legitimately go
+    // quiet for hours, and calling that "quiet" would report the one
+    // connection that matters most as if it were half dead.
+    const subs = c.event_subscriptions || 0;
+    const live = subs > 0 || now - c.last_seen_unix < 120;
+    const how = subs > 0
+      ? (subs > 1 ? "subscribed ×" + subs : "subscribed")
+      : (live ? "polling" : "quiet");
     return {
       key: "c" + c.user_agent, kind: "chip",
       cls: "cl" + (live ? " live" : ""),
-      text: c.user_agent + " · " + (live ? "polling" : "quiet") + " · " + fmtAgo(c.last_seen_unix),
-      tip: c.calls + " calls since " + fmtTime(c.first_seen_unix) + " — last: " + c.last_method,
+      text: c.user_agent + " · " + how + " · " + fmtAgo(c.last_seen_unix),
+      tip: c.calls + " calls since " + fmtTime(c.first_seen_unix)
+        + " — last: " + c.last_method
+        + " · " + (c.api === "native" ? "native API" : "nzbget-compat API")
+        + (subs > 0 ? " · receiving events live" : ""),
     };
   }), dom);
 }

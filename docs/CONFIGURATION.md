@@ -61,6 +61,32 @@ unpack = true                    # optional per-category unpack override
 extensions = []                  # extension scripts to run for this category
 ```
 
+`name` is matched against the job's category case-insensitively, so an
+*arr sending `TV` lands on `name = "tv"`.
+
+`dest_dir` is a **move at the end of post-processing**, not a different
+download target: the engine always writes under `paths.dest_dir`, and the
+finished folder is relocated to `<category dest_dir>/<job name>` before
+extension scripts run and before any path is reported. Cross-filesystem
+destinations work (the move falls back to copy-then-remove), which is the
+usual homelab shape — download on the SSD, library on the NAS. If the
+move fails, the failure is logged loudly and every reported path names
+where the files actually are, not where they were meant to go.
+
+`unpack` overrides `[post] unpack` for this category only. `extensions`
+names the post-processing scripts this category runs, by file name or
+stem (`"Clean.py"` and `"clean"` both select `Clean.py`); an empty list —
+the default — runs every discovered script, which is the global behavior.
+
+> **Behavior change (integration phase 1).** These three keys were parsed
+> and advertised to compat clients as `CategoryN.DestDir` / `.Unpack` /
+> `.Extensions` for a long time while post-processing ignored all of
+> them. A config that set `dest_dir` "expecting nothing to happen" will
+> now see files move there. This was fixed rather than documented as a
+> quirk because an *arr path-maps off the advertised value: advertised
+> paths that are not actual paths are a silent import failure with
+> nothing in any log to explain it.
+
 ## `[queue]`
 
 ```toml

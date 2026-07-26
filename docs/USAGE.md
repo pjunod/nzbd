@@ -141,13 +141,20 @@ per-job passwords (`*Unpack:Password`) behave like NZBGet. XML-RPC
 
 ## The *arr handoff, demystified
 
-There is no push: **Sonarr/Radarr poll nzbd's history** (every ~30 s)
-for entries they queued, import the files themselves, and then delete
-the history entry (NZBGet `HistoryDelete` — which *hides*, not erases).
-If the *arr is down when a download finishes, nothing is lost — the
-entry waits in history and gets picked up on the next poll after it
-returns. Downloads only rot on disk when an import fails silently on
-the *arr side, which is exactly the case nzbd now makes visible.
+The handoff is a **pull, and it still works if nothing else does**:
+Sonarr/Radarr poll nzbd's history (every ~30 s) for entries they queued,
+import the files themselves, and then delete the history entry (NZBGet
+`HistoryDelete` — which *hides*, not erases). If the *arr is down when a
+download finishes, nothing is lost — the entry waits in history and gets
+picked up on the next poll after it returns. Downloads only rot on disk
+when an import fails silently on the *arr side, which is exactly the
+case nzbd makes visible.
+
+A consumer that would rather **not wait up to 30 s** can subscribe
+instead of polling — see "Subscribing to the handoff" below. Push is an
+optimization on top of this pull, never a replacement for it: nzbd makes
+no outbound connections and does not know any consumer's address, so a
+subscriber that never connects loses nothing the poll cannot recover.
 
 The **History** tab shows each stage of that pull:
 
@@ -166,6 +173,65 @@ Manual controls per entry: **restore** re-exposes a hidden entry so a
 connected *arr re-imports it on its next poll (the fix for "imported
 but the files went missing"); **hide** does the reverse; **forget**
 drops the record and keeps files; **delete files** removes both.
+
+## Subscribing to the handoff
+
+`GET /api/v1/events` is a Server-Sent Events stream carrying everything
+the engine does. Two events cover the handoff:
+
+- `job_pp_stage` — post-processing entered a stage (`par_verify`,
+  `unpack`, `move`, …). This is what turns "stuck on something" into
+  "repairing, since four minutes ago".
+- `job_pp_finished` — post-processing ended. Carries `pp_status`, the
+  job's params, and **`final_dir`: where the files actually are**. Note
+  that the older `job_finished` fires when the *download* ends, before
+  any of this.
+
+```bash
+curl -N -H 'Authorization: Bearer <token>' \
+     -H 'X-Nzbd-Client: myapp/1.0' \
+     http://localhost:6789/api/v1/events
+```
+
+Send `X-Nzbd-Client` and your subscription shows up in the connected
+clients strip, so "is it attached right now" is a glance rather than a
+guess. `EventSource` in a browser cannot set headers; a server-side
+consumer using a plain HTTP client can.
+
+**Resuming.** Every engine event carries `id: <seq>` (also in the body as
+`seq`). Reconnect with `Last-Event-ID: <the last seq you handled>` and
+nzbd replays exactly what you missed. Two things to handle:
+
+- `event: reset` with `{"reason":"gap"}` means the gap could not be
+  covered — you were away longer than the 1024-event buffer, or the
+  daemon restarted (`seq` is process-lifetime and starts over). Do a full
+  reconcile before trusting the stream again.
+- `event: lagged` with `{"skipped":N}` means *your* connection fell
+  behind. Reconnect with your `Last-Event-ID` to fill the hole.
+
+**The reconcile that always works.** `GET /api/v1/history?since_seq=N`
+returns entries newer than cursor `N`, oldest first, including entries
+another client has hidden. Take the last row's `seq` as your next cursor.
+`job_pp_finished` carries the `history_seq` of the row it refers to, and
+is emitted only after that row is durably written — so reacting to the
+event by reading `?since_seq=<history_seq - 1>` is guaranteed to find it,
+with no retry loop. A consumer that was offline for a week catches up
+from the cursor alone; the event stream is the fast path, the cursor is
+the correct one.
+
+**Tagging your downloads.** Add jobs with your own tracking id:
+
+```bash
+curl -X POST --data-binary @release.nzb \
+     -H 'X-Nzbd-Client: myapp/1.0' \
+     'http://localhost:6789/api/v1/jobs?name=Show.S01E01&category=tv&params=%7B%22myapp-id%22%3A%22t-42%22%7D'
+```
+
+`params` is a URL-encoded JSON object of strings. The id then appears on
+the job in the queue, on the `job_pp_finished` event, in the history
+entry and in compat `Parameters` — so grepping any log for it finds the
+whole story. Keys beginning with `*` are reserved for nzbd's internals
+and are rejected with a 422 naming the key.
 
 
 ## Native API

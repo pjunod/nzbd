@@ -35,6 +35,15 @@ Optionally runs as a **multi-node cluster** over a shared work volume.
   renames, then a final job-name pass (SABnzbd-style dominant-file rule,
   plus numbered season packs, which SABnzbd skips). Evidence always beats
   heuristics; every rename is logged and recorded in history.
+- **A handoff you can watch, not infer** — the event stream reports every
+  post-processing stage and a completion carrying `final_dir`, so a
+  consumer learns where the files landed instead of polling history and
+  guessing. Frames are numbered and resumable (`Last-Event-ID`), a gap
+  too big to replay says so rather than looking contiguous, and
+  `GET /api/v1/history?since_seq=N` reconstructs anything the stream
+  dropped. Tag a download with your own id at add time and grep for it
+  across the whole pipeline. nzbd makes no outbound connections: push is
+  an optimization over the poll, never a replacement.
 - **RSS/Atom feeds** with the NZBGet filter language
   (`Accept`/`Reject`/`Require`, wildcards, size/age windows, per-rule
   category/priority/dupe options).
@@ -100,6 +109,7 @@ NZBGet configuration and prints a mapping report.
 | [docs/USAGE.md](docs/USAGE.md) | CLI, web UI, connecting the *arr apps, RSS feeds + filter language, extension scripts, deobfuscation |
 | [docs/DEPLOY.md](docs/DEPLOY.md) | systemd, Docker Compose, Kubernetes, multi-node cluster deployment |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Design: the whole system, phase by phase |
+| [docs/INTEGRATION_PLAN.md](docs/INTEGRATION_PLAN.md) | The event/cursor contract consumers build against, and how it was built |
 | [docs/CLUSTERING.md](docs/CLUSTERING.md) | Cluster design (ADR-13…16), failure matrix, operations |
 | [STATUS.md](STATUS.md) | What's done, what's next, with commit evidence |
 
