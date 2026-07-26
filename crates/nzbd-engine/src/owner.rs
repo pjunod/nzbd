@@ -1971,6 +1971,12 @@ impl Owner {
                     pp_done: j.params.iter().any(|(k, _)| k == nzbd_types::PP_DONE_PARAM),
                     dupe_key: j.dupe.key.clone(),
                     dupe_score: j.dupe.score,
+                    params: j
+                        .params
+                        .iter()
+                        .filter(|(k, _)| !k.starts_with('*'))
+                        .cloned()
+                        .collect(),
                     rate_bps: 0,
                     retried_articles: 0,
                 };

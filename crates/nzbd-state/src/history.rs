@@ -290,9 +290,12 @@ impl HistoryDb {
     /// consumer's catch-up must still see that the job finished. This is
     /// the path that makes SSE loss harmless: the stream can drop
     /// anything, and `since_seq` still reconstructs it.
-    pub fn list_since(&self, since_seq: i64, limit: usize) -> Result<Vec<HistoryEntry>, StateError> {
-        let sql =
-            format!("SELECT {COLUMNS} FROM history WHERE id > ?1 ORDER BY id ASC LIMIT ?2");
+    pub fn list_since(
+        &self,
+        since_seq: i64,
+        limit: usize,
+    ) -> Result<Vec<HistoryEntry>, StateError> {
+        let sql = format!("SELECT {COLUMNS} FROM history WHERE id > ?1 ORDER BY id ASC LIMIT ?2");
         self.query(&sql, rusqlite::params![since_seq, limit as i64])
     }
 
@@ -574,6 +577,102 @@ mod tests {
             2,
             "rebuilt from JSONL (incl. deleted-locally row)"
         );
+    }
+
+    /// The cursor a consumer walks forward on. Two properties matter and
+    /// both are asserted here: paging from any point returns exactly the
+    /// later rows in ascending order (so the last row's seq is a valid
+    /// next cursor), and the pre-existing `?limit=` path is untouched.
+    #[test]
+    fn since_seq_pages_forward_without_disturbing_the_newest_first_view() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = HistoryDb::open(&tmp.path().join("local/history.sqlite"), None).unwrap();
+        for n in 1..=5 {
+            db.record(&entry(n, 100 * n as i64)).unwrap();
+        }
+
+        let all = db.list_since(0, 100).unwrap();
+        assert_eq!(
+            all.iter().map(|e| e.job.0).collect::<Vec<_>>(),
+            vec![1, 2, 3, 4, 5],
+            "oldest first — a consumer reads forward"
+        );
+        let seqs: Vec<i64> = all.iter().map(|e| e.seq).collect();
+        assert!(seqs.windows(2).all(|w| w[0] < w[1]), "seq is monotone");
+
+        // From every midpoint: exactly the rows after it.
+        for (i, cursor) in seqs.iter().enumerate() {
+            let rest = db.list_since(*cursor, 100).unwrap();
+            assert_eq!(
+                rest.iter().map(|e| e.job.0).collect::<Vec<_>>(),
+                (i as u32 + 2..=5).collect::<Vec<_>>(),
+                "paging from seq {cursor} must return exactly what follows it"
+            );
+        }
+        assert!(db
+            .list_since(*seqs.last().unwrap(), 100)
+            .unwrap()
+            .is_empty());
+        assert_eq!(db.list_since(0, 2).unwrap().len(), 2, "limit applies");
+
+        // A row another client hid is still news to a second consumer
+        // catching up: hidden means "someone else imported it", not
+        // "this never happened".
+        assert!(db.hide(crate::JobId(3), Some("sonarr"), 999).unwrap());
+        assert!(
+            db.list_since(0, 100).unwrap().iter().any(|e| e.job.0 == 3),
+            "the cursor path must not hide rows from a catching-up consumer"
+        );
+
+        // And the UI's view is unchanged: newest first, hidden included.
+        let newest = db.list_filtered(10, true).unwrap();
+        assert_eq!(
+            newest.iter().map(|e| e.job.0).collect::<Vec<_>>(),
+            vec![5, 4, 3, 2, 1]
+        );
+    }
+
+    /// `record_seq` is what lets a completion event name its own history
+    /// row. If it reported the wrong rowid, consumers would page from the
+    /// wrong place and silently skip entries.
+    #[test]
+    fn record_seq_names_the_row_it_just_wrote() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = HistoryDb::open(&tmp.path().join("local/history.sqlite"), None).unwrap();
+        let a = db.record_seq(&entry(1, 100)).unwrap();
+        let b = db.record_seq(&entry(2, 200)).unwrap();
+        assert!(a > 0 && b > a);
+        assert_eq!(
+            db.list_since(a - 1, 10).unwrap().first().map(|e| e.job.0),
+            Some(1),
+            "reading from seq-1 must find the row the write reported"
+        );
+        // Re-recording the same entry is an upsert, not a new row — and it
+        // must still report that row, not the last insert on the handle.
+        assert_eq!(db.record_seq(&entry(1, 100)).unwrap(), a);
+    }
+
+    /// The JSONL is portable and gets re-imported into indices that assign
+    /// their own rowids; persisting one node's seq into it would write a
+    /// number that is wrong everywhere else.
+    #[test]
+    fn the_portable_log_does_not_carry_a_local_rowid() {
+        let tmp = tempfile::tempdir().unwrap();
+        let shared = tmp.path().join("shared");
+        let db = HistoryDb::open(&tmp.path().join("local/history.sqlite"), Some(&shared)).unwrap();
+        db.record(&entry(1, 100)).unwrap();
+        drop(db);
+
+        let line = std::fs::read_to_string(shared.join("history.jsonl")).unwrap();
+        let v: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(
+            v["seq"], 0,
+            "a rowid is index-local and must not be published: {line}"
+        );
+
+        // A fresh index still assigns a usable cursor on rebuild.
+        let db2 = HistoryDb::open(&tmp.path().join("other/history.sqlite"), Some(&shared)).unwrap();
+        assert!(db2.list_since(0, 10).unwrap()[0].seq > 0);
     }
 
     #[test]

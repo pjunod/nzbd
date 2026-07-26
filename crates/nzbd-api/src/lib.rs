@@ -175,13 +175,7 @@ impl ClientRegistry {
         Self::touch(&mut m, client, method, now_unix, "native");
     }
 
-    fn note_api(
-        &self,
-        user_agent: Option<&str>,
-        method: &str,
-        now_unix: i64,
-        api: &'static str,
-    ) {
+    fn note_api(&self, user_agent: Option<&str>, method: &str, now_unix: i64, api: &'static str) {
         *self.current.lock().unwrap() = user_agent.map(String::from);
         let mut m = self.inner.lock().unwrap();
         Self::touch(&mut m, user_agent, method, now_unix, api);
@@ -244,9 +238,7 @@ impl ClientRegistry {
     /// matters most.
     pub fn snapshot(&self, now_unix: i64) -> Vec<ClientInfo> {
         let mut m = self.inner.lock().unwrap();
-        m.retain(|_, c| {
-            c.event_subscriptions > 0 || now_unix - c.last_seen_unix < CLIENT_TTL_SECS
-        });
+        m.retain(|_, c| c.event_subscriptions > 0 || now_unix - c.last_seen_unix < CLIENT_TTL_SECS);
         let mut v: Vec<ClientInfo> = m.values().cloned().collect();
         drop(m);
         v.sort_by_key(|c| std::cmp::Reverse(c.last_seen_unix));
@@ -1064,7 +1056,10 @@ async fn sse_events(State(st): State<ApiState>, headers: axum::http::HeaderMap) 
     // Note the subscriber so `GET /api/v1/clients` can show that a push
     // consumer is actually attached — "is monarr subscribed right now" is
     // otherwise only answerable by reading logs.
-    let subscriber = st.clients.as_ref().map(|c| c.subscribe(client_name(&headers)));
+    let subscriber = st
+        .clients
+        .as_ref()
+        .map(|c| c.subscribe(client_name(&headers)));
     let guard = hub.stream_guard();
 
     let engine = st.engine.clone();
@@ -1399,7 +1394,10 @@ async fn metrics(State(st): State<ApiState>) -> Response {
             let _ = writeln!(m, "# TYPE nzbd_pp_stage_seconds summary");
             for (stage, count, secs) in rows {
                 let label = stage.as_str();
-                let _ = writeln!(m, "nzbd_pp_stage_seconds_count{{stage=\"{label}\"}} {count}");
+                let _ = writeln!(
+                    m,
+                    "nzbd_pp_stage_seconds_count{{stage=\"{label}\"}} {count}"
+                );
                 let _ = writeln!(m, "nzbd_pp_stage_seconds_sum{{stage=\"{label}\"}} {secs}");
             }
         }
@@ -3005,7 +3003,10 @@ mod tests {
             history_seq: 913,
         });
         assert_eq!(name, "job_pp_finished");
-        assert!(data.contains("\"final_dir\":\"/dest/Show.S01E01\""), "{data}");
+        assert!(
+            data.contains("\"final_dir\":\"/dest/Show.S01E01\""),
+            "{data}"
+        );
         assert!(data.contains("\"history_seq\":913"), "{data}");
         assert!(
             data.contains("monarr-transfer"),

@@ -155,8 +155,7 @@ impl EventHub {
             // `oldest <= last + 1`; anything older fell out of the ring.
             Some(oldest) if oldest > last + 1 => Replay::Reset,
             Some(_) => {
-                let frames: Vec<SeqFrame> =
-                    ring.iter().filter(|f| f.seq > last).cloned().collect();
+                let frames: Vec<SeqFrame> = ring.iter().filter(|f| f.seq > last).cloned().collect();
                 if frames.is_empty() {
                     Replay::Live
                 } else {

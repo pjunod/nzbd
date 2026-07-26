@@ -495,7 +495,16 @@ fn listgroups_json(state: &CompatState) -> Value {
                 "DupeKey": j.dupe_key,
                 "DupeScore": j.dupe_score,
                 "DupeMode": "SCORE",
-                "Parameters": [],
+                // NZBGet reports a queued job's PP parameters here, and
+                // this used to be a hardcoded empty array — so a client
+                // that set a tracking id at add time could not read it
+                // back until the job reached history. Same values the
+                // history projection has always used, same shape.
+                "Parameters": j
+                    .params
+                    .iter()
+                    .map(|(k, v)| json!({ "Name": k, "Value": v }))
+                    .collect::<Vec<_>>(),
                 "ScriptStatuses": [],
                 "ServerStats": [],
                 "PostInfoText": "NONE",

@@ -35,8 +35,10 @@ impl PpStageStats {
     pub fn record(&self, stage: PostStage, elapsed: std::time::Duration) {
         let i = Self::index(stage);
         self.count[i].fetch_add(1, Ordering::Relaxed);
-        self.millis[i]
-            .fetch_add(elapsed.as_millis().min(u64::MAX as u128) as u64, Ordering::Relaxed);
+        self.millis[i].fetch_add(
+            elapsed.as_millis().min(u64::MAX as u128) as u64,
+            Ordering::Relaxed,
+        );
     }
 
     /// `(stage, runs, total seconds)` for every stage that has ever run.
@@ -71,7 +73,10 @@ mod tests {
 
         let snap = s.snapshot();
         assert_eq!(snap.len(), 2, "only the stages that ran are reported");
-        let unpack = snap.iter().find(|(st, ..)| *st == PostStage::Unpack).unwrap();
+        let unpack = snap
+            .iter()
+            .find(|(st, ..)| *st == PostStage::Unpack)
+            .unwrap();
         assert_eq!(unpack.1, 2);
         assert!((unpack.2 - 2.0).abs() < f64::EPSILON);
     }

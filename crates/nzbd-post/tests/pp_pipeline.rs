@@ -722,3 +722,210 @@ async fn health_action_delete_removes_files() {
     tracker.wait().await;
     engine.shutdown().await;
 }
+
+// ---------------------------------------------------------------------------
+// N6 — category destination honesty (docs/INTEGRATION_PLAN.md)
+// ---------------------------------------------------------------------------
+
+/// `[[category]] dest_dir` was parsed and advertised to compat clients as
+/// `CategoryN.DestDir` for a long time while post-processing quietly wrote
+/// somewhere else. An *arr that path-maps off the advertised value then
+/// looks in a folder that will never contain anything — a silent import
+/// failure with nothing in any log to explain it. Advertised must equal
+/// actual, and "actual" means: the files are there, and every place we
+/// report the path agrees.
+#[tokio::test]
+async fn category_dest_dir_is_where_the_files_actually_land() {
+    let tmp = tempfile::tempdir().unwrap();
+    let engine = spawn_engine(tmp.path()).await;
+    let dir = tmp.path().join("dest/catjob");
+    std::fs::create_dir_all(&dir).unwrap();
+    let data = b"payload".to_vec();
+    std::fs::write(dir.join("payload.bin"), &data).unwrap();
+
+    let library = tmp.path().join("library/tv");
+    let mut job = completed_job(1, "catjob", vec![file_entry(1, "payload.bin", None, false)]);
+    job.category = Some("TV".into()); // matched case-insensitively
+    engine.import_job(job, false, false).await.unwrap();
+
+    let hist = history(tmp.path());
+    let cfg = PostConfig {
+        // Off so the assertion below can name the file: the final
+        // deobfuscation pass would rename it to the job name, which is a
+        // different feature's business.
+        deobfuscate_final: false,
+        categories: vec![nzbd_post::manager::CategoryRule {
+            name: "tv".into(),
+            dest_dir: Some(library.clone()),
+            ..Default::default()
+        }],
+        ..PostConfig::default()
+    };
+    let out = process_job(&engine, &cfg, &hist, &tmp.path().join("dest"), JobId(1))
+        .await
+        .unwrap();
+    assert_eq!(out, PpFinal::Success);
+
+    let landed = library.join("catjob/payload.bin");
+    assert!(
+        std::fs::read(&landed).unwrap_or_default() == data,
+        "files must be under the category destination: {}",
+        landed.display()
+    );
+    assert!(
+        !tmp.path().join("dest/catjob").exists(),
+        "and must not be left behind in the global destination"
+    );
+    let entry = &hist.list(10).unwrap()[0];
+    assert_eq!(
+        entry.final_dir.as_deref(),
+        library.join("catjob").to_str(),
+        "history must report where the files are, not where they started"
+    );
+    engine.shutdown().await;
+}
+
+/// A category that turns unpacking off must actually leave the archive
+/// alone. (The key was advertised as `CategoryN.Unpack` and ignored.)
+#[tokio::test]
+async fn category_unpack_false_leaves_the_archive_alone() {
+    if !require_tool("7z") {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let engine = spawn_engine(tmp.path()).await;
+    let dir = tmp.path().join("dest/nounpack");
+    std::fs::create_dir_all(&dir).unwrap();
+    let inner = dir.join("inside.txt");
+    std::fs::write(&inner, b"secret").unwrap();
+    let archive = dir.join("bundle.7z");
+    let ok = std::process::Command::new("7z")
+        .arg("a")
+        .arg(&archive)
+        .arg(&inner)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    assert!(ok, "could not build the test archive");
+    std::fs::remove_file(&inner).unwrap();
+
+    let mut job = completed_job(1, "nounpack", vec![file_entry(1, "bundle.7z", None, false)]);
+    job.category = Some("raw".into());
+    engine.import_job(job, false, false).await.unwrap();
+
+    let hist = history(tmp.path());
+    let cfg = PostConfig {
+        categories: vec![nzbd_post::manager::CategoryRule {
+            name: "raw".into(),
+            unpack: Some(false),
+            ..Default::default()
+        }],
+        ..PostConfig::default()
+    };
+    process_job(&engine, &cfg, &hist, &tmp.path().join("dest"), JobId(1))
+        .await
+        .unwrap();
+
+    assert!(archive.is_file(), "the archive must survive");
+    assert!(
+        !inner.exists(),
+        "nothing should have been extracted for a category with unpack = false"
+    );
+    engine.shutdown().await;
+}
+
+/// `extensions` selects which post-processing scripts a category runs.
+/// The key was parsed and then neither implemented nor removed; leaving it
+/// half-done is the same lie as `dest_dir` was.
+#[tokio::test]
+async fn category_extensions_select_which_scripts_run() {
+    let tmp = tempfile::tempdir().unwrap();
+    let engine = spawn_engine(tmp.path()).await;
+    let dir = tmp.path().join("dest/scripted");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("payload.bin"), b"x").unwrap();
+
+    let scripts = tmp.path().join("scripts");
+    std::fs::create_dir_all(&scripts).unwrap();
+    let touched = tmp.path().join("touched");
+    for name in ["wanted.sh", "unwanted.sh"] {
+        let path = scripts.join(name);
+        std::fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\n### NZBGET POST-PROCESSING SCRIPT ###\n\
+                 echo {name} >> {}\nexit 93\n",
+                touched.display()
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+
+    let mut job = completed_job(
+        1,
+        "scripted",
+        vec![file_entry(1, "payload.bin", None, false)],
+    );
+    job.category = Some("tv".into());
+    engine.import_job(job, false, false).await.unwrap();
+
+    let hist = history(tmp.path());
+    let cfg = PostConfig {
+        scripts_dir: Some(scripts),
+        categories: vec![nzbd_post::manager::CategoryRule {
+            name: "tv".into(),
+            extensions: vec!["wanted".into()], // by stem; the file is wanted.sh
+            ..Default::default()
+        }],
+        ..PostConfig::default()
+    };
+    process_job(&engine, &cfg, &hist, &tmp.path().join("dest"), JobId(1))
+        .await
+        .unwrap();
+
+    let ran = std::fs::read_to_string(&touched).unwrap_or_default();
+    assert!(ran.contains("wanted.sh"), "the selected script must run");
+    assert!(
+        !ran.contains("unwanted.sh"),
+        "a script outside the category's extensions must not run: {ran:?}"
+    );
+    engine.shutdown().await;
+}
+
+/// A job with no matching category behaves exactly as before — the global
+/// destination, the global unpack setting, every discovered script.
+#[tokio::test]
+async fn a_job_without_a_category_rule_is_untouched_by_any_of_this() {
+    let tmp = tempfile::tempdir().unwrap();
+    let engine = spawn_engine(tmp.path()).await;
+    let dir = tmp.path().join("dest/plain");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("payload.bin"), b"x").unwrap();
+
+    let mut job = completed_job(1, "plain", vec![file_entry(1, "payload.bin", None, false)]);
+    job.category = Some("movies".into()); // configured category is "tv"
+    engine.import_job(job, false, false).await.unwrap();
+
+    let hist = history(tmp.path());
+    let cfg = PostConfig {
+        deobfuscate_final: false,
+        categories: vec![nzbd_post::manager::CategoryRule {
+            name: "tv".into(),
+            dest_dir: Some(tmp.path().join("library/tv")),
+            ..Default::default()
+        }],
+        ..PostConfig::default()
+    };
+    process_job(&engine, &cfg, &hist, &tmp.path().join("dest"), JobId(1))
+        .await
+        .unwrap();
+
+    assert!(dir.join("payload.bin").is_file(), "stays put");
+    assert_eq!(hist.list(10).unwrap()[0].final_dir.as_deref(), dir.to_str());
+    engine.shutdown().await;
+}

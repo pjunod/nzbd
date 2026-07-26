@@ -42,6 +42,12 @@ pub struct JobSummary {
     /// Duplicate-detection metadata (empty key = no dupe tracking).
     pub dupe_key: String,
     pub dupe_score: i32,
+    /// The job's non-internal parameters — a consumer's own tracking id
+    /// (`drone`, `monarr-transfer`) among them. Carried on the snapshot so
+    /// the queue UI and `GET /api/v1/jobs/{id}` can show it without an
+    /// export round-trip: the whole value of a transfer id is that you can
+    /// SEE it on the job it belongs to. `*`-internal params stay out.
+    pub params: Vec<(String, String)>,
 }
 
 #[derive(Debug, Clone, Serialize)]

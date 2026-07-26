@@ -585,10 +585,7 @@ pub async fn process_job_ctx(
     // (PostStage::Move), not a different download target.
     let mut dir = dest_dir.join(&sanitized);
     let rule = cfg.rule_for(job.category.as_deref()).cloned();
-    let unpack_enabled = rule
-        .as_ref()
-        .and_then(|r| r.unpack)
-        .unwrap_or(cfg.unpack);
+    let unpack_enabled = rule.as_ref().and_then(|r| r.unpack).unwrap_or(cfg.unpack);
     // Superseded staging dirs (a reclaimed lease's leftovers) are garbage
     // by definition — this lease is now the only live executor.
     let staging = dir.join(format!(".pp.{}", ctx.tag));
@@ -782,7 +779,9 @@ pub async fn process_job_ctx(
     if let Some(scripts_dir) = &cfg.scripts_dir {
         let scripts = select_scripts(
             discover(scripts_dir),
-            rule.as_ref().map(|r| r.extensions.as_slice()).unwrap_or(&[]),
+            rule.as_ref()
+                .map(|r| r.extensions.as_slice())
+                .unwrap_or(&[]),
         );
         if !scripts.is_empty() {
             stages.enter(PostStage::Script).await;
@@ -804,7 +803,12 @@ pub async fn process_job_ctx(
                                 if let Some(set) = par2::load_dir(&dir)? {
                                     if let Some(main) = set.main_path {
                                         let _ = repair_loop(
-                                            engine, cfg, &par_tool, &mut stages, job_id, &main,
+                                            engine,
+                                            cfg,
+                                            &par_tool,
+                                            &mut stages,
+                                            job_id,
+                                            &main,
                                         )
                                         .await;
                                     }
@@ -966,7 +970,8 @@ fn select_scripts(found: Vec<PathBuf>, extensions: &[String]) -> Vec<PathBuf> {
         .into_iter()
         .filter(|p| {
             let name = |f: Option<&std::ffi::OsStr>| {
-                f.map(|s| s.to_string_lossy().into_owned()).unwrap_or_default()
+                f.map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_default()
             };
             let file = name(p.file_name());
             let stem = name(p.file_stem());
