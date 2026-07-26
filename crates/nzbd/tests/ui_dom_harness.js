@@ -1081,6 +1081,18 @@ const models = (jobs) => jobs.map((j, i) => T.rowModel(j, { idx: i, count: jobs.
   ok(warn.innerHTML.includes("./config:/etc/nzbd"), "…shows the volume line that fixes it");
   ok(warn.innerHTML.includes("/data/queue/nzbd.toml.saved"), "…and where the durable copy lives");
 
+  // (c2) in the WIZARD there is no config yet, so there is no state dir to
+  // name — the banner must promise the behaviour instead of printing a
+  // mirror path derived from a main_dir the operator has not chosen. Live
+  // check 2026-07-26 against nuc3: setup mode reports writable=true,
+  // container=true and no config at all, which is exactly this state.
+  ok(T.showConfigDurability({ config_path: "/etc/nzbd/nzbd.toml", durable: false }),
+    "the wizard still warns about an ephemeral config directory");
+  ok(!/nzbd\.toml\.saved/.test(warn.innerHTML),
+    "…without inventing a path for a config that does not exist yet");
+  ok(warn.innerHTML.includes("as soon as you save"),
+    "…promising the durable copy from the moment there is something to copy");
+
   // (d) after a recovery it reports what happened, not just what might
   ok(T.showConfigDurability({
     config_path: "/etc/nzbd/nzbd.toml", durable: false,

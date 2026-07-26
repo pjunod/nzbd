@@ -798,6 +798,14 @@ fn first_run_setup_wizard_writes_config_and_reloads() {
     assert_eq!(code, 200);
     let v: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(v["setup_mode"], true, "{body}");
+    // No config yet means no state directory, so the wizard must not name a
+    // mirror path: `current` is still Config::default() there, and reporting
+    // its state_dir would print a confident path derived from a main_dir the
+    // operator has not chosen yet.
+    assert!(
+        v["mirror_path"].is_null(),
+        "setup mode must not name a mirror: {body}"
+    );
 
     let req = serde_json::json!({
         "main_dir": tmp.path().join("data").to_string_lossy(),
@@ -844,6 +852,23 @@ fn first_run_setup_wizard_writes_config_and_reloads() {
     assert_eq!(
         saved, text,
         "the mirror is the config, not a re-render of it"
+    );
+
+    // …and once a config exists the endpoint names it, so the UI banner can
+    // tell the operator where their safety net actually lives.
+    let (_, body) = try_http(
+        &api_addr,
+        "GET",
+        "/api/v1/setup",
+        b"",
+        Some("nzbd:wizard-pw"),
+    )
+    .unwrap();
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(
+        v["mirror_path"].as_str(),
+        Some(mirror.display().to_string().as_str()),
+        "a running daemon names its mirror: {body}"
     );
 
     // Authenticated requests work; setup mode is over.

@@ -2722,7 +2722,11 @@ function showConfigDurability(s) {
         ? "nzbd also keeps a durable copy at <code>" + esc(s.mirror_path) +
           "</code> and restores from it automatically, so you will not lose your " +
           "settings — but fix the mount."
-        : "");
+        // No config yet, so no state directory to name: promise the
+        // behaviour, not a path we would be guessing at.
+        : "nzbd will keep a durable copy beside its data as soon as you save " +
+          "below, and restore from it automatically — so this is the last time " +
+          "a recreate can send you back to this form. Fix the mount anyway.");
   }
   box.innerHTML = html;
   box.hidden = !html;

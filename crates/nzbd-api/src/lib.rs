@@ -1674,10 +1674,16 @@ async fn get_setup(State(st): State<ApiState>) -> Response {
             // Set when this boot recovered the config from the data volume
             // because the config file was gone.
             "recovered_from": s.recovered_from.as_ref().map(|p| p.display().to_string()),
-            // Where the durable copy lives, so the UI can name it.
-            "mirror_path": nzbd_config::durable::mirror_path(
-                &s.current.lock().unwrap().state_dir()
-            ).display().to_string(),
+            // Where the durable copy lives, so the UI can name it — but
+            // ONLY once there is a real config. In setup mode `current` is
+            // still Config::default(), so this would name a state dir
+            // derived from a main_dir the operator has not chosen yet: a
+            // confident, wrong path. Null means "not until you save".
+            "mirror_path": (!s.setup_mode).then(|| {
+                nzbd_config::durable::mirror_path(&s.current.lock().unwrap().state_dir())
+                    .display()
+                    .to_string()
+            }),
             // Lets the UI explain that config_path is a *container* path
             // and how to find its host side (docker inspect / docker cp).
             "container": in_container(),
