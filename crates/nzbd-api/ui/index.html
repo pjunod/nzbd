@@ -44,7 +44,7 @@
   header { display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap; }
   #theme { margin-left: 8px; }
   header h1 { font-size: 20px; margin: 0; letter-spacing: -.01em; }
-  header .ver { color: var(--muted); font-size: 12px; }
+  footer .ver { color: var(--muted); }
   header .spacer { flex: 1; }
 
   .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
@@ -320,7 +320,6 @@
 <div class="wrap">
   <header>
     <h1>nzbd</h1>
-    <span class="ver" id="ver"></span>
     <span class="spacer"></span>
     <span class="badges" id="srv-chips"></span>
     <span class="badges" id="badges"></span>
@@ -473,7 +472,7 @@
     </div>
   </section>
 
-  <footer>nzbd — NZBGet-compatible usenet daemon · <a href="/api/v1/openapi.json" style="color:var(--muted)">API</a> · <a href="/metrics" style="color:var(--muted)">metrics</a></footer>
+  <footer>nzbd <span class="ver" id="ver"></span> — NZBGet-compatible usenet daemon · <a href="/api/v1/openapi.json" style="color:var(--muted)">API</a> · <a href="/metrics" style="color:var(--muted)">metrics</a></footer>
 </div>
 <div id="toasts" aria-live="polite" role="status"></div>
 
@@ -1385,7 +1384,16 @@ function renderStatus() {
   if (!s) return;
   store.healthAbort = !!s.health_abort;
   setPauseButtons(!!s.download_paused);
-  setText($("ver"), "v" + s.version);
+  // The footer version identifies the BUILD, not the project: version,
+  // git hash when the build had one, and the compile stamp in the tooltip
+  // — "which build is this box actually running?" must be answerable from
+  // the page itself.
+  const ver = $("ver");
+  setText(ver, "v" + s.version);
+  if (ver && s.built) {
+    const tip = "built " + s.built + " — the build this daemon is running";
+    if (ver.title !== tip) ver.title = tip;
+  }
   setText($("s-rate"), fmtRate(s.download_rate_bps));
   setText($("s-eta"), s.download_paused ? "paused"
     : fmtEta(s.remaining_bytes, s.download_rate_bps));
@@ -2726,7 +2734,7 @@ if (typeof __nzbd_test_enable !== "undefined") {
     __setClocks: (tick, hb) => { lastTickAt = tick; lastHbAt = hb; },
     __setRateClock: (t) => { ratePushedAt = t; },
     PENDING_TTL_MS, PENDING_HARD_MS, UNDO_MS, ARM_MS, refreshTab,
-    armButton, armIsSet, disarmButton, histKey, renderHistory,
+    armButton, armIsSet, disarmButton, histKey, renderHistory, renderStatus,
     deleteJob, requeueJob, jobAction, histAction, post,
     pushRate, pushRateSampled, rateSeries, spark, SPARK_N, titleFor,
     appendLogs, logMatches, renderLogs, serverChipModels, LOG_RING_MAX,

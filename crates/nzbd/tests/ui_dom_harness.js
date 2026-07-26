@@ -677,6 +677,28 @@ const models = (jobs) => jobs.map((j, i) => T.rowModel(j, { idx: i, count: jobs.
   T.connState("live");
 }
 
+// --- 19c². the version identifies the build, from the footer --------------
+// Field request 2026-07-26: a version pinned at the top that never changes
+// identifies nothing. It lives in the footer now and renderStatus feeds it
+// the daemon's build identity (version+hash, compile stamp in the tooltip).
+{
+  ok(html.indexOf("<footer>") >= 0 && html.indexOf("<footer>") < html.indexOf('id="ver"'),
+    "the version element lives in the footer, not the header");
+  const ver = sandbox.document.getElementById("ver");
+  ver.textContent = ""; ver.__t = undefined; ver.title = "";
+  T.store.status = {
+    version: "0.1.0+gdeadbee42", built: "2026-07-26 21:14 UTC",
+    download_paused: false, download_rate_bps: 0, remaining_bytes: 0,
+    session_downloaded_bytes: 0, jobs_downloading: 0, jobs_queued: 0,
+    blocked_servers: [], servers: [], health_abort: false,
+    speed_limit_bps: null, disk_low: false, quota_reached: false,
+  };
+  T.renderStatus();
+  eq(ver.textContent, "v0.1.0+gdeadbee42", "footer shows version + git hash");
+  ok(ver.title.includes("built 2026-07-26 21:14 UTC"),
+    "…and the tooltip carries the compile stamp");
+}
+
 // --- 19d. the sparkline survives on polls, sampled ------------------------
 // The old page fed the sparkline only from SSE ticks: on a dead stream the
 // rate number kept polling while the shape froze. Poll data feeds it now,
