@@ -200,6 +200,54 @@ impl Engine {
         // exists) and fail same-URL pile-ups as duplicates.
         let (refetch, refetch_dupes) =
             crate::owner::plan_url_refetches(owner.pending_url_fetches());
+
+        // Destination free-space prober — OFF the owner loop. statvfs on a
+        // write-saturated FUSE/network destination blocks for seconds, and
+        // running it inline every 10th tick starved lease handout: speed
+        // sawtoothed 30% down and slowly back at >100 MiB/s (field report
+        // 2026-07-26). The owner reads the cached answer; only this task
+        // (on a blocking thread) ever touches the syscall.
+        if cfg.tuning.min_free_disk_bytes > 0 {
+            let disk_free = owner.disk_free_handle();
+            // Prime the cache once before the owner starts, so the very
+            // first guard tick sees a real number — a daemon booting onto a
+            // full disk must hold downloads within a second, not a probe
+            // cycle later.
+            let d = cfg.dest_dir.clone();
+            let free = tokio::task::spawn_blocking(move || crate::volumes::free_space(&d))
+                .await
+                .unwrap_or(u64::MAX);
+            disk_free.store(free, std::sync::atomic::Ordering::Relaxed);
+            let dest = cfg.dest_dir.clone();
+            let probe_cancel = cancel.clone();
+            tracker.spawn(async move {
+                let mut tick = tokio::time::interval(std::time::Duration::from_secs(10));
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                loop {
+                    tokio::select! {
+                        _ = probe_cancel.cancelled() => break,
+                        _ = tick.tick() => {
+                            let d = dest.clone();
+                            let started = std::time::Instant::now();
+                            let free =
+                                tokio::task::spawn_blocking(move || crate::volumes::free_space(&d))
+                                    .await
+                                    .unwrap_or(u64::MAX);
+                            let ms = started.elapsed().as_millis() as u64;
+                            if ms > 2000 {
+                                tracing::warn!(
+                                    ms,
+                                    "free-space probe (statvfs) on the destination is slow — volume saturated? \
+                                     the disk-low guard reacts up to one probe late; nothing else waits on this"
+                                );
+                            }
+                            disk_free.store(free, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
+                }
+            });
+        }
+
         tracker.spawn(owner.run(engine_rx));
 
         // Connection tasks: `max_connections` per active server. Tasks are

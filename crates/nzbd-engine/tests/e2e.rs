@@ -742,3 +742,41 @@ async fn url_fetch_resumes_after_restart_with_clean_name() {
     );
     engine.shutdown().await;
 }
+
+/// The disk-low guard reads a CACHED free-space value maintained by a
+/// dedicated prober task — the owner loop never calls statvfs itself. On a
+/// write-saturated FUSE/network destination that syscall blocks for
+/// seconds, and running it inline every 10th tick starved lease handout
+/// (throughput sawtoothed ~30% down and slowly back; field report
+/// 2026-07-26). This drives the whole wired path: prober task → atomic →
+/// guard tick → published snapshot.
+#[tokio::test]
+async fn disk_low_guard_flips_from_the_cached_probe() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join("dest")).unwrap();
+    let mut tuning = test_tuning();
+    tuning.min_free_disk_bytes = u64::MAX; // no real volume clears this bar
+    let engine = Engine::spawn(EngineConfig::single_node(
+        vec![],
+        tmp.path().join("state"),
+        tmp.path().join("dest"),
+        tuning,
+        None,
+    ))
+    .await
+    .expect("engine spawn");
+    // The cache is primed before the owner starts, so this flips on the
+    // first guard tick (~1 s); the deadline is pure slack.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if engine.snapshot().disk_low {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "disk_low never flipped from the cached probe"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    engine.shutdown().await;
+}

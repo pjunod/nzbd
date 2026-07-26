@@ -23,6 +23,7 @@ use nzbd_state::{FsJournal, JobJournals, JournalRecord, SnapshotStore, UncleanMa
 use nzbd_types::{FileId, Health, Job, JobId, JobStatus, SegmentState, ServerDef, ServerId};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio::time::{Duration, Instant, MissedTickBehavior};
@@ -319,6 +320,13 @@ pub(crate) struct Owner {
     /// slow state volume stretches the save cadence instead of consuming
     /// the owner loop.
     last_save_ms: u64,
+    /// Destination free space, updated by a dedicated prober task (engine
+    /// spawn wires it). The owner NEVER calls statvfs itself: on a
+    /// write-saturated FUSE/network destination that syscall blocks for
+    /// seconds, and it used to run inline every 10th tick — starving lease
+    /// handout and cutting throughput 30% on a sawtooth (field report
+    /// 2026-07-26). `u64::MAX` = not yet measured; never trips the guard.
+    disk_free: Arc<AtomicU64>,
     marker: UncleanMarker,
     /// Queue-authority persistence (snapshot save/compact). Worker-mode
     /// engines run with this off; journals stay on regardless.
@@ -477,6 +485,7 @@ impl Owner {
             dirty: false,
             last_save: Instant::now(),
             last_save_ms: 0,
+            disk_free: Arc::new(AtomicU64::new(u64::MAX)),
             volumes: crate::volumes::VolumeBook::load(state_dir, journal_suffix),
             quota_reached: false,
             disk_low: false,
@@ -1742,9 +1751,15 @@ impl Owner {
         true
     }
 
+    /// The prober task's write side, handed out at spawn (lib.rs) so the
+    /// statvfs syscall lives on a blocking thread, never in this loop.
+    pub(crate) fn disk_free_handle(&self) -> Arc<AtomicU64> {
+        self.disk_free.clone()
+    }
+
     fn update_guards(&mut self) {
         if self.tuning.min_free_disk_bytes > 0 {
-            let free = crate::volumes::free_space(&self.dest_dir);
+            let free = self.disk_free.load(Ordering::Relaxed);
             let was = self.disk_low;
             self.disk_low = free < self.tuning.min_free_disk_bytes;
             if self.disk_low != was {
@@ -1784,12 +1799,20 @@ impl Owner {
     fn on_tick(&mut self) {
         let tick_started = Instant::now();
         self.guard_tick = self.guard_tick.wrapping_add(1);
-        // NOT `is_multiple_of`: stabilized in 1.87, MSRV is 1.85.
-        if self.guard_tick % 10 == 0 {
+        // Guards on the FIRST tick and every 10th after (== 1, not == 0:
+        // a fresh boot should know it is out of disk within a second, not
+        // ten). NOT `is_multiple_of`: stabilized in 1.87, MSRV is 1.85.
+        let mut guards_ms = 0u64;
+        if self.guard_tick % 10 == 1 {
+            let t = Instant::now();
             self.update_guards();
+            guards_ms = t.elapsed().as_millis() as u64;
         }
+        let mut volumes_ms = 0u64;
         if self.guard_tick % 30 == 0 {
+            let t = Instant::now();
             self.volumes.save_if_dirty();
+            volumes_ms = t.elapsed().as_millis() as u64;
         }
 
         // ONE wire measurement. The drain is stamped with the wall time it
@@ -1823,7 +1846,9 @@ impl Owner {
         // model the dashboard lives on must not queue behind them — that
         // was the "page shows nothing for a while, then everything jumps"
         // field report.
+        let t = Instant::now();
         self.publish_snapshot(rate);
+        let publish_ms = t.elapsed().as_millis() as u64;
 
         let sync_started = Instant::now();
         if let Err(e) = self.journal.sync() {
@@ -1831,12 +1856,14 @@ impl Owner {
         }
         let sync_ms = sync_started.elapsed().as_millis() as u64;
 
+        let t = Instant::now();
         let pending = std::mem::take(&mut self.pending_finalize);
         for (j, f) in pending {
             if !self.finalize_sent.contains(&f) {
                 self.send_finalize(j, f);
             }
         }
+        let finalize_ms = t.elapsed().as_millis() as u64;
 
         let mut save_ms = 0u64;
         if self.dirty && self.last_save.elapsed() > save_spacing(self.last_save_ms) {
@@ -1847,17 +1874,22 @@ impl Owner {
 
         // A tick that runs long stalls everything behind this loop:
         // commands answer late (a delete can time out client-side and its
-        // row spring back), publishes stop (the UI goes quiet, then
-        // jumps), and drains stretch. Name the culprit with numbers — this
-        // line is what turns "the dashboard goes quiet sometimes" into a
-        // diagnosis of the state volume.
+        // row spring back), lease handout starves (throughput dives), and
+        // publishes queue (the UI goes quiet, then jumps). Every section is
+        // timed separately — the first field report under this warn had the
+        // stall hiding in the ONE untimed section (a statvfs against a
+        // saturated destination volume), so nothing here goes unmeasured.
         let total_ms = tick_started.elapsed().as_millis() as u64;
         if total_ms > 1500 {
             tracing::warn!(
                 total_ms,
+                guards_ms,
+                volumes_ms,
+                publish_ms,
                 journal_sync_ms = sync_ms,
+                finalize_ms,
                 snapshot_save_ms = save_ms,
-                "engine tick ran long — state volume too slow? commands and UI updates stall behind this"
+                "engine tick ran long — the breakdown names the stall; commands and UI updates queue behind this"
             );
         }
     }
