@@ -313,6 +313,8 @@ impl ClusterRuntime {
                 setup: None, // cluster mode always has a config file
                 clients: Some(shared_clients.clone()),
                 shutdown: None,
+                pp_stats: None,
+                events: None, // router_with starts the hub
             })
             .merge(nzbd_compat::router(compat_state)),
             auth,

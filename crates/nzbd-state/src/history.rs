@@ -15,6 +15,13 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+/// Every column a [`HistoryEntry`] is read from, in the order the row
+/// mapper expects. `id` (the cursor `seq`) is appended last so adding it
+/// did not renumber the existing indices.
+const COLUMNS: &str = "job_id, name, category, final_dir, status, size, health, params,
+                       dupe_key, dupe_score, completed_at, hidden, first_seen, last_seen,
+                       seen_count, removed_at, picked_up_by, id";
+
 pub struct HistoryDb {
     conn: Mutex<Connection>,
     jsonl: Option<PathBuf>,
@@ -186,6 +193,15 @@ impl HistoryDb {
     }
 
     fn insert(&self, entry: &HistoryEntry, and_jsonl: bool) -> Result<bool, StateError> {
+        self.insert_seq(entry, and_jsonl).map(|(new, _)| new)
+    }
+
+    /// `insert`, also reporting the row's cursor value — `(was_new, seq)`.
+    /// The rowid is read back rather than taken from `last_insert_rowid`:
+    /// after an upsert that *updated*, that function reports the last
+    /// insert on the connection, which would be some other row. A consumer
+    /// handed a wrong cursor silently skips history.
+    fn insert_seq(&self, entry: &HistoryEntry, and_jsonl: bool) -> Result<(bool, i64), StateError> {
         let conn = self.conn.lock().unwrap();
         let n = conn
             .execute(
@@ -215,16 +231,32 @@ impl HistoryDb {
                 ],
             )
             .map_err(|e| StateError::Corrupt(format!("sqlite insert: {e}")))?;
+        let seq = conn
+            .query_row(
+                "SELECT id FROM history WHERE job_id = ?1 AND completed_at = ?2",
+                rusqlite::params![entry.job.0, entry.completed_at_unix],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap_or(0);
         drop(conn);
         if n > 0 && and_jsonl {
             self.append_jsonl(entry)?;
         }
-        Ok(n > 0)
+        Ok((n > 0, seq))
     }
 
     pub fn record(&self, entry: &HistoryEntry) -> Result<(), StateError> {
         self.insert(entry, true)?;
         Ok(())
+    }
+
+    /// `record`, returning the entry's cursor value (`seq`) so a caller
+    /// can publish "the row you want is at N" in the same breath as the
+    /// event announcing it. This is what makes the `job_pp_finished`
+    /// ordering guarantee usable: the consumer gets the event *and* the
+    /// exact cursor, and never has to guess how far to page back.
+    pub fn record_seq(&self, entry: &HistoryEntry) -> Result<i64, StateError> {
+        self.insert_seq(entry, true).map(|(_, seq)| seq)
     }
 
     /// Visible (non-hidden) entries — what NZBGet-compat clients see.
@@ -237,23 +269,44 @@ impl HistoryDb {
         limit: usize,
         include_hidden: bool,
     ) -> Result<Vec<HistoryEntry>, StateError> {
-        let conn = self.conn.lock().unwrap();
         let sql = format!(
-            "SELECT job_id, name, category, final_dir, status, size, health, params,
-                    dupe_key, dupe_score, completed_at, hidden, first_seen, last_seen,
-                    seen_count, removed_at, picked_up_by
-             FROM history {} ORDER BY completed_at DESC, id DESC LIMIT ?1",
+            "SELECT {COLUMNS} FROM history {} ORDER BY completed_at DESC, id DESC LIMIT ?1",
             if include_hidden {
                 ""
             } else {
                 "WHERE hidden = 0"
             }
         );
+        self.query(&sql, rusqlite::params![limit as i64])
+    }
+
+    /// The cursor form: every entry newer than `since_seq`, oldest first.
+    ///
+    /// Ascending and hidden-inclusive, both deliberately. Ascending
+    /// because a consumer walking forward must be able to take the last
+    /// row's `seq` as its next cursor — descending would make the cursor
+    /// meaningless mid-page. Hidden-inclusive because "hidden" means some
+    /// *other* client removed the entry after its own import; a second
+    /// consumer's catch-up must still see that the job finished. This is
+    /// the path that makes SSE loss harmless: the stream can drop
+    /// anything, and `since_seq` still reconstructs it.
+    pub fn list_since(&self, since_seq: i64, limit: usize) -> Result<Vec<HistoryEntry>, StateError> {
+        let sql =
+            format!("SELECT {COLUMNS} FROM history WHERE id > ?1 ORDER BY id ASC LIMIT ?2");
+        self.query(&sql, rusqlite::params![since_seq, limit as i64])
+    }
+
+    fn query(
+        &self,
+        sql: &str,
+        params: &[&dyn rusqlite::ToSql],
+    ) -> Result<Vec<HistoryEntry>, StateError> {
+        let conn = self.conn.lock().unwrap();
         let mut stmt = conn
-            .prepare(&sql)
+            .prepare(sql)
             .map_err(|e| StateError::Corrupt(e.to_string()))?;
         let rows = stmt
-            .query_map([limit as i64], |r| {
+            .query_map(params, |r| {
                 let params: String = r.get(7)?;
                 Ok(HistoryEntry {
                     job: crate::JobId(r.get::<_, i64>(0)? as u32),
@@ -273,6 +326,7 @@ impl HistoryDb {
                     seen_count: r.get::<_, i64>(14)? as u32,
                     removed_at_unix: r.get(15)?,
                     picked_up_by: r.get(16)?,
+                    seq: r.get(17)?,
                 })
             })
             .map_err(|e| StateError::Corrupt(e.to_string()))?;
@@ -363,7 +417,14 @@ impl HistoryDb {
                 fsx::create_dir_all(parent)?;
             }
             let mut f = fsx::open_append(path)?;
-            let mut line = serde_json::to_vec(entry)?;
+            // The JSONL is the portable, mergeable source of truth and is
+            // re-imported into indices that assign their own rowids —
+            // writing this node's `seq` into it would persist a number
+            // that is wrong everywhere else. Zero it on the way out; the
+            // read path fills it in from the row it actually came from.
+            let mut portable = entry.clone();
+            portable.seq = 0;
+            let mut line = serde_json::to_vec(&portable)?;
             line.push(b'\n');
             fsx::write_all(&mut f, &line, path)?;
             fsx::sync_data(&f, path)?;
@@ -485,6 +546,7 @@ mod tests {
             seen_count: 0,
             removed_at_unix: None,
             picked_up_by: None,
+            seq: 0,
         }
     }
 

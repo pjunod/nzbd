@@ -13,6 +13,7 @@ use crate::{par2, DownloadEvidence, PostError, RepairResult, VerifyResult};
 use nzbd_engine::{EngineHandle, Event};
 use nzbd_state::history::HistoryDb;
 use nzbd_state::HistoryEntry;
+use nzbd_types::metrics::PpStageStats;
 use nzbd_types::{Health, Job, JobId, JobStatus, PostStage};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -46,7 +47,28 @@ impl HealthAction {
     }
 }
 
-#[derive(Debug, Clone)]
+/// What a `[[category]]` block actually changes about post-processing.
+///
+/// These keys were parsed and advertised to compat clients as
+/// `CategoryN.DestDir` / `CategoryN.Unpack` long before anything applied
+/// them, so an operator who set a per-category destination got files
+/// somewhere else and an *arr that path-mapped off the advertised value
+/// found nothing. Advertised must equal actual; that is what this type
+/// carries into the pipeline.
+#[derive(Debug, Clone, Default)]
+pub struct CategoryRule {
+    pub name: String,
+    /// Completed files are moved here (under `<dest_dir>/<job name>`)
+    /// instead of the global destination.
+    pub dest_dir: Option<PathBuf>,
+    /// Per-category override of `[post] unpack`.
+    pub unpack: Option<bool>,
+    /// Extension scripts to run for this category, by file name or stem.
+    /// Empty = every discovered script, which is the global behavior.
+    pub extensions: Vec<String>,
+}
+
+#[derive(Clone)]
 pub struct PostConfig {
     pub par2_cmd: String,
     pub unrar_cmd: String,
@@ -66,6 +88,10 @@ pub struct PostConfig {
     pub script_timeout: Duration,
     /// How long to wait for delayed par files to download.
     pub par_fetch_timeout: Duration,
+    /// `[[category]]` rules, matched against the job's category name.
+    pub categories: Vec<CategoryRule>,
+    /// Stage-duration counters for `/metrics`, when the daemon wired one.
+    pub stats: Option<Arc<PpStageStats>>,
 }
 
 impl Default for PostConfig {
@@ -83,7 +109,24 @@ impl Default for PostConfig {
             tool_timeout: Duration::from_secs(3600),
             script_timeout: Duration::from_secs(3600),
             par_fetch_timeout: Duration::from_secs(600),
+            categories: Vec::new(),
+            stats: None,
         }
+    }
+}
+
+impl PostConfig {
+    /// The `[[category]]` rule for a job's category, if one is configured.
+    /// Matched case-insensitively, like the compat shim's category
+    /// handling — an *arr sending "TV" must land on `name = "tv"`.
+    fn rule_for(&self, category: Option<&str>) -> Option<&CategoryRule> {
+        let want = category?.trim();
+        if want.is_empty() {
+            return None;
+        }
+        self.categories
+            .iter()
+            .find(|c| c.name.eq_ignore_ascii_case(want))
     }
 }
 
@@ -223,7 +266,7 @@ async fn manager_task(
                         };
                         let entry = HistoryEntry {
                             job,
-                            name,
+                            name: name.clone(),
                             category: exported.as_ref().and_then(|j| j.category.clone()),
                             final_dir: None,
                             status: fail_status.into(),
@@ -242,9 +285,34 @@ async fn manager_task(
                             seen_count: 0,
                             removed_at_unix: None,
                             picked_up_by: None,
+                            seq: 0,
                         };
                         let h = history.clone();
-                        let _ = tokio::task::spawn_blocking(move || h.record(&entry)).await;
+                        let record = entry.clone();
+                        let history_seq =
+                            tokio::task::spawn_blocking(move || h.record_seq(&record))
+                                .await
+                                .ok()
+                                .and_then(|r| r.ok())
+                                .unwrap_or(0);
+                        // These jobs never enter the stage pipeline, but they
+                        // ARE terminal, and a consumer waiting for
+                        // `job_pp_finished` must not wait forever on a
+                        // download that died at the health gate. The status
+                        // string is the history one verbatim
+                        // (`FAILURE/HEALTH` / `FAILURE/FETCH`) — same
+                        // FAILURE prefix consumers already switch on.
+                        engine.emit(Event::JobPpFinished {
+                            job,
+                            name,
+                            category: entry.category.clone(),
+                            pp_status: fail_status.into(),
+                            final_dir: None,
+                            size_bytes: entry.size,
+                            health,
+                            params: entry.params.clone(),
+                            history_seq,
+                        });
                         if let Some(mut fin) = exported {
                             if cfg.health_action == HealthAction::Delete {
                                 let dir = dest_dir
@@ -420,8 +488,63 @@ fn evidence_of(
         .collect()
 }
 
-async fn set_stage(engine: &EngineHandle, job: JobId, stage: PostStage) {
-    let _ = engine.set_job_status(job, JobStatus::Post { stage }).await;
+/// Drives one job's stage transitions: sets the queue status (as before),
+/// publishes `job_pp_stage` on the engine stream, and times each stage for
+/// `/metrics`.
+///
+/// This is the one place stage changes happen, because the three things
+/// have to stay in lockstep — a status the UI shows, an event a consumer
+/// reacts to and a timing an operator graphs must never disagree about
+/// which stage the job is in.
+struct Stages<'a> {
+    engine: &'a EngineHandle,
+    job: JobId,
+    name: String,
+    stats: Option<Arc<PpStageStats>>,
+    current: Option<(PostStage, std::time::Instant)>,
+}
+
+impl<'a> Stages<'a> {
+    fn new(engine: &'a EngineHandle, job: JobId, name: String, cfg: &PostConfig) -> Stages<'a> {
+        Stages {
+            engine,
+            job,
+            name,
+            stats: cfg.stats.clone(),
+            current: None,
+        }
+    }
+
+    async fn enter(&mut self, stage: PostStage) {
+        self.close();
+        let _ = self
+            .engine
+            .set_job_status(self.job, JobStatus::Post { stage })
+            .await;
+        self.engine.emit(Event::JobPpStage {
+            job: self.job,
+            name: self.name.clone(),
+            stage,
+        });
+        self.current = Some((stage, std::time::Instant::now()));
+    }
+
+    /// Bank the running stage's duration. Called on every transition and
+    /// once when the pipeline ends, so the last stage is measured too.
+    fn close(&mut self) {
+        if let (Some((stage, started)), Some(stats)) = (self.current.take(), self.stats.as_ref()) {
+            stats.record(stage, started.elapsed());
+        }
+    }
+}
+
+impl Drop for Stages<'_> {
+    /// A job that returns early (lease lost, tool error, cancelled) still
+    /// spent time in its last stage. Closing on drop means "how long does
+    /// unpack take" is not silently biased toward the runs that succeeded.
+    fn drop(&mut self) {
+        self.close();
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -456,20 +579,30 @@ pub async fn process_job_ctx(
     else {
         return Err(PostError::Subprocess("job vanished".into()));
     };
-    let dir = dest_dir.join(nzbd_engine::queue::sanitize_name(&job.name));
+    let sanitized = nzbd_engine::queue::sanitize_name(&job.name);
+    // The engine always writes downloads under the global destination;
+    // a `[[category]] dest_dir` is a *move* at the end of the pipeline
+    // (PostStage::Move), not a different download target.
+    let mut dir = dest_dir.join(&sanitized);
+    let rule = cfg.rule_for(job.category.as_deref()).cloned();
+    let unpack_enabled = rule
+        .as_ref()
+        .and_then(|r| r.unpack)
+        .unwrap_or(cfg.unpack);
     // Superseded staging dirs (a reclaimed lease's leftovers) are garbage
     // by definition — this lease is now the only live executor.
     let staging = dir.join(format!(".pp.{}", ctx.tag));
     remove_stale_staging(&dir, &staging);
+    let mut stages = Stages::new(engine, job_id, job.name.clone(), cfg);
 
     // ---- RENAME stage (par-rename, then rar-rename) ------------------------
     // Obfuscated posts get their real names back before anything verifies
     // or unpacks. Whole-file CRCs are content-addressed, so download
     // evidence just needs its paths remapped.
-    set_stage(engine, job_id, PostStage::ParRename).await;
+    stages.enter(PostStage::ParRename).await;
     let mut renames = par_rename(&dir);
-    if cfg.unpack {
-        set_stage(engine, job_id, PostStage::RarRename).await;
+    if unpack_enabled {
+        stages.enter(PostStage::RarRename).await;
         renames.extend(rar_rename(&dir));
     }
     let rename_map: std::collections::HashMap<PathBuf, PathBuf> = renames.into_iter().collect();
@@ -486,12 +619,12 @@ pub async fn process_job_ctx(
     let mut par2_names: std::collections::HashSet<String> = Default::default();
     if let Some(set) = par2::load_dir(&dir)? {
         par2_names = set.files.iter().map(|f| f.name.clone()).collect();
-        set_stage(engine, job_id, PostStage::ParVerify).await;
+        stages.enter(PostStage::ParVerify).await;
         let quick = par2::quick_verify(&set, &evidence_of(&job, &dir, &rename_map));
         if quick == VerifyResult::Intact {
             tracing::info!(job = job_id.0, "par quick-verify: intact (no data re-read)");
         } else if let Some(main) = set.main_path.clone() {
-            par_ok = repair_loop(engine, cfg, &par_tool, job_id, &main).await?;
+            par_ok = repair_loop(engine, cfg, &par_tool, &mut stages, job_id, &main).await?;
             par_did_repair = par_ok;
         } else {
             par_ok = false;
@@ -501,10 +634,10 @@ pub async fn process_job_ctx(
     // ---- UNPACK stage ------------------------------------------------------
     let mut unpack_ok = true;
     let mut unpacked_any = false;
-    if cfg.unpack {
+    if unpack_enabled {
         let archives = detect_archives(&dir);
         if !archives.is_empty() {
-            set_stage(engine, job_id, PostStage::Unpack).await;
+            stages.enter(PostStage::Unpack).await;
             let ex = Extractors {
                 unrar_cmd: cfg.unrar_cmd.clone(),
                 sevenzip_cmd: cfg.sevenzip_cmd.clone(),
@@ -530,10 +663,12 @@ pub async fn process_job_ctx(
                                 job = job_id.0,
                                 "unpack failed; forcing par repair + retry"
                             );
-                            set_stage(engine, job_id, PostStage::ParRepair).await;
-                            if repair_loop(engine, cfg, &par_tool, job_id, &main).await? {
+                            stages.enter(PostStage::ParRepair).await;
+                            if repair_loop(engine, cfg, &par_tool, &mut stages, job_id, &main)
+                                .await?
+                            {
                                 par_did_repair = true;
-                                set_stage(engine, job_id, PostStage::Unpack).await;
+                                stages.enter(PostStage::Unpack).await;
                                 let _ = std::fs::remove_dir_all(&staging);
                                 r = ex.extract(archive, *kind, &staging, password).await?;
                             }
@@ -563,7 +698,7 @@ pub async fn process_job_ctx(
 
     // ---- CLEANUP stage -----------------------------------------------------
     if cfg.cleanup && par_ok && unpack_ok && unpacked_any {
-        set_stage(engine, job_id, PostStage::Cleanup).await;
+        stages.enter(PostStage::Cleanup).await;
         cleanup_dir(&dir);
     }
 
@@ -577,12 +712,8 @@ pub async fn process_job_ctx(
     // parameters, which persist into history.
     let mut deobfuscated: Vec<(PathBuf, PathBuf)> = Vec::new();
     if cfg.deobfuscate_final && par_ok && unpack_ok {
-        set_stage(engine, job_id, PostStage::PostUnpackRename).await;
-        deobfuscated = crate::deobfuscate::deobfuscate_dir(
-            &dir,
-            &nzbd_engine::queue::sanitize_name(&job.name),
-            &par2_names,
-        );
+        stages.enter(PostStage::PostUnpackRename).await;
+        deobfuscated = crate::deobfuscate::deobfuscate_dir(&dir, &sanitized, &par2_names);
         for (from, to) in &deobfuscated {
             tracing::info!(
                 job = job_id.0,
@@ -600,13 +731,61 @@ pub async fn process_job_ctx(
         }
     }
 
+    // ---- MOVE stage --------------------------------------------------------
+    // `[[category]] dest_dir` finally means something. The download landed
+    // under the global destination (that is where the engine writes); if
+    // the category names another root, the finished folder moves there
+    // now, before scripts run and before anything is reported — so the
+    // path in the event, in history, and in compat `FinalDir` is the path
+    // the files are actually at. Moving earlier would fight the unpack
+    // staging; moving later would report a path that is about to change.
+    if let Some(target_root) = rule.as_ref().and_then(|r| r.dest_dir.as_ref()) {
+        let target = target_root.join(&sanitized);
+        if target != dir && dir.exists() {
+            stages.enter(PostStage::Move).await;
+            if !(ctx.commit_ok)() {
+                return Err(PostError::Subprocess("pp lease lost before move".into()));
+            }
+            let from = dir.clone();
+            let to = target.clone();
+            let moved = tokio::task::spawn_blocking(move || move_dir(&from, &to))
+                .await
+                .unwrap_or_else(|e| Err(std::io::Error::other(e.to_string())));
+            match moved {
+                Ok(()) => {
+                    tracing::info!(
+                        job = job_id.0,
+                        category = job.category.as_deref().unwrap_or(""),
+                        to = %target.display(),
+                        "moved to the category destination"
+                    );
+                    dir = target;
+                }
+                Err(e) => {
+                    // Report where the files ARE, not where they were
+                    // meant to go. A wrong path here is the silent import
+                    // failure this whole change exists to remove.
+                    tracing::error!(
+                        job = job_id.0,
+                        to = %target.display(),
+                        error = %e,
+                        "category move failed; leaving the files in the global destination"
+                    );
+                }
+            }
+        }
+    }
+
     // ---- SCRIPT stage ------------------------------------------------------
     let mut script_ok = true;
     let mut final_dir = dir.to_string_lossy().into_owned();
     if let Some(scripts_dir) = &cfg.scripts_dir {
-        let scripts = discover(scripts_dir);
+        let scripts = select_scripts(
+            discover(scripts_dir),
+            rule.as_ref().map(|r| r.extensions.as_slice()).unwrap_or(&[]),
+        );
         if !scripts.is_empty() {
-            set_stage(engine, job_id, PostStage::Script).await;
+            stages.enter(PostStage::Script).await;
             let host = ScriptHost {
                 timeout: cfg.script_timeout,
             };
@@ -624,8 +803,10 @@ pub async fn process_job_ctx(
                             crate::script_exit::PAR_CHECK => {
                                 if let Some(set) = par2::load_dir(&dir)? {
                                     if let Some(main) = set.main_path {
-                                        let _ = repair_loop(engine, cfg, &par_tool, job_id, &main)
-                                            .await;
+                                        let _ = repair_loop(
+                                            engine, cfg, &par_tool, &mut stages, job_id, &main,
+                                        )
+                                        .await;
                                     }
                                 }
                             }
@@ -692,7 +873,7 @@ pub async fn process_job_ctx(
             job: job_id,
             name: fin.name.clone(),
             category: fin.category.clone(),
-            final_dir: Some(final_dir),
+            final_dir: Some(final_dir.clone()),
             status: outcome.as_str().into(),
             size: fin.totals.size,
             health,
@@ -706,14 +887,94 @@ pub async fn process_job_ctx(
             seen_count: 0,
             removed_at_unix: None,
             picked_up_by: None,
+            seq: 0,
         };
         // History first, stamp second: a crash in between re-runs PP (the
         // stages are idempotent) — the reverse would lose the entry forever.
         let h = history.clone();
-        let _ = tokio::task::spawn_blocking(move || h.record(&entry)).await;
-        let _ = engine.import_job(fin, false, false).await;
+        let history_seq = tokio::task::spawn_blocking(move || h.record_seq(&entry))
+            .await
+            .ok()
+            .and_then(|r| r.ok())
+            .unwrap_or(0);
+        let _ = engine.import_job(fin.clone(), false, false).await;
+        // Only now — after the history row is durably written — does the
+        // completion become public. A consumer may react to this event by
+        // reading `?since_seq=history_seq-1` and is guaranteed to find the
+        // row; announcing first would hand every consumer an invisible
+        // race against our own write.
+        stages.close();
+        engine.emit(Event::JobPpFinished {
+            job: job_id,
+            name: fin.name.clone(),
+            category: fin.category.clone(),
+            pp_status: outcome.as_str().into(),
+            final_dir: Some(final_dir),
+            size_bytes: fin.totals.size,
+            health,
+            params: user_params(&fin),
+            history_seq,
+        });
     }
     Ok(outcome)
+}
+
+/// Move a finished job folder to another root, across filesystems if need
+/// be. `rename` is the fast path and the only atomic one; a category
+/// destination on a different volume (the common homelab shape — download
+/// on SSD, library on the NAS) returns `EXDEV` and falls back to a
+/// copy-then-remove. The copy is verified by the remove succeeding: a
+/// partial copy leaves the source in place, and PP re-runs from scratch.
+fn move_dir(from: &Path, to: &Path) -> std::io::Result<()> {
+    if let Some(parent) = to.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    match std::fs::rename(from, to) {
+        Ok(()) => return Ok(()),
+        Err(e) if e.raw_os_error() == Some(18) => {} // EXDEV: different volume
+        Err(e) if e.kind() == std::io::ErrorKind::CrossesDevices => {}
+        Err(e) => return Err(e),
+    }
+    copy_dir_all(from, to)?;
+    std::fs::remove_dir_all(from)
+}
+
+fn copy_dir_all(from: &Path, to: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(to)?;
+    for entry in std::fs::read_dir(from)? {
+        let entry = entry?;
+        let target = to.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_dir_all(&entry.path(), &target)?;
+        } else {
+            std::fs::copy(entry.path(), &target)?;
+        }
+    }
+    Ok(())
+}
+
+/// Narrow the discovered post-processing scripts to a category's
+/// `extensions` list. An empty list means "all of them" — the global
+/// behavior, and what every category without the key gets. Matching is on
+/// the file name or its stem, case-insensitively, so both
+/// `Extensions=Clean.py` and `Extensions=clean` name the same script.
+fn select_scripts(found: Vec<PathBuf>, extensions: &[String]) -> Vec<PathBuf> {
+    if extensions.is_empty() {
+        return found;
+    }
+    found
+        .into_iter()
+        .filter(|p| {
+            let name = |f: Option<&std::ffi::OsStr>| {
+                f.map(|s| s.to_string_lossy().into_owned()).unwrap_or_default()
+            };
+            let file = name(p.file_name());
+            let stem = name(p.file_stem());
+            extensions
+                .iter()
+                .any(|e| e.eq_ignore_ascii_case(&file) || e.eq_ignore_ascii_case(&stem))
+        })
+        .collect()
 }
 
 /// verify_full → (unpause delayed pars → wait → re-verify)* → repair.
@@ -721,6 +982,7 @@ async fn repair_loop(
     engine: &EngineHandle,
     cfg: &PostConfig,
     par: &Par2Tool,
+    stages: &mut Stages<'_>,
     job_id: JobId,
     main: &Path,
 ) -> Result<bool, PostError> {
@@ -728,7 +990,7 @@ async fn repair_loop(
         match par.verify_full(main).await? {
             VerifyResult::Intact => return Ok(true),
             VerifyResult::Repairable { .. } => {
-                set_stage(engine, job_id, PostStage::ParRepair).await;
+                stages.enter(PostStage::ParRepair).await;
                 return Ok(par.repair(main).await? == RepairResult::Repaired);
             }
             VerifyResult::NeedMoreBlocks { blocks_needed } => {

@@ -131,7 +131,11 @@ fn main() -> anyhow_lite::Result<()> {
 // ---------------------------------------------------------------------------
 
 /// Map `[post]` config onto the PP manager's runtime config.
-fn post_config(cfg: &nzbd_config::Config, slots: usize) -> nzbd_post::manager::PostConfig {
+fn post_config(
+    cfg: &nzbd_config::Config,
+    slots: usize,
+    stats: Option<Arc<nzbd_types::metrics::PpStageStats>>,
+) -> nzbd_post::manager::PostConfig {
     nzbd_post::manager::PostConfig {
         par2_cmd: cfg.post.par2_cmd.clone(),
         unrar_cmd: cfg.post.unrar_cmd.clone(),
@@ -149,7 +153,29 @@ fn post_config(cfg: &nzbd_config::Config, slots: usize) -> nzbd_post::manager::P
         tool_timeout: Duration::from_secs(cfg.post.tool_timeout_secs.max(1)),
         script_timeout: Duration::from_secs(cfg.post.script_timeout_secs.max(1)),
         par_fetch_timeout: Duration::from_secs(cfg.post.par_fetch_timeout_secs.max(1)),
+        categories: category_rules(cfg),
+        stats,
     }
+}
+
+/// `[[category]]` blocks as post-processing rules.
+///
+/// These keys were parsed and advertised to compat clients as
+/// `CategoryN.*` long before anything applied them: an operator who set
+/// `dest_dir` got files in the global destination and an *arr that
+/// path-mapped off the advertised value found nothing there. Same values,
+/// one source, now actually used — see `compat_options`, which projects
+/// the identical set.
+fn category_rules(cfg: &nzbd_config::Config) -> Vec<nzbd_post::manager::CategoryRule> {
+    cfg.categories
+        .iter()
+        .map(|c| nzbd_post::manager::CategoryRule {
+            name: c.name.clone(),
+            dest_dir: c.dest_dir.as_ref().map(|p| nzbd_config::expand_home(p)),
+            unpack: c.unpack,
+            extensions: c.extensions.clone(),
+        })
+        .collect()
 }
 
 /// NZBGet-style option projection for the compat shim's `config` method
@@ -486,14 +512,19 @@ fn run(
         let pp_cancel = tokio_util::sync::CancellationToken::new();
         let pp_tracker = tokio_util::task::TaskTracker::new();
         let mut history = None;
+        // Shared with the API so `/metrics` can report stage durations
+        // measured where they actually happen.
+        let mut pp_stats = None;
         if cfg.post.enabled {
             let state_dir = cfg.state_dir();
             let db = open_history(&state_dir, &state_dir.join("history"), None)?;
             history = Some(db.clone());
             let slots = nzbd_post::manager::strategy_slots(&cfg.post.strategy);
+            let stats = Arc::new(nzbd_types::metrics::PpStageStats::new());
+            pp_stats = Some(stats.clone());
             nzbd_post::manager::spawn_post_manager(
                 engine.clone(),
-                post_config(&cfg, slots),
+                post_config(&cfg, slots, Some(stats)),
                 db,
                 cfg.dest_dir(),
                 None, // single node: always the authority
@@ -547,6 +578,8 @@ fn run(
                 setup: setup.clone(),
                 clients: Some(clients_registry.clone()),
                 shutdown: Some(sse_shutdown_rx),
+                pp_stats,
+                events: None, // router_with starts the hub
             })
             .merge(nzbd_compat::router(compat_state)),
             nzbd_api::AuthConfig {
@@ -732,7 +765,11 @@ async fn run_cluster(
         let jsonl_dir = shared_dir.join(".nzbd-cluster/history");
         let history = open_history(&cfg.state_dir(), &jsonl_dir, Some(&c.node_name))?;
         Some(nzbd_cluster::PpSetup {
-            post: post_config(&cfg, cfg.cluster.pp_slots.max(1) as usize),
+            // Cluster PP stage timings are not wired to this node's
+            // /metrics: the leases run wherever the scheduler puts them,
+            // so a per-node summary would describe an arbitrary slice of
+            // the work. Cluster-wide PP metrics need their own design.
+            post: post_config(&cfg, cfg.cluster.pp_slots.max(1) as usize, None),
             history,
         })
     } else {
@@ -968,7 +1005,7 @@ mod tests {
         let cfg = cfg_with(
             "[post]\nhealth_action = \"park\"\ntool_timeout_secs = 0\nscripts_dir = \"~/scripts\"\n",
         );
-        let pc = post_config(&cfg, 3);
+        let pc = post_config(&cfg, 3, None);
         assert_eq!(pc.health_action, nzbd_post::manager::HealthAction::Park);
         assert_eq!(pc.slots, 3);
         // Zero timeout is clamped to something sane rather than "instant".

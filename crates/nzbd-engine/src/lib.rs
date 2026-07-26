@@ -312,6 +312,14 @@ pub struct AddOpts {
     pub dupe: Option<nzbd_types::DupeInfo>,
     /// Add in Paused state (NZBGet `AddPaused`).
     pub paused: bool,
+    /// Job parameters set at admit time (a consumer's own tracking id —
+    /// Sonarr's `drone`, monarr's `monarr-transfer`). Applied in the same
+    /// owner-loop turn as the add, so the param is on the job from its
+    /// first appearance in the queue rather than a round-trip later; that
+    /// is what makes it visible in the UI, history and compat
+    /// `Parameters` with no second write path. `*`-prefixed keys are
+    /// reserved for internals and are rejected at the API edge.
+    pub params: Vec<(String, String)>,
 }
 
 /// Cloneable handle to a running engine.
@@ -382,6 +390,7 @@ impl EngineHandle {
             priority: opts.priority,
             dupe: opts.dupe,
             paused: opts.paused,
+            params: opts.params,
             reply: tx,
         })
         .await?;
@@ -457,6 +466,7 @@ impl EngineHandle {
             priority: opts.priority,
             dupe: opts.dupe,
             paused: opts.paused,
+            params: opts.params,
             reply: tx,
         })
         .await?;
@@ -662,6 +672,15 @@ impl EngineHandle {
 
     pub fn subscribe(&self) -> broadcast::Receiver<Event> {
         self.events.subscribe()
+    }
+
+    /// Publish an event on the engine's broadcast from outside the owner
+    /// loop. Post-processing runs in its own crate but its events belong on
+    /// the same stream as everything else — a second bus would mean two
+    /// orderings, two subscribe calls, and an SSE stream that is only
+    /// half the story. Fire-and-forget: no subscribers is not an error.
+    pub fn emit(&self, event: Event) {
+        let _ = self.events.send(event);
     }
 
     /// Graceful shutdown: stop leasing, flush journal + snapshot, clear the

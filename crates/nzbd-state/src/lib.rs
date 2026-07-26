@@ -487,6 +487,15 @@ pub struct HistoryEntry {
     /// User-Agent of the polling/deleting client (Sonarr/x, Radarr/x…).
     #[serde(default)]
     pub picked_up_by: Option<String>,
+    /// Read-side cursor: this node's SQLite rowid, ascending and monotone.
+    /// Populated on read, ignored on write, and deliberately **not**
+    /// persisted to the JSONL — the JSONL is the portable source of truth
+    /// and a rowid is an artifact of one node's index, so a rebuilt index
+    /// legitimately assigns different ones. Consumers treat it as an
+    /// opaque "everything newer than this" token against the node they are
+    /// talking to (`GET /api/v1/history?since_seq=`).
+    #[serde(default)]
+    pub seq: i64,
 }
 
 fn default_health() -> u16 {

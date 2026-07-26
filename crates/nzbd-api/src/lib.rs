@@ -10,10 +10,13 @@ use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use base64::Engine as _;
 
+pub mod eventhub;
 pub mod logbuf;
+pub use eventhub::{EventHub, Replay};
 pub use logbuf::{LogBuffer, LogBufferLayer};
 use nzbd_engine::{EngineHandle, JobSummary, QueueSnapshot};
 use nzbd_state::history::HistoryDb;
+use nzbd_types::metrics::PpStageStats;
 use nzbd_types::{JobId, JobStatus};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -37,6 +40,13 @@ pub struct ApiState {
     /// graceful shutdown can drain and the process can re-serve — without
     /// it, an open `/api/v1/events` stream blocks a restart forever.
     pub shutdown: Option<tokio::sync::watch::Receiver<bool>>,
+    /// Post-processing stage timings, shared with the PP manager. `None`
+    /// when the daemon runs without post-processing.
+    pub pp_stats: Option<Arc<PpStageStats>>,
+    /// Seq-stamped event stream + replay ring. Filled in by `router_with`
+    /// when the caller leaves it `None`, so there is exactly one hub per
+    /// router and no code path where events are unnumbered.
+    pub events: Option<Arc<EventHub>>,
 }
 
 /// Shared handle between the setup endpoint and the daemon's run loop.
@@ -121,8 +131,13 @@ fn probe_writable(config_path: &std::path::Path) -> bool {
     true
 }
 
-/// Observed API consumers (the *arrs polling the compat shim). Answers
-/// "is Sonarr even talking to this daemon?" without reading its logs.
+/// Observed API consumers. Answers "is Sonarr even talking to this
+/// daemon?", and now "is monarr subscribed to events right now?", without
+/// reading logs.
+///
+/// Shared between the compat shim and the native API: a consumer that
+/// speaks `/api/v1` used to be completely invisible here, so a working
+/// native client looked exactly like a broken one.
 #[derive(Default)]
 pub struct ClientRegistry {
     inner: std::sync::Mutex<std::collections::HashMap<String, ClientInfo>>,
@@ -138,23 +153,62 @@ pub struct ClientInfo {
     pub last_seen_unix: i64,
     pub calls: u64,
     pub last_method: String,
+    /// Which API this client last spoke: `compat` or `native`.
+    pub api: &'static str,
+    /// `/api/v1/events` streams this client holds open right now. Nonzero
+    /// means push is genuinely attached — the fact an operator otherwise
+    /// has to infer from the absence of complaints.
+    pub event_subscriptions: u32,
 }
 
 impl ClientRegistry {
     pub fn note(&self, user_agent: Option<&str>, method: &str, now_unix: i64) {
-        let ua = user_agent.unwrap_or("unknown").to_string();
+        self.note_api(user_agent, method, now_unix, "compat");
+    }
+
+    /// A call on the native `/api/v1` surface. Kept distinct from `note`
+    /// in one respect: it does not claim the `current()` slot, which the
+    /// compat shim uses to attribute history observations to the request
+    /// it is inside. Native handlers pass their client name explicitly.
+    pub fn note_native(&self, client: Option<&str>, method: &str, now_unix: i64) {
+        let mut m = self.inner.lock().unwrap();
+        Self::touch(&mut m, client, method, now_unix, "native");
+    }
+
+    fn note_api(
+        &self,
+        user_agent: Option<&str>,
+        method: &str,
+        now_unix: i64,
+        api: &'static str,
+    ) {
         *self.current.lock().unwrap() = user_agent.map(String::from);
         let mut m = self.inner.lock().unwrap();
+        Self::touch(&mut m, user_agent, method, now_unix, api);
+    }
+
+    fn touch<'a>(
+        m: &'a mut std::collections::HashMap<String, ClientInfo>,
+        name: Option<&str>,
+        method: &str,
+        now_unix: i64,
+        api: &'static str,
+    ) -> &'a mut ClientInfo {
+        let ua = name.unwrap_or("unknown").to_string();
         let e = m.entry(ua.clone()).or_insert_with(|| ClientInfo {
             user_agent: ua,
             first_seen_unix: now_unix,
             last_seen_unix: now_unix,
             calls: 0,
             last_method: String::new(),
+            api,
+            event_subscriptions: 0,
         });
         e.last_seen_unix = now_unix;
         e.calls += 1;
         e.last_method = method.to_string();
+        e.api = api;
+        e
     }
 
     /// UA of the in-flight compat request (best effort).
@@ -162,17 +216,56 @@ impl ClientRegistry {
         self.current.lock().unwrap().clone()
     }
 
+    /// Register one open event stream, released when the returned guard
+    /// drops. A guard, not a pair of calls: the stream can end at any
+    /// await point, and a count that only decrements on the tidy path
+    /// would show phantom subscribers forever.
+    pub fn subscribe(self: &Arc<Self>, client: Option<String>) -> Subscription {
+        let now = unix_now();
+        {
+            let mut m = self.inner.lock().unwrap();
+            let e = Self::touch(&mut m, client.as_deref(), "events", now, "native");
+            e.event_subscriptions += 1;
+        }
+        Subscription {
+            registry: self.clone(),
+            key: client.unwrap_or_else(|| "unknown".into()),
+        }
+    }
+
     /// Live clients, most-recent first. Anything not heard from within
     /// `CLIENT_TTL_SECS` is dropped from the registry (a client that has
     /// gone quiet for 5 minutes isn't "connected" — and this also keeps
     /// the map from growing unbounded as clients cycle User-Agents).
+    ///
+    /// A client with an open event stream is exempt from the TTL: a push
+    /// consumer legitimately makes no requests for hours, and pruning it
+    /// would report "nothing connected" about the one connection that
+    /// matters most.
     pub fn snapshot(&self, now_unix: i64) -> Vec<ClientInfo> {
         let mut m = self.inner.lock().unwrap();
-        m.retain(|_, c| now_unix - c.last_seen_unix < CLIENT_TTL_SECS);
+        m.retain(|_, c| {
+            c.event_subscriptions > 0 || now_unix - c.last_seen_unix < CLIENT_TTL_SECS
+        });
         let mut v: Vec<ClientInfo> = m.values().cloned().collect();
         drop(m);
         v.sort_by_key(|c| std::cmp::Reverse(c.last_seen_unix));
         v
+    }
+}
+
+/// One open event stream's registration.
+pub struct Subscription {
+    registry: Arc<ClientRegistry>,
+    key: String,
+}
+
+impl Drop for Subscription {
+    fn drop(&mut self) {
+        let mut m = self.registry.inner.lock().unwrap();
+        if let Some(c) = m.get_mut(&self.key) {
+            c.event_subscriptions = c.event_subscriptions.saturating_sub(1);
+        }
     }
 }
 
@@ -594,6 +687,38 @@ struct AddJobQuery {
     paused: Option<bool>,
     dupe_key: Option<String>,
     dupe_score: Option<i32>,
+    /// URL-encoded JSON object of string→string, set on the job at admit
+    /// time: a consumer's own tracking id (Sonarr's `drone`, monarr's
+    /// `monarr-transfer`). Params flow from the job into history rows and
+    /// the compat `Parameters` array through the existing plumbing, so
+    /// this is one write, not a second path.
+    params: Option<String>,
+}
+
+/// Parse the `params` query field. `*`-prefixed keys are rejected rather
+/// than accepted-and-ignored: that prefix is nzbd's internal namespace
+/// (`*PP:done`, `*URL`, `*Unpack:Password`), and letting a client write
+/// there would let it forge post-processing state. The error names the
+/// offending key, because "invalid params" tells the operator nothing.
+fn parse_add_params(raw: &str) -> Result<Vec<(String, String)>, String> {
+    let value: serde_json::Value = serde_json::from_str(raw)
+        .map_err(|e| format!("params must be a JSON object of strings: {e}"))?;
+    let Some(obj) = value.as_object() else {
+        return Err("params must be a JSON object of strings".into());
+    };
+    let mut out = Vec::with_capacity(obj.len());
+    for (k, v) in obj {
+        if k.starts_with('*') {
+            return Err(format!(
+                "param key {k:?} is reserved: keys starting with '*' are internal to nzbd"
+            ));
+        }
+        let Some(v) = v.as_str() else {
+            return Err(format!("param {k:?} must be a string"));
+        };
+        out.push((k.clone(), v.to_string()));
+    }
+    Ok(out)
 }
 
 /// `POST /api/v1/jobs` with the raw NZB document as the request body.
@@ -604,6 +729,10 @@ async fn add_job(
     body: axum::body::Bytes,
 ) -> Response {
     let name = q.name.unwrap_or_default();
+    let params = match q.params.as_deref().map(parse_add_params).transpose() {
+        Ok(p) => p.unwrap_or_default(),
+        Err(msg) => return error(StatusCode::UNPROCESSABLE_ENTITY, &msg),
+    };
     let opts = nzbd_engine::AddOpts {
         category: q.category,
         priority: q.priority.unwrap_or(0),
@@ -613,6 +742,7 @@ async fn add_job(
             score: q.dupe_score.unwrap_or(0),
             mode: None,
         }),
+        params,
     };
     if let Some(url) = &q.url {
         return match st.engine.add_url(&name, url, opts).await {
@@ -688,6 +818,7 @@ async fn park_snapshot(st: &ApiState, job: JobId) -> Option<Parked> {
             seen_count: 0,
             removed_at_unix: None,
             picked_up_by: None,
+            seq: 0,
         },
         nzb,
     })
@@ -911,11 +1042,31 @@ async fn test_server(State(st): State<ApiState>, Json(body): Json<TestServerBody
 /// exactly the "page frozen until I hit refresh" field report. Header
 /// stats and per-job rows come from the SAME snapshot, so they can never
 /// disagree the way two separately-cached endpoints did.
-async fn sse_events(State(st): State<ApiState>) -> Response {
+async fn sse_events(State(st): State<ApiState>, headers: axum::http::HeaderMap) -> Response {
     use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
     use tokio_stream::wrappers::{BroadcastStream, ReceiverStream};
 
-    let events = BroadcastStream::new(st.engine.subscribe());
+    let hub = match st.events.clone() {
+        Some(h) => h,
+        None => return error(StatusCode::NOT_IMPLEMENTED, "event hub not configured"),
+    };
+    // Subscribe BEFORE resolving the replay window. The reverse order has
+    // a hole exactly one event wide: anything published between reading
+    // the ring and attaching to the fan-out is in neither. Overlapping the
+    // two costs a duplicate, which the seq filter below drops.
+    let live = hub.subscribe();
+    let last_event_id = headers
+        .get("last-event-id")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().parse::<u64>().ok());
+    let replay = hub.replay(last_event_id);
+
+    // Note the subscriber so `GET /api/v1/clients` can show that a push
+    // consumer is actually attached — "is monarr subscribed right now" is
+    // otherwise only answerable by reading logs.
+    let subscriber = st.clients.as_ref().map(|c| c.subscribe(client_name(&headers)));
+    let guard = hub.stream_guard();
+
     let engine = st.engine.clone();
     let log = st.log.clone();
     let mut shutdown = st.shutdown.clone();
@@ -924,6 +1075,11 @@ async fn sse_events(State(st): State<ApiState>) -> Response {
     // must never hold graceful shutdown (and thus a restart) open.
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<SseEvent, std::convert::Infallible>>(64);
     tokio::spawn(async move {
+        // Both live for the lifetime of the stream: dropping them is what
+        // decrements the gauge and the per-client subscription count.
+        let _guard = guard;
+        let _subscriber = subscriber;
+        let events = BroadcastStream::new(live);
         tokio::pin!(events);
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -934,6 +1090,40 @@ async fn sse_events(State(st): State<ApiState>) -> Response {
         // tab, and the REST endpoint is the backfill for when it does.
         let mut last_frame = std::time::Instant::now();
         let mut last_log_id = log.as_ref().map(|l| l.newest_id()).unwrap_or(0);
+        // Highest seq already written to this stream — the de-dupe against
+        // the deliberate subscribe/replay overlap above.
+        let mut sent_seq = 0u64;
+
+        // ---- resume ------------------------------------------------------
+        match replay {
+            eventhub::Replay::Live => {}
+            eventhub::Replay::Reset => {
+                // The honest answer to "I missed some": say so, and name
+                // why, so the client reconciles instead of assuming the
+                // stream it is now reading is complete.
+                let sse = SseEvent::default()
+                    .event("reset")
+                    .data(json!({"reason": "gap"}).to_string());
+                if tx.send(Ok(sse)).await.is_err() {
+                    return;
+                }
+                last_frame = std::time::Instant::now();
+            }
+            eventhub::Replay::Frames(frames) => {
+                for f in frames {
+                    let sse = SseEvent::default()
+                        .id(f.seq.to_string())
+                        .event(f.name)
+                        .data(&*f.data);
+                    if tx.send(Ok(sse)).await.is_err() {
+                        return;
+                    }
+                    sent_seq = sent_seq.max(f.seq);
+                }
+                last_frame = std::time::Instant::now();
+            }
+        }
+
         loop {
             tokio::select! {
                 _ = wait_shutdown(&mut shutdown) => break,
@@ -984,22 +1174,34 @@ async fn sse_events(State(st): State<ApiState>) -> Response {
                     }
                 }
                 next = events.next() => match next {
-                    Some(Ok(ev)) => {
-                        let (name, data) = event_wire(&ev);
-                        let sse = SseEvent::default().event(name).data(data);
+                    Some(Ok(frame)) => {
+                        if frame.seq <= sent_seq {
+                            continue; // already replayed
+                        }
+                        // `tick`/`hb`/`log` above carry no `id:` on purpose:
+                        // they are stream-local views, not engine facts, and
+                        // resuming from one would mean nothing.
+                        let sse = SseEvent::default()
+                            .id(frame.seq.to_string())
+                            .event(frame.name)
+                            .data(&*frame.data);
                         if tx.send(Ok(sse)).await.is_err() {
                             break; // client hung up
                         }
+                        sent_seq = frame.seq;
                         last_frame = std::time::Instant::now();
                     }
                     Some(Err(BroadcastStreamRecvError::Lagged(n))) => {
+                        // This stream fell behind the hub. The client's own
+                        // `Last-Event-ID` will cover the hole on reconnect;
+                        // until then it at least knows there is one.
                         let sse = SseEvent::default()
                             .event("lagged")
                             .data(json!({ "skipped": n }).to_string());
                         let _ = tx.send(Ok(sse)).await;
                         last_frame = std::time::Instant::now();
                     }
-                    None => break, // broadcast closed (engine gone)
+                    None => break, // hub closed (engine gone)
                 },
             }
         }
@@ -1007,6 +1209,18 @@ async fn sse_events(State(st): State<ApiState>) -> Response {
     Sse::new(ReceiverStream::new(rx))
         .keep_alive(KeepAlive::default())
         .into_response()
+}
+
+/// How a caller identifies itself: `X-Nzbd-Client` when it sets one (the
+/// header the UI already uses for pause attribution, and what the
+/// integration contract asks consumers to send), else its User-Agent.
+fn client_name(headers: &axum::http::HeaderMap) -> Option<String> {
+    headers
+        .get("x-nzbd-client")
+        .or_else(|| headers.get(axum::http::header::USER_AGENT))
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
 }
 
 /// How long a silent stream may stay silent before it emits `hb`. Shorter
@@ -1040,10 +1254,19 @@ async fn wait_shutdown(rx: &mut Option<tokio::sync::watch::Receiver<bool>>) {
     }
 }
 
-fn event_wire(ev: &nzbd_engine::Event) -> (&'static str, String) {
+/// One engine event as `(SSE event name, JSON body)`.
+///
+/// Names are spelled out per variant rather than derived from a catch-all,
+/// because consumers key on them: the UI nudges its refresh on specific
+/// names, and monarr's subscriber switches on `job_pp_finished`. A rename
+/// here is a breaking change for both.
+///
+/// Returns a `Value`, not a string, so the event hub can stamp `"seq"`
+/// into the body without re-parsing what we just serialized.
+fn event_json(ev: &nzbd_engine::Event) -> (&'static str, serde_json::Value) {
     use nzbd_engine::Event as E;
     match ev {
-        E::JobAdded { job, name } => ("job_added", json!({"job": job.0, "name": name}).to_string()),
+        E::JobAdded { job, name } => ("job_added", json!({"job": job.0, "name": name})),
         E::JobFinished {
             job,
             name,
@@ -1051,9 +1274,9 @@ fn event_wire(ev: &nzbd_engine::Event) -> (&'static str, String) {
             health,
         } => (
             "job_finished",
-            json!({"job": job.0, "name": name, "status": status, "health": health}).to_string(),
+            json!({"job": job.0, "name": name, "status": status, "health": health}),
         ),
-        E::JobDeleted { job } => ("job_deleted", json!({"job": job.0}).to_string()),
+        E::JobDeleted { job } => ("job_deleted", json!({"job": job.0})),
         E::FileFinished {
             job,
             file,
@@ -1061,30 +1284,52 @@ fn event_wire(ev: &nzbd_engine::Event) -> (&'static str, String) {
             ok,
         } => (
             "file_finished",
-            json!({"job": job.0, "file": file.0, "filename": filename, "ok": ok}).to_string(),
+            json!({"job": job.0, "file": file.0, "filename": filename, "ok": ok}),
         ),
         E::SegmentExhausted { job, file, segment } => (
             "segment_exhausted",
-            json!({"job": job.0, "file": file.0, "segment": segment}).to_string(),
+            json!({"job": job.0, "file": file.0, "segment": segment}),
         ),
         E::ServerBlocked { server, seconds } => (
             "server_blocked",
-            json!({"server": server.0, "seconds": seconds}).to_string(),
+            json!({"server": server.0, "seconds": seconds}),
         ),
-        // Named wire events, not a `_ => "event"` catch-all: the UI keys
-        // its refresh nudges on these names (a pause emitted as the opaque
-        // "event" was invisible to it — part of the stale-pause report).
         E::QueuePauseChanged { paused, source } => (
             "queue_pause_changed",
-            json!({"paused": paused, "source": source}).to_string(),
+            json!({"paused": paused, "source": source}),
         ),
         E::SpeedLimitChanged { bytes_per_sec } => (
             "speed_limit_changed",
-            json!({"bytes_per_sec": bytes_per_sec}).to_string(),
+            json!({"bytes_per_sec": bytes_per_sec}),
         ),
-        E::JobAssigned { job, node } => (
-            "job_assigned",
-            json!({"job": job.0, "node": node}).to_string(),
+        E::JobAssigned { job, node } => ("job_assigned", json!({"job": job.0, "node": node})),
+        E::JobPpStage { job, name, stage } => (
+            "job_pp_stage",
+            json!({"job": job.0, "name": name, "stage": stage.as_str()}),
+        ),
+        E::JobPpFinished {
+            job,
+            name,
+            category,
+            pp_status,
+            final_dir,
+            size_bytes,
+            health,
+            params,
+            history_seq,
+        } => (
+            "job_pp_finished",
+            json!({
+                "job": job.0,
+                "name": name,
+                "category": category,
+                "pp_status": pp_status,
+                "final_dir": final_dir,
+                "size_bytes": size_bytes,
+                "health": health,
+                "params": params,
+                "history_seq": history_seq,
+            }),
         ),
     }
 }
@@ -1137,6 +1382,28 @@ async fn metrics(State(st): State<ApiState>) -> Response {
     }
     let _ = writeln!(m, "# TYPE nzbd_up_since_seconds gauge");
     let _ = writeln!(m, "nzbd_up_since_seconds {}", snap.up_since_unix);
+    // Integration observability: is the event stream actually producing,
+    // and is anything actually listening. A pipeline that silently stopped
+    // pushing looks identical to an idle one until these two disagree.
+    if let Some(hub) = &st.events {
+        let _ = writeln!(m, "# TYPE nzbd_events_emitted_total counter");
+        for (event, n) in hub.counts() {
+            let _ = writeln!(m, "nzbd_events_emitted_total{{event=\"{event}\"}} {n}");
+        }
+        let _ = writeln!(m, "# TYPE nzbd_sse_clients gauge");
+        let _ = writeln!(m, "nzbd_sse_clients {}", hub.sse_clients());
+    }
+    if let Some(stats) = &st.pp_stats {
+        let rows = stats.snapshot();
+        if !rows.is_empty() {
+            let _ = writeln!(m, "# TYPE nzbd_pp_stage_seconds summary");
+            for (stage, count, secs) in rows {
+                let label = stage.as_str();
+                let _ = writeln!(m, "nzbd_pp_stage_seconds_count{{stage=\"{label}\"}} {count}");
+                let _ = writeln!(m, "nzbd_pp_stage_seconds_sum{{stage=\"{label}\"}} {secs}");
+            }
+        }
+    }
     (
         [(
             axum::http::header::CONTENT_TYPE,
@@ -1187,19 +1454,35 @@ async fn get_logs(State(st): State<ApiState>, Query(q): Query<LogsQuery>) -> Res
 #[derive(Debug, Deserialize)]
 struct HistoryQuery {
     limit: Option<usize>,
+    /// Cursor form: entries with `seq > since_seq`, oldest first. This is
+    /// the catch-up path after a consumer was away, and the poll path's
+    /// way to fetch only what is new. It exists because SSE is lossy by
+    /// design — the cursor is what makes that loss harmless.
+    since_seq: Option<i64>,
 }
 
 /// `GET /api/v1/history` — completed/failed jobs (NZBGet parity: finished
 /// jobs leave the queue and live here).
+///
+/// Two shapes, kept separate rather than merged into one clever query:
+/// `?limit=` is newest-first for the UI and byte-for-byte what it always
+/// was, and `?since_seq=` is oldest-first for a consumer walking forward
+/// (so the last row's `seq` is its next cursor). Mixing the two orders in
+/// one response is how cursors quietly start skipping rows.
 async fn get_history(State(st): State<ApiState>, Query(q): Query<HistoryQuery>) -> Response {
     let Some(db) = &st.history else {
         return error(StatusCode::NOT_IMPLEMENTED, "history store not configured");
     };
     let db = db.clone();
     let limit = q.limit.unwrap_or(200).min(10_000);
+    let since = q.since_seq;
     let entries = tokio::task::spawn_blocking(move || {
         let _ = db.refresh(); // pick up other nodes' appends (throttled)
-        db.list_filtered(limit, true).map(|entries| {
+        let rows = match since {
+            Some(seq) => db.list_since(seq, limit),
+            None => db.list_filtered(limit, true),
+        };
+        rows.map(|entries| {
             // `can_requeue` is derived, not stored: it answers "is the
             // requeue source still on this node?", which only a look at the
             // spool (or the parked `*URL`) can honestly say.
@@ -1242,7 +1525,9 @@ async fn openapi() -> Response {
                               {"name": "url", "in": "query"},
                               {"name": "paused", "in": "query"},
                               {"name": "dupe_key", "in": "query"},
-                              {"name": "dupe_score", "in": "query"}
+                              {"name": "dupe_score", "in": "query"},
+                              {"name": "params", "in": "query",
+                               "description": "URL-encoded JSON object of string→string job params; '*' keys rejected"}
                           ] }
             },
             "/api/v1/jobs/{id}": { "get": { "summary": "Job detail" } },
@@ -1252,10 +1537,15 @@ async fn openapi() -> Response {
             "/api/v1/servers/test": { "post": { "summary": "Live news-server connectivity probe (connect + greeting + AUTHINFO)" } },
             "/api/v1/jobs/{id}/files": { "get": { "summary": "Per-file detail (segments done/failed, sizes, paused, par2)" } },
             "/api/v1/jobs/{id}/nzb": { "get": { "summary": "Download the job's NZB (regenerated from queue state)" } },
-            "/api/v1/history": { "get": { "summary": "Finished and deleted jobs (entries carry can_requeue)" } },
+            "/api/v1/history": { "get": { "summary": "Finished and deleted jobs (entries carry can_requeue and seq)",
+                                          "parameters": [
+                                              {"name": "limit", "in": "query"},
+                                              {"name": "since_seq", "in": "query",
+                                               "description": "Cursor: entries with seq > N, ascending"}
+                                          ] } },
             "/api/v1/history/{id}/actions/{action}": { "post": { "summary": "restore|hide|delete|delete-files|requeue" } },
             "/api/v1/logs": { "get": { "summary": "Recent daemon log entries" } },
-            "/api/v1/events": { "get": { "summary": "Engine events (SSE)" } },
+            "/api/v1/events": { "get": { "summary": "Engine events (SSE); frames carry id: <seq>, Last-Event-ID resumes, 'reset' means poll-reconcile" } },
             "/metrics": { "get": { "summary": "Prometheus exposition" } },
             "/healthz": { "get": { "summary": "Liveness" } }
         }
@@ -1279,6 +1569,8 @@ pub fn router(engine: EngineHandle) -> Router {
         setup: None,
         clients: None,
         shutdown: None,
+        pp_stats: None,
+        events: None,
     })
 }
 
@@ -1631,6 +1923,15 @@ async fn history_requeue(st: &ApiState, db: Arc<HistoryDb>, job: JobId) -> Respo
             mode: None,
         }),
         paused: false,
+        // A requeue is the same download again, so it carries the same
+        // consumer params — the tracking id that names this transfer must
+        // survive an undo, or the trace it belongs to ends mid-story.
+        params: entry
+            .params
+            .iter()
+            .filter(|(k, _)| !k.starts_with('*'))
+            .cloned()
+            .collect(),
     };
     let added = match (&nzb, &url) {
         (Some(bytes), _) => st.engine.add_nzb_opts(&entry.name, bytes, opts).await,
@@ -1660,6 +1961,7 @@ async fn history_requeue(st: &ApiState, db: Arc<HistoryDb>, job: JobId) -> Respo
 async fn history_action(
     State(st): State<ApiState>,
     Path((id, action)): Path<(u32, String)>,
+    headers: axum::http::HeaderMap,
 ) -> Response {
     let Some(db) = st.history.clone() else {
         return error(StatusCode::NOT_IMPLEMENTED, "history store not configured");
@@ -1673,9 +1975,15 @@ async fn history_action(
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
     let act = action.clone();
+    // Hiding an entry right after import IS the "imported" signal, so it
+    // must name who did it — a native consumer hiding via `/api/v1` gets
+    // the same `picked_up_by` attribution the compat `HistoryDelete` path
+    // has always written. Without this, a native monarr's imports look
+    // like a human clicked them away.
+    let by = client_name(&headers).unwrap_or_else(|| "user".into());
     let result = tokio::task::spawn_blocking(move || match act.as_str() {
         "restore" => db.restore(job).map(|ok| (ok, None)),
-        "hide" => db.hide(job, Some("user"), now).map(|ok| (ok, None)),
+        "hide" => db.hide(job, Some(&by), now).map(|ok| (ok, None)),
         "delete" => db.delete(job).map(|ok| (ok, None)),
         "delete-files" => {
             let dir = db
@@ -1707,7 +2015,21 @@ async fn history_action(
     }
 }
 
+/// Build the native API router.
+///
+/// Must be called from within a Tokio runtime: the event hub's pump task
+/// starts here so that events are numbered from the daemon's first moment,
+/// not from whenever the first SSE client happens to connect. Every caller
+/// already builds its router inside one.
 pub fn router_with(state: ApiState) -> Router {
+    let state = ApiState {
+        events: state
+            .events
+            .clone()
+            .or_else(|| Some(EventHub::spawn(&state.engine))),
+        ..state
+    };
+    let clients = state.clients.clone();
     Router::new()
         .route("/api/v1/status", get(get_status))
         .route("/api/v1/jobs", get(list_jobs).post(add_job))
@@ -1740,6 +2062,28 @@ pub fn router_with(state: ApiState) -> Router {
         .route("/icons/icon-maskable-512.png", get(icon_maskable))
         .route("/apple-touch-icon.png", get(apple_touch_icon))
         .layer(axum::middleware::from_fn(no_store_by_default))
+        // Attribution for the native surface. The compat shim has noted
+        // its callers for a long time; a consumer speaking `/api/v1` was
+        // invisible, which made a perfectly healthy native client look
+        // exactly like nothing being connected at all.
+        .layer(axum::middleware::from_fn(
+            move |req: axum::extract::Request, next: axum::middleware::Next| {
+                let clients = clients.clone();
+                async move {
+                    if let Some(reg) = &clients {
+                        let path = req.uri().path();
+                        if path.starts_with("/api/v1") && !auth_exempt(path) {
+                            reg.note_native(
+                                client_name(req.headers()).as_deref(),
+                                path,
+                                unix_now(),
+                            );
+                        }
+                    }
+                    next.run(req).await
+                }
+            },
+        ))
         .with_state(state)
 }
 
@@ -2260,6 +2604,8 @@ mod tests {
             setup: None,
             clients: None,
             shutdown: None,
+            pp_stats: None,
+            events: None,
         });
         // Pre-existing lines must NOT be replayed: a fresh connection tails
         // from now, and the REST endpoint is the backfill.
@@ -2450,6 +2796,8 @@ mod tests {
             ))),
             clients: None,
             shutdown: None,
+            pp_stats: None,
+            events: None,
         });
 
         let probe = |app: Router, body: serde_json::Value| async move {
@@ -2610,7 +2958,11 @@ mod tests {
     #[test]
     fn event_wire_names_cover_pause_and_limit() {
         use nzbd_engine::Event as E;
-        let (name, data) = event_wire(&E::QueuePauseChanged {
+        let wire = |ev: &E| {
+            let (name, body) = event_json(ev);
+            (name, body.to_string())
+        };
+        let (name, data) = wire(&E::QueuePauseChanged {
             paused: true,
             source: "monarr/1.0".into(),
         });
@@ -2620,15 +2972,44 @@ mod tests {
             data.contains("monarr/1.0"),
             "pause events carry their source: {data}"
         );
-        let (name, data) = event_wire(&E::SpeedLimitChanged {
+        let (name, data) = wire(&E::SpeedLimitChanged {
             bytes_per_sec: Some(1024),
         });
         assert_eq!(name, "speed_limit_changed");
         assert!(data.contains("1024"));
-        let (name, _) = event_wire(&E::JobAssigned {
+        let (name, _) = wire(&E::JobAssigned {
             job: JobId(7),
             node: Some("n2".into()),
         });
         assert_eq!(name, "job_assigned");
+
+        // The post-processing pair is what the integration contract is
+        // built on; their names and the stage spelling are load-bearing
+        // for every consumer, so they are asserted, not assumed.
+        let (name, data) = wire(&E::JobPpStage {
+            job: JobId(7),
+            name: "Show.S01E01".into(),
+            stage: nzbd_types::PostStage::ParVerify,
+        });
+        assert_eq!(name, "job_pp_stage");
+        assert!(data.contains("\"stage\":\"par_verify\""), "{data}");
+        let (name, data) = wire(&E::JobPpFinished {
+            job: JobId(7),
+            name: "Show.S01E01".into(),
+            category: Some("tv".into()),
+            pp_status: "SUCCESS".into(),
+            final_dir: Some("/dest/Show.S01E01".into()),
+            size_bytes: 42,
+            health: 1000,
+            params: vec![("monarr-transfer".into(), "t-42-a3f9c1".into())],
+            history_seq: 913,
+        });
+        assert_eq!(name, "job_pp_finished");
+        assert!(data.contains("\"final_dir\":\"/dest/Show.S01E01\""), "{data}");
+        assert!(data.contains("\"history_seq\":913"), "{data}");
+        assert!(
+            data.contains("monarr-transfer"),
+            "the transfer id must survive to the wire: {data}"
+        );
     }
 }

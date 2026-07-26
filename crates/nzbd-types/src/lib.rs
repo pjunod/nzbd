@@ -6,6 +6,8 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod metrics;
+
 // ---------------------------------------------------------------------------
 // Identifiers
 // ---------------------------------------------------------------------------
@@ -250,6 +252,39 @@ pub enum PostStage {
     Move,
     PostUnpackRename,
     Script,
+}
+
+impl PostStage {
+    /// The wire name — the same snake_case spelling serde produces, but as
+    /// a `&'static str` so event payloads and metric labels cannot drift
+    /// from the serialized form.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            PostStage::ParRename => "par_rename",
+            PostStage::ParVerify => "par_verify",
+            PostStage::ParRepair => "par_repair",
+            PostStage::RarRename => "rar_rename",
+            PostStage::Unpack => "unpack",
+            PostStage::Cleanup => "cleanup",
+            PostStage::Move => "move",
+            PostStage::PostUnpackRename => "post_unpack_rename",
+            PostStage::Script => "script",
+        }
+    }
+
+    /// Every variant, in pipeline order. Metrics exposition walks this, so
+    /// a stage added above appears on `/metrics` without a second edit.
+    pub const ALL: [PostStage; 9] = [
+        PostStage::ParRename,
+        PostStage::ParVerify,
+        PostStage::ParRepair,
+        PostStage::RarRename,
+        PostStage::Unpack,
+        PostStage::Cleanup,
+        PostStage::Move,
+        PostStage::PostUnpackRename,
+        PostStage::Script,
+    ];
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

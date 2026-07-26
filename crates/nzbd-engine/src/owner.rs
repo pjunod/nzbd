@@ -44,6 +44,8 @@ pub(crate) enum QueueCommand {
         priority: i32,
         dupe: Option<nzbd_types::DupeInfo>,
         paused: bool,
+        /// Caller-supplied job params, applied in this same turn.
+        params: Vec<(String, String)>,
         reply: oneshot::Sender<JobId>,
     },
     AddUrl {
@@ -53,6 +55,7 @@ pub(crate) enum QueueCommand {
         priority: i32,
         dupe: Option<nzbd_types::DupeInfo>,
         paused: bool,
+        params: Vec<(String, String)>,
         /// Replies `(id, created)`. `created == false` means the same URL is
         /// already fetching — the caller must NOT spawn a second fetch task.
         reply: oneshot::Sender<(JobId, bool)>,
@@ -618,6 +621,7 @@ impl Owner {
                 priority,
                 dupe,
                 paused,
+                params,
                 reply,
             } => {
                 let id = self.state.admit_nzb(
@@ -634,6 +638,7 @@ impl Owner {
                     if paused {
                         j.status = JobStatus::Paused;
                     }
+                    j.params.extend(params);
                 }
                 tracing::info!(job = id.0, %name, "job added");
                 self.save_snapshot(); // adds are durable immediately
@@ -649,6 +654,7 @@ impl Owner {
                 priority,
                 dupe,
                 paused,
+                params,
                 reply,
             } => {
                 // Same URL already mid-fetch? Return that job instead of
@@ -683,6 +689,7 @@ impl Owner {
                     if paused {
                         j.params.push(("*AddPaused".into(), "yes".into()));
                     }
+                    j.params.extend(params);
                 }
                 tracing::info!(job = id.0, %name, %url, "url job added (fetching)");
                 self.save_snapshot();

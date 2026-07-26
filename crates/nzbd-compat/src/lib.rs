@@ -555,6 +555,10 @@ async fn append(state: &CompatState, params: &Value) -> Result<Value, (i64, &'st
                 priority,
                 dupe: dupe.clone(),
                 paused: add_paused,
+                // The compat surface is frozen: NZBGet's `append` has no
+                // params argument, and clients that want them use the
+                // separate `editqueue`/`GroupSetParameter` call as before.
+                params: Vec::new(),
             };
             match state.engine.add_nzb_opts(&filename, &bytes, opts).await {
                 Ok(id) => Ok(json!(id.0)),
@@ -570,6 +574,10 @@ async fn append(state: &CompatState, params: &Value) -> Result<Value, (i64, &'st
                 priority,
                 dupe: dupe.clone(),
                 paused: add_paused,
+                // The compat surface is frozen: NZBGet's `append` has no
+                // params argument, and clients that want them use the
+                // separate `editqueue`/`GroupSetParameter` call as before.
+                params: Vec::new(),
             };
             match state.engine.add_url(&filename, &url, opts).await {
                 Ok(id) => Ok(json!(id.0)),
@@ -672,6 +680,7 @@ async fn record_dupe_reject(state: &CompatState, filename: &str, d: &nzbd_types:
         seen_count: 0,
         removed_at_unix: None,
         picked_up_by: None,
+        seq: 0,
     };
     let db = db.clone();
     let _ = tokio::task::spawn_blocking(move || db.record(&entry)).await;
@@ -963,6 +972,7 @@ async fn delete_to_history(state: &CompatState, id: JobId, with_files: bool) -> 
                 seen_count: 0,
                 removed_at_unix: None,
                 picked_up_by: None,
+                seq: 0,
             };
             let db = db.clone();
             let _ = tokio::task::spawn_blocking(move || db.record(&entry)).await;
@@ -1334,6 +1344,7 @@ mod tests {
             seen_count: 0,
             removed_at_unix: None,
             picked_up_by: None,
+            seq: 0,
         })
         .unwrap();
 
@@ -1418,6 +1429,7 @@ mod tests {
                 seen_count: 0,
                 removed_at_unix: None,
                 picked_up_by: None,
+                seq: 0,
             })
             .unwrap();
         }
@@ -1503,6 +1515,7 @@ mod tests {
                 seen_count: 0,
                 removed_at_unix: None,
                 picked_up_by: None,
+                seq: 0,
             })
             .unwrap();
 
