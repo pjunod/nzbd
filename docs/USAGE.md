@@ -53,16 +53,21 @@ Two things are *not* undoable, and behave differently on purpose:
 
 **How to read the header.** The connection indicator is the thing to
 check first when the page looks stuck: `● live updates` means the event
-stream is delivering; `◌ polling — reconnecting…` means the stream
-dropped and 5-second polls are carrying the page; a red banner across the
-top means the daemon is not answering at all and every number below it is
-the last state seen. The rate tile's sparkline is the last three minutes,
+stream is delivering; `◌ updates delayed` means the stream is fine but
+the daemon itself has stopped publishing fresh data — its engine is busy
+or its state disk is slow; the page shows the last data it sent and
+clears the moment it catches up (the daemon logs `engine tick ran long`
+with timings when this happens — that log line names the culprit);
+`◌ polling — reconnecting…` means the stream dropped and 5-second polls
+are carrying the page while it is rebuilt automatically; a red banner
+across the top means the daemon is not answering at all and every number
+below it is the last state seen. The rate tile's sparkline is the last three minutes,
 one point per second — a provider that dies for ten seconds a minute is
 invisible in the number and obvious in the shape. The chips beside the
 badges are your news servers with their current share of the wire rate;
-they add up to the header rate because they are the same bytes counted
-per server, and one turns red when that server is blocked after
-connection failures. The browser tab title tickers
+they add up to the header rate exactly — the tile IS their sum, the
+same bytes counted per server — and one turns red when that server is
+blocked after connection failures. The browser tab title tickers
 `▼ 93 MiB/s · 12m — nzbd` while downloading, so you can watch it from
 another tab.
 

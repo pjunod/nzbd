@@ -300,12 +300,12 @@ pub(crate) struct Owner {
     /// Per-job download-rate EMA, fed from downloaded-byte deltas at
     /// snapshot time (job id → meter).
     job_rates: HashMap<u32, JobRateMeter>,
-    /// Wire-byte EMA per job (B/s), fed from the meter's per-job counters
-    /// at 1 Hz — the same measurement as the header rate.
+    /// Wire-byte EMA per job (B/s), folded from the meter's time-stamped
+    /// drains — the same measurement as the header rate.
     job_wire_ema: HashMap<u32, f64>,
-    /// The same, per server. Same counters, same cadence, same alpha — the
-    /// per-server rates are the header rate sliced by provider, so they sum
-    /// to it instead of to a second, differently-derived figure.
+    /// The same, per server. Same counters, same drains, same alpha — and
+    /// the header rate IS the sum of these, so the chips sum to the tile
+    /// exactly instead of to a second, differently-derived figure.
     server_wire_ema: HashMap<u32, f64>,
     /// Article retries per job (any failed attempt that goes back on the
     /// ladder). Surfaced in the snapshot: this is the gap between wire
@@ -1681,7 +1681,16 @@ impl Owner {
         self.delegated.remove(&job_id);
         self.mirror.remove(&job_id);
         if self.persist {
-            let _ = self.journal.remove_job(job_id);
+            // A delete whose journal removal AND snapshot save both fail
+            // is resurrected by the next restart's recovery. The save
+            // failure already logs loudly; this one must too — if a
+            // deleted job "came back", this line is the receipt.
+            if let Err(e) = self.journal.remove_job(job_id) {
+                tracing::error!(
+                    job = job_id.0, error = %e,
+                    "could not remove the deleted job's journal — if the snapshot save also fails, this delete will not survive a restart"
+                );
+            }
         }
         if delete_files {
             let dir = self.dest_dir.join(sanitize_name(&job.name));
@@ -1768,6 +1777,7 @@ impl Owner {
     }
 
     fn on_tick(&mut self) {
+        let tick_started = Instant::now();
         self.guard_tick = self.guard_tick.wrapping_add(1);
         // NOT `is_multiple_of`: stabilized in 1.87, MSRV is 1.85.
         if self.guard_tick % 10 == 0 {
@@ -1776,36 +1786,25 @@ impl Owner {
         if self.guard_tick % 30 == 0 {
             self.volumes.save_if_dirty();
         }
-        let rate = self.meter.tick();
 
-        // Per-job wire rates: fold this second's attributed bytes into a
-        // ~5 s EMA (same cadence as the tick). Jobs with no bytes this
-        // second decay toward zero instead of freezing at their last rate.
-        let per_job = self.meter.drain_jobs();
-        const ALPHA: f64 = 1.0 / 5.0;
-        for (job, ema) in self.job_wire_ema.iter_mut() {
-            let inst = per_job.get(job).copied().unwrap_or(0) as f64;
-            *ema += ALPHA * (inst - *ema);
-        }
-        for (job, bytes) in per_job {
-            self.job_wire_ema
-                .entry(job)
-                .or_insert_with(|| bytes as f64 * ALPHA);
-        }
-
-        // Per-server wire rates: the identical fold over the identical
-        // counters, so "which provider is actually delivering this?" is
-        // answered in the same units as the header tile.
-        let per_server = self.meter.drain_servers();
-        for (server, ema) in self.server_wire_ema.iter_mut() {
-            let inst = per_server.get(server).copied().unwrap_or(0) as f64;
-            *ema += ALPHA * (inst - *ema);
-        }
-        for (server, bytes) in per_server {
-            self.server_wire_ema
-                .entry(server)
-                .or_insert_with(|| bytes as f64 * ALPHA);
-        }
+        // ONE wire measurement. The drain is stamped with the wall time it
+        // covers, per-job and per-server EMAs fold the same bytes at the
+        // same alpha, and the header rate is the SUM of the per-server
+        // EMAs — so the tile, the chips and the rows can only disagree by
+        // integer rounding, at any tick cadence (field report 2026-07-26:
+        // 24.8 MiB/s header vs 9.9 rows was the old ring-vs-EMA split,
+        // inflated by fsync-delayed ticks counting >1 s of bytes as 1 s).
+        let drained = self.meter.drain();
+        crate::rate::fold_wire_ema(&mut self.job_wire_ema, &drained.per_job, drained.secs);
+        crate::rate::fold_wire_ema(&mut self.server_wire_ema, &drained.per_server, drained.secs);
+        // Ghost entries (removed servers) decay; drop them below display
+        // resolution so they cannot linger in the snapshot forever.
+        self.server_wire_ema.retain(|_, v| *v > 0.4);
+        let rate: u64 = self
+            .server_wire_ema
+            .values()
+            .map(|e| e.max(0.0) as u64)
+            .sum();
 
         let now = Instant::now();
         let before = self.blocked.len();
@@ -1814,9 +1813,18 @@ impl Owner {
             self.bump_epoch(); // blocked servers came back: hand out work
         }
 
+        // Publish BEFORE the durability work. Journal fsync and snapshot
+        // saves can block for seconds on a slow state volume, and the read
+        // model the dashboard lives on must not queue behind them — that
+        // was the "page shows nothing for a while, then everything jumps"
+        // field report.
+        self.publish_snapshot(rate);
+
+        let sync_started = Instant::now();
         if let Err(e) = self.journal.sync() {
             tracing::error!(error = %e, "journal fsync failed");
         }
+        let sync_ms = sync_started.elapsed().as_millis() as u64;
 
         let pending = std::mem::take(&mut self.pending_finalize);
         for (j, f) in pending {
@@ -1825,10 +1833,27 @@ impl Owner {
             }
         }
 
-        self.publish_snapshot(rate);
-
+        let mut save_ms = 0u64;
         if self.dirty && self.last_save.elapsed() > Duration::from_secs(2) {
+            let save_started = Instant::now();
             self.save_snapshot();
+            save_ms = save_started.elapsed().as_millis() as u64;
+        }
+
+        // A tick that runs long stalls everything behind this loop:
+        // commands answer late (a delete can time out client-side and its
+        // row spring back), publishes stop (the UI goes quiet, then
+        // jumps), and drains stretch. Name the culprit with numbers — this
+        // line is what turns "the dashboard goes quiet sometimes" into a
+        // diagnosis of the state volume.
+        let total_ms = tick_started.elapsed().as_millis() as u64;
+        if total_ms > 1500 {
+            tracing::warn!(
+                total_ms,
+                journal_sync_ms = sync_ms,
+                snapshot_save_ms = save_ms,
+                "engine tick ran long — state volume too slow? commands and UI updates stall behind this"
+            );
         }
     }
 

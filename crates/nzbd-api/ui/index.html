@@ -562,7 +562,7 @@ const store = {
   logs: null,          // LogRecord[] | null (not loaded) | "off" (501)
   jobFiles: null,      // open job's file list
   jobLogs: null,       // open job's activity tail
-  conn: "connecting",  // connecting | live | reconnecting | unreachable
+  conn: "connecting",  // connecting | live | stalled | reconnecting | unreachable
   pauseSource: null,   // who last (un)paused the queue (from the event)
   healthAbort: false,  // [post] health_action arms the critical-health abort
 };
@@ -1272,6 +1272,16 @@ function pushRate(bps) {
   spark.buf[spark.n % SPARK_N] = Math.max(0, bps || 0);
   spark.n++;
 }
+// Ticks and poll fallbacks both feed the sparkline (the old page fed it
+// only from ticks, so a dead stream froze the shape while the number kept
+// polling). Sampled to ~1 Hz so a nudge-burst can't smear the time axis.
+let ratePushedAt = 0;
+function pushRateSampled(bps) {
+  const now = Date.now();
+  if (now - ratePushedAt < 900) return;
+  ratePushedAt = now;
+  pushRate(bps);
+}
 /// Oldest first, at most SPARK_N samples.
 function rateSeries() {
   const len = Math.min(spark.n, SPARK_N);
@@ -1661,6 +1671,7 @@ async function refreshStatus() {
   if (!r.ok) { pollResult(false); throw new Error("status " + r.status); }
   pollResult(true);
   store.status = await r.json();
+  pushRateSampled(store.status.download_rate_bps);
   renderStatus();
 }
 async function refreshQueue() {
@@ -2014,13 +2025,18 @@ function refreshAll() {
 let debounce = null;
 function nudge() { clearTimeout(debounce); debounce = setTimeout(refreshAll, 150); }
 
-// Connection honesty. Three states, and the page must be able to tell them
-// apart — an idle queue and a silently dead stream look identical otherwise,
-// because the daemon deduplicates idle ticks on purpose (that quiet-stream
-// property is deliberate: battery and radio on phone PWAs).
+// Connection honesty. Four states beyond boot, and the page must be able to
+// tell them apart — an idle queue and a silently dead stream look identical
+// otherwise, because the daemon deduplicates idle ticks on purpose (that
+// quiet-stream property is deliberate: battery and radio on phone PWAs).
 //
-//   live          a tick arrived recently
-//   reconnecting  EventSource errored; it retries itself, polls carry us
+//   live          a tick arrived recently (or the stream is up and idle)
+//   stalled       the stream is alive (hb flowing) but the read model has
+//                 stopped advancing while the wire was moving — the ENGINE
+//                 is wedged (slow state disk), not the connection. The old
+//                 UI showed "live" here and froze, because hb was wrongly
+//                 treated as freshness.
+//   reconnecting  the stream is down; polls carry the page while we rebuild
 //   unreachable   the polls are failing too — say so across the whole page,
 //                 not with a gray dot in the corner
 let pollFails = 0;
@@ -2033,6 +2049,10 @@ function connState(mode) {
     el.className = "conn ok";
     el.textContent = "● live updates";
     el.title = "Connected to the daemon's event stream — changes appear the moment they happen.";
+  } else if (mode === "stalled") {
+    el.className = "conn warn";
+    el.textContent = "◌ updates delayed";
+    el.title = "Connected, but the daemon hasn't published fresh data in a while — its engine may be blocked on slow storage. Numbers below are the last state it sent; this clears itself the moment it catches up.";
   } else if (mode === "reconnecting") {
     el.className = "conn warn";
     el.textContent = "◌ polling — reconnecting…";
@@ -2051,23 +2071,54 @@ function connState(mode) {
     : "");
   setClass(off, mode === "unreachable" ? "show" : "");
 }
+let lastTickAt = 0; // when the stream last delivered a full read model
+let lastHbAt = 0;   // when it last proved it was alive WITHOUT data
+/// Is the wire supposed to be moving, per the last state we saw? This is
+/// what separates "quiet because idle" from "quiet because wedged".
+function activeWire() {
+  const s = store.status;
+  return !!(s && !s.download_paused && s.download_rate_bps > 0);
+}
+/// The honest connection verdict from the two clocks. hb is LIVENESS, not
+/// freshness: a stream that heartbeats while ticks have stopped and the
+/// wire was moving means the daemon's engine has stopped publishing.
+function connFromGaps() {
+  const now = Date.now();
+  if (now - lastTickAt <= 6500) return "live";
+  if (now - lastHbAt <= 6500) return activeWire() ? "stalled" : "live";
+  return "reconnecting";
+}
 /// Every poll reports whether it got an answer. Two misses in a row is the
 /// difference between "one request lost the race with a restart" and "the
 /// daemon is gone".
 function pollResult(ok) {
   if (ok) {
     pollFails = 0;
-    if (store.conn === "unreachable")
-      connState(Date.now() - lastTickAt < 6500 ? "live" : "reconnecting");
+    if (store.conn === "unreachable") connState(connFromGaps());
     return;
   }
   if (++pollFails >= 2) connState("unreachable");
 }
-let lastTickAt = 0; // when the SSE stream last delivered a full read model
-function connectSse() {
-  const es = new EventSource("/api/v1/events");
-  es.onopen = () => connState("live");
-  es.onerror = () => connState("reconnecting"); // EventSource retries by itself
+
+// ---- the event stream, owned --------------------------------------------
+// EventSource's built-in retry only covers clean network failures. Any
+// HTTP-level answer that is not a 200 event stream — the 503 of a daemon
+// mid-restart, a proxy error page, an auth blip — closes it for good
+// (readyState CLOSED) with the same `error` event, and it will never try
+// again. The old page trusted the built-in retry, which is how a single
+// restart could leave "polling — reconnecting…" up forever with a stream
+// that was never coming back. This page owns the retry.
+let es = null, esRetryMs = 1000, esRetryTimer = null, esRetryPending = false;
+function startStream() {
+  if (es) { try { es.close(); } catch {} }
+  es = new EventSource("/api/v1/events");
+  es.onopen = () => { esRetryMs = 1000; connState("live"); };
+  es.onerror = () => {
+    if (store.conn !== "unreachable") connState("reconnecting");
+    // readyState CONNECTING means the browser is retrying by itself
+    // (network drop). CLOSED is fatal — rebuild it ourselves, backing off.
+    if (es && es.readyState === 2) scheduleStream();
+  };
   // Structural events nudge a refresh; every engine event is wired in so
   // pause/resume and limit changes from ANY client (another tab, an *arr,
   // the CLI) land here immediately too.
@@ -2086,26 +2137,13 @@ function connectSse() {
   // it directly: no fetch round-trip, nothing for a browser cache to wedge,
   // progress moves the moment the daemon publishes.
   es.addEventListener("tick", (e) => {
-    lastTickAt = Date.now();
-    connState("live");
-    try {
-      const d = JSON.parse(e.data);
-      store.status = d.status;
-      store.jobs = d.jobs;
-      store.jobsLoaded = true;
-      pending.reconcile(d.jobs);
-      pushRate(d.status.download_rate_bps);
-      renderStatus();
-      if (activeTab === "queue") renderQueue();
-    } catch { /* malformed frame — the poll fallback still corrects */ }
+    try { applyTick(JSON.parse(e.data)); }
+    catch { /* malformed frame — the poll fallback still corrects */ }
   });
   // An idle queue deduplicates its ticks, so silence is normal. `hb` is how
   // the daemon says "still here" without shipping a read model — it is the
   // difference between a quiet queue and a dead stream.
-  es.addEventListener("hb", () => {
-    lastTickAt = Date.now();
-    connState("live");
-  });
+  es.addEventListener("hb", applyHb);
   // Live log tail. Everything lands in the client ring regardless of the
   // scope toggles (they filter at render time) and the open job's activity
   // panel feeds off the same stream.
@@ -2124,6 +2162,41 @@ function connectSse() {
       }
     } catch { /* malformed frame — the backfill poll still corrects */ }
   });
+}
+function scheduleStream() {
+  if (esRetryPending) return;
+  esRetryPending = true;
+  esRetryTimer = setTimeout(() => {
+    esRetryPending = false;
+    // If the browser's own retry recovered it in the meantime, leave the
+    // live stream alone.
+    if (!es || es.readyState === 2) startStream();
+  }, esRetryMs);
+  esRetryMs = Math.min(Math.round(esRetryMs * 1.6), 15000);
+}
+/// The belt to scheduleStream's suspender, run from the 5 s pass: a stream
+/// that is CLOSED with no rebuild pending gets one, whatever closed it.
+function ensureStream() {
+  if (es && es.readyState === 2 && !esRetryPending) scheduleStream();
+}
+function applyTick(d) {
+  lastTickAt = Date.now();
+  connState("live"); // fresh data is the one thing that clears "stalled"
+  store.status = d.status;
+  store.jobs = d.jobs;
+  store.jobsLoaded = true;
+  pending.reconcile(d.jobs);
+  pushRateSampled(d.status.download_rate_bps);
+  renderStatus();
+  if (activeTab === "queue") renderQueue();
+}
+function applyHb() {
+  lastHbAt = Date.now();
+  // hb proves the STREAM, not the data. It may upgrade a state that was
+  // about the connection (reconnecting/unreachable/boot), but it must
+  // never paper over "stalled" — only a tick clears that.
+  if (store.conn === "reconnecting" || store.conn === "unreachable" || store.conn === "connecting")
+    connState(connFromGaps());
 }
 
 // ---- settings: a real form over nzbd.toml -------------------------------
@@ -2605,25 +2678,33 @@ async function checkSetup() {
 }
 
 initTheme();
+// The 5 s pass. Poll fallback engages whenever ticks are stale AND the
+// verdict is not "healthy idle stream": a dead stream is carried by polls
+// while it rebuilds, and a stalled engine is polled too (the poll returns
+// the same stale snapshot, but it keeps `unreachable` detection honest).
+// History/logs/settings tabs have no tick payload, so they refresh on the
+// timer regardless.
+function pollPass() {
+  ensureStream();
+  if (Date.now() - lastTickAt > 6500) {
+    const verdict = connFromGaps(); // live (idle) | stalled | reconnecting
+    if (store.conn !== "unreachable") connState(verdict);
+    if (verdict !== "live") refreshAll();
+    else if (activeTab !== "queue") refreshTab();
+  } else if (activeTab !== "queue") refreshTab();
+  if (openJob != null) refreshJobDetail();
+}
 (async () => {
   if (await checkSetup()) return;
-  connectSse();
-  // Poll fallback: only when SSE ticks go quiet (stream down or the
-  // daemon deduplicated an idle tick). History/logs/settings tabs have no
-  // tick payload, so they refresh on the timer regardless.
-  setInterval(() => {
-    if (Date.now() - lastTickAt > 6500) {
-      if (store.conn === "live") connState("reconnecting");
-      refreshAll();
-    } else if (activeTab !== "queue") refreshTab();
-    if (openJob != null) refreshJobDetail();
-  }, 5000);
+  startStream();
+  setInterval(pollPass, 5000);
   // The pending-op grace period has to expire even when nothing is arriving
   // — a dead stream must never leave a row invisible forever.
   setInterval(() => pending.sweep(), 1000);
-  // Coming back to the tab: repaint now, not at the next timer.
+  // Coming back to the tab: repaint now, not at the next timer — and give a
+  // stream the browser tore down in the background its rebuild immediately.
   document.addEventListener("visibilitychange", () => {
-    if (!document.hidden) refreshAll();
+    if (!document.hidden) { ensureStream(); refreshAll(); }
   });
   refreshAll();
 })();
@@ -2639,10 +2720,15 @@ if (typeof __nzbd_test_enable !== "undefined") {
     histModel, fileModel, statusModels, queueModels, detailModel,
     statusName, healthColor, fmtBytes, fmtRate, fmtEta,
     pending, satisfied, toast, connState, pollResult,
+    connFromGaps, activeWire, applyTick, applyHb, pollPass,
+    startStream, ensureStream,
+    __stream: () => ({ es, retryPending: esRetryPending, retryMs: esRetryMs }),
+    __setClocks: (tick, hb) => { lastTickAt = tick; lastHbAt = hb; },
+    __setRateClock: (t) => { ratePushedAt = t; },
     PENDING_TTL_MS, PENDING_HARD_MS, UNDO_MS, ARM_MS, refreshTab,
     armButton, armIsSet, disarmButton, histKey, renderHistory,
     deleteJob, requeueJob, jobAction, histAction, post,
-    pushRate, rateSeries, spark, SPARK_N, titleFor,
+    pushRate, pushRateSampled, rateSeries, spark, SPARK_N, titleFor,
     appendLogs, logMatches, renderLogs, serverChipModels, LOG_RING_MAX,
     setOpenJob: (id) => { openJob = id; },
     setActiveTab: (t) => { activeTab = t; },

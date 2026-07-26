@@ -139,7 +139,11 @@ const sandbox = {
   location: { reload() {} },
   // Swappable so the action tests can script the daemon's answers.
   fetch: async (url, init) => routeFetch(url, init),
-  EventSource: class { constructor(u) { this.url = u; } addEventListener() {} },
+  EventSource: class {
+    constructor(u) { this.url = u; this.readyState = 0; this.listeners = {}; }
+    addEventListener(n, f) { this.listeners[n] = f; }
+    close() { this.readyState = 2; }
+  },
   setInterval: () => 0, clearInterval() {},
   setTimeout: () => 0, clearTimeout() {},
   confirm: () => true, alert() {},
@@ -578,6 +582,113 @@ const models = (jobs) => jobs.map((j, i) => T.rowModel(j, { idx: i, count: jobs.
   T.pollResult(true);
   ok(T.conn() !== "unreachable", "an answered poll clears it");
   eq(off.className, "", "banner gone");
+}
+
+// --- 19b. hb is liveness, not freshness ----------------------------------
+// The daemon heartbeats a stream whose ticks it deduplicated. While the
+// wire was moving, deduplicated ticks are impossible — missing ticks mean
+// the ENGINE stopped publishing (wedged on slow storage). The old page fed
+// hb into the same clock as ticks, told the user "● live updates", and
+// never engaged the poll fallback: frozen page, green dot. That is the
+// "dash goes long times without any update" field report (2026-07-26).
+{
+  const fullStatus = (over) => Object.assign({
+    version: "0.1.0", up_since_unix: 1, download_rate_bps: 10 * 1048576,
+    remaining_bytes: 1e9, session_downloaded_bytes: 5e7,
+    download_paused: false, disk_low: false, quota_reached: false,
+    blocked_servers: [], health_abort: false, speed_limit_bps: null,
+    jobs_queued: 1, jobs_downloading: 1, jobs_finished: 0, servers: [],
+  }, over || {});
+  routes.clear(); seen.length = 0;
+  routes.set("/api/v1/status", { status: 200, body: fullStatus() });
+  routes.set("/api/v1/jobs", { status: 200, body: { jobs: [] } });
+  T.store.status = fullStatus();
+  const now = Date.now();
+
+  // Ticks stale, hb fresh, wire active -> the engine is wedged: say so.
+  T.connState("live");
+  T.__setClocks(now - 20000, now - 1000);
+  T.pollPass();
+  eq(T.conn(), "stalled", "hb without ticks while downloading reads as stalled, not live");
+  ok(seen.some(r => r.url.includes("/api/v1/status")),
+    "…and the poll fallback engages instead of trusting the heartbeat");
+
+  // A real tick is the one thing that clears it.
+  T.applyTick({ status: fullStatus(), jobs: [] });
+  eq(T.conn(), "live", "fresh data clears stalled");
+
+  // Same gaps with an idle wire: a quiet stream is healthy, not stalled.
+  seen.length = 0;
+  T.store.status = fullStatus({ download_rate_bps: 0, jobs_downloading: 0 });
+  T.__setClocks(now - 20000, now - 1000);
+  T.pollPass();
+  eq(T.conn(), "live", "an idle queue's deduplicated ticks stay live on hb alone");
+  ok(!seen.some(r => r.url.includes("/api/v1/status")),
+    "…without burning a status poll on a healthy idle stream");
+
+  // hb stale too: the stream itself is gone.
+  T.__setClocks(now - 20000, now - 20000);
+  T.pollPass();
+  eq(T.conn(), "reconnecting", "no ticks and no hb is a dead stream");
+
+  // And hb may repair connection-level states, but never a stall.
+  T.store.status = fullStatus();
+  T.__setClocks(now - 20000, now);
+  T.connState("reconnecting");
+  T.applyHb();
+  eq(T.conn(), "stalled", "hb upgrades reconnecting only as far as honesty allows");
+  T.connState("stalled");
+  T.applyHb();
+  eq(T.conn(), "stalled", "hb alone never clears a stall — only a tick does");
+
+  T.__setClocks(Date.now(), Date.now());
+  T.connState("live");
+  routes.clear(); seen.length = 0;
+}
+
+// --- 19c. a fatally-closed EventSource is rebuilt, not mourned -----------
+// EventSource retries by itself only after clean network failures. Any
+// non-200 answer (a 503 mid-restart, a proxy error page) closes it for
+// good — the spec's "fail the connection" — and the old page would sit on
+// "polling — reconnecting…" forever with a stream that was never coming
+// back. The page owns that retry now.
+{
+  T.startStream();
+  const s1 = T.__stream();
+  ok(s1.es && s1.es.url.includes("/api/v1/events"), "stream points at the daemon");
+  eq(s1.retryPending, false, "no rebuild pending while it is healthy");
+
+  s1.es.readyState = 2; // the fatal close: non-200 answer, no built-in retry
+  s1.es.onerror();
+  const s2 = T.__stream();
+  eq(s2.retryPending, true, "a fatal close schedules our own rebuild");
+  eq(T.conn(), "reconnecting", "…and the page says what is happening");
+  ok(s2.retryMs > 1000, "the retry backs off instead of hammering a restarting daemon");
+
+  // The 5 s pass is the belt to that suspender: a CLOSED stream with no
+  // rebuild pending (however it got that way) is given one.
+  T.startStream();
+  T.__stream().es.readyState = 2;
+  T.__setClocks(Date.now(), Date.now()); // fresh clocks: pollPass must act on readyState alone
+  T.pollPass();
+  eq(T.__stream().retryPending, true, "ensureStream rebuilds a closed stream found by the timer");
+
+  T.startStream(); // leave a healthy stream behind for later tests
+  T.connState("live");
+}
+
+// --- 19d. the sparkline survives on polls, sampled ------------------------
+// The old page fed the sparkline only from SSE ticks: on a dead stream the
+// rate number kept polling while the shape froze. Poll data feeds it now,
+// through a ~1 Hz sampler so a nudge-burst cannot smear the time axis.
+{
+  T.spark.n = 0; T.spark.buf.fill(0);
+  T.__setRateClock(0); // rewind the sampler (earlier tests just pushed)
+  T.pushRateSampled(1000);
+  T.pushRateSampled(2000); // within the sampling window: dropped
+  eq(T.rateSeries().length, 1, "burst pushes collapse to one sample");
+  eq(T.rateSeries()[0], 1000, "…keeping the first, not smearing the axis");
+  T.spark.n = 0; T.spark.buf.fill(0);
 }
 
 // --- 20. no blocking dialogs anywhere in the page ------------------------

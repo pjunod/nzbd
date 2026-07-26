@@ -2331,27 +2331,36 @@ mod tests {
     /// bytes counted twice, never two independently-derived figures. This
     /// is the same-measurement invariant the per-job rates already keep
     /// (field report 2026-07-25: a header claiming 93 MiB/s over rows that
-    /// claimed 56).
+    /// claimed 56 — and 2026-07-26: a header window disagreeing with the
+    /// chips by 2.5× — which is why the header is now literally the sum of
+    /// the per-server EMAs, folded from one time-stamped drain).
     #[test]
     fn per_server_rates_are_the_same_bytes_as_the_header_rate() {
-        use nzbd_engine::rate::SpeedMeter;
+        use nzbd_engine::rate::{fold_wire_ema, SpeedMeter};
         let m = SpeedMeter::new();
         m.add_for(1, 0, 600);
         m.add_for(2, 0, 400);
         m.add_for(1, 1, 1000);
-        let per_job = m.drain_jobs();
-        let per_server = m.drain_servers();
-        let job_sum: u64 = per_job.values().sum();
-        let server_sum: u64 = per_server.values().sum();
+        let d = m.drain();
+        let job_sum: u64 = d.per_job.values().sum();
+        let server_sum: u64 = d.per_server.values().sum();
         assert_eq!(job_sum, 2000);
         assert_eq!(server_sum, job_sum, "same bytes, two attributions");
-        assert_eq!(m.tick(), 2000, "…and the same bytes again in the header");
-        assert_eq!(per_server[&0], 1000);
-        assert_eq!(per_server[&1], 1000);
+        assert_eq!(d.per_server[&0], 1000);
+        assert_eq!(d.per_server[&1], 1000);
         assert!(
-            m.drain_servers().is_empty(),
-            "draining resets, so the next second starts clean"
+            m.drain().per_server.is_empty(),
+            "draining resets, so the next window starts clean"
         );
+        // The header the snapshot publishes is Σ per-server EMAs — fold the
+        // same drain into both maps and the sums cannot disagree.
+        let mut job_ema = std::collections::HashMap::new();
+        let mut server_ema = std::collections::HashMap::new();
+        fold_wire_ema(&mut job_ema, &d.per_job, 1.0);
+        fold_wire_ema(&mut server_ema, &d.per_server, 1.0);
+        let header: u64 = server_ema.values().map(|e| e.max(0.0) as u64).sum();
+        let rows: u64 = job_ema.values().map(|e| e.max(0.0) as u64).sum();
+        assert_eq!(header, rows, "tile and rows are one measurement");
     }
 
     /// The status DTO carries the per-server rows the UI draws its chips
