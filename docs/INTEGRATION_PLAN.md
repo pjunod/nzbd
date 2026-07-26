@@ -36,14 +36,15 @@
 > nothing; the plain monotone `seq` still rides in the body. Consumers
 > should treat the id as opaque and echo it back verbatim.
 >
-> **Known wart, flagged not fixed.** `?since_seq=` can hand a consumer the
-> same history entry twice. `HistoryDb::delete` removes the index row but
-> not the JSONL line (deliberate, pre-existing: the JSONL is the
-> authoritative cross-node log and a delete is index-local), so the next
-> refresh re-imports it with a fresh, higher rowid. The duplicate is
+> **Known wart, flagged not fixed —
+> [DEFECT_HISTORY_DELETE.md](DEFECT_HISTORY_DELETE.md).** `?since_seq=` can
+> hand a consumer the same history entry twice: `HistoryDb::delete` removes
+> the index row but not the authoritative JSONL line, so the next refresh
+> re-imports it with a fresh, higher rowid. The duplicate is
 > byte-identical — **consumers dedupe on `(job, completed_at)`**, the key
-> the index is already unique on. A proper fix means durable delete
-> tombstones, which changes cross-node semantics and is its own decision.
+> the index is already unique on. That file has the reproduction, the
+> operator-facing half of the same bug ("forget" doesn't forget), and the
+> two fix options with the semantic decision they turn on.
 >
 > Not done, and deliberately: cluster-mode PP stage timings are not wired
 > to a node's `/metrics`. Leases run wherever the scheduler puts them, so

@@ -291,18 +291,15 @@ impl HistoryDb {
     /// the path that makes SSE loss harmless: the stream can drop
     /// anything, and `since_seq` still reconstructs it.
     ///
-    /// **Known wart, inherited from `delete`.** `delete` removes the index
-    /// row but not the JSONL line — deliberately, because the JSONL is the
-    /// authoritative cross-node log and a delete is index-local (see
-    /// `record_list_delete_and_jsonl_rebuild`). The next `refresh`
-    /// re-imports that line and SQLite assigns it a *new, higher* rowid,
-    /// so a consumer paging forward can be handed the same entry a second
-    /// time under a later cursor. The duplicate is byte-identical, so
-    /// **dedupe on `(job, completed_at)`** — the same key the index is
-    /// already unique on. Fixing it properly means giving deletes a
-    /// durable tombstone, which changes cross-node semantics and deserves
-    /// its own change rather than riding in as a side effect of adding a
-    /// cursor.
+    /// **Known defect — `docs/DEFECT_HISTORY_DELETE.md`.** `delete` removes
+    /// the index row but not the authoritative JSONL line, so the next
+    /// `refresh` re-imports it with a *new, higher* rowid and a consumer
+    /// paging forward is handed the same entry a second time under a later
+    /// cursor. The duplicate is byte-identical, so **dedupe on
+    /// `(job, completed_at)`** — the key this index is already unique on.
+    /// Pinned by `delete_resurrects_the_entry_with_a_new_cursor`, which
+    /// documents the wrong behavior on purpose; that doc has the two fix
+    /// options and the semantic decision they wait on.
     pub fn list_since(
         &self,
         since_seq: i64,
@@ -448,6 +445,16 @@ impl HistoryDb {
         Ok(())
     }
 
+    /// Forget an entry.
+    ///
+    /// **Known defect — `docs/DEFECT_HISTORY_DELETE.md`.** This removes the
+    /// index row only. The JSONL line survives, and the next `refresh`
+    /// puts the entry back with a fresh rowid, so the delete does not
+    /// stick — the UI's "forget" is undone within one history poll and
+    /// `list_since` reports the entry twice. `hide` re-appends its change
+    /// to the log for exactly this reason; `delete` has no equivalent, and
+    /// giving it one is a cross-node semantic decision rather than a
+    /// mechanical fix. Read that doc before changing this function.
     pub fn delete(&self, job: crate::JobId) -> Result<bool, StateError> {
         let n = {
             let conn = self.conn.lock().unwrap();
@@ -686,6 +693,56 @@ mod tests {
         // A fresh index still assigns a usable cursor on rebuild.
         let db2 = HistoryDb::open(&tmp.path().join("other/history.sqlite"), Some(&shared)).unwrap();
         assert!(db2.list_since(0, 10).unwrap()[0].seq > 0);
+    }
+
+    /// **Pins a known defect on purpose** (`docs/DEFECT_HISTORY_DELETE.md`).
+    ///
+    /// A deleted entry comes back on the next refresh with a new rowid, so
+    /// "forget" does not stick and a cursor consumer sees the entry twice.
+    /// This test asserts the WRONG behavior so that a fix cannot land
+    /// silently: when someone implements tombstones, this test fails, and
+    /// its replacement is item 1 and item 3 of that doc's acceptance list.
+    #[test]
+    fn delete_resurrects_the_entry_with_a_new_cursor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let shared = tmp.path().join("shared");
+        let db = HistoryDb::open(&tmp.path().join("local/history.sqlite"), Some(&shared)).unwrap();
+        for n in 1..=3 {
+            db.record(&entry(n, 100 * n as i64)).unwrap();
+        }
+        let before = db.list_since(0, 50).unwrap();
+        let cursor = before.last().unwrap().seq;
+        let gone_at = before.iter().find(|e| e.job.0 == 2).unwrap().seq;
+
+        assert!(db.delete(crate::JobId(2)).unwrap());
+        assert!(
+            !db.list_since(0, 50).unwrap().iter().any(|e| e.job.0 == 2),
+            "the delete does take effect in the index"
+        );
+
+        // …until the first read rebuilds the index from the log, which is
+        // every history poll. `open` seeds without arming the throttle, so
+        // this first `refresh` is not skipped.
+        db.refresh().unwrap();
+        let back = db
+            .list_since(0, 50)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.job.0 == 2)
+            .expect("DEFECT: the deleted entry is back");
+        assert!(
+            back.seq > gone_at,
+            "and it is back as a NEW row (seq {} > {gone_at}), which is why \
+             a consumer past cursor {cursor} is handed it a second time",
+            back.seq
+        );
+        assert!(
+            db.list_since(cursor, 50)
+                .unwrap()
+                .iter()
+                .any(|e| e.job.0 == 2),
+            "DEFECT: duplicate delivery on the cursor"
+        );
     }
 
     #[test]
