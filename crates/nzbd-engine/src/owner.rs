@@ -678,6 +678,24 @@ impl Owner {
                         %url,
                         "url add deduplicated: same URL is already fetching"
                     );
+                    // The retry still gets its params applied. A client
+                    // that re-adds because the fetch looked stalled is the
+                    // same client that will later look for its tracking id
+                    // on the job; dropping the params here loses the id on
+                    // exactly the adds most likely to be retried, and the
+                    // caller has no way to tell it happened.
+                    if !params.is_empty() {
+                        if let Some(j) = self.state.job_mut(id) {
+                            for (k, v) in params {
+                                match j.params.iter_mut().find(|(pk, _)| *pk == k) {
+                                    Some(slot) => slot.1 = v,
+                                    None => j.params.push((k, v)),
+                                }
+                            }
+                        }
+                        self.save_snapshot();
+                        self.publish_now();
+                    }
                     let _ = reply.send((id, false));
                     return;
                 }

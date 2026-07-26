@@ -117,10 +117,12 @@ fn wait_healthy(addr: &str, deadline: Duration) {
     }
 }
 
-/// One frame off the SSE stream.
+/// One frame off the SSE stream. `id` is the raw `<boot>-<seq>` wire
+/// form; `seq` is its second half, which is what the assertions care
+/// about.
 #[derive(Debug, Clone)]
 struct Frame {
-    id: Option<u64>,
+    id: Option<String>,
     event: String,
     data: String,
 }
@@ -128,6 +130,9 @@ struct Frame {
 impl Frame {
     fn json(&self) -> serde_json::Value {
         serde_json::from_str(&self.data).unwrap_or(serde_json::Value::Null)
+    }
+    fn seq(&self) -> Option<u64> {
+        self.id.as_ref()?.split_once('-')?.1.parse().ok()
     }
 }
 
@@ -194,7 +199,7 @@ impl Sse {
                 continue;
             }
             match line.split_once(':') {
-                Some(("id", v)) => id = v.trim().parse().ok(),
+                Some(("id", v)) => id = Some(v.trim().to_string()),
                 Some(("event", v)) => event = Some(v.trim().to_string()),
                 Some(("data", v)) => data = Some(v.trim().to_string()),
                 _ => {} // comment keep-alive, or a chunk-size line
@@ -342,7 +347,7 @@ fn a_finished_download_announces_its_stages_its_final_dir_and_its_history_row() 
     // Every engine frame is resumable (N2): stream-local views are not.
     for f in &engine_frames {
         assert!(
-            f.id.is_some(),
+            f.seq().is_some(),
             "engine frame {:?} carried no id: — a consumer cannot resume from it",
             f.event
         );
@@ -462,7 +467,9 @@ fn a_reconnecting_consumer_replays_exactly_what_it_missed() {
     let (code, _) = request(&d.addr, "POST", "/api/v1/queue/actions/pause", b"", &[]);
     assert_eq!(code, 200);
     let frames = sse.until(deadline, "queue_pause_changed");
-    let last_id = frames.last().unwrap().id.expect("id on an engine frame");
+    let last = frames.last().unwrap();
+    let last_id = last.id.clone().expect("id on an engine frame");
+    let last_seq = last.seq().expect("<boot>-<seq> wire form");
     drop(sse); // "the tab was closed"
 
     // Three events happen while nobody is listening.
@@ -477,7 +484,7 @@ fn a_reconnecting_consumer_replays_exactly_what_it_missed() {
         assert_eq!(code, 200);
     }
 
-    let mut resumed = Sse::open(&d.addr, &[("Last-Event-ID", &last_id.to_string())]);
+    let mut resumed = Sse::open(&d.addr, &[("Last-Event-ID", &last_id)]);
     let deadline = Instant::now() + Duration::from_secs(30);
     let mut replayed = Vec::new();
     while replayed.len() < 3 {
@@ -495,8 +502,8 @@ fn a_reconnecting_consumer_replays_exactly_what_it_missed() {
         "exactly the three missed events, in order"
     );
     assert_eq!(
-        replayed.iter().filter_map(|f| f.id).collect::<Vec<_>>(),
-        vec![last_id + 1, last_id + 2, last_id + 3],
+        replayed.iter().filter_map(|f| f.seq()).collect::<Vec<_>>(),
+        vec![last_seq + 1, last_seq + 2, last_seq + 3],
         "contiguous with where the consumer left off"
     );
     assert!(
@@ -504,17 +511,33 @@ fn a_reconnecting_consumer_replays_exactly_what_it_missed() {
         "a coverable gap must not be reported as a reset"
     );
 
-    // An id this daemon never issued (a previous process's numbering, or a
-    // consumer restored from an old snapshot) is answered honestly.
-    let mut stale = Sse::open(&d.addr, &[("Last-Event-ID", "999999")]);
+    // An id from a DIFFERENT process. This is the case a bare sequence
+    // number cannot catch: after a restart the daemon re-issues low
+    // numbers for entirely different events, and serving those as the
+    // continuation of an old stream is silent corruption rather than a
+    // visible gap. The epoch in the id is what makes it detectable.
+    let boot = last_id.split_once('-').unwrap().0.parse::<u64>().unwrap();
+    let foreign = format!("{}-1", boot - 1);
+    let mut stale = Sse::open(&d.addr, &[("Last-Event-ID", &foreign)]);
     let first = stale
         .next(Instant::now() + Duration::from_secs(15))
         .expect("a frame");
     assert_eq!(
         first.event, "reset",
-        "an uncoverable gap must say so, not hand over a stream that looks complete"
+        "a restart must not be served as a clean resume"
     );
     assert_eq!(first.json()["reason"], "gap");
+    drop(stale);
+
+    // A seq this process never issued is equally uncoverable.
+    let mut ahead = Sse::open(&d.addr, &[("Last-Event-ID", &format!("{boot}-999999"))]);
+    assert_eq!(
+        ahead
+            .next(Instant::now() + Duration::from_secs(15))
+            .expect("a frame")
+            .event,
+        "reset"
+    );
 }
 
 // ---------------------------------------------------------------------------

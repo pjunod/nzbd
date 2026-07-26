@@ -15,10 +15,14 @@
 //!
 //! Two things this deliberately does NOT do:
 //!
-//! * It does not persist. `seq` is process-lifetime; a restarted daemon
-//!   starts at 0 again and any client holding an old id is told to
-//!   reconcile ([`Replay::Reset`]) rather than handed events that look
-//!   contiguous and are not.
+//! * It does not persist. `seq` is process-lifetime and restarts at 1.
+//!   The wire id is therefore `<boot>-<seq>`, where `boot` is unique to
+//!   this process: a bare seq cannot tell "you missed events 51-60" from
+//!   "we restarted and these are a *different* events 51-60", and the
+//!   second one served as a clean resume is silent corruption of a
+//!   consumer's view. `Last-Event-ID` is opaque to SSE, so carrying the
+//!   epoch in it costs nothing; the plain `seq` still rides in the body
+//!   for consumers that want an ordering.
 //! * It does not make SSE reliable enough to depend on. The ring is a
 //!   convenience over the real recovery path (`?since_seq=` on history).
 //!   A client that ignores `reset` and trusts the stream is still wrong.
@@ -46,7 +50,34 @@ pub struct SeqFrame {
     pub data: Arc<str>,
 }
 
+/// A `Last-Event-ID` value: `<boot>-<seq>`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EventId {
+    pub boot: u64,
+    pub seq: u64,
+}
+
+impl EventId {
+    pub fn parse(raw: &str) -> Option<EventId> {
+        let (boot, seq) = raw.trim().split_once('-')?;
+        Some(EventId {
+            boot: boot.parse().ok()?,
+            seq: seq.parse().ok()?,
+        })
+    }
+}
+
+impl std::fmt::Display for EventId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}-{}", self.boot, self.seq)
+    }
+}
+
 pub struct EventHub {
+    /// Identifies this process's numbering. Any value that does not
+    /// repeat across a restart works; the boot instant in nanoseconds is
+    /// the cheapest one that never collides in practice.
+    boot: u64,
     next: AtomicU64,
     ring: Mutex<VecDeque<SeqFrame>>,
     tx: broadcast::Sender<SeqFrame>,
@@ -75,25 +106,28 @@ impl EventHub {
     /// Start the pump. Must be called from within a Tokio runtime; every
     /// caller builds the router inside one.
     pub fn spawn(engine: &nzbd_engine::EngineHandle) -> Arc<EventHub> {
-        let (tx, _) = broadcast::channel(RING);
-        let hub = Arc::new(EventHub {
-            next: AtomicU64::new(1),
-            ring: Mutex::new(VecDeque::with_capacity(RING)),
-            tx,
-            counts: Mutex::new(BTreeMap::new()),
-            sse_clients: AtomicI64::new(0),
-        });
+        let boot = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(1);
+        let hub = Arc::new(EventHub::new(boot));
         let mut rx = engine.subscribe();
         let pump = hub.clone();
         tokio::spawn(async move {
             loop {
                 match rx.recv().await {
                     Ok(ev) => pump.publish(&ev),
-                    // The pump lagging means the ring is already the
-                    // authority on what was missed; individual SSE streams
-                    // report their own lag. Keep pumping.
+                    // The pump itself fell behind the engine: events were
+                    // dropped before they were ever numbered, so no seq
+                    // gap exists to betray them and neither the ring nor a
+                    // reconnecting client would ever know. Publish the
+                    // loss AS an event — it takes a seq, lands in the
+                    // ring, and reaches live and replaying clients alike,
+                    // so the one loss mode this design otherwise cannot
+                    // signal becomes the one it signals loudest.
                     Err(broadcast::error::RecvError::Lagged(n)) => {
                         tracing::warn!(skipped = n, "event hub lagged behind the engine broadcast");
+                        pump.publish_raw("lagged", serde_json::json!({ "skipped": n }));
                     }
                     Err(broadcast::error::RecvError::Closed) => break,
                 }
@@ -102,8 +136,28 @@ impl EventHub {
         hub
     }
 
+    fn new(boot: u64) -> EventHub {
+        EventHub {
+            boot,
+            next: AtomicU64::new(1),
+            ring: Mutex::new(VecDeque::with_capacity(RING)),
+            tx: broadcast::channel(RING).0,
+            counts: Mutex::new(BTreeMap::new()),
+            sse_clients: AtomicI64::new(0),
+        }
+    }
+
+    /// This process's event-id epoch.
+    pub fn boot(&self) -> u64 {
+        self.boot
+    }
+
     fn publish(&self, ev: &nzbd_engine::Event) {
-        let (name, mut body) = crate::event_json(ev);
+        let (name, body) = crate::event_json(ev);
+        self.publish_raw(name, body);
+    }
+
+    fn publish_raw(&self, name: &'static str, mut body: Value) {
         let seq = self.next.fetch_add(1, Ordering::Relaxed);
         if let Some(o) = body.as_object_mut() {
             o.insert("seq".into(), Value::from(seq));
@@ -133,15 +187,20 @@ impl EventHub {
     }
 
     /// Resolve a `Last-Event-ID` into what the client should receive.
-    pub fn replay(&self, last_event_id: Option<u64>) -> Replay {
-        let Some(last) = last_event_id else {
+    pub fn replay(&self, last_event_id: Option<EventId>) -> Replay {
+        let Some(id) = last_event_id else {
             return Replay::Live;
         };
+        if id.boot != self.boot {
+            // A different process numbered that id. Its seq 50 and ours
+            // are unrelated events; serving ours as the continuation of
+            // theirs would look perfectly contiguous and be nonsense.
+            return Replay::Reset;
+        }
+        let last = id.seq;
         let highest = self.next.load(Ordering::Relaxed).saturating_sub(1);
         if last > highest {
-            // Ahead of us: this daemon restarted (seq reset to 1) and the
-            // client is quoting the previous process's numbering.
-            return Replay::Reset;
+            return Replay::Reset; // an id we never issued
         }
         let ring = self.ring.lock().unwrap();
         let oldest = ring.front().map(|f| f.seq);
@@ -205,14 +264,14 @@ mod tests {
     use nzbd_engine::Event;
     use nzbd_types::JobId;
 
+    const BOOT: u64 = 7;
+
     fn hub() -> Arc<EventHub> {
-        Arc::new(EventHub {
-            next: AtomicU64::new(1),
-            ring: Mutex::new(VecDeque::with_capacity(RING)),
-            tx: broadcast::channel(RING).0,
-            counts: Mutex::new(BTreeMap::new()),
-            sse_clients: AtomicI64::new(0),
-        })
+        Arc::new(EventHub::new(BOOT))
+    }
+
+    fn id(seq: u64) -> Option<EventId> {
+        Some(EventId { boot: BOOT, seq })
     }
 
     fn added(hub: &EventHub, n: u32) {
@@ -243,7 +302,7 @@ mod tests {
         for n in 1..=5 {
             added(&h, n);
         }
-        match h.replay(Some(2)) {
+        match h.replay(id(2)) {
             Replay::Frames(f) => {
                 assert_eq!(
                     f.iter().map(|f| f.seq).collect::<Vec<_>>(),
@@ -254,7 +313,7 @@ mod tests {
             _ => panic!("expected a replay"),
         }
         assert!(
-            matches!(h.replay(Some(5)), Replay::Live),
+            matches!(h.replay(id(5)), Replay::Live),
             "a caught-up client replays nothing"
         );
         assert!(matches!(h.replay(None), Replay::Live));
@@ -268,24 +327,74 @@ mod tests {
         }
         // seq 1 is long gone; handing this client the ring's contents
         // would look contiguous and be missing 10 events.
-        assert!(matches!(h.replay(Some(1)), Replay::Reset));
+        assert!(matches!(h.replay(id(1)), Replay::Reset));
         // The oldest still-held event is replayable from one before it.
         let oldest = h.ring.lock().unwrap().front().unwrap().seq;
-        assert!(matches!(h.replay(Some(oldest - 1)), Replay::Frames(_)));
+        assert!(matches!(h.replay(id(oldest - 1)), Replay::Frames(_)));
     }
 
     #[test]
     fn an_id_from_a_previous_process_is_a_reset() {
         let h = hub();
         added(&h, 1);
-        assert!(matches!(h.replay(Some(9_999)), Replay::Reset));
+        assert!(
+            matches!(h.replay(id(9_999)), Replay::Reset),
+            "a seq we never issued"
+        );
+        // And — the case a bare seq cannot catch — an id from an EARLIER
+        // process whose numbering this one has already caught up past.
+        // Those are different events wearing the same numbers.
+        for n in 2..=20 {
+            added(&h, n);
+        }
+        assert!(
+            matches!(
+                h.replay(Some(EventId {
+                    boot: BOOT - 1,
+                    seq: 5
+                })),
+                Replay::Reset
+            ),
+            "a restart must not be served as a clean resume"
+        );
+    }
+
+    #[test]
+    fn a_pump_lag_is_published_rather_than_swallowed() {
+        let h = hub();
+        added(&h, 1);
+        // Events dropped before they were numbered leave no seq gap, so
+        // the loss has to become an event of its own or nothing downstream
+        // can ever learn about it.
+        h.publish_raw("lagged", serde_json::json!({ "skipped": 12 }));
+        match h.replay(id(1)) {
+            Replay::Frames(f) => {
+                assert_eq!(f.len(), 1);
+                assert_eq!(f[0].name, "lagged");
+                assert!(f[0].data.contains("\"skipped\":12"));
+            }
+            _ => panic!("the lag must be replayable like any other frame"),
+        }
+    }
+
+    #[test]
+    fn event_ids_round_trip_through_the_wire_form() {
+        let id = EventId { boot: 42, seq: 7 };
+        assert_eq!(id.to_string(), "42-7");
+        assert_eq!(EventId::parse("42-7"), Some(id));
+        assert_eq!(EventId::parse(" 42-7 "), Some(id));
+        // Anything else is not an id we issued; the caller treats a failed
+        // parse as "no Last-Event-ID", which is a fresh stream, not a
+        // silently-accepted resume.
+        assert_eq!(EventId::parse("7"), None);
+        assert_eq!(EventId::parse("beef-7"), None);
     }
 
     #[test]
     fn a_fresh_daemon_serves_a_zero_cursor_as_live() {
         let h = hub();
-        assert!(matches!(h.replay(Some(0)), Replay::Live));
-        assert!(matches!(h.replay(Some(3)), Replay::Reset));
+        assert!(matches!(h.replay(id(0)), Replay::Live));
+        assert!(matches!(h.replay(id(3)), Replay::Reset));
     }
 
     #[test]

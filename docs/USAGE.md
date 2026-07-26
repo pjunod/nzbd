@@ -198,16 +198,19 @@ clients strip, so "is it attached right now" is a glance rather than a
 guess. `EventSource` in a browser cannot set headers; a server-side
 consumer using a plain HTTP client can.
 
-**Resuming.** Every engine event carries `id: <seq>` (also in the body as
-`seq`). Reconnect with `Last-Event-ID: <the last seq you handled>` and
-nzbd replays exactly what you missed. Two things to handle:
+**Resuming.** Every engine event carries an `id:` — treat it as opaque
+and echo it back verbatim. Reconnect with
+`Last-Event-ID: <the last id you handled>` and nzbd replays exactly what
+you missed. Two things to handle:
 
 - `event: reset` with `{"reason":"gap"}` means the gap could not be
   covered — you were away longer than the 1024-event buffer, or the
-  daemon restarted (`seq` is process-lifetime and starts over). Do a full
-  reconcile before trusting the stream again.
-- `event: lagged` with `{"skipped":N}` means *your* connection fell
-  behind. Reconnect with your `Last-Event-ID` to fill the hole.
+  daemon restarted (ids are process-scoped and a restart invalidates
+  them). Do a full reconcile before trusting the stream again.
+- `event: lagged` with `{"skipped":N}` means events were dropped.
+  Reconnect with your `Last-Event-ID` to fill the hole; if the loss
+  happened upstream of the numbering, this event arrives *in* the stream
+  with an id of its own, so it survives a replay too.
 
 **The reconcile that always works.** `GET /api/v1/history?since_seq=N`
 returns entries newer than cursor `N`, oldest first, including entries

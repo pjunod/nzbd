@@ -1050,8 +1050,9 @@ async fn sse_events(State(st): State<ApiState>, headers: axum::http::HeaderMap) 
     let last_event_id = headers
         .get("last-event-id")
         .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.trim().parse::<u64>().ok());
+        .and_then(eventhub::EventId::parse);
     let replay = hub.replay(last_event_id);
+    let boot = hub.boot();
 
     // Note the subscriber so `GET /api/v1/clients` can show that a push
     // consumer is actually attached — "is monarr subscribed right now" is
@@ -1107,7 +1108,7 @@ async fn sse_events(State(st): State<ApiState>, headers: axum::http::HeaderMap) 
             eventhub::Replay::Frames(frames) => {
                 for f in frames {
                     let sse = SseEvent::default()
-                        .id(f.seq.to_string())
+                        .id(eventhub::EventId { boot, seq: f.seq }.to_string())
                         .event(f.name)
                         .data(&*f.data);
                     if tx.send(Ok(sse)).await.is_err() {
@@ -1177,7 +1178,7 @@ async fn sse_events(State(st): State<ApiState>, headers: axum::http::HeaderMap) 
                         // they are stream-local views, not engine facts, and
                         // resuming from one would mean nothing.
                         let sse = SseEvent::default()
-                            .id(frame.seq.to_string())
+                            .id(eventhub::EventId { boot, seq: frame.seq }.to_string())
                             .event(frame.name)
                             .data(&*frame.data);
                         if tx.send(Ok(sse)).await.is_err() {

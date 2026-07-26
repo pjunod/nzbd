@@ -26,6 +26,25 @@
 > queue view it exists to be visible in), and compat `listgroups`
 > hardcoded `"Parameters": []` (NZBGet populates it).
 >
+> **Contract amendment (from the post-build review).** The SSE `id:` is
+> `<boot>-<seq>`, not a bare `<seq>`. A bare sequence number cannot
+> distinguish "you missed events 51-60" from "we restarted and these are a
+> *different* events 51-60" — the second served as a clean resume is
+> silent corruption of the consumer's view, and the plan's own `reset`
+> rule ("or the server restarted — seq resets") is unimplementable
+> without an epoch. `Last-Event-ID` is opaque to SSE, so carrying it costs
+> nothing; the plain monotone `seq` still rides in the body. Consumers
+> should treat the id as opaque and echo it back verbatim.
+>
+> **Known wart, flagged not fixed.** `?since_seq=` can hand a consumer the
+> same history entry twice. `HistoryDb::delete` removes the index row but
+> not the JSONL line (deliberate, pre-existing: the JSONL is the
+> authoritative cross-node log and a delete is index-local), so the next
+> refresh re-imports it with a fresh, higher rowid. The duplicate is
+> byte-identical — **consumers dedupe on `(job, completed_at)`**, the key
+> the index is already unique on. A proper fix means durable delete
+> tombstones, which changes cross-node semantics and is its own decision.
+>
 > Not done, and deliberately: cluster-mode PP stage timings are not wired
 > to a node's `/metrics`. Leases run wherever the scheduler puts them, so
 > a per-node summary would describe an arbitrary slice of the work;

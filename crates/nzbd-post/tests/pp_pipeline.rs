@@ -929,3 +929,111 @@ async fn a_job_without_a_category_rule_is_untouched_by_any_of_this() {
     assert_eq!(hist.list(10).unwrap()[0].final_dir.as_deref(), dir.to_str());
     engine.shutdown().await;
 }
+
+/// Crash between the category move and the `*PP:done` stamp. The files
+/// are at the library, the global path is gone, and the next pass has to
+/// pick up where the last one left off. Before this was handled, the
+/// re-run drove the whole pipeline against a directory that no longer
+/// existed: par2 load failed with ENOENT, `process_job` returned an
+/// error, and the job was wedged forever — never stamped, never in
+/// history, never announced, never retired from the queue. "The stages
+/// are idempotent" is the assumption the entire crash model rests on, and
+/// Move is the one stage that relocates its own input.
+#[tokio::test]
+async fn post_processing_resumes_after_a_crash_between_move_and_stamp() {
+    let tmp = tempfile::tempdir().unwrap();
+    let engine = spawn_engine(tmp.path()).await;
+    let library = tmp.path().join("library/tv");
+
+    // The state a crash right after the move leaves behind.
+    std::fs::create_dir_all(library.join("crashjob")).unwrap();
+    std::fs::write(library.join("crashjob/payload.bin"), b"already moved").unwrap();
+    assert!(!tmp.path().join("dest/crashjob").exists());
+
+    let mut job = completed_job(
+        1,
+        "crashjob",
+        vec![file_entry(1, "payload.bin", None, false)],
+    );
+    job.category = Some("tv".into());
+    engine.import_job(job, false, false).await.unwrap();
+
+    let hist = history(tmp.path());
+    let cfg = PostConfig {
+        deobfuscate_final: false,
+        categories: vec![nzbd_post::manager::CategoryRule {
+            name: "tv".into(),
+            dest_dir: Some(library.clone()),
+            ..Default::default()
+        }],
+        ..PostConfig::default()
+    };
+    let out = process_job(&engine, &cfg, &hist, &tmp.path().join("dest"), JobId(1))
+        .await
+        .expect("the re-run must complete, not error on the vanished source");
+    assert_eq!(out, PpFinal::Success);
+
+    assert_eq!(
+        std::fs::read(library.join("crashjob/payload.bin")).unwrap(),
+        b"already moved",
+        "the moved files must survive the re-run untouched"
+    );
+    assert_eq!(
+        hist.list(10).unwrap()[0].final_dir.as_deref(),
+        library.join("crashjob").to_str(),
+        "and history must name where they are"
+    );
+    let job = engine.export_job(JobId(1)).await.unwrap().unwrap();
+    assert!(
+        job.params.iter().any(|(k, _)| k == PP_DONE_PARAM),
+        "the job must end up stamped rather than looping forever"
+    );
+    engine.shutdown().await;
+}
+
+/// An interrupted cross-filesystem move must leave the library either
+/// untouched or complete — never a half-copied folder that a consumer
+/// would happily import from and that every later `rename` would then
+/// fail against with ENOTEMPTY.
+#[tokio::test]
+async fn an_interrupted_move_leaves_no_half_copied_folder_behind() {
+    let tmp = tempfile::tempdir().unwrap();
+    let engine = spawn_engine(tmp.path()).await;
+    let dir = tmp.path().join("dest/atomic");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("payload.bin"), b"content").unwrap();
+
+    // Simulate the scratch dir a killed copy leaves behind. The next
+    // attempt must clear it rather than trip over it.
+    let library = tmp.path().join("library/tv");
+    std::fs::create_dir_all(library.join("atomic.pp-move.local")).unwrap();
+    std::fs::write(library.join("atomic.pp-move.local/partial.bin"), b"half").unwrap();
+
+    let mut job = completed_job(1, "atomic", vec![file_entry(1, "payload.bin", None, false)]);
+    job.category = Some("tv".into());
+    engine.import_job(job, false, false).await.unwrap();
+
+    let hist = history(tmp.path());
+    let cfg = PostConfig {
+        deobfuscate_final: false,
+        categories: vec![nzbd_post::manager::CategoryRule {
+            name: "tv".into(),
+            dest_dir: Some(library.clone()),
+            ..Default::default()
+        }],
+        ..PostConfig::default()
+    };
+    process_job(&engine, &cfg, &hist, &tmp.path().join("dest"), JobId(1))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        std::fs::read(library.join("atomic/payload.bin")).unwrap(),
+        b"content"
+    );
+    assert!(
+        !library.join("atomic.pp-move.local").exists(),
+        "a dead attempt's scratch dir must not accumulate in the library"
+    );
+    engine.shutdown().await;
+}

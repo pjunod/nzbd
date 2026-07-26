@@ -290,6 +290,19 @@ impl HistoryDb {
     /// consumer's catch-up must still see that the job finished. This is
     /// the path that makes SSE loss harmless: the stream can drop
     /// anything, and `since_seq` still reconstructs it.
+    ///
+    /// **Known wart, inherited from `delete`.** `delete` removes the index
+    /// row but not the JSONL line — deliberately, because the JSONL is the
+    /// authoritative cross-node log and a delete is index-local (see
+    /// `record_list_delete_and_jsonl_rebuild`). The next `refresh`
+    /// re-imports that line and SQLite assigns it a *new, higher* rowid,
+    /// so a consumer paging forward can be handed the same entry a second
+    /// time under a later cursor. The duplicate is byte-identical, so
+    /// **dedupe on `(job, completed_at)`** — the same key the index is
+    /// already unique on. Fixing it properly means giving deletes a
+    /// durable tombstone, which changes cross-node semantics and deserves
+    /// its own change rather than riding in as a side effect of adding a
+    /// cursor.
     pub fn list_since(
         &self,
         since_seq: i64,

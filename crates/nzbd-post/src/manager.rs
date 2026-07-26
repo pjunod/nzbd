@@ -585,6 +585,25 @@ pub async fn process_job_ctx(
     // (PostStage::Move), not a different download target.
     let mut dir = dest_dir.join(&sanitized);
     let rule = cfg.rule_for(job.category.as_deref()).cloned();
+    // Re-run after a crash between the move and the `*PP:done` stamp: the
+    // files are already at the category destination and the global path is
+    // gone. Adopt what is on disk. Without this the whole pipeline runs
+    // against a directory that no longer exists — par2 load fails with
+    // ENOENT, `process_job` errors, and the job is wedged forever: never
+    // stamped, never in history, never announced, never retired from the
+    // queue. The stage graph is idempotent, and this is what keeps that
+    // true across the one step that moves its own input.
+    if let Some(moved) = rule.as_ref().and_then(|r| r.dest_dir.as_ref()) {
+        let moved = moved.join(&sanitized);
+        if !dir.exists() && moved.is_dir() {
+            tracing::info!(
+                job = job_id.0,
+                dir = %moved.display(),
+                "resuming post-processing at the category destination (already moved)"
+            );
+            dir = moved;
+        }
+    }
     let unpack_enabled = rule.as_ref().and_then(|r| r.unpack).unwrap_or(cfg.unpack);
     // Superseded staging dirs (a reclaimed lease's leftovers) are garbage
     // by definition — this lease is now the only live executor.
@@ -739,13 +758,15 @@ pub async fn process_job_ctx(
     if let Some(target_root) = rule.as_ref().and_then(|r| r.dest_dir.as_ref()) {
         let target = target_root.join(&sanitized);
         if target != dir && dir.exists() {
+            let _ = std::fs::remove_dir_all(&staging); // never move the lease's scratch
             stages.enter(PostStage::Move).await;
             if !(ctx.commit_ok)() {
                 return Err(PostError::Subprocess("pp lease lost before move".into()));
             }
             let from = dir.clone();
             let to = target.clone();
-            let moved = tokio::task::spawn_blocking(move || move_dir(&from, &to))
+            let tag = ctx.tag.clone();
+            let moved = tokio::task::spawn_blocking(move || move_dir(&from, &to, &tag))
                 .await
                 .unwrap_or_else(|e| Err(std::io::Error::other(e.to_string())));
             match moved {
@@ -924,25 +945,47 @@ pub async fn process_job_ctx(
 }
 
 /// Move a finished job folder to another root, across filesystems if need
-/// be. `rename` is the fast path and the only atomic one; a category
-/// destination on a different volume (the common homelab shape — download
-/// on SSD, library on the NAS) returns `EXDEV` and falls back to a
-/// copy-then-remove. The copy is verified by the remove succeeding: a
-/// partial copy leaves the source in place, and PP re-runs from scratch.
-fn move_dir(from: &Path, to: &Path) -> std::io::Result<()> {
+/// be.
+///
+/// `rename` is the fast path and the only atomic one. A category
+/// destination on a different volume — the usual homelab shape, download
+/// on the SSD, library on the NAS — answers `EXDEV`, and then the copy
+/// goes to a **sibling scratch directory** and is renamed into place only
+/// once every byte is on disk. Copying straight into `to` would leave a
+/// half-populated library folder if the process died mid-copy: the next
+/// attempt's `rename` would fail `ENOTEMPTY` forever, and in the meantime
+/// a truncated file would be sitting where a consumer expects a finished
+/// one. This way an interrupted move leaves only `<to>.pp-move`, which
+/// the next attempt removes, and the source is untouched until the commit
+/// succeeds — so a re-run is always either "not moved yet" or "moved",
+/// never "half moved".
+fn move_dir(from: &Path, to: &Path, tag: &str) -> std::io::Result<()> {
     if let Some(parent) = to.parent() {
         std::fs::create_dir_all(parent)?;
     }
+    // Clear any leftovers from an attempt that died mid-copy first, and
+    // unconditionally: whichever path this attempt takes, a completed move
+    // must not leave scratch behind in the library.
+    let scratch = to.with_file_name(format!(
+        "{}.pp-move.{tag}",
+        to.file_name().unwrap_or_default().to_string_lossy()
+    ));
+    let _ = std::fs::remove_dir_all(&scratch);
     match std::fs::rename(from, to) {
         Ok(()) => return Ok(()),
         Err(e) if e.raw_os_error() == Some(18) => {} // EXDEV: different volume
         Err(e) if e.kind() == std::io::ErrorKind::CrossesDevices => {}
         Err(e) => return Err(e),
     }
-    copy_dir_all(from, to)?;
+    copy_dir_all(from, &scratch)?;
+    std::fs::rename(&scratch, to)?;
     std::fs::remove_dir_all(from)
 }
 
+/// Recursive copy, fsyncing each file before it counts as written. The
+/// fsync is the difference between "the kernel accepted these bytes" and
+/// "these bytes survive a power cut", and the source is deleted right
+/// after — so without it a badly-timed crash loses the download outright.
 fn copy_dir_all(from: &Path, to: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(to)?;
     for entry in std::fs::read_dir(from)? {
@@ -952,7 +995,13 @@ fn copy_dir_all(from: &Path, to: &Path) -> std::io::Result<()> {
             copy_dir_all(&entry.path(), &target)?;
         } else {
             std::fs::copy(entry.path(), &target)?;
+            if let Ok(f) = std::fs::File::open(&target) {
+                let _ = f.sync_all();
+            }
         }
+    }
+    if let Ok(d) = std::fs::File::open(to) {
+        let _ = d.sync_all(); // the directory entries themselves
     }
     Ok(())
 }
