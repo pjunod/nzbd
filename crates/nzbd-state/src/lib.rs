@@ -351,34 +351,33 @@ impl SnapshotStore {
         })
     }
 
-    /// Atomic write: tmp + fsync + rename + fsync(dir).
-    pub fn save(&self, doc: &QueueSnapshotDoc) -> Result<(), StateError> {
+    /// Atomic write: encode to memory, ONE `write_all`, fsync + rename +
+    /// fsync(dir). Returns the snapshot's size in bytes.
+    pub fn save(&self, doc: &QueueSnapshotDoc) -> Result<u64, StateError> {
         self.save_guarded(doc, &|| true)
     }
 
     /// Atomic write with a fencing guard checked immediately before the
     /// commit rename (CLUSTERING.md §6.4: a deposed leader must not clobber
     /// its successor's snapshot). Returns `Corrupt("fenced")` when the
-    /// guard rejects.
+    /// guard rejects; the snapshot's size in bytes otherwise.
+    ///
+    /// The doc is serialized to memory first and hits the file as a single
+    /// `write_all`. This is load-bearing, not style: `serde_json::to_writer`
+    /// straight into a `File` issues one tiny write syscall per JSON token,
+    /// and a queue of a few hundred thousand segments on a FUSE/network
+    /// state volume turned every save into ~65 s of syscalls while the
+    /// engine sat blocked behind it (field report 2026-07-26 — the volume's
+    /// fsync itself took 20 ms). One buffer, one write: the volume only
+    /// pays for the fsync it can't be spared.
     pub fn save_guarded(
         &self,
         doc: &QueueSnapshotDoc,
         guard: &dyn Fn() -> bool,
-    ) -> Result<(), StateError> {
+    ) -> Result<u64, StateError> {
+        let bytes = serde_json::to_vec(doc)?;
         let mut f = fsx::create(&self.tmp)?;
-        // A serde failure here is almost always the *disk* (ENOSPC, EDQUOT)
-        // rather than the document, so surface it with the path attached.
-        serde_json::to_writer(&mut f, doc).map_err(|e| {
-            if e.is_io() {
-                StateError::Io {
-                    op: "write",
-                    path: self.tmp.clone(),
-                    source: e.into(),
-                }
-            } else {
-                StateError::Serde(e)
-            }
-        })?;
+        fsx::write_whole(&mut f, &bytes, &self.tmp)?;
         fsx::sync_data(&f, &self.tmp)?;
         drop(f);
         if !guard() {
@@ -390,7 +389,7 @@ impl SnapshotStore {
         if let Ok(d) = File::open(&self.dir) {
             let _ = d.sync_all(); // best-effort directory fsync
         }
-        Ok(())
+        Ok(bytes.len() as u64)
     }
 
     /// `None` if no snapshot exists yet. A corrupt snapshot is an error —
@@ -580,13 +579,90 @@ mod tests {
             download_paused: true,
             speed_limit_bps: Some(1_000_000),
         };
-        store.save(&doc).unwrap();
+        let bytes = store.save(&doc).unwrap();
+        assert_eq!(
+            bytes,
+            std::fs::metadata(dir.path().join("queue.json"))
+                .unwrap()
+                .len(),
+            "save reports exactly what landed on disk"
+        );
         let loaded = store.load().unwrap().unwrap();
         assert_eq!(loaded.next_job_id, 7);
         assert_eq!(loaded.next_file_id, 42);
         assert!(loaded.download_paused);
         assert_eq!(loaded.speed_limit_bps, Some(1_000_000));
         assert!(!dir.path().join("queue.json.tmp").exists());
+    }
+
+    /// A production-shaped queue (hundreds of thousands of segments) must
+    /// round-trip through the snapshot store. The size this doc reaches is
+    /// why the save path pre-encodes and writes ONCE — the field failure
+    /// this pins was ~30 MiB of JSON emitted as millions of token-sized
+    /// write syscalls onto a FUSE volume, 65 s per save.
+    #[test]
+    fn snapshot_survives_a_production_sized_queue() {
+        use nzbd_types::{DupeInfo, FileEntry, Job, JobKind, JobStatus, JobTotals, SegmentState};
+        let dir = tempfile::tempdir().unwrap();
+        let store = SnapshotStore::open(dir.path()).unwrap();
+        let seg = |n: u32| nzbd_types::Segment {
+            message_id: format!("part{n}of9999.deadbeefcafebabe{n:08x}@news.example.org").into(),
+            number: n,
+            size: 750_000,
+            state: if n % 3 == 0 {
+                SegmentState::Done {
+                    offset: n as u64 * 750_000,
+                    len: 750_000,
+                    crc: 0xC0FFEE ^ n,
+                }
+            } else {
+                SegmentState::Pending
+            },
+        };
+        let file = |fid: u32| FileEntry {
+            id: FileId(fid),
+            subject: format!("a file {fid}"),
+            filename: format!("linux-{fid:04}.r{:02}", fid % 100),
+            filename_confirmed: true,
+            is_par2: fid % 7 == 0,
+            paused: false,
+            groups: vec!["alt.binaries.example".into()],
+            date: Some(1_753_000_000),
+            segments: (0..500).map(seg).collect(),
+            crc32: None,
+            finalized: false,
+        };
+        let doc = QueueSnapshotDoc {
+            jobs: (0..4u32)
+                .map(|j| Job {
+                    id: JobId(j),
+                    kind: JobKind::Nzb,
+                    name: format!("job {j}"),
+                    category: Some("tv".into()),
+                    priority: 0,
+                    dupe: DupeInfo::default(),
+                    params: vec![("drone".into(), format!("id-{j}"))],
+                    files: (j * 100..j * 100 + 100).map(file).collect(),
+                    totals: JobTotals::default(),
+                    status: JobStatus::Downloading,
+                })
+                .collect(),
+            next_job_id: 5,
+            next_file_id: 400,
+            download_paused: false,
+            speed_limit_bps: None,
+        };
+        // 4 jobs × 100 files × 500 segments = 200k segments.
+        let bytes = store.save(&doc).unwrap();
+        assert!(bytes > 10 << 20, "doc is production-sized ({bytes} B)");
+        let loaded = store.load().unwrap().unwrap();
+        assert_eq!(loaded.jobs.len(), 4);
+        assert_eq!(loaded.jobs[3].files.len(), 100);
+        assert_eq!(loaded.jobs[3].files[99].segments.len(), 500);
+        assert_eq!(
+            loaded.jobs[1].files[0].segments[0].message_id,
+            doc.jobs[1].files[0].segments[0].message_id
+        );
     }
 
     #[test]

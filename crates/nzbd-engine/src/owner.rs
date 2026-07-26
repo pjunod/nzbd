@@ -315,6 +315,10 @@ pub(crate) struct Owner {
     state_dir: PathBuf,
     journal: JobJournals,
     snap_store: SnapshotStore,
+    /// How long the last snapshot write took — feeds [`save_spacing`], so a
+    /// slow state volume stretches the save cadence instead of consuming
+    /// the owner loop.
+    last_save_ms: u64,
     marker: UncleanMarker,
     /// Queue-authority persistence (snapshot save/compact). Worker-mode
     /// engines run with this off; journals stay on regardless.
@@ -472,6 +476,7 @@ impl Owner {
             up_since_unix: unix_now(),
             dirty: false,
             last_save: Instant::now(),
+            last_save_ms: 0,
             volumes: crate::volumes::VolumeBook::load(state_dir, journal_suffix),
             quota_reached: false,
             disk_low: false,
@@ -1834,7 +1839,7 @@ impl Owner {
         }
 
         let mut save_ms = 0u64;
-        if self.dirty && self.last_save.elapsed() > Duration::from_secs(2) {
+        if self.dirty && self.last_save.elapsed() > save_spacing(self.last_save_ms) {
             let save_started = Instant::now();
             self.save_snapshot();
             save_ms = save_started.elapsed().as_millis() as u64;
@@ -2056,6 +2061,7 @@ impl Owner {
             return;
         }
         let doc = self.state.to_doc();
+        let write_started = Instant::now();
         let result = match &self.persist_guard {
             Some(g) => {
                 let g = g.clone();
@@ -2063,12 +2069,31 @@ impl Owner {
             }
             None => self.snap_store.save(&doc),
         };
-        if let Err(e) = result {
-            tracing::error!(error = %e, "snapshot save failed (fenced or io); demoting persistence until re-adopted");
-            if matches!(e, nzbd_state::StateError::Corrupt(_)) {
-                self.persist = false; // deposed: stop writing authority state
+        let bytes = match result {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::error!(error = %e, "snapshot save failed (fenced or io); demoting persistence until re-adopted");
+                if matches!(e, nzbd_state::StateError::Corrupt(_)) {
+                    self.persist = false; // deposed: stop writing authority state
+                }
+                return;
             }
-            return;
+        };
+        // Duration and throughput, remembered for the adaptive spacing and
+        // said out loud when slow — "how fast is the state volume really?"
+        // must be answerable from the log, with numbers.
+        let ms = write_started.elapsed().as_millis() as u64;
+        self.last_save_ms = ms;
+        let mib_s = (bytes as f64 / (1 << 20) as f64) / (ms.max(1) as f64 / 1000.0);
+        if ms > 1000 {
+            tracing::warn!(
+                bytes,
+                ms,
+                throughput_mib_s = format!("{mib_s:.1}"),
+                "snapshot save is slow — saves are spaced out to compensate (the journal still protects progress)"
+            );
+        } else {
+            tracing::debug!(bytes, ms, "snapshot saved");
         }
         // The snapshot now embodies every folded segment: compact journals
         // of jobs we own outright, plus orphaned job dirs (deleted jobs,
@@ -2107,6 +2132,20 @@ impl Owner {
     fn bump_epoch(&self) {
         self.epoch_tx.send_modify(|v| *v += 1);
     }
+}
+
+/// How long after a save the next debounced save may run: 10× the last
+/// save's duration, floored at the historical 2 s, capped at 5 min. A
+/// fast volume keeps the old cadence; a slow one gets its saves spaced so
+/// the owner loop spends at most ~10% of wall time blocked in them
+/// (field report 2026-07-26: 65 s saves fired back-to-back and consumed
+/// the loop — commands, publishes and the dashboard all queued behind
+/// storage). Stretching the cadence risks no data: every completed
+/// segment is in the fsync'd journal, and recovery is snapshot + replay.
+/// Structural saves (delete, import) stay immediate — they don't come
+/// through the debounce.
+fn save_spacing(last_save_ms: u64) -> Duration {
+    Duration::from_millis(last_save_ms.saturating_mul(10).clamp(2_000, 300_000))
 }
 
 /// Combine per-segment CRCs into the whole-file CRC. Requires contiguous
@@ -2185,5 +2224,18 @@ mod tests {
         let (refetch, dupes) = plan_url_refetches(Vec::new());
         assert!(refetch.is_empty());
         assert!(dupes.is_empty());
+    }
+
+    #[test]
+    fn save_spacing_scales_with_save_cost() {
+        // Fast volume: the historical 2 s cadence.
+        assert_eq!(save_spacing(0), Duration::from_secs(2));
+        assert_eq!(save_spacing(120), Duration::from_secs(2));
+        // A 1 s save gets 10 s between saves (~10% duty cycle)…
+        assert_eq!(save_spacing(1_000), Duration::from_secs(10));
+        // …the field report's 65 s save gets spaced way out…
+        assert_eq!(save_spacing(65_000), Duration::from_secs(300));
+        // …and the cap holds even for absurd values.
+        assert_eq!(save_spacing(u64::MAX / 20), Duration::from_secs(300));
     }
 }

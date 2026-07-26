@@ -71,6 +71,13 @@ pub(super) fn write_all(f: &mut File, buf: &[u8], p: &Path) -> Result<(), StateE
     ctx(f.write_all(buf), "append to", p)
 }
 
+/// Like [`write_all`] but for writing a fresh file's whole content — the
+/// error op says "write", not "append to", so a snapshot failure reads
+/// correctly in the log.
+pub(super) fn write_whole(f: &mut File, buf: &[u8], p: &Path) -> Result<(), StateError> {
+    ctx(f.write_all(buf), "write", p)
+}
+
 pub(super) fn sync_data(f: &File, p: &Path) -> Result<(), StateError> {
     ctx(f.sync_data(), "fsync", p)
 }
