@@ -815,6 +815,11 @@ async fn category_unpack_false_leaves_the_archive_alone() {
 
     let hist = history(tmp.path());
     let cfg = PostConfig {
+        // Off, like the sibling category tests: the final deobfuscation
+        // pass renames a lone leftover file to the job name, so with it on
+        // the surviving archive is `nounpack.7z` and an assertion by name
+        // fails for a reason that has nothing to do with unpacking.
+        deobfuscate_final: false,
         categories: vec![nzbd_post::manager::CategoryRule {
             name: "raw".into(),
             unpack: Some(false),
