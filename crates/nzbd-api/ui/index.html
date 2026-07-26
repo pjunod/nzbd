@@ -238,6 +238,19 @@
   #logbox .k-ERROR { color: var(--bad); } #logbox .k-WARNING { color: var(--warn); }
   #logbox .k-INFO { color: var(--ink); } #logbox .k-DETAIL { color: var(--muted); }
   .empty { color: var(--muted); padding: 22px; text-align: center; }
+  .pager { display: flex; align-items: center; gap: 8px; margin-top: 10px;
+           flex-wrap: wrap; font-size: 12.5px; color: var(--ink2);
+           font-variant-numeric: tabular-nums; }
+  .pager[hidden] { display: none; }
+  .pager #pager-info { min-width: 12ch; text-align: center; }
+  .pager label { display: flex; align-items: center; gap: 6px; }
+  .pager select { background: var(--panel); color: var(--ink);
+                  border: 1px solid var(--line); border-radius: 7px;
+                  padding: 4px 6px; font: inherit; font-size: 12px; }
+  @media (max-width: 640px) {
+    .pager .spacer { display: none; }
+    .pager { justify-content: center; }
+  }
   footer { color: var(--muted); font-size: 11.5px; margin-top: 22px; }
   /* Toasts: the replacement for both confirm() and silence. Every action
      that changed something says so; every action that failed says THAT,
@@ -427,6 +440,22 @@
         <th class="num">Size</th><th class="num">Health</th><th style="width:190px"></th></tr></thead>
       <tbody id="queue-body"><tr><td colspan="6" class="empty">Loading the queue…</td></tr></tbody>
     </table>
+    <div class="pager" id="queue-pager" hidden>
+      <button class="small" data-action="page-first" title="first page">⤒</button>
+      <button class="small" data-action="page-prev" title="previous page">‹ prev</button>
+      <span id="pager-info"></span>
+      <button class="small" data-action="page-next" title="next page">next ›</button>
+      <button class="small" data-action="page-last" title="last page">⤓</button>
+      <span class="spacer" style="flex:1"></span>
+      <label>rows per page
+        <select id="page-size">
+          <option value="20">20</option>
+          <option value="50">50</option>
+          <option value="100">100</option>
+          <option value="0">all</option>
+        </select>
+      </label>
+    </div>
   </section>
 
   <section id="tab-history" hidden>
@@ -1202,6 +1231,76 @@ function applyNote(node, m, d) {
 }
 KINDS.note = { build: buildNote, apply: applyNote };
 
+// ---- paging -------------------------------------------------------------
+// The tick already carries the whole queue, so this is a view concern, not
+// a wire one: paging server-side would mean the tick takes page parameters,
+// and the "header stats and job rows come from ONE snapshot" property is
+// worth more than the bytes it would save. `0` means every job on one page,
+// which is the old behavior and stays available.
+const PAGE_SIZES = [20, 50, 100, 0];
+const PAGE_SIZE_DEFAULT = 20;
+let pageSize = PAGE_SIZE_DEFAULT;
+let page = 0; // zero-based
+
+function loadPageSize() {
+  let n = PAGE_SIZE_DEFAULT;
+  try {
+    const v = localStorage.getItem("nzbd-page-size");
+    if (v !== null && PAGE_SIZES.includes(Number(v))) n = Number(v);
+  } catch { /* private mode: the default is fine */ }
+  pageSize = n;
+  const sel = $("page-size");
+  if (sel) sel.value = String(n);
+}
+function setPageSize(n) {
+  if (!PAGE_SIZES.includes(n)) return;
+  // Keep the job you were looking at in view: land on the page that still
+  // contains the first row you could see, rather than jumping to the top.
+  const anchor = pageSize > 0 ? page * pageSize : 0;
+  pageSize = n;
+  page = n > 0 ? Math.floor(anchor / n) : 0;
+  try { localStorage.setItem("nzbd-page-size", String(n)); } catch {}
+  renderQueue();
+}
+function setPage(n) {
+  page = Math.max(0, n);
+  renderQueue();
+}
+
+/// Split the visible queue into the current page. Clamps `page` — a queue
+/// that shrinks under you (jobs finishing is the normal case) must not
+/// leave the view stranded on a page that no longer exists.
+function pageSlice(jobs) {
+  const total = jobs.length;
+  const size = pageSize > 0 ? pageSize : Math.max(total, 1);
+  const pages = Math.max(1, Math.ceil(total / size));
+  if (page > pages - 1) page = pages - 1;
+  if (page < 0) page = 0;
+  const start = page * size;
+  return { shown: jobs.slice(start, start + size), start, total, pages, page, size };
+}
+
+function renderPager(p) {
+  const bar = $("queue-pager");
+  if (!bar) return;
+  // No chrome for a queue that fits: the controls appear when they could
+  // do something, and the "all" option stays reachable once they have.
+  const relevant = p.total > PAGE_SIZES[0] || pageSize !== PAGE_SIZE_DEFAULT;
+  bar.hidden = !relevant;
+  if (!relevant) return;
+  const first = p.total ? p.start + 1 : 0;
+  const last = Math.min(p.start + p.size, p.total);
+  setText($("pager-info"), p.pages > 1
+    ? first + "–" + last + " of " + p.total + " · page " + (p.page + 1) + "/" + p.pages
+    : p.total + (p.total === 1 ? " job" : " jobs"));
+  const atFirst = p.page === 0, atLast = p.page >= p.pages - 1;
+  for (const [sel, off] of [["page-first", atFirst], ["page-prev", atFirst],
+                            ["page-next", atLast], ["page-last", atLast]]) {
+    const b = bar.querySelector('[data-action="' + sel + '"]');
+    if (b) b.disabled = off;
+  }
+}
+
 // ---- queue render -------------------------------------------------------
 function queueModels() {
   if (!store.jobsLoaded)
@@ -1210,18 +1309,26 @@ function queueModels() {
   // tick cannot flash a deleted row back into view before the daemon has
   // caught up with the click.
   const jobs = pending.order(store.jobs).filter(j => !pending.hidden(j.id));
+  const p = pageSlice(jobs);
+  renderPager(p);
   if (!jobs.length)
     return [{
       key: "__empty", kind: "empty", span: 6,
       text: "No downloads in the queue. Drop one in with “+ add nzb”.",
     }];
   const out = [];
-  jobs.forEach((j, idx) => {
+  p.shown.forEach((j, i) => {
     out.push(rowModel(j, {
-      idx, count: jobs.length,
+      // GLOBAL position, not the position on this page: "move up" is a
+      // queue operation, so the first row of page 2 can still move up.
+      idx: p.start + i,
+      count: p.total,
       healthAbortArmed: store.healthAbort,
       pendingOps: pending,
     }));
+    // The detail panel belongs to its row, so it only exists while that
+    // row is on screen. Reopening on the way back is instant — `openJob`
+    // is not cleared by paging.
     if (j.id === openJob) out.push(detailModel(j));
   });
   return out;
@@ -1885,6 +1992,7 @@ document.addEventListener("click", (ev) => {
   // Any other click disarms a pending two-step button: aiming somewhere
   // else is as clear a "no" as waiting it out.
   if (action !== "h-delete-files" && armed.key) { disarmButton(); renderHistory(); }
+  if (PAGE_MOVES[action]) { PAGE_MOVES[action](); return; }
   if (action === "detail" || action === "detail-close") {
     toggleJob(id);
     return;
@@ -1939,6 +2047,13 @@ const MOVES = {
   "move-down": (at, n) => Math.min(n - 1, at + 1),
   "move-bottom": (at, n) => n - 1,
 };
+// Paging is view state — no request, no optimism, nothing to revert.
+const PAGE_MOVES = {
+  "page-first": () => setPage(0),
+  "page-prev": () => setPage(page - 1),
+  "page-next": () => setPage(page + 1),
+  "page-last": () => setPage(Number.MAX_SAFE_INTEGER), // pageSlice clamps
+};
 
 // ---- controls -----------------------------------------------------------
 // Optimistic: flip the visible state the instant the button is clicked
@@ -1970,6 +2085,7 @@ $("btn-limit").onclick = async () => {
 };
 for (const s of ["system", "job", "file"])
   $("lg-" + s).onchange = () => renderLogs();
+$("page-size").onchange = () => setPageSize(Number($("page-size").value));
 
 // ---- add NZBs from disk ---------------------------------------------------
 $("btn-addnzb").onclick = () => $("nzb-file").click();
@@ -2686,6 +2802,7 @@ async function checkSetup() {
 }
 
 initTheme();
+loadPageSize();
 // The 5 s pass. Poll fallback engages whenever ticks are stale AND the
 // verdict is not "healthy idle stream": a dead stream is carried by polls
 // while it rebuilds, and a stalled engine is polled too (the poll returns
@@ -2738,6 +2855,8 @@ if (typeof __nzbd_test_enable !== "undefined") {
     deleteJob, requeueJob, jobAction, histAction, post,
     pushRate, pushRateSampled, rateSeries, spark, SPARK_N, titleFor,
     appendLogs, logMatches, renderLogs, serverChipModels, LOG_RING_MAX,
+    pageSlice, setPage, setPageSize, renderPager, PAGE_SIZES, PAGE_SIZE_DEFAULT,
+    pageState: () => ({ page, pageSize }),
     setOpenJob: (id) => { openJob = id; },
     setActiveTab: (t) => { activeTab = t; },
     conn: () => store.conn,

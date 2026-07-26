@@ -76,6 +76,14 @@ text — and the row springs back to where it was. An action that gets no
 answer within five seconds reverts the same way. Nothing is ever shown as
 done merely because the click happened.
 
+**Long queues are paged** — 20 rows at a time by default, with 50, 100
+and *all* in the picker under the table; your choice is remembered in the
+browser. The controls only appear once there is more than one page (or
+once you have changed the setting, so you can get back). Paging is
+display only: the move arrows still move a job through the whole queue,
+so the first row of page 2 can move up into page 1, and the page index
+follows along as jobs finish and the queue shrinks.
+
 ## On your phone (PWA)
 
 The UI is a progressive web app: responsive on small screens, installable

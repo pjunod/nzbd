@@ -845,6 +845,99 @@ const models = (jobs) => jobs.map((j, i) => T.rowModel(j, { idx: i, count: jobs.
   T.store.logs = [];
 }
 
+// --- 27. paging ----------------------------------------------------------
+// The tick carries the whole queue, so paging is a view concern. The thing
+// that must not break: "move up" is a QUEUE operation, so a row's arrows
+// have to reflect its global position, not its position on the page.
+{
+  const many = (n) => Array.from({ length: n }, (_, i) => job(i + 1));
+  const bar = sandbox.document.getElementById("queue-pager");
+  const info = sandbox.document.getElementById("pager-info");
+  const rows = () => T.queueModels().filter(m => m.kind === "job");
+
+  T.store.jobsLoaded = true;
+  T.pending.clear();
+  T.setPageSize(20);
+  T.setPage(0);
+  eq(T.PAGE_SIZE_DEFAULT, 20, "20 per page by default");
+  ok(T.PAGE_SIZES.includes(0), "…and 'all' is one of the options");
+
+  // 45 jobs, 20 to a page.
+  T.store.jobs = many(45);
+  let p = T.pageSlice(T.store.jobs);
+  eq(p.pages, 3, "45 jobs at 20/page is three pages");
+  eq(p.shown.length, 20, "the first page holds 20");
+  eq(p.start, 0, "…starting at the top");
+  eq(rows().length, 20, "and that is what renders");
+  eq(rows()[0].id, 1, "first job on page 1");
+  eq(rows()[0].upDisabled, true, "the very first row cannot move up");
+  eq(bar.hidden, false, "the pager appears once it could do something");
+  ok(info.textContent.includes("1–20 of 45"), `range is stated (got ${info.textContent})`);
+  ok(info.textContent.includes("page 1/3"), "…and so is the position");
+
+  // Page 2: the arrows must know these rows are NOT at the queue's edges.
+  T.setPage(1);
+  eq(rows()[0].id, 21, "page 2 starts at job 21");
+  eq(rows()[0].upDisabled, false,
+    "the first row of page 2 can still move up — paging is a view, not the queue");
+  eq(rows()[19].downDisabled, false, "…and its last row can still move down");
+
+  // Last page: partial, and the true last row is pinned.
+  T.setPage(2);
+  p = T.pageSlice(T.store.jobs);
+  eq(p.shown.length, 5, "the last page holds the remainder");
+  eq(rows()[4].id, 45, "…ending at the last job");
+  eq(rows()[4].downDisabled, true, "the very last row cannot move down");
+  ok(info.textContent.includes("41–45 of 45"), "the range follows");
+
+  // The queue shrinking under you (jobs finishing) must not strand the view.
+  T.store.jobs = many(5);
+  eq(rows().length, 5, "a shrunk queue renders");
+  eq(T.pageState().page, 0, "…and the page clamps instead of showing nothing");
+
+  // "All" really is all.
+  T.store.jobs = many(137);
+  T.setPageSize(0);
+  p = T.pageSlice(T.store.jobs);
+  eq(p.pages, 1, "'all' is a single page");
+  eq(rows().length, 137, "…holding every job");
+  eq(rows()[136].downDisabled, true, "the last row is still the last row");
+
+  // Changing the page size keeps you near where you were looking, rather
+  // than dumping you back at the top.
+  T.setPageSize(20);
+  T.setPage(4); // rows 81–100
+  T.setPageSize(50);
+  eq(T.pageState().page, 1, "80 rows in => page 2 of 50 (rows 51–100), not page 1");
+  T.setPageSize(20);
+  T.setPage(0);
+
+  // The detail panel belongs to its row, so it lives on that row's page.
+  T.store.jobs = many(45);
+  T.store.jobFiles = null;
+  T.store.jobLogs = null;
+  T.setOpenJob(25);
+  eq(T.queueModels().some(m => m.kind === "detail"), false,
+    "the open job's panel is not on a page that does not contain it");
+  T.setPage(1);
+  eq(T.queueModels().some(m => m.kind === "detail"), true,
+    "…and comes back with it");
+  T.setOpenJob(null);
+  T.setPage(0);
+
+  // A queue that fits gets no chrome at all.
+  T.store.jobs = many(7);
+  T.queueModels();
+  eq(bar.hidden, true, "no pager for a queue that fits on one page");
+  // …unless the reader chose a non-default size, which they need a way back from.
+  T.setPageSize(0);
+  T.queueModels();
+  eq(bar.hidden, false, "the control stays reachable once it has been used");
+  T.setPageSize(20);
+  T.store.jobs = [];
+  T.pending.clear();
+}
+
 // --- 22. the delete -> Undo state machine, end to end -------------------
 // This is the whole point of M4: one click deletes, the toast offers Undo
 // for as long as the server says the job is parked, and Undo requeues it.
