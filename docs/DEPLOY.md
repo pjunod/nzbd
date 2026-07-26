@@ -45,9 +45,16 @@ Where the wizard's write actually lands, by deployment shape:
 - **Config directory mounted (above)** — written to the host, survives
   anything. This is the recommended shape.
 - **No config volume** — the write succeeds into the container's own
-  filesystem layer and works fine *until the container is recreated*
-  (`docker rm` / image update), which silently starts setup over. Fine
-  for kicking the tires, not for keeps.
+  filesystem layer and is destroyed when the container is recreated
+  (`docker rm`, `compose up --build`, image update). This used to start
+  setup over from scratch. Since 2026-07-26 it does not: every config
+  write also lands a copy at `<main_dir>/queue/nzbd.toml.saved` on the
+  **data** volume, and a boot that finds no config file recovers from
+  that copy, restores the file and carries on configured. You get a
+  warning banner in the UI and a `warn` in the log both before the first
+  loss (the daemon can see that the directory is not a mount) and after
+  a recovery. Fix the mount anyway — recovery is a safety net, not a
+  deployment.
 - **Read-only config (`:ro` bind, compose `configs:`, Kubernetes
   ConfigMap)** — the daemon can't write at all: the wizard *and* the
   Settings tab both fail their save with `Read-only file system

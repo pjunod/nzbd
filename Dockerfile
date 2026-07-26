@@ -26,6 +26,13 @@ COPY --from=build /src/target/release/nzbd /usr/local/bin/nzbd
 RUN useradd -r -u 1000 -m -d /var/lib/nzbd nzbd \
  && mkdir -p /data /etc/nzbd && chown nzbd /data /etc/nzbd /var/lib/nzbd
 USER nzbd
+
+# /data is the durable volume, and this names it for the daemon. With no
+# config file to read `paths.main_dir` from, an env var is the only way
+# boot-time recovery can find the copy of the configuration nzbd keeps
+# beside its state — which is what stops a container that lost its config
+# mount from coming back up as an unconfigured first-run install.
+ENV NZBD_MAIN_DIR=/data
 VOLUME ["/data"]
 EXPOSE 6789
 

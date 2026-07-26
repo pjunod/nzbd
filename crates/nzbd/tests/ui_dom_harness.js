@@ -108,6 +108,25 @@ function stubEl(id) {
   return t;
 }
 const elCache = new Map();
+// Selector-routed queryAll, for the handful of places the page reaches for
+// a *set* of elements. `.wrap > *` is the one that matters: the first-run
+// wizard hides the app through it.
+const qsa = new Map();
+function selMatch(el, sel) {
+  return sel.split(",").map((x) => x.trim()).filter(Boolean).some((one) => {
+    if (one.startsWith("#")) return el.id === one.slice(1);
+    if (one.startsWith(".")) return (" " + el.className + " ").includes(" " + one.slice(1) + " ");
+    return el.tag === one;
+  });
+}
+function wrapChild(tag, id, cls) {
+  // Reuse the id-addressed stub so the page and the test see one object.
+  const el = id ? (elCache.get(id) || (elCache.set(id, stubEl(id)), elCache.get(id))) : stubEl("_" + tag);
+  el.tag = tag;
+  if (cls) el.className = cls;
+  el.matches = (sel) => selMatch(el, sel);
+  return el;
+}
 // Scripted daemon. `routes` maps a URL substring to {status, body}; the
 // default is a dead daemon, which is what the boot path should survive.
 const routes = new Map();
@@ -129,7 +148,7 @@ const sandbox = {
       if (!elCache.has(id)) elCache.set(id, stubEl(id));
       return elCache.get(id);
     },
-    querySelectorAll: () => [],
+    querySelectorAll: (sel) => qsa.get(sel) || [],
     createElement: (t) => stubEl("_" + t),
     documentElement: stubEl("_root"),
     addEventListener() {},
@@ -994,6 +1013,82 @@ const models = (jobs) => jobs.map((j, i) => T.rowModel(j, { idx: i, count: jobs.
   await T.requeueJob(7, "vanished");
   ok(stack.children[0].children[0].textContent.includes("no parked NZB"),
     "a requeue that cannot work says why");
+
+  // --- 23. the first-run wizard takes the page OVER -----------------------
+  // Field report 2026-07-26: the wizard rendered on top of a live-looking
+  // dashboard — stat tiles, queue controls and tabs all still on screen,
+  // all showing dashes, on a daemon that had no config at all. Two halves,
+  // both pinned here.
+  //
+  // (a) the script hides every panel except the ones the wizard needs.
+  const wrapKids = [
+    wrapChild("header", null, ""),
+    wrapChild("div", "cfgwarn", ""),
+    wrapChild("section", "setup", ""),
+    wrapChild("div", "offline", ""),
+    wrapChild("div", null, "stats"),
+    wrapChild("div", null, "controls"),
+    wrapChild("nav", null, "tabs"),
+    wrapChild("section", "tab-queue", ""),
+    wrapChild("footer", null, ""),
+  ];
+  qsa.set(".wrap > *", wrapKids);
+  T.hideAppForSetup();
+  const shown = (el) => el.hidden === false;
+  ok(shown(wrapKids[0]), "the header stays — the wizard is still nzbd");
+  ok(shown(wrapKids[1]), "the config-durability warning stays: it explains the wizard");
+  ok(shown(wrapKids[2]), "the wizard itself is revealed");
+  ok(shown(wrapKids[8]), "the footer stays (it carries the build identity)");
+  for (const el of [wrapKids[3], wrapKids[4], wrapKids[5], wrapKids[6], wrapKids[7]])
+    ok(el.hidden === true, `${el.id || el.className} is hidden behind the wizard`);
+
+  // (b) and `hidden` actually wins in the stylesheet. This is the half that
+  // broke: .stats is a grid and .controls/nav.tabs are flexes, so the UA's
+  // `[hidden] { display: none }` lost on specificity and those three — and
+  // exactly those three — stayed on screen. A global !important override is
+  // the only fix that also protects every element added later.
+  const styleBlock = (html.match(/<style>([\s\S]*?)<\/style>/) || [])[1] || "";
+  ok(/(^|[^.\w\[])\[hidden\]\s*\{[^}]*display:\s*none\s*!important/m.test(styleBlock),
+    "the stylesheet carries a global [hidden] { display: none !important }");
+  // Every rule that sets `display` on a class/tag is a candidate to shadow
+  // it, so the override is not optional housekeeping — prove some exist.
+  const displayRules = [...styleBlock.matchAll(/([^{}]+)\{[^}]*display:\s*(grid|flex|block|inline[\w-]*)/g)]
+    .map((m) => m[1].trim()).filter((sel) => !sel.includes("[hidden]"));
+  ok(displayRules.length > 0, "…and there are display: rules it has to outrank");
+
+  // --- 24. the config-durability banner ----------------------------------
+  // The root cause behind the wizard: a config directory that is writable
+  // but ephemeral. Saves work, the operator believes the install is
+  // configured, and the next container recreate serves this wizard again.
+  const warn = sandbox.document.getElementById("cfgwarn");
+
+  // (a) healthy mounts say nothing at all
+  eq(T.showConfigDurability({ config_path: "/etc/nzbd/nzbd.toml", durable: true }), false,
+    "a durable config directory raises no banner");
+  ok(warn.hidden === true, "…and the banner stays out of the page");
+
+  // (b) unknown (non-Linux, no /proc) is not an accusation
+  eq(T.showConfigDurability({ config_path: "/etc/nzbd/nzbd.toml", durable: null }), false,
+    "an unknown durability is not reported as a fault");
+
+  // (c) ephemeral warns BEFORE anything is lost, and names the fix
+  ok(T.showConfigDurability({
+    config_path: "/etc/nzbd/nzbd.toml", durable: false,
+    mirror_path: "/data/queue/nzbd.toml.saved",
+  }), "an ephemeral config directory raises the banner");
+  ok(warn.hidden === false, "…which is visible");
+  ok(warn.innerHTML.includes("/etc/nzbd/nzbd.toml"), "…names the path at risk");
+  ok(warn.innerHTML.includes("./config:/etc/nzbd"), "…shows the volume line that fixes it");
+  ok(warn.innerHTML.includes("/data/queue/nzbd.toml.saved"), "…and where the durable copy lives");
+
+  // (d) after a recovery it reports what happened, not just what might
+  ok(T.showConfigDurability({
+    config_path: "/etc/nzbd/nzbd.toml", durable: false,
+    recovered_from: "/data/queue/nzbd.toml.saved",
+  }), "a recovered boot raises the banner");
+  ok(warn.innerHTML.includes("recovered"), "…says the config was recovered");
+  ok(warn.innerHTML.includes("/data/queue/nzbd.toml.saved"), "…from where");
+  ok(warn.innerHTML.includes("./config:/etc/nzbd"), "…and still shows the mount to add");
 
   if (failures.length) {
     console.error("UI DOM FAILURES:");

@@ -1,5 +1,7 @@
 //! Typed TOML configuration + (phase 3) `nzbget.conf` importer.
 
+pub mod durable;
+
 use nzbd_types::{CertLevel, ServerDef, ServerId, TlsMode};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;

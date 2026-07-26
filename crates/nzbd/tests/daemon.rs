@@ -670,6 +670,108 @@ fn setup_unwritable_config_offers_copyable_toml() {
     assert_eq!(json(&body)["setup_mode"], true);
 }
 
+/// A missing config file is NOT automatically a first run.
+///
+/// Field report 2026-07-26: nzbd on a NAS kept coming back to the first-run
+/// wizard. The config directory was writable but was not a mount, so every
+/// config the wizard wrote lived in the container's own layer and died with
+/// the next `docker compose up` — a configured, downloading install silently
+/// reverted to unconfigured on each deploy, and the page blamed the config
+/// path instead of the missing volume.
+///
+/// So boot now looks for the copy kept beside the *state* (which is on the
+/// data volume, the mount that demonstrably survives) before it decides
+/// anything. This proves it: no config file, a mirror on the data volume,
+/// and the daemon must come up CONFIGURED — auth on, wizard gone — and put
+/// the file back where it belongs.
+#[test]
+fn a_missing_config_is_recovered_from_the_data_volume_not_replaced_by_the_wizard() {
+    let tmp = tempfile::tempdir().unwrap();
+    let port = free_port();
+    let api_addr = format!("127.0.0.1:{port}");
+    // The config path the daemon is pointed at — nothing there, exactly as
+    // after a container recreate wiped an unmounted /etc/nzbd.
+    let cfg_path = tmp.path().join("etc/nzbd.toml");
+    let main_dir = tmp.path().join("data");
+
+    // What the operator configured last time, still sitting on the data
+    // volume because that mount is real.
+    let saved = format!(
+        "[paths]\nmain_dir = \"{}\"\ndest_dir = \"{}\"\n\n\
+         [api]\nbind = \"{}\"\npassword = \"recovered-pw\"\n\n\
+         [[server]]\nname = \"primary\"\nhost = \"127.0.0.1\"\nport = 1199\n\
+         tls = false\nconnections = 2\n",
+        main_dir.display(),
+        main_dir.join("complete").display(),
+        api_addr,
+    );
+    let state_dir = main_dir.join("queue");
+    nzbd_config::durable::save_mirror(&state_dir, &saved).unwrap();
+    assert!(!cfg_path.exists(), "the config file really is gone");
+
+    let bin = env!("CARGO_BIN_EXE_nzbd");
+    let child = Command::new(bin)
+        .args(["run", "--config"])
+        .arg(&cfg_path)
+        .args(["--bind", &api_addr])
+        // How recovery finds the data volume with no config to read it from
+        // — set by the image, so a container needs no extra wiring.
+        .env(nzbd_config::durable::MAIN_DIR_ENV, &main_dir)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn nzbd");
+    let _child = KillOnDrop(child);
+    wait_healthy(&api_addr, Duration::from_secs(15));
+
+    // Auth is on, which can only come from the recovered config.
+    let (code, _) = try_http(&api_addr, "GET", "/api/v1/status", b"", None).unwrap();
+    assert_eq!(code, 401, "the recovered config's api password is in force");
+
+    let (code, body) = try_http(
+        &api_addr,
+        "GET",
+        "/api/v1/setup",
+        b"",
+        Some("nzbd:recovered-pw"),
+    )
+    .unwrap();
+    assert_eq!(code, 200, "{body}");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(
+        v["setup_mode"], false,
+        "the wizard must NOT be serving: {body}"
+    );
+    assert_eq!(
+        v["recovered_from"].as_str(),
+        Some(
+            nzbd_config::durable::mirror_path(&state_dir)
+                .display()
+                .to_string()
+                .as_str()
+        ),
+        "the UI is told where the config came from so it can name the broken mount"
+    );
+
+    // The file is back on disk: a config directory that IS durable heals
+    // itself, and a hand-edit finds a real config either way.
+    let text = std::fs::read_to_string(&cfg_path).expect("config file restored");
+    let cfg = nzbd_config::Config::from_toml(&text).unwrap();
+    assert_eq!(cfg.api.password.as_deref(), Some("recovered-pw"));
+    assert_eq!(cfg.servers.len(), 1);
+
+    // The queue is live — recovery means running, not just not-wizarding.
+    let (code, body) = try_http(
+        &api_addr,
+        "GET",
+        "/api/v1/status",
+        b"",
+        Some("nzbd:recovered-pw"),
+    )
+    .unwrap();
+    assert_eq!(code, 200, "{body}");
+}
+
 /// First-run setup: booting with a missing --config serves the wizard;
 /// POST writes the file; the daemon reloads with it (auth turns on).
 #[test]
@@ -733,6 +835,16 @@ fn first_run_setup_wizard_writes_config_and_reloads() {
     assert!(!cfg.servers[0].tls);
     assert_eq!(cfg.api.password.as_deref(), Some("wizard-pw"));
     assert_eq!(cfg.api.bind, api_addr);
+
+    // …and the durable copy landed beside the state, byte for byte. This is
+    // what makes the config survive a container that loses its config mount.
+    let mirror = nzbd_config::durable::mirror_path(&cfg.state_dir());
+    let saved = std::fs::read_to_string(&mirror)
+        .unwrap_or_else(|e| panic!("no durable copy at {}: {e}", mirror.display()));
+    assert_eq!(
+        saved, text,
+        "the mirror is the config, not a re-render of it"
+    );
 
     // Authenticated requests work; setup mode is over.
     let (code, body) = try_http(

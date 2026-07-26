@@ -76,6 +76,10 @@ pub struct SetupHandle {
     /// Sections saved to disk but not yet applied — the UI's "restart
     /// required" banner. Cleared by a restart (fresh handle).
     pub pending_restart: std::sync::Mutex<std::collections::BTreeSet<&'static str>>,
+    /// Set when this boot found no config file and recovered one from the
+    /// mirror on the data volume: the path it came from. The UI turns this
+    /// into "your config directory isn't keeping anything — fix the mount".
+    pub recovered_from: Option<std::path::PathBuf>,
 }
 
 impl SetupHandle {
@@ -91,6 +95,7 @@ impl SetupHandle {
             writable,
             current: std::sync::Mutex::new(nzbd_config::Config::default()),
             pending_restart: std::sync::Mutex::new(Default::default()),
+            recovered_from: None,
         }
     }
 
@@ -110,6 +115,41 @@ impl SetupHandle {
             writable,
             current: std::sync::Mutex::new(current),
             pending_restart: std::sync::Mutex::new(Default::default()),
+            recovered_from: None,
+        }
+    }
+
+    /// Record that this boot ran on a config recovered from the mirror.
+    pub fn recovered_from(mut self, from: Option<std::path::PathBuf>) -> Self {
+        self.recovered_from = from;
+        self
+    }
+
+    /// Keep the durable copy of the configuration in step with the file.
+    ///
+    /// Called after every successful write of the real config — first-run
+    /// setup and the settings editor both — so the copy on the data volume
+    /// is never a stale config from three edits ago. Best-effort: the
+    /// operator's save already succeeded, and failing it now because the
+    /// spare copy didn't land would be a worse bargain than the risk it
+    /// insures against. Returns the mirror path when it was written.
+    pub fn mirror_config(cfg: &nzbd_config::Config, toml_text: &str) -> Option<std::path::PathBuf> {
+        let state_dir = cfg.state_dir();
+        match nzbd_config::durable::save_mirror(&state_dir, toml_text) {
+            Ok(p) => {
+                tracing::info!(path = %p.display(), "saved a durable copy of the configuration");
+                Some(p)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    dir = %state_dir.display(),
+                    error = %e,
+                    "could not save the durable copy of the configuration — if the \
+                     config directory is not a mounted volume, this config will not \
+                     survive the container being recreated"
+                );
+                None
+            }
         }
     }
 }
@@ -1621,6 +1661,23 @@ async fn get_setup(State(st): State<ApiState>) -> Response {
             "setup_mode": s.setup_mode && !s.applied.load(std::sync::atomic::Ordering::Relaxed),
             "config_path": s.config_path.as_ref().map(|p| p.display().to_string()),
             "writable": s.writable,
+            // "Writable" was never the whole question. A config directory
+            // on the container's own layer is writable and still throws
+            // every save away the next time the container is recreated —
+            // the failure that kept sending working installs back to this
+            // wizard. false = ephemeral, true = persists, null = unknown.
+            "durable": match s.config_path.as_deref().map(nzbd_config::durable::durability) {
+                Some(nzbd_config::durable::Durability::Ephemeral) => Some(false),
+                Some(nzbd_config::durable::Durability::Persistent) => Some(true),
+                _ => None,
+            },
+            // Set when this boot recovered the config from the data volume
+            // because the config file was gone.
+            "recovered_from": s.recovered_from.as_ref().map(|p| p.display().to_string()),
+            // Where the durable copy lives, so the UI can name it.
+            "mirror_path": nzbd_config::durable::mirror_path(
+                &s.current.lock().unwrap().state_dir()
+            ).display().to_string(),
             // Lets the UI explain that config_path is a *container* path
             // and how to find its host side (docker inspect / docker cp).
             "container": in_container(),
@@ -1635,16 +1692,10 @@ async fn get_setup(State(st): State<ApiState>) -> Response {
 }
 
 /// Best-effort "are we in a container?" — advisory, for setup-UI wording
-/// only. Covers docker (/.dockerenv), podman (/run/.containerenv) and
-/// kubernetes (service env / cgroup paths).
-fn in_container() -> bool {
-    std::path::Path::new("/.dockerenv").exists()
-        || std::path::Path::new("/run/.containerenv").exists()
-        || std::env::var_os("KUBERNETES_SERVICE_HOST").is_some()
-        || std::fs::read_to_string("/proc/1/cgroup")
-            .map(|s| s.contains("docker") || s.contains("kubepods") || s.contains("containerd"))
-            .unwrap_or(false)
-}
+/// only. One implementation, shared with the durability probe that has to
+/// agree with it: two copies of this answer drifting apart is exactly how
+/// you get a UI that says "persistent" while the daemon logs "ephemeral".
+use nzbd_config::durable::in_container;
 
 fn hostname() -> Option<String> {
     std::fs::read_to_string("/proc/sys/kernel/hostname")
@@ -1742,12 +1793,21 @@ async fn post_setup(State(st): State<ApiState>, Json(req): Json<SetupReq>) -> Re
     if let Err(e) = std::fs::write(&cfg_path, &toml_text) {
         return write_failed(format!("write {}: {e}", cfg_path.display()));
     }
+    // Before anything else: the copy that makes this survive a container
+    // recreate even if /etc/nzbd turns out not to be mounted.
+    let mirrored = SetupHandle::mirror_config(&cfg, &toml_text);
     tracing::info!(path = %cfg_path.display(), "setup: configuration written; reloading");
     setup
         .applied
         .store(true, std::sync::atomic::Ordering::Relaxed);
     setup.reload.notify_one();
-    Json(json!({ "written": path, "reloading": true, "toml": toml_text })).into_response()
+    Json(json!({
+        "written": path,
+        "reloading": true,
+        "toml": toml_text,
+        "mirrored": mirrored.map(|p| p.display().to_string()),
+    }))
+    .into_response()
 }
 
 // ---------------------------------------------------------------------------
@@ -1836,6 +1896,8 @@ async fn put_config(
             ),
         );
     }
+    // The file is on disk; keep the durable copy in step with it.
+    let mirrored = SetupHandle::mirror_config(&new_cfg, &toml_text);
     // Live-apply what the engine can absorb without a restart.
     if live.contains(&"speed limit") {
         let bps = new_cfg.queue.speed_limit_kib.map(|k| k * 1024);
@@ -1857,6 +1919,7 @@ async fn put_config(
         "ok": true,
         "applied_live": live,
         "restart_required": pending,
+        "mirrored": mirrored.map(|p| p.display().to_string()),
     }))
     .into_response()
 }

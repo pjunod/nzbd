@@ -399,12 +399,39 @@ fn with_fs_hint<E: std::error::Error + 'static>(e: E) -> anyhow_lite::Error {
     anyhow_lite::Error::msg(e.to_string())
 }
 
+/// Put a recovered config back at the path the daemon was pointed at.
+///
+/// Best-effort by design: recovery already has the bytes in hand, so a
+/// read-only or root-owned config directory must not turn a successful
+/// boot into a failed one — it just means the mirror stays the source of
+/// truth until the mount is fixed.
+fn restore_config_file(path: &std::path::Path, toml: &str) -> bool {
+    if let Some(parent) = path.parent() {
+        if std::fs::create_dir_all(parent).is_err() {
+            return false;
+        }
+    }
+    match std::fs::write(path, toml.as_bytes()) {
+        Ok(()) => true,
+        Err(e) => {
+            tracing::warn!(
+                path = %path.display(),
+                error = %e,
+                "could not write the recovered config back to its file; \
+                 running from the saved copy instead"
+            );
+            false
+        }
+    }
+}
+
 fn run(
     config: Option<PathBuf>,
     bind: Option<String>,
     logbuf: Arc<nzbd_api::LogBuffer>,
 ) -> anyhow_lite::Result<RunOutcome> {
     let mut setup_path: Option<PathBuf> = None;
+    let mut recovered_from: Option<PathBuf> = None;
     let cfg = match &config {
         Some(path) => {
             // Actionable errors for the two classic container mistakes.
@@ -419,14 +446,46 @@ fn run(
                 )));
             }
             if !path.exists() {
-                // First-run setup: boot with defaults (no servers) and let
-                // the web UI write this file, then reload.
-                tracing::warn!(
-                    path = %path.display(),
-                    "no config file — first-run setup is live in the web UI"
-                );
-                setup_path = Some(path.clone());
-                nzbd_config::Config::default()
+                // A missing config file is not proof of a first run. In a
+                // container it usually means nothing is mounted at the
+                // config directory, so the config written last time went
+                // into the image's writable layer and died with the
+                // container — and serving the wizard here would throw away
+                // a working install on every deploy. Look for the mirror
+                // we keep on the data volume first.
+                match nzbd_config::durable::find_mirror() {
+                    Some(rec) => {
+                        // Put the file back if we can: the operator's next
+                        // `cat`/hand-edit should find a real config, and a
+                        // config dir that IS durable self-heals for good.
+                        let restored = restore_config_file(path, &rec.toml);
+                        tracing::warn!(
+                            path = %path.display(),
+                            recovered_from = %rec.from.display(),
+                            restored,
+                            "config file is MISSING — recovered the last saved \
+                             configuration from the data volume. The config \
+                             directory did not keep what was written to it: in \
+                             Docker this means no volume is mounted at it, so \
+                             every container recreate loses the file. Mount one \
+                             (see docs/DEPLOY.md); until then this copy is what \
+                             keeps the daemon configured."
+                        );
+                        recovered_from = Some(rec.from);
+                        rec.config
+                    }
+                    None => {
+                        // Genuinely nothing to run: first-run setup, boot
+                        // with defaults (no servers) and let the web UI
+                        // write this file, then reload.
+                        tracing::warn!(
+                            path = %path.display(),
+                            "no config file — first-run setup is live in the web UI"
+                        );
+                        setup_path = Some(path.clone());
+                        nzbd_config::Config::default()
+                    }
+                }
             } else {
                 let text = std::fs::read_to_string(path).map_err(|e| {
                     anyhow_lite::Error::msg(format!("cannot read config {}: {e}", path.display()))
@@ -442,12 +501,26 @@ fn run(
     // it powers the Settings tab (view/edit config + hot reload).
     let setup = Some(match setup_path {
         Some(p) => Arc::new(nzbd_api::SetupHandle::new(p, bind.clone())),
-        None => Arc::new(nzbd_api::SetupHandle::for_running(
-            config.clone(),
-            bind.clone(),
-            cfg.clone(),
-        )),
+        None => Arc::new(
+            nzbd_api::SetupHandle::for_running(config.clone(), bind.clone(), cfg.clone())
+                .recovered_from(recovered_from),
+        ),
     });
+    // Say it at boot, not only when something already went wrong: a config
+    // directory on the container's writable layer looks perfectly healthy
+    // — saves succeed — right up until the container is recreated.
+    if let Some(path) = &config {
+        if nzbd_config::durable::durability(path) == nzbd_config::durable::Durability::Ephemeral {
+            tracing::warn!(
+                path = %path.display(),
+                "the config directory is INSIDE THE CONTAINER, not on a mounted \
+                 volume — saves will succeed and then be destroyed the next time \
+                 this container is recreated (compose up, image pull). Mount a \
+                 volume at it (see docs/DEPLOY.md). nzbd keeps a copy beside its \
+                 state and restores it automatically, but fix the mount."
+            );
+        }
+    }
 
     let servers = cfg.server_defs();
     for s in &servers {

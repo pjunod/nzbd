@@ -37,6 +37,13 @@
     }
   }
   * { box-sizing: border-box; }
+  /* `hidden` is a promise the page makes to itself, and the UA stylesheet
+     backs it with `display: none` — which ANY class rule setting `display`
+     silently outranks. That is not theoretical: it is why the first-run
+     wizard used to render on top of a live dashboard (.stats is a grid,
+     .controls and nav.tabs are flexes, so `el.hidden = true` did nothing
+     to exactly those three). One rule, applied to every element, forever. */
+  [hidden] { display: none !important; }
   body { margin: 0; background: var(--bg); color: var(--ink);
          font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
   .wrap { max-width: 1060px; margin: 0 auto; padding: 18px 16px 48px; }
@@ -241,7 +248,7 @@
   .pager { display: flex; align-items: center; gap: 8px; margin-top: 10px;
            flex-wrap: wrap; font-size: 12.5px; color: var(--ink2);
            font-variant-numeric: tabular-nums; }
-  .pager[hidden] { display: none; }
+  /* (the global [hidden] rule near the top covers .pager too) */
   .pager #pager-info { min-width: 12ch; text-align: center; }
   .pager label { display: flex; align-items: center; gap: 6px; }
   .pager select { background: var(--panel); color: var(--ink);
@@ -276,6 +283,17 @@
              border: 1px solid color-mix(in srgb, var(--bad) 40%, transparent); }
   #offline.show { display: block; }
   #conn.bad { color: var(--bad); }
+  /* The config directory is not keeping what we write to it. Silent for
+     everyone whose mounts are right; unmissable for everyone else, because
+     the symptom (a wizard, a reset install) never named the cause. */
+  #cfgwarn { margin: 12px 0 0; padding: 10px 12px; border-radius: 8px;
+             font-size: 12.5px; color: var(--ink2);
+             background: color-mix(in srgb, var(--warn) 10%, transparent);
+             border: 1px solid color-mix(in srgb, var(--warn) 40%, transparent); }
+  #cfgwarn b { color: var(--warn); }
+  #cfgwarn code { background: var(--panel2); border-radius: 4px; padding: 1px 5px; }
+  #cfgwarn pre { margin: 7px 0 0; padding: 8px 10px; overflow-x: auto;
+                 background: var(--panel2); border-radius: 6px; font-size: 12px; }
   /* A row with an unconfirmed action on it reads as in-flight. */
   tr.pending td { opacity: .55; }
   /* first-run setup */
@@ -337,6 +355,10 @@
     <span class="badges" id="srv-chips"></span>
     <span class="badges" id="badges"></span>
   </header>
+
+  <!-- Config durability: shown in the app AND above the wizard, because
+       the wizard appearing at all is usually this problem's first symptom. -->
+  <div id="cfgwarn" hidden></div>
 
   <section id="setup" hidden>
     <h2>First-run setup</h2>
@@ -2665,7 +2687,60 @@ $("btn-restart").onclick = async () => {
   refreshAll();
 };
 
+// ---- config durability ---------------------------------------------------
+// A config directory that is writable but not mounted is the failure this
+// page had no words for: saves succeed, the operator believes the daemon is
+// configured, and the next `docker compose up` serves a first-run wizard on
+// an install that was working. Two states are worth interrupting for.
+function showConfigDurability(s) {
+  const box = $("cfgwarn");
+  if (!box) return false;
+  const mount = s.config_path
+    ? "<pre>volumes:\n  - ./config:" + esc(s.config_path.replace(/\/[^/]*$/, "") || "/etc/nzbd") + "</pre>"
+    : "";
+  let html = "";
+  if (s.recovered_from) {
+    // Already bitten: say what was lost, what saved it, and what to fix.
+    html =
+      "<b>The config file was missing at boot — nzbd recovered it.</b> " +
+      "Your settings came back from the copy it keeps beside its data at <code>" +
+      esc(s.recovered_from) + "</code>, so this daemon is running configured. " +
+      "But <code>" + esc(s.config_path || "the config directory") + "</code> did not " +
+      "keep what was written to it — in Docker that means nothing is mounted there, " +
+      "and each container recreate wipes it. Add the mount to your compose file:" +
+      mount +
+      "Until you do, every restart leans on the recovered copy.";
+  } else if (s.durable === false) {
+    // Not bitten yet. This is the only chance to warn before the loss.
+    html =
+      "<b>This config directory lives inside the container.</b> " +
+      "Saves to <code>" + esc(s.config_path || "") + "</code> work now and are " +
+      "destroyed the next time the container is recreated (<code>compose up</code>, " +
+      "an image pull). Mount a volume at it:" +
+      mount +
+      (s.mirror_path
+        ? "nzbd also keeps a durable copy at <code>" + esc(s.mirror_path) +
+          "</code> and restores from it automatically, so you will not lose your " +
+          "settings — but fix the mount."
+        : "");
+  }
+  box.innerHTML = html;
+  box.hidden = !html;
+  return !!html;
+}
+
 // ---- first-run setup ----------------------------------------------------
+// The wizard takes the page over: a daemon in setup mode has no config, so
+// every panel behind it would show dashes and every control would act on
+// nothing. Named and exported because "which elements survive" is a rule
+// worth pinning, not a loop buried in an async function.
+const SETUP_KEEP = "header, #cfgwarn, #setup, footer";
+function hideAppForSetup() {
+  for (const el of document.querySelectorAll(".wrap > *"))
+    if (!el.matches(SETUP_KEEP)) el.hidden = true;
+  $("setup").hidden = false;
+}
+
 async function checkSetup() {
   let s;
   try {
@@ -2673,13 +2748,12 @@ async function checkSetup() {
     if (!r.ok) return false;
     s = await r.json();
   } catch { return false; }
+  showConfigDurability(s);
   if (!s.setup_mode) return false;
 
   $("setup-path").textContent = s.config_path;
   if (s.writable === false) $("setup-ro").hidden = false;
-  for (const el of document.querySelectorAll(".wrap > *"))
-    if (!el.matches("header, #setup, footer")) el.hidden = true;
-  $("setup").hidden = false;
+  hideAppForSetup();
   $("conn").textContent = "setup";
 
   const collect = (preview) => ({
@@ -2868,6 +2942,7 @@ if (typeof __nzbd_test_enable !== "undefined") {
     appendLogs, logMatches, renderLogs, serverChipModels, LOG_RING_MAX,
     pageSlice, setPage, setPageSize, renderPager, PAGE_SIZES, PAGE_SIZE_DEFAULT,
     pageState: () => ({ page, pageSize }),
+    hideAppForSetup, SETUP_KEEP, showConfigDurability,
     setOpenJob: (id) => { openJob = id; },
     setActiveTab: (t) => { activeTab = t; },
     conn: () => store.conn,
