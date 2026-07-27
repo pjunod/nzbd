@@ -1262,6 +1262,36 @@ fn client_name(headers: &axum::http::HeaderMap) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+/// The caller, but only when it is another *application* — not this daemon's
+/// own web UI.
+///
+/// Used for the handoff signal, where that distinction is the whole point. A
+/// history read means "a consumer has seen these entries", and an operator
+/// opening the History tab must not satisfy it: if the browser counted, every
+/// row would flip to `seen by Chrome` the moment you looked at the page, and
+/// the column that tells you whether your *arr collected the files would be
+/// answering a different question than the one it asks.
+///
+/// An explicit `X-Nzbd-Client` is always a consumer — a browser has no reason
+/// to send it. Otherwise a User-Agent counts only if it is a product token
+/// rather than a browser's `Mozilla/…` masquerade, which is the same rule the
+/// UI uses to decide whether to prettify a chip label.
+fn consumer_name(headers: &axum::http::HeaderMap) -> Option<String> {
+    if let Some(explicit) = headers
+        .get("x-nzbd-client")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+    {
+        return Some(explicit);
+    }
+    headers
+        .get(axum::http::header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty() && !s.starts_with("Mozilla/"))
+}
+
 /// How long a silent stream may stay silent before it emits `hb`. Shorter
 /// than the client's 6.5 s staleness threshold, so an idle daemon never
 /// looks disconnected.
@@ -1511,13 +1541,27 @@ struct HistoryQuery {
 /// was, and `?since_seq=` is oldest-first for a consumer walking forward
 /// (so the last row's `seq` is its next cursor). Mixing the two orders in
 /// one response is how cursors quietly start skipping rows.
-async fn get_history(State(st): State<ApiState>, Query(q): Query<HistoryQuery>) -> Response {
+///
+/// The read is also the handoff signal. A consumer listing history is the
+/// only evidence nzbd has that anyone came for the files, and until this was
+/// wired the compat `history` RPC was the sole writer of `last_seen` — so a
+/// *native* consumer polling every 30 s left every finished job reading
+/// `⏳ awaiting pickup` forever, which inverts the meaning of the one column
+/// that answers "did my *arr take these?". The browser is excluded; see
+/// [`consumer_name`].
+async fn get_history(
+    State(st): State<ApiState>,
+    headers: axum::http::HeaderMap,
+    Query(q): Query<HistoryQuery>,
+) -> Response {
     let Some(db) = &st.history else {
         return error(StatusCode::NOT_IMPLEMENTED, "history store not configured");
     };
     let db = db.clone();
     let limit = q.limit.unwrap_or(200).min(10_000);
     let since = q.since_seq;
+    let consumer = consumer_name(&headers);
+    let now = unix_now();
     let entries = tokio::task::spawn_blocking(move || {
         let _ = db.refresh(); // pick up other nodes' appends (throttled)
         let rows = match since {
@@ -1525,6 +1569,17 @@ async fn get_history(State(st): State<ApiState>, Query(q): Query<HistoryQuery>) 
             None => db.list_filtered(limit, true),
         };
         rows.map(|entries| {
+            // Record the pull before decorating: this poll SAW these
+            // entries. Both shapes count — a `since_seq` catch-up walk is
+            // still the consumer reading them. A failure here is not worth
+            // failing the read over; the observation is diagnostic, the
+            // response is the job.
+            if consumer.is_some() {
+                let jobs: Vec<crate::JobId> = entries.iter().map(|e| e.job).collect();
+                if !jobs.is_empty() {
+                    let _ = db.mark_seen(&jobs, consumer.as_deref(), now);
+                }
+            }
             // `can_requeue` is derived, not stored: it answers "is the
             // requeue source still on this node?", which only a look at the
             // spool (or the parked `*URL`) can honestly say.

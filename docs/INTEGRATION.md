@@ -294,9 +294,22 @@ downloader's side: the files finished *and someone collected them*.
 | Text | Means |
 |---|---|
 | `✓ imported by <who> <ago>` | the client deleted the entry after importing |
-| `seen by <who> <ago> ×<n>` | listed in the client's history poll n times; import not yet observed |
-| `⏳ awaiting pickup <ago>` | no client has polled history since this finished |
+| `seen by <who> <ago> ×<n>` | listed in a consumer's history poll n times; import not yet observed |
+| `⏳ awaiting pickup <ago>` | no consumer has polled history since this finished |
 | `hidden` | you hid it from clients |
+
+**A consumer, not a browser.** Opening this tab does not count: a history read
+records the pull only when the caller sends `X-Nzbd-Client`, or a User-Agent
+that is a product token rather than a browser's `Mozilla/…`. If the browser
+counted, every row would flip to `seen` the moment you looked at the page, and
+the column would be answering a different question than the one it asks.
+
+> **Fixed 2026-07.** Until then only the nzbget-compat `history` RPC recorded
+> the pull — the native `GET /api/v1/history` did not. A native consumer
+> polling every 30 seconds therefore left every finished job reading
+> `⏳ awaiting pickup` forever, which inverts the meaning of the one column
+> that answers "did my *arr take these?". If you are on an older build, read
+> this column as compat-clients-only.
 
 **How to verify.**
 
@@ -310,7 +323,9 @@ single clearest sign the *consumer* is down, not nzbd — the download worked,
 nobody came for it. It will resolve itself when monarr returns; nzbd does not
 need to be told. Persistent `seen ×n` with no `✓` means the consumer is
 listing the entry and refusing to import it — look at monarr's Activity trace,
-not at nzbd.
+not at nzbd. That is the more interesting failure of the two, and the one this
+column exists to make visible: a downloader can only report that it finished,
+never that the files were used.
 
 ---
 

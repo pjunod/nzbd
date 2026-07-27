@@ -664,6 +664,79 @@ fn params_are_validated_and_native_consumers_are_visible() {
         row["picked_up_by"], "monarr/9.9.9",
         "a native hide is an import signal and must name the consumer: {row}"
     );
+
+    // ---- N6: a native history READ is the handoff signal ---------------
+    // Until this was wired, only the nzbget-compat `history` RPC wrote
+    // `last_seen`, so a native consumer polling every 30 s left every
+    // finished job reading "awaiting pickup" forever — the column that
+    // answers "did my *arr take these?" said no while it was saying yes.
+    let seen_count = |addr: &str| -> u64 {
+        let (_, v) = get(addr, "/api/v1/history?limit=50");
+        v["entries"]
+            .as_array()
+            .and_then(|e| e.iter().find(|e| e["job"] == id))
+            .and_then(|r| r["seen_count"].as_u64())
+            .expect("the row is listed")
+    };
+    // Every read above sent no User-Agent at all, so nothing has counted.
+    assert_eq!(seen_count(&d.addr), 0, "an anonymous read is not a pickup");
+
+    // A browser must never satisfy the handoff. If it did, opening the
+    // History tab would flip every row to "seen" and the column would be
+    // answering a different question than the one it asks.
+    let (code, _) = request(
+        &d.addr,
+        "GET",
+        "/api/v1/history?limit=50",
+        b"",
+        &[(
+            "User-Agent",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+        )],
+    );
+    assert_eq!(code, 200);
+    assert_eq!(
+        seen_count(&d.addr),
+        0,
+        "the operator opening the History tab is not the consumer collecting the files"
+    );
+
+    // An application identifying itself is.
+    let (code, _) = request(
+        &d.addr,
+        "GET",
+        "/api/v1/history?limit=50",
+        b"",
+        &[("X-Nzbd-Client", "monarr/9.9.9")],
+    );
+    assert_eq!(code, 200);
+    assert_eq!(
+        seen_count(&d.addr),
+        1,
+        "a native consumer's history poll must record the pull"
+    );
+    let (_, v) = get(&d.addr, "/api/v1/history?limit=50");
+    let row = v["entries"]
+        .as_array()
+        .and_then(|e| e.iter().find(|e| e["job"] == id))
+        .expect("the row is listed");
+    assert!(
+        row["last_seen_at_unix"].as_i64().unwrap_or(0) > 0,
+        "the handoff badge reads off last_seen_at_unix: {row}"
+    );
+
+    // The cursor form counts too — a catch-up walk is still the consumer
+    // reading them, and a consumer that only ever uses ?since_seq= would
+    // otherwise look like one that never polled at all.
+    let (code, _) = request(
+        &d.addr,
+        "GET",
+        "/api/v1/history?since_seq=0",
+        b"",
+        &[("X-Nzbd-Client", "monarr/9.9.9")],
+    );
+    assert_eq!(code, 200);
+    assert_eq!(seen_count(&d.addr), 2, "a since_seq walk is also a pull");
 }
 
 /// Percent-encode a query value. (The daemon takes `params` as a query
