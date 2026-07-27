@@ -170,6 +170,44 @@ fn rar5_volume_number(data: &[u8]) -> Option<u64> {
     None
 }
 
+/// An extension that names a continuation volume of a set someone else has
+/// already numbered.
+///
+/// Two shapes, and the rule is deliberately wider than the one case that bit
+/// us:
+///
+///   - all digits — `.001`–`.999` (7z/split), and
+///   - one letter then two digits — `.r00` (RAR), `.z01` (split ZIP), and
+///     every other archiver that followed the same convention.
+///
+/// **These must never be renamed.** Every volume of a set — not just the
+/// first — begins with the format's magic bytes, so a signature-based renamer
+/// sees a whole old-style set as a pile of "hidden" archives and renumbers
+/// them into `.partNN.rar`. That severs the chain from the real first volume
+/// `name.rar`, which keeps its own extension because `rar` is a known one.
+/// unrar then extracts volume 1, goes looking for `name.r00`, and finds it
+/// renamed away.
+///
+/// The result is a file exactly one volume long — 500 MiB minus a header, for
+/// a typical set — reported as a completed download, after which `cleanup_dir`
+/// deletes the renamed husks and takes the recoverable data with them. It cost
+/// two 40-60 GB remuxes before anyone noticed, because the extraction
+/// "succeeded" in about a second and nothing compared the result to the job
+/// size.
+///
+/// The rule errs wide on purpose. Declining to rename a genuinely obfuscated
+/// file whose random extension happens to look like `a01` costs one unpack
+/// that fails loudly; renaming a real volume corrupts the set silently. Those
+/// are not comparable prices.
+pub(crate) fn split_volume_ext(ext: &str) -> bool {
+    if ext.len() != 3 {
+        return false;
+    }
+    let b = ext.as_bytes();
+    b.iter().all(|c| c.is_ascii_digit())
+        || (b[0].is_ascii_alphabetic() && b[1].is_ascii_digit() && b[2].is_ascii_digit())
+}
+
 /// rar-rename (plus 7z/zip signatures). Returns `(old, new)` pairs.
 pub fn rar_rename(dir: &Path) -> Vec<(PathBuf, PathBuf)> {
     let mut renames = Vec::new();
@@ -181,9 +219,7 @@ pub fn rar_rename(dir: &Path) -> Vec<(PathBuf, PathBuf)> {
             .extension()
             .map(|e| e.to_string_lossy().to_lowercase())
             .unwrap_or_default();
-        if known.contains(&ext.as_str())
-            || ext.chars().all(|c| c.is_ascii_digit()) && !ext.is_empty()
-        {
+        if known.contains(&ext.as_str()) || split_volume_ext(&ext) {
             continue;
         }
         let h = head(&p, 32);
@@ -327,6 +363,89 @@ mod tests {
             "plain files untouched"
         );
         assert_eq!(renames.len(), 2);
+    }
+
+    /// A volume set someone else numbered must survive this pass untouched.
+    ///
+    /// THE regression test. Every RAR volume begins with the same `Rar!`
+    /// magic, not just the first, so a signature renamer sees an old-style set
+    /// as a pile of hidden archives and renumbers them into `.partNN.rar` —
+    /// severing the chain from `set.rar`, which keeps its name because `rar`
+    /// is a known extension. unrar then wrote volume 1, went looking for
+    /// `set.r00`, and stopped. The observed cost: a 48 GiB remux delivered as
+    /// a 500 MiB file, reported as a completed download, with the renamed
+    /// volumes deleted afterwards by cleanup.
+    #[test]
+    fn a_numbered_volume_set_is_never_renamed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut rar = b"Rar!\x1a\x07\x00".to_vec();
+        rar.extend_from_slice(&[0u8; 64]);
+
+        // Old-style RAR: the chain is set.rar → set.r00 → set.r01 …
+        for name in ["set.rar", "set.r00", "set.r01", "set.r02"] {
+            std::fs::write(tmp.path().join(name), &rar).unwrap();
+        }
+        // Split ZIP and 7z/split numbering are the same shape and the same
+        // trap — a continuation volume carrying the format's magic bytes.
+        let mut zip = ZIP_MAGIC.to_vec();
+        zip.extend_from_slice(&[0u8; 32]);
+        std::fs::write(tmp.path().join("pack.zip"), &zip).unwrap();
+        std::fs::write(tmp.path().join("pack.z01"), &zip).unwrap();
+        std::fs::write(tmp.path().join("pack.z02"), &zip).unwrap();
+        let mut sz = SEVENZIP_MAGIC.to_vec();
+        sz.extend_from_slice(&[0u8; 32]);
+        std::fs::write(tmp.path().join("blob.7z.001"), &sz).unwrap();
+        std::fs::write(tmp.path().join("blob.7z.002"), &sz).unwrap();
+
+        let before: Vec<String> = files_of(tmp.path())
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        let renames = rar_rename(tmp.path());
+        let after: Vec<String> = files_of(tmp.path())
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+
+        assert!(
+            renames.is_empty(),
+            "a numbered volume set must not be renamed; got {renames:?}"
+        );
+        assert_eq!(
+            before, after,
+            "renaming a continuation volume severs the chain from its first \
+             volume, and the extractor then writes exactly one volume"
+        );
+        for name in ["set.rar", "set.r00", "set.r01", "set.r02"] {
+            assert!(tmp.path().join(name).exists(), "{name} was renamed away");
+        }
+    }
+
+    /// The wide rule, stated as a table. It errs toward leaving files alone:
+    /// declining to rename a genuinely obfuscated file costs one loud unpack
+    /// failure, where renaming a real volume corrupts a set in silence.
+    #[test]
+    fn split_volume_extensions_are_recognised() {
+        for yes in ["r00", "r99", "z01", "c00", "a01", "001", "999", "000"] {
+            assert!(split_volume_ext(yes), "{yes} is a volume extension");
+        }
+        for no in ["rar", "mkv", "nfo", "", "r0", "r000", "0a0", "abc", "1ab"] {
+            assert!(!split_volume_ext(no), "{no} is not a volume extension");
+        }
+    }
+
+    /// The renamer still does its actual job: a genuinely obfuscated single
+    /// archive, with no volume numbering to respect, is still named.
+    #[test]
+    fn an_obfuscated_single_archive_is_still_renamed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut rar = b"Rar!\x1a\x07\x00".to_vec();
+        rar.extend_from_slice(&[0u8; 64]);
+        std::fs::write(tmp.path().join("a1b2c3d4e5"), &rar).unwrap();
+
+        let renames = rar_rename(tmp.path());
+        assert_eq!(renames.len(), 1, "{renames:?}");
+        assert!(tmp.path().join("a1b2c3d4e5.rar").exists());
     }
 
     #[test]

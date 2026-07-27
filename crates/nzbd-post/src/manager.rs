@@ -691,7 +691,24 @@ pub async fn process_job_ctx(
                         }
                     }
                 }
-                if r.success {
+                // "It said OK" is not the same as "it read the whole set".
+                // Checked BEFORE the commit, so a short extraction is thrown
+                // away with the staging dir instead of being renamed over the
+                // top of the volumes it failed to read.
+                let short = if r.success {
+                    crate::tools::unpack_shortfall(&dir, archive, &staging)
+                } else {
+                    None
+                };
+                if let Some(why) = &short {
+                    tracing::error!(
+                        job = job_id.0,
+                        archive = %archive.display(),
+                        reason = %why,
+                        "unpack claimed success without consuming the volume set"
+                    );
+                }
+                if r.success && short.is_none() {
                     if !(ctx.commit_ok)() {
                         let _ = std::fs::remove_dir_all(&staging);
                         return Err(PostError::Subprocess("pp lease lost before commit".into()));

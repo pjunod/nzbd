@@ -1042,3 +1042,132 @@ async fn an_interrupted_move_leaves_no_half_copied_folder_behind() {
     );
     engine.shutdown().await;
 }
+
+/// A multi-volume archive must extract to the WHOLE file, and a set with a
+/// hole in it must fail rather than deliver part of one.
+///
+/// This is the end-to-end guard on the worst defect this project has had: a
+/// 48 GiB remux delivered as a 500 MiB file — exactly one volume, minus its
+/// header — reported as a completed download. Three things had to line up
+/// for that: the signature renamer severed an old-style volume chain
+/// (pinned by `rename::tests::a_numbered_volume_set_is_never_renamed`),
+/// unrar's result was judged on its exit code alone with its output
+/// suppressed, and nothing ever compared what was extracted against what was
+/// promised.
+///
+/// `rar` is not free software and CI will not have it, so this self-skips
+/// rather than going through `require_tool` — which would turn a missing
+/// non-free package into a CI failure. The unit test above carries the
+/// regression in CI; this one carries the proof that the pipeline really
+/// extracts a real multi-volume set.
+#[tokio::test]
+async fn a_multi_volume_archive_extracts_whole_or_fails() {
+    if std::process::Command::new("rar")
+        .arg("-iver")
+        .output()
+        .is_err()
+    {
+        eprintln!("SKIPPED: `rar` not installed — cannot build a multi-volume set");
+        return;
+    }
+    if !require_tool("unrar") {
+        return;
+    }
+
+    // A payload several volumes long, and incompressible so that -m0 volumes
+    // are genuinely the size we asked for.
+    let payload: Vec<u8> = (0..900_000u32)
+        .map(|i| (i.wrapping_mul(2654435761) >> 13) as u8)
+        .collect();
+
+    for (case, drop_a_volume) in [("whole", false), ("holed", true)] {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = spawn_engine(tmp.path()).await;
+        let dir = tmp.path().join(format!("dest/{case}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("movie.mkv"), &payload).unwrap();
+
+        let built = std::process::Command::new("rar")
+            .args(["a", "-m0", "-v200k", "-idq", "-ep", "set.rar", "movie.mkv"])
+            .current_dir(&dir)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        assert!(built, "could not build the multi-volume set");
+        std::fs::remove_file(dir.join("movie.mkv")).unwrap();
+
+        let mut volumes: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|e| e == "rar"))
+            .collect();
+        volumes.sort();
+        assert!(
+            volumes.len() >= 3,
+            "the point of this test is more than one volume, got {volumes:?}"
+        );
+        if drop_a_volume {
+            // Lose a middle volume: the chain now stops partway, which is
+            // what a severed or incomplete set looks like to unrar.
+            std::fs::remove_file(&volumes[1]).unwrap();
+        }
+
+        let files: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .enumerate()
+            .map(|(i, e)| {
+                let name = e.file_name().to_string_lossy().into_owned();
+                let bytes = std::fs::read(e.path()).unwrap();
+                file_entry(i as u32 + 1, &name, Some(crc(&bytes)), false)
+            })
+            .collect();
+        let job_id = if drop_a_volume { 61 } else { 60 };
+        engine
+            .import_job(completed_job(job_id, case, files), false, false)
+            .await
+            .unwrap();
+
+        let hist = history(tmp.path());
+        let cfg = PostConfig {
+            deobfuscate_final: false,
+            ..PostConfig::default()
+        };
+        let out = process_job(
+            &engine,
+            &cfg,
+            &hist,
+            &tmp.path().join("dest"),
+            JobId(job_id),
+        )
+        .await
+        .unwrap();
+
+        if drop_a_volume {
+            assert_ne!(
+                out,
+                PpFinal::Success,
+                "a set with a missing volume produced a SUCCESS — this is the \
+                 shape that shipped 500 MiB of a 48 GiB film"
+            );
+            let extracted = dir.join("movie.mkv");
+            assert!(
+                !extracted.exists() || std::fs::metadata(&extracted).unwrap().len() == 0,
+                "a failed unpack must not leave a truncated film in place"
+            );
+        } else {
+            assert_eq!(out, PpFinal::Success, "a complete set must extract");
+            let got = std::fs::read(dir.join("movie.mkv")).unwrap();
+            assert_eq!(
+                got.len(),
+                payload.len(),
+                "extracted {} bytes of a {}-byte file — one volume is not the film",
+                got.len(),
+                payload.len()
+            );
+            assert_eq!(got, payload, "the extracted bytes are not the original");
+        }
+        engine.shutdown().await;
+    }
+}

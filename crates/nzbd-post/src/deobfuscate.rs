@@ -48,10 +48,11 @@ fn skip_ext(p: &Path) -> bool {
     if SKIP_EXTS.contains(&e.as_str()) {
         return true;
     }
-    // Split volumes: .r00 … .r99, .000 … .999
-    e.len() == 3
-        && (e.starts_with('r') && e[1..].bytes().all(|b| b.is_ascii_digit())
-            || e.bytes().all(|b| b.is_ascii_digit()))
+    // Split volumes — `.r00`, `.z01`, `.001`. Shared with the signature
+    // renamer on purpose: the two passes have to agree about what a volume
+    // is, and they did not. A set survived this one and was mangled by the
+    // other.
+    crate::rename::split_volume_ext(&e)
 }
 
 fn video_ext(p: &Path) -> bool {

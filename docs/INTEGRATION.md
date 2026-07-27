@@ -165,6 +165,17 @@ curl -sS -H "Authorization: Bearer $TOK" "$NZBD/api/v1/status"   # the probe mon
 curl -sS "$NZBD/healthz"                                          # -> the literal: ok
 ```
 
+> **Extractors lie, and one of them shipped in this image.** `unrar-free` —
+> the GPL clone Debian installs for `unrar` — cannot handle multi-volume
+> archives and does not say so: given volume 1 of a five-volume set with every
+> volume present, it extracts volume 1, prints `All OK`, and exits 0. Nearly
+> every release above a few hundred megabytes is multi-volume, so the result
+> was a 48 GiB film delivered as its first 500 MiB and reported as a completed
+> download. Fixed 2026-07: the image no longer installs it, the RAR path falls
+> back to 7-Zip when the configured extractor under-delivers, and the unpack
+> is checked against the volume set's own size before anything is committed.
+> If you built an older image, `docker compose up -d --build` is the fix.
+
 **How to read it.** `/api/v1/status` answering with a `version` field is the
 whole of "nzbd is really there" — monarr treats a 200 with no `version` as a
 hard failure (`nzbd: … answered, but not like nzbd`), because a reverse proxy

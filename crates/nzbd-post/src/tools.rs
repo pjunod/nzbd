@@ -176,6 +176,184 @@ pub struct Extractors {
     pub timeout: Duration,
 }
 
+/// The volume of a multi-volume set this file is, if it is one.
+///
+/// `name.part07.rar` → 7, `name.r05` → 6 (old-style counts the bare `.rar` as
+/// volume 1 and `.r00` as volume 2), `name.rar` → 1. Anything else → None.
+fn volume_number(name: &str) -> Option<u32> {
+    if let Some(idx) = name.rfind(".part") {
+        if name.ends_with(".rar") {
+            let digits: String = name[idx + 5..]
+                .chars()
+                .take_while(|c| c.is_ascii_digit())
+                .collect();
+            return digits.parse().ok();
+        }
+    }
+    if name.ends_with(".rar") {
+        return Some(1);
+    }
+    let ext = name.rsplit_once('.')?.1;
+    if ext.len() == 3 && ext.starts_with('r') && ext[1..].bytes().all(|b| b.is_ascii_digit()) {
+        return ext[1..].parse::<u32>().ok().map(|n| n + 2);
+    }
+    None
+}
+
+/// The volumes missing from a set, by number.
+///
+/// Extraction has no completeness check of its own: unrar is handed a first
+/// volume and trusted to walk the chain, and when the chain stops it writes
+/// what it had. Checking before we start turns "a truncated film reported as
+/// finished" into a named failure — and names the volume, because "volume 43
+/// is missing" is actionable where "unpack failed" is not.
+pub fn missing_volumes(dir: &Path, first: &Path) -> Vec<u32> {
+    let stem = first
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_lowercase();
+    // The set's base name: strip .partNN.rar, .rNN or .rar.
+    let base = match stem.rfind(".part") {
+        Some(i) if stem.ends_with(".rar") => stem[..i].to_owned(),
+        _ => match stem.rsplit_once('.') {
+            Some((b, _)) => b.to_owned(),
+            None => stem.clone(),
+        },
+    };
+    let mut seen: Vec<u32> = Vec::new();
+    for p in files_of(dir) {
+        let name = p
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_lowercase();
+        let matches_set = match name.rfind(".part") {
+            Some(i) if name.ends_with(".rar") => name[..i] == base,
+            _ => name.rsplit_once('.').is_some_and(|(b, _)| b == base),
+        };
+        if !matches_set {
+            continue;
+        }
+        if let Some(n) = volume_number(&name) {
+            seen.push(n);
+        }
+    }
+    // One volume is not a set, and a set of one cannot have a gap.
+    if seen.len() < 2 {
+        return Vec::new();
+    }
+    seen.sort_unstable();
+    seen.dedup();
+    let highest = *seen.last().unwrap_or(&1);
+    (1..=highest).filter(|n| !seen.contains(n)).collect()
+}
+
+/// Files (not directories) directly in `dir`.
+fn files_of(dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut out: Vec<PathBuf> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_file())
+        .collect();
+    out.sort();
+    out
+}
+
+/// Every file belonging to the same volume set as `first`, and their total
+/// size on disk.
+fn volume_set(dir: &Path, first: &Path) -> (usize, u64) {
+    let stem = first
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_lowercase();
+    let base = match stem.rfind(".part") {
+        Some(i) if stem.ends_with(".rar") => stem[..i].to_owned(),
+        _ => match stem.rsplit_once('.') {
+            Some((b, _)) => b.to_owned(),
+            None => stem.clone(),
+        },
+    };
+    let mut count = 0usize;
+    let mut bytes = 0u64;
+    for p in files_of(dir) {
+        let name = p
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_lowercase();
+        let in_set = match name.rfind(".part") {
+            Some(i) if name.ends_with(".rar") => name[..i] == base,
+            _ => name.rsplit_once('.').is_some_and(|(b, _)| b == base),
+        };
+        if in_set && volume_number(&name).is_some() {
+            count += 1;
+            bytes += std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
+        }
+    }
+    (count, bytes)
+}
+
+/// Total size of everything under `dir`, recursively.
+fn tree_bytes(dir: &Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .map(|e| {
+            let p = e.path();
+            if p.is_dir() {
+                tree_bytes(&p)
+            } else {
+                std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0)
+            }
+        })
+        .sum()
+}
+
+/// Did the extraction actually consume the whole volume set?
+///
+/// Returns the shortfall message when it plainly did not.
+///
+/// Extractors lie. `unrar-free` — the GPL clone Debian installs when you ask
+/// for `unrar`, and what this image shipped until it was caught — cannot do
+/// multi-volume archives and does not say so: given volume 1 of a five-volume
+/// set with every volume present, it extracts volume 1, prints "All OK" and
+/// exits 0. Nothing downstream could tell that from a real success, so a
+/// 48 GiB film arrived as its first 500 MiB, marked complete.
+///
+/// The check is deliberately arithmetic rather than a parse of the archive's
+/// declared contents: it needs no listing pass, no per-format output format,
+/// and it holds for any extractor. Decompressed output is never meaningfully
+/// smaller than the compressed input it came from, so output far below the
+/// bytes fed in means volumes went unread. Stored media archives — what
+/// nearly every release is — land within a hair of 1.0.
+///
+/// The 90% floor is slack for archive headers and recovery records, not a
+/// tolerance for missing data: the failure this catches is off by whole
+/// volumes, so anything near the boundary is already something else.
+pub fn unpack_shortfall(dir: &Path, first: &Path, dest: &Path) -> Option<String> {
+    let (volumes, packed) = volume_set(dir, first);
+    if volumes < 2 || packed == 0 {
+        return None; // not a set; nothing to be short of
+    }
+    let extracted = tree_bytes(dest);
+    let floor = packed / 10 * 9;
+    if extracted >= floor {
+        return None;
+    }
+    Some(format!(
+        "extracted {extracted} bytes from a {volumes}-volume set totalling {packed} \
+         bytes — the extractor stopped early (an extractor without multi-volume \
+         support reports success after the first volume; check `post.unrar_cmd`)"
+    ))
+}
+
 /// First-volume archives in a directory, extraction-ordered.
 pub fn detect_archives(dir: &Path) -> Vec<(PathBuf, ArchiveKind)> {
     let mut out = Vec::new();
@@ -223,6 +401,58 @@ impl Extractors {
     ) -> Result<ExtractOutcome, PostError> {
         std::fs::create_dir_all(dest)?;
         let dir = archive.parent().unwrap_or(Path::new("."));
+        // RAR, then 7-Zip if RAR did not deliver.
+        //
+        // The fallback is not belt-and-braces, it is the working path on any
+        // image that has `unrar-free` instead of the real thing: that clone
+        // extracts volume 1 of a multi-volume set, prints "All OK" and exits
+        // 0. 7-Zip reads the same archive correctly. Rather than demand a
+        // particular binary, try the configured one and check the result — a
+        // tool that under-delivers gets overruled by one that does not.
+        if matches!(kind, ArchiveKind::Rar) {
+            let first = self.extract_once(archive, kind, dest, password).await;
+            let usable = match &first {
+                Ok(o) => o.success && unpack_shortfall(dir, archive, dest).is_none(),
+                Err(_) => false,
+            };
+            if usable {
+                return first;
+            }
+            // Password failures are about the credential, not the tool, and
+            // retrying with another extractor cannot help.
+            if let Ok(o) = &first {
+                if o.password_error {
+                    return first;
+                }
+            }
+            tracing::warn!(
+                archive = %archive.display(),
+                "unrar did not deliver the whole archive; retrying with 7-Zip"
+            );
+            let _ = std::fs::remove_dir_all(dest);
+            std::fs::create_dir_all(dest)?;
+            let second = self
+                .extract_once(archive, ArchiveKind::SevenZip, dest, password)
+                .await;
+            return match second {
+                Ok(o) if o.success => Ok(o),
+                // Neither worked: report the first attempt's outcome, which
+                // is the one whose password/disk flags mean something.
+                other => first.or(other),
+            };
+        }
+        self.extract_once(archive, kind, dest, password).await
+    }
+
+    async fn extract_once(
+        &self,
+        archive: &Path,
+        kind: ArchiveKind,
+        dest: &Path,
+        password: Option<&str>,
+    ) -> Result<ExtractOutcome, PostError> {
+        std::fs::create_dir_all(dest)?;
+        let dir = archive.parent().unwrap_or(Path::new("."));
         let arch = archive.to_string_lossy().into_owned();
         let dest_s = dest.to_string_lossy().into_owned();
         match kind {
@@ -232,20 +462,36 @@ impl Extractors {
                     None => "-p-".into(),
                 };
                 let dest_slash = format!("{dest_s}/");
+                // `-idc` silences the copyright banner but KEEPS the result
+                // line. `-idq` suppressed everything, so the diagnostics below
+                // could never fire: the exit code was the only evidence, and
+                // unrar can stop at a missing volume having written a whole
+                // one — a success by that measure and a truncated film by any
+                // other.
                 let args = [
                     "x",
                     "-y",
                     "-o+",
-                    "-idq",
+                    "-idc",
                     pw.as_str(),
                     arch.as_str(),
                     dest_slash.as_str(),
                 ];
                 let out = run_tool(&self.unrar_cmd, &args, dir, self.timeout).await?;
+                let all = format!("{}\n{}", out.stdout, out.stderr);
                 // NZBGet's unrar exit-code map: 11 = wrong password,
                 // 5 = write/disk error, 0 = success.
+                //
+                // Exit 0 is necessary and not sufficient. unrar must also say
+                // "All OK", exactly as 7z must say "Everything is Ok" in the
+                // arm below — a rule this code enforced for one extractor and
+                // not the other, which is the whole difference between
+                // noticing a broken volume chain and shipping one volume.
+                let broke_the_chain = ["Cannot find volume", "You need to start extraction"]
+                    .iter()
+                    .any(|m| all.contains(m));
                 Ok(ExtractOutcome {
-                    success: out.code == 0,
+                    success: out.code == 0 && all.contains("All OK") && !broke_the_chain,
                     password_error: out.code == 11
                         || out.stderr.contains("password")
                         || out.stdout.contains("password is incorrect"),
