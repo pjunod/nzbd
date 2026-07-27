@@ -286,26 +286,25 @@ pub fn recompute_job_totals(job: &mut Job) {
 
 /// Turn whatever an indexer/*arr handed us into a human job name.
 ///
-/// Handles the classic garbage: an obfuscated hash filename with the
-/// download URL's query glued on (`a7709….nzb&i=136144&r=<apikey>`).
-/// Strategy: strip URL/query junk and the .nzb extension, percent-decode,
-/// and if what's left still looks obfuscated, prefer the NZB's own
-/// `<meta name>` title, then the par2 recovery-set base name.
+/// The name a client hands us is a *hint*; the NZB itself is *evidence*.
+/// The hint wins whenever it carries real information, but a hint that
+/// carries none — a hash, a random token, a posting artifact like `yEnc` —
+/// loses to what the document says about itself: its `<meta name>` title,
+/// its par2 recovery-set base, then the common stem of its payload files.
 pub fn clean_job_name(raw: &str, nzb: &nzbd_nzb::ParsedNzb) -> String {
     let cleaned = strip_name_junk(raw);
-    if !looks_obfuscated(&cleaned) && !cleaned.is_empty() {
+    if !cleaned.is_empty() && !is_uninformative(&cleaned) {
         return cleaned;
     }
-    if let Some(title) = nzb.meta.title.as_deref() {
-        let t = strip_name_junk(title);
-        if !t.is_empty() && !looks_obfuscated(&t) {
-            return t;
-        }
-    }
-    if let Some(base) = par2_base_name(nzb) {
-        let b = strip_name_junk(&base);
-        if !b.is_empty() && !looks_obfuscated(&b) {
-            return b;
+    let evidence = [
+        nzb.meta.title.as_deref().map(str::to_string),
+        par2_base_name(nzb),
+        common_file_stem(nzb),
+    ];
+    for candidate in evidence.into_iter().flatten() {
+        let c = strip_name_junk(&candidate);
+        if !c.is_empty() && !is_uninformative(&c) {
+            return c;
         }
     }
     if cleaned.is_empty() {
@@ -375,6 +374,12 @@ fn percent_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+/// A name that tells a human nothing: a hash, a random token, or a Usenet
+/// posting artifact. Any of these should lose to the NZB's own evidence.
+fn is_uninformative(name: &str) -> bool {
+    looks_obfuscated(name) || looks_like_token(name) || is_posting_artifact(name)
+}
+
 /// Hash-looking single token: long, one "word", overwhelmingly hex.
 fn looks_obfuscated(name: &str) -> bool {
     let core: String = name.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
@@ -385,6 +390,39 @@ fn looks_obfuscated(name: &str) -> bool {
     let hexish = core.chars().filter(|c| c.is_ascii_hexdigit()).count();
     let word_chars = name.chars().filter(|c| c.is_ascii_alphabetic()).count();
     hexish * 10 >= core.len() * 9 && word_chars * 3 < core.len() * 2
+}
+
+/// A long opaque token — base64/base62 ids like `UcsRDCyhGHPCP2TqBJWrnUg`
+/// that `looks_obfuscated` misses because they are not hex. A scene name
+/// always carries separators (`Show.S01E01.1080p`, `Some Movie 2024`); a
+/// 16+ character run with none at all is an id, not a title.
+fn looks_like_token(name: &str) -> bool {
+    let n = name.trim();
+    n.chars().count() >= 16
+        && !n
+            .chars()
+            .any(|c| matches!(c, ' ' | '.' | '-' | '_' | '(' | ')' | '[' | ']'))
+        && n.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '/' | '='))
+}
+
+/// Everything left after dropping Usenet posting furniture — the `yEnc`
+/// marker and bare part counters (`(1/44)`, `[01/44]`) — is nothing.
+///
+/// Field report 2026-07-27: monarr handed us `yEnc` as the NZB filename and
+/// eight jobs in a row were titled `yEnc` while their own file list read
+/// `Bates.Motel.S01E07.720p.WEB-DL.DD5.1.H.264-KiNGS`.
+fn is_posting_artifact(name: &str) -> bool {
+    let informative: usize = name
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|t| {
+            !t.is_empty()
+                && !t.eq_ignore_ascii_case("yenc")
+                && !t.chars().all(|c| c.is_ascii_digit())
+        })
+        .map(|t| t.len())
+        .sum();
+    informative < 3
 }
 
 /// Recovery-set base: the main `<base>.par2` (not `.volXX+YY`) filename.
@@ -406,6 +444,47 @@ fn par2_base_name(nzb: &nzbd_nzb::ParsedNzb) -> Option<String> {
         }
     }
     best
+}
+
+/// Last resort when there is no par2 set and no meta title: the common
+/// prefix of the payload filenames, cut back off the volume counter.
+/// `X.part01.rar` + `X.part02.rar` → `X`.
+fn common_file_stem(nzb: &nzbd_nzb::ParsedNzb) -> Option<String> {
+    let names: Vec<String> = nzb
+        .files
+        .iter()
+        .map(|f| f.filename_hint())
+        .filter(|n| {
+            let l = n.to_ascii_lowercase();
+            !(l.ends_with(".par2") || l.ends_with(".nfo") || l.ends_with(".sfv"))
+        })
+        .collect();
+    if names.len() < 2 {
+        return None;
+    }
+    let mut prefix: Vec<char> = names[0].chars().collect();
+    for n in &names[1..] {
+        let common = prefix
+            .iter()
+            .zip(n.chars())
+            .take_while(|(a, b)| **a == *b)
+            .count();
+        prefix.truncate(common);
+        if prefix.is_empty() {
+            return None;
+        }
+    }
+    // `Show.part0` → drop the counter, the volume word, then the separator.
+    let s: String = prefix.into_iter().collect();
+    let s = s.trim_end_matches(|c: char| c.is_ascii_digit());
+    let s = s.trim_end_matches(['.', '-', '_', ' ']);
+    let lower = s.to_ascii_lowercase();
+    let s = [".part", ".vol", ".disc", ".cd", ".r", ".s"]
+        .iter()
+        .find(|w| lower.ends_with(*w))
+        .map_or(s, |w| &s[..s.len() - w.len()]);
+    let s = s.trim_end_matches(['.', '-', '_', ' ']);
+    (s.chars().count() >= 4).then(|| s.to_string())
 }
 
 /// Filesystem-safe job/file names (path separators and control chars out).
@@ -654,6 +733,71 @@ mod tests {
             ),
             "Nice Show S02"
         );
+    }
+
+    /// Field report 2026-07-27 (screenshot): eight jobs in a row titled
+    /// `yEnc`, every one of them from monarr, every one of them listing its
+    /// files correctly underneath. The client's filename was posting
+    /// furniture; the NZB knew its own name the whole time.
+    #[test]
+    fn clean_name_rejects_posting_furniture() {
+        let nzb = nzb_with(
+            &[
+                "Bates.Motel.S01E07.720p.WEB-DL.DD5.1.H.264-KiNGS.par2",
+                "Bates.Motel.S01E07.720p.WEB-DL.DD5.1.H.264-KiNGS.part01.rar",
+            ],
+            None,
+        );
+        let want = "Bates.Motel.S01E07.720p.WEB-DL.DD5.1.H.264-KiNGS";
+        assert_eq!(clean_job_name("yEnc", &nzb), want);
+        assert_eq!(clean_job_name("yEnc (1/44)", &nzb), want);
+        assert_eq!(clean_job_name("[01/44] - yEnc", &nzb), want);
+        // A counter on its own is just as empty.
+        assert_eq!(clean_job_name("(1/2)", &nzb), want);
+    }
+
+    /// Same queue, job 120: a base64-ish id, which the hex test never saw.
+    #[test]
+    fn clean_name_rejects_opaque_token() {
+        let nzb = nzb_with(&[], Some("Some.Movie.2025.2160p.WEB-DL-GRP"));
+        assert_eq!(
+            clean_job_name("UcsRDCyhGHPCP2TqBJWrnUg", &nzb),
+            "Some.Movie.2025.2160p.WEB-DL-GRP"
+        );
+        // Separators mean it is a title, however terse.
+        assert_eq!(
+            clean_job_name("Him.2025.UHD.BluRay", &nzb),
+            "Him.2025.UHD.BluRay"
+        );
+    }
+
+    #[test]
+    fn clean_name_falls_back_to_common_file_stem() {
+        // No meta title, no par2 — the payload still agrees on a stem.
+        let nzb = nzb_with(
+            &[
+                "The.Running.Man.1987.2160p.REMUX-CiNEPHiLES.part01.rar",
+                "The.Running.Man.1987.2160p.REMUX-CiNEPHiLES.part02.rar",
+                "The.Running.Man.1987.2160p.REMUX-CiNEPHiLES.part03.rar",
+            ],
+            None,
+        );
+        assert_eq!(
+            clean_job_name("yEnc", &nzb),
+            "The.Running.Man.1987.2160p.REMUX-CiNEPHiLES"
+        );
+        // A trailing year must survive the counter trim.
+        let split = nzb_with(&["Blade.Runner.2049.001", "Blade.Runner.2049.002"], None);
+        assert_eq!(clean_job_name("yEnc", &split), "Blade.Runner.2049");
+    }
+
+    /// Nothing to go on anywhere: keep the junk rather than invent a name,
+    /// so the operator can still see what the client actually sent.
+    #[test]
+    fn clean_name_keeps_junk_when_there_is_no_evidence() {
+        let nzb = nzb_with(&[], None);
+        assert_eq!(clean_job_name("yEnc", &nzb), "yEnc");
+        assert_eq!(clean_job_name("", &nzb), "download");
     }
 
     fn server(id: u32, tier: u8) -> ServerDef {
