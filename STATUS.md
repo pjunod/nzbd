@@ -8,7 +8,7 @@ roadmaps in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) §16 and
 Legend: ✅ done (implemented, tested, committed) · 🔶 partial · ⬜ not
 started · 👤 operator action (Paul)
 
-**Snapshot (2026-07-26):** 261 tests · clippy clean · **phases 0–4
+**Snapshot (2026-07-27):** 261 tests · clippy clean · **phases 0–4
 complete incl. RSS feeds, cluster C1+C2 complete, phase 5 partial,
 integration phase 1 (N1–N7) complete** — every NZBGet user-facing surface
 exists; what remains is beyond-parity performance work and operator
@@ -209,6 +209,8 @@ actions
 
   - 🔶 Flagged, not fixed — **[docs/DEFECT_HISTORY_DELETE.md](docs/DEFECT_HISTORY_DELETE.md)**, open, needs a decision before code. `HistoryDb::delete` removes the index row but not the authoritative JSONL line, so the next `refresh()` re-imports it with a fresh rowid: the UI's "forget" is undone within one history poll (clicking again just repeats the cycle), and `?since_seq=` hands a consumer the same entry twice under two cursor values. Confirmed by probe 2026-07-26, present since `1fdad15`. The cursor half is worked around by deduping on `(job, completed_at)` (documented in USAGE, the plan doc and at `list_since`); the "forget doesn't forget" half has no workaround. The decision the fix waits on: does forgetting an entry mean *here* (a local tombstone table) or *everywhere* (tombstone records in the shared JSONL)? Today's code says "here" and does not implement it
   - ⬜ Next: monarr phase 2 (native client + push subscription) consumes all of this; nothing here waits on it
+
+- ✅ A client chip is a glance, not a User-Agent dump (field report 2026-07-27, screenshot: one chip in the API-clients strip ran the full width of the page). The strip renders whatever `User-Agent` each client sent, and an open browser tab sends ~130 characters of Mozilla-compatibility archaeology — so the browser's own chip dwarfed and pushed down the two chips that answer the question the strip exists for (*is the \*arr connected?*). `clientLabel()` now collapses a browser agent to browser + major version + platform (`Chrome 150 (macOS)`), matching most-specific-first so Edge and Opera are not read as Chrome and Chrome's own `Safari/` token is not read as Safari; a product token (`Monarr/0.7.0`, `Sonarr/4.0.0.748`) is already the short name and is passed through untouched, capped only against an absurd one. The raw agent is not lost — it moved to the first line of the tooltip, where length costs nothing — and the chip's reconciler **key stays the raw agent**, because two browsers can collapse to the same label and a duplicate key would merge two clients into one row. Chip CSS tightened (11 px, 2×9 padding, 6 px gap) with a `max-width` + ellipsis belt so no future agent can stretch the strip past the table above it; the empty-state chip is a chip again, its sentence of explanation moved to its own tooltip. Tests: DOM harness 272→303 — Chrome/Firefox/Edge/Safari-on-iOS labels, the unrecognised-Mozilla fallback, product tokens and the absurd-token cap, missing agent, the chip text/tooltip split, quiet vs live, and two same-label browsers still reconciling to two chips
 
 ## Operator checklist 👤
 

@@ -1120,6 +1120,76 @@ const models = (jobs) => jobs.map((j, i) => T.rowModel(j, { idx: i, count: jobs.
   ok(dMasked.body.includes("refuses to start"), "…naming what happens if you use it anyway");
   ok(dMasked.body.includes(maskedToml), "…while still containing the config itself");
 
+  // --- 26. a client chip is a glance, not a User-Agent dump --------------
+  // Field report 2026-07-27: the API-clients strip rendered each agent
+  // verbatim, so an open browser tab pushed a ~130-character
+  // "Mozilla/5.0 (Macintosh; …) AppleWebKit/… Chrome/… Safari/…" chip
+  // across the full width of the page and buried the two chips that
+  // actually answer the question (is the *arr connected?).
+  const CHROME_MAC = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    + "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36";
+  eq(T.clientLabel(CHROME_MAC), "Chrome 150 (macOS)",
+    "a browser agent collapses to browser + major version + platform");
+  ok(T.clientLabel(CHROME_MAC).length < 20, "…short enough to sit beside its siblings");
+  eq(T.clientLabel("Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Gecko/20100101 Firefox/128.0"),
+    "Firefox 128 (Windows)", "Firefox is not mistaken for anything else");
+  eq(T.clientLabel("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    + "(KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36 Edg/149.0.0.0"),
+    "Edge 149 (Windows)", "Edge claims Chrome in its own agent — specificity wins");
+  eq(T.clientLabel("Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 "
+    + "(KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"),
+    "Safari 17 (iOS)", "…and Chrome's Safari token does not make Safari read as Chrome");
+  eq(T.clientLabel("Mozilla/5.0 (compatible; SomethingNew/1.0)"), "browser",
+    "an unrecognised Mozilla agent still gets a short name, not the raw string");
+
+  // A product token IS the short name — never mangle the one client whose
+  // identity the operator is actually looking for.
+  eq(T.clientLabel("Monarr/0.7.0"), "Monarr/0.7.0", "an *arr keeps its own name and version");
+  eq(T.clientLabel("Sonarr/4.0.0.748"), "Sonarr/4.0.0.748", "…however long its version is");
+  eq(T.clientLabel(""), "unknown", "a client that sent no agent is named, not blank");
+  eq(T.clientLabel(null), "unknown", "…including a missing one");
+  const longToken = "X".repeat(100);
+  eq(T.clientLabel(longToken).length, T.UA_MAX, "an absurd non-browser token is still capped");
+  ok(T.clientLabel(longToken).endsWith("…"), "…and says it was cut");
+
+  {
+    const now = 1_700_000_000;
+    const client = (over) => Object.assign({
+      user_agent: CHROME_MAC, calls: 12, first_seen_unix: now - 600,
+      last_seen_unix: now - 1, last_method: "GET /api/v1/status",
+      api: "native", event_subscriptions: 1,
+    }, over || {});
+
+    const [chip] = T.clientChipModels([client()], now);
+    ok(chip.text.startsWith("Chrome 150 (macOS) · subscribed · "),
+      "the chip leads with the short label, then how it is attached");
+    ok(!chip.text.includes("AppleWebKit"), "the raw agent is gone from the chip text");
+    ok(chip.tip.startsWith(CHROME_MAC), "…and is the first thing in the tooltip");
+    ok(chip.tip.includes("12 calls since"), "the tooltip keeps everything it used to say");
+    ok(chip.tip.includes("receiving events live"), "…including the subscription");
+    eq(chip.key, "c" + CHROME_MAC, "identity is the raw agent, not the collapsed label");
+    ok(chip.cls.includes("live"), "a subscriber is live");
+
+    // Two browsers that collapse to the same label must remain two rows.
+    const CHROME_WIN = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+      + "(KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36";
+    const both = T.clientChipModels(
+      [client(), client({ user_agent: CHROME_WIN })], now);
+    ok(both[0].key !== both[1].key, "same-browser clients keep distinct keys");
+    const strip = node("div");
+    T.reconcileRows(strip, both, fake);
+    eq(strip.children.length, 2, "…and therefore distinct chips");
+
+    const quiet = T.clientChipModels(
+      [client({ event_subscriptions: 0, last_seen_unix: now - 9999 })], now)[0];
+    ok(quiet.text.includes("· quiet ·"), "a long-silent poller reads as quiet");
+    ok(!quiet.cls.includes("live"), "…and is not styled live");
+
+    const [none] = T.clientChipModels([], now);
+    ok(none.text.length < 30, "the empty-state chip is a chip, not a paragraph");
+    ok(none.tip.includes("/api/v1/events"), "…with the explanation moved to its tooltip");
+  }
+
   if (failures.length) {
     console.error("UI DOM FAILURES:");
     for (const f of failures) console.error("  - " + f);

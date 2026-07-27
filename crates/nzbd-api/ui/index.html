@@ -225,10 +225,14 @@
     margin-top: 8px; font: 12px/1.55 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
     background: var(--panel); color: var(--ink); border: 1px solid var(--line);
     border-radius: 8px; padding: 12px; tab-size: 2; }
-  #clients-strip { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 12px;
-    font-size: 12px; color: var(--muted); align-items: center; }
+  #clients-strip { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 10px;
+    font-size: 11px; color: var(--muted); align-items: center; }
+  /* Belt and braces: clientLabel() already shortens the agent, but a chip
+     must never be able to stretch the strip past the table above it. */
   #clients-strip .cl { border: 1px solid var(--line); border-radius: 999px;
-    padding: 3px 11px; background: var(--panel); color: var(--ink2); }
+    padding: 2px 9px; background: var(--panel); color: var(--ink2);
+    max-width: 42ch; overflow: hidden; text-overflow: ellipsis;
+    white-space: nowrap; }
   #clients-strip .cl b { color: var(--ink); font-weight: 600; }
   #clients-strip .cl.live { border-color: color-mix(in srgb, var(--ok) 45%, transparent); }
   .ho { display: inline-block; font-size: 11px; font-weight: 600; padding: 2px 8px;
@@ -1711,20 +1715,55 @@ function applyChip(node, m, d) {
 }
 KINDS.chip = { build: buildChip, apply: applyChip };
 
-function renderClients() {
-  const cl = store.clients;
-  if (cl == null) return;
-  const strip = $("clients-strip");
-  strip.hidden = false;
-  if (!cl.length) {
-    reconcileRows(strip, [{
-      key: "__none", kind: "chip", cls: "cl",
-      text: "no API clients seen yet — a connected Sonarr/Radarr polls every ~30 s, a subscriber holds /api/v1/events open",
-    }], dom);
-    return;
+// A client identifies itself with whatever User-Agent it sends, and a
+// browser sends ~130 characters of Mozilla-compatibility archaeology.
+// Rendered raw, one chip grew wider than the table it sits above and the
+// strip stopped being scannable — the point of the strip is "is the *arr
+// connected?", answered at a glance. So the chip carries a short label and
+// the raw string moves to the tooltip, where length costs nothing.
+const UA_BROWSERS = [
+  // Order matters: Edge and Opera both also claim Chrome, and Chrome also
+  // claims Safari. Most specific first, or every browser reads as Chrome.
+  [/\bEdgi?A?e?\/(\d+)/, "Edge"],
+  [/\bOPR\/(\d+)/, "Opera"],
+  [/\bFirefox\/(\d+)/, "Firefox"],
+  [/\bChrome\/(\d+)/, "Chrome"],
+  [/\bVersion\/(\d+)[^ ]* .*\bSafari\//, "Safari"],
+];
+const UA_PLATFORMS = [
+  [/\b(iPhone|iPad|iPod)\b/, "iOS"],
+  [/\bAndroid\b/, "Android"],
+  [/\bMacintosh\b|\bMac OS X\b/, "macOS"],
+  [/\bWindows\b/, "Windows"],
+  [/\bX11\b|\bLinux\b/, "Linux"],
+];
+const UA_MAX = 24;
+
+function clientLabel(ua) {
+  const s = (ua || "").trim();
+  if (!s) return "unknown";
+  // Anything that is not pretending to be Mozilla is already a product
+  // token — "Monarr/0.7.0", "Sonarr/4.0.0" — which is exactly what we
+  // want to show. Only guard against an absurd one.
+  if (!/^Mozilla\//.test(s))
+    return s.length > UA_MAX ? s.slice(0, UA_MAX - 1) + "…" : s;
+  for (const [re, name] of UA_BROWSERS) {
+    const m = s.match(re);
+    if (!m) continue;
+    let plat = "";
+    for (const [pre, p] of UA_PLATFORMS) if (pre.test(s)) { plat = p; break; }
+    return name + " " + m[1] + (plat ? " (" + plat + ")" : "");
   }
-  const now = Date.now() / 1000;
-  reconcileRows(strip, cl.map(c => {
+  return "browser";
+}
+
+function clientChipModels(cl, now) {
+  if (!cl.length) return [{
+    key: "__none", kind: "chip", cls: "cl",
+    text: "no API clients yet",
+    tip: "a connected Sonarr/Radarr polls every ~30 s; a subscriber holds /api/v1/events open",
+  }];
+  return cl.map(c => {
     // A subscriber holding an open event stream is attached whether or
     // not it has called anything lately — push consumers legitimately go
     // quiet for hours, and calling that "quiet" would report the one
@@ -1735,15 +1774,26 @@ function renderClients() {
       ? (subs > 1 ? "subscribed ×" + subs : "subscribed")
       : (live ? "polling" : "quiet");
     return {
+      // Keyed on the raw agent, never the label: two browsers can collapse
+      // to the same short name, and duplicate keys break row identity.
       key: "c" + c.user_agent, kind: "chip",
       cls: "cl" + (live ? " live" : ""),
-      text: c.user_agent + " · " + how + " · " + fmtAgo(c.last_seen_unix),
-      tip: c.calls + " calls since " + fmtTime(c.first_seen_unix)
+      text: clientLabel(c.user_agent) + " · " + how + " · " + fmtAgo(c.last_seen_unix),
+      tip: (c.user_agent || "unknown") + "\n"
+        + c.calls + " calls since " + fmtTime(c.first_seen_unix)
         + " — last: " + c.last_method
         + " · " + (c.api === "native" ? "native API" : "nzbget-compat API")
         + (subs > 0 ? " · receiving events live" : ""),
     };
-  }), dom);
+  });
+}
+
+function renderClients() {
+  const cl = store.clients;
+  if (cl == null) return;
+  const strip = $("clients-strip");
+  strip.hidden = false;
+  reconcileRows(strip, clientChipModels(cl, Date.now() / 1000), dom);
 }
 
 // ---- logs ---------------------------------------------------------------
@@ -2969,6 +3019,7 @@ if (typeof __nzbd_test_enable !== "undefined") {
     deleteJob, requeueJob, jobAction, histAction, post,
     pushRate, pushRateSampled, rateSeries, spark, SPARK_N, titleFor,
     appendLogs, logMatches, renderLogs, serverChipModels, LOG_RING_MAX,
+    clientLabel, clientChipModels, UA_MAX,
     pageSlice, setPage, setPageSize, renderPager, PAGE_SIZES, PAGE_SIZE_DEFAULT,
     pageState: () => ({ page, pageSize }),
     hideAppForSetup, SETUP_KEEP, showConfigDurability, advDownloadFile,
