@@ -31,6 +31,49 @@ being called.
 
 Default ports: **nzbd 6789** · monarr 7676 · plurx 32600.
 
+## Wiring the three together in Docker
+
+**One shared user-defined network, and address everything by container name.**
+That is the recommended setup, not merely one that works.
+
+```bash
+docker network create media          # once, on the host
+```
+
+Then in **each** compose file — nzbd's, monarr's, plurx's — attach the service
+and declare the network as external:
+
+```yaml
+services:
+  nzbd:
+    container_name: nzbd             # this name IS the hostname
+    # ...the rest of your service...
+    networks:
+      - media
+
+networks:
+  media:
+    external: true                   # created above; compose must not own it
+```
+
+`docker compose up -d` in each directory. Monarr's nzbd client then points at
+host `nzbd`, port `6789` — no `host.docker.internal`, no published-port
+arithmetic.
+
+Two consequences worth knowing:
+
+**Published ports are irrelevant on this path.** `ports: - "6789:6789"` maps
+host→container; container→container traffic goes straight to the *internal*
+port and works even with none published. Keep the published one for your own
+browser.
+
+**`nzbd` must be reachable from the container doing the reaching.** nzbd never
+dials out (see the non-goals below), so it is always the callee here — but
+`extra_hosts: ["host.docker.internal:host-gateway"]` on nzbd's own compose
+does nothing for anyone else. That setting belongs on the *caller*, which is
+why the shared network is the cleaner answer: it is one fact configured once
+instead of the same fact configured per-container and easy to get half-right.
+
 ## The seams nzbd has
 
 | # | Seam | Direction | Transport | Who starts it |
