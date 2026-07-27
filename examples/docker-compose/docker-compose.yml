@@ -15,8 +15,15 @@
 services:
   nzbd:
     image: ghcr.io/pjunod/nzbd:latest
-    # …or build from this checkout instead of pulling:
-    # build: ../..
+    # …or build from this checkout instead of pulling. The build context
+    # excludes .git, so pass the commit in or the daemon reports
+    # `<version>+unknown` in its footer and on /api/v1/status — run
+    #   NZBD_GIT_DESCRIBE="$(git describe --tags --always --dirty)" \
+    #     docker compose up -d --build
+    # build:
+    #   context: ../..
+    #   args:
+    #     NZBD_GIT_DESCRIBE: ${NZBD_GIT_DESCRIBE:-}
     container_name: nzbd
     restart: unless-stopped
     ports:

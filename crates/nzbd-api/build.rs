@@ -1,14 +1,19 @@
-//! Build identity for the running daemon (field request 2026-07-26: the
-//! UI said "v0.1.0" through every deploy — a version that never changes
-//! identifies nothing, and "which build is nuc3 actually running?" burned
-//! three debugging rounds in one evening).
+//! Build identity for the running daemon.
+//!
+//! This script only *gathers* facts; the `version` module turns them into
+//! the string the footer shows, because a pure function is testable and a
+//! build script is not.
 //!
 //! Emits two rustc-envs:
 //!
-//! * `NZBD_VERSION_FULL` — `<cargo version>` plus `+g<short-hash>` when a
-//!   git checkout is visible. The Docker build context deliberately strips
-//!   `.git` (context size), so container builds fall back to the bare
-//!   version — the build stamp below is what distinguishes them.
+//! * `NZBD_GIT_DESCRIBE` — `git describe --tags --always --dirty`, or the
+//!   `NZBD_GIT_DESCRIBE` build environment variable when no checkout is
+//!   visible, or empty. **Empty is the interesting case**: the Docker
+//!   build context strips `.git` (context size), so an image built without
+//!   `--build-arg NZBD_GIT_DESCRIBE=…` has no idea what it is, and the
+//!   composed version says `+unknown` out loud rather than quietly
+//!   reporting the same bare Cargo version every deploy for a hundred
+//!   commits (field report 2026-07-27).
 //! * `NZBD_BUILT` — UTC timestamp of when this crate was last compiled.
 //!   Layer-cached rebuilds that reuse the compiled crate keep their stamp,
 //!   which is correct: same binary, same build.
@@ -18,28 +23,28 @@
 
 use std::process::Command;
 
-fn git_short_hash() -> Option<String> {
+/// `git describe` against the checkout being compiled, if there is one.
+///
+/// `--always` means a repository with no tags still answers (a bare short
+/// hash); `--dirty` means a hash never lies about the working tree;
+/// `--match=v[0-9]*` keeps a stray non-release tag out of the version.
+fn git_describe() -> Option<String> {
     let out = Command::new("git")
-        .args(["rev-parse", "--short=9", "HEAD"])
+        .args([
+            "describe",
+            "--tags",
+            "--always",
+            "--dirty",
+            "--abbrev=9",
+            "--match=v[0-9]*",
+        ])
         .output()
         .ok()?;
     if !out.status.success() {
         return None;
     }
-    let hash = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if hash.is_empty() {
-        return None;
-    }
-    // Mark builds with uncommitted changes: a hash that lies about the
-    // working tree is worse than no hash.
-    let dirty = Command::new("git")
-        .args(["status", "--porcelain"])
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| !o.stdout.is_empty())
-        .unwrap_or(false);
-    Some(if dirty { format!("{hash}-dirty") } else { hash })
+    let d = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!d.is_empty()).then_some(d)
 }
 
 /// Unix seconds → `YYYY-MM-DD HH:MM UTC` (civil-from-days; Hinnant).
@@ -62,19 +67,29 @@ fn utc_stamp(secs: u64) -> String {
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
-    // Re-stamp when HEAD moves, so a local `git commit` + rebuild shows
-    // the new hash without a full clean build. Harmless if absent.
-    for p in ["../../.git/HEAD", "../../.git/index"] {
+    // Re-stamp when HEAD, the index or the tags move, so a local commit or
+    // `git tag` + rebuild shows the new identity without a clean build.
+    for p in [
+        "../../.git/HEAD",
+        "../../.git/index",
+        "../../.git/refs/tags",
+        "../../.git/packed-refs",
+    ] {
         if std::path::Path::new(p).exists() {
             println!("cargo:rerun-if-changed={p}");
         }
     }
-    let version = std::env::var("CARGO_PKG_VERSION").unwrap_or_default();
-    let full = match git_short_hash() {
-        Some(h) => format!("{version}+g{h}"),
-        None => version,
-    };
-    println!("cargo:rustc-env=NZBD_VERSION_FULL={full}");
+    println!("cargo:rerun-if-env-changed=NZBD_GIT_DESCRIBE");
+
+    // A visible checkout is the truth. The build argument is the fallback
+    // for container builds, which by design cannot see one.
+    let describe = git_describe()
+        .or_else(|| std::env::var("NZBD_GIT_DESCRIBE").ok())
+        .map(|d| d.trim().to_string())
+        .filter(|d| !d.is_empty())
+        .unwrap_or_default();
+    println!("cargo:rustc-env=NZBD_GIT_DESCRIBE={describe}");
+
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())

@@ -18,7 +18,10 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+# Releases are git tags `v<this>` — see docs/DEPLOY.md, "Cutting a
+# release". What the daemon reports comes from `git describe`, so it moves
+# on every commit; this is only the release the count is measured from.
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.85"
 # License note: this code is written from scratch against a behavioral spec

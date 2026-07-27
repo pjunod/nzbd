@@ -1,14 +1,24 @@
 # nzbd — multi-stage build: static-ish Rust binary + the PP toolchain.
 #
-#   docker build -t nzbd .
+#   docker build -t nzbd \
+#     --build-arg NZBD_GIT_DESCRIBE="$(git describe --tags --always --dirty --abbrev=9)" .
 #   docker run -d -p 6789:6789 \
 #     -v /data/usenet:/data -v ./config:/etc/nzbd nzbd
+#
+# Or just `make docker-build`, which fills the argument in for you.
 #
 # Mount the config DIRECTORY, not the file: a file bind mount whose host
 # side doesn't exist yet makes Docker create a directory in its place,
 # and the first-run setup UI couldn't persist the config it writes.
 
 FROM rust:1-bookworm AS build
+# The build context deliberately excludes `.git` (see .dockerignore), so
+# the binary cannot work out its own commit — it has to be told. Without
+# this the daemon reports `<version>+unknown`, which is deliberately loud:
+# a hundred commits once shipped as an unchanging "v0.1.0" precisely
+# because a missing hash failed silently (field report 2026-07-27).
+ARG NZBD_GIT_DESCRIBE
+ENV NZBD_GIT_DESCRIBE=${NZBD_GIT_DESCRIBE}
 WORKDIR /src
 COPY . .
 RUN cargo build --release -p nzbd

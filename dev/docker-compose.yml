@@ -24,6 +24,13 @@ services:
     build:
       context: ..                # repo root (the Dockerfile lives there)
       dockerfile: Dockerfile
+      args:
+        # The context excludes .git, so the image is told its commit here.
+        # Unset → the daemon honestly reports `<version>+unknown`.
+        # `make docker` fills this in; by hand:
+        #   NZBD_GIT_DESCRIBE="$(git describe --tags --always --dirty)" \
+        #     docker compose up --build
+        NZBD_GIT_DESCRIBE: ${NZBD_GIT_DESCRIBE:-}
     image: nzbd:dev
     container_name: nzbd-dev
     ports:

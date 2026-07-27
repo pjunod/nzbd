@@ -105,3 +105,70 @@ fn the_image_points_recovery_at_its_data_volume() {
         nzbd_config::durable::MAIN_DIR_ENV
     );
 }
+
+/// A container build must be told which commit it is.
+///
+/// Regression (field report 2026-07-27: "the version at the bottom of the
+/// main page has been the same for a hundred commits"). `.dockerignore`
+/// excludes `.git` to keep the build context small, so the build script's
+/// `git describe` finds nothing inside the image build and the daemon
+/// falls back to the bare crate version — on the one machine whose build
+/// anyone ever needs to identify. The commit therefore travels as a build
+/// argument, and every link of that chain is pinned here: the Dockerfile
+/// declares and forwards it, the Makefile fills it in, and any Compose
+/// file that actually builds the image passes it through.
+///
+/// A build that skips it is not silently wrong — it reports
+/// `<version>+unknown` — but the paths we ship should never need that.
+#[test]
+fn the_image_is_told_which_commit_it_is() {
+    const ARG: &str = "NZBD_GIT_DESCRIBE";
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let read = |rel: &str| {
+        std::fs::read_to_string(root.join(rel)).unwrap_or_else(|e| panic!("read {rel}: {e}"))
+    };
+    // Uncommented lines only — a recipe in a comment builds nothing.
+    let code = |text: &str| {
+        text.lines()
+            .filter(|l| !l.trim_start().starts_with('#'))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    let dockerfile = code(&read("Dockerfile"));
+    assert!(
+        dockerfile
+            .lines()
+            .any(|l| l.trim_start().starts_with("ARG ") && l.contains(ARG)),
+        "the Dockerfile must declare `ARG {ARG}` — without it the image \
+         cannot learn its own commit, because the context has no .git"
+    );
+    assert!(
+        dockerfile
+            .lines()
+            .any(|l| l.trim_start().starts_with("ENV ") && l.contains(ARG)),
+        "the Dockerfile declares `ARG {ARG}` but never forwards it as an \
+         ENV, so the build script never sees it"
+    );
+
+    let makefile = read("Makefile");
+    assert!(
+        makefile.contains(&format!("--build-arg {ARG}=")),
+        "the Makefile's image build must pass --build-arg {ARG}=…"
+    );
+
+    for rel in [
+        "examples/docker-compose/docker-compose.yml",
+        "dev/docker-compose.yml",
+    ] {
+        let yaml = code(&read(rel));
+        if !yaml.lines().any(|l| l.trim_start().starts_with("build:")) {
+            continue; // pulls a published image; nothing to stamp
+        }
+        assert!(
+            yaml.contains(&format!("{ARG}:")),
+            "{rel} builds the image but does not pass {ARG}, so it would \
+             produce a container that cannot say which commit it is"
+        );
+    }
+}

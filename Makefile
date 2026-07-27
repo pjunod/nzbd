@@ -13,6 +13,10 @@ DAEMON  := nzbd
 # Minimum supported Rust (keep in sync with Cargo.toml rust-version).
 MSRV    := 1.85
 UNAME_S := $(shell uname -s)
+# Build identity for container builds. The Docker context excludes .git
+# (see .dockerignore), so an image cannot derive its own commit — it has
+# to be passed in, or the daemon reports `<version>+unknown`.
+GIT_DESCRIBE := $(shell git describe --tags --always --dirty --abbrev=9 --match='v[0-9]*' 2>/dev/null)
 
 # Optional overrides for `make run`, e.g.
 #   make run CONFIG=dev/config/nzbd.toml BIND=0.0.0.0:6789
@@ -84,7 +88,16 @@ run: ## Run the daemon (CONFIG=... BIND=... optional; no config -> first-run set
 
 .PHONY: docker
 docker: ## Build the container from the working tree and run it (dev/ compose)
-	cd dev && docker compose up --build
+	cd dev && NZBD_GIT_DESCRIBE=$(GIT_DESCRIBE) docker compose up --build
+
+.PHONY: docker-build
+docker-build: ## Build the image only, stamped with this checkout's identity
+	docker build --build-arg NZBD_GIT_DESCRIBE=$(GIT_DESCRIBE) -t nzbd .
+	@echo "OK - built nzbd:latest as $(GIT_DESCRIBE)"
+
+.PHONY: version
+version: ## Print the build identity this checkout would stamp into an image
+	@echo "$(GIT_DESCRIBE)"
 
 ##@ Test & quality gates
 

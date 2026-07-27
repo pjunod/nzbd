@@ -12,6 +12,7 @@ use base64::Engine as _;
 
 pub mod eventhub;
 pub mod logbuf;
+pub mod version;
 pub use eventhub::{EventHub, Replay};
 pub use logbuf::{LogBuffer, LogBufferLayer};
 use nzbd_engine::{EngineHandle, JobSummary, QueueSnapshot};
@@ -398,12 +399,14 @@ pub fn require_auth(router: Router, auth: AuthConfig) -> Router {
 
 #[derive(Debug, Serialize)]
 pub struct StatusDto {
-    /// Cargo version plus `+g<git-hash>` when the build saw a checkout —
-    /// the UI footer shows this. A bare, never-bumped "0.1.0" identified
-    /// nothing across deploys (field request 2026-07-26).
+    /// The build identity the UI footer shows: the crate version, then
+    /// what `git describe` said about the checkout — so it moves on every
+    /// commit — or `+unknown` when the build had no way to know. See
+    /// [`crate::version`]; a bare, never-changing "0.1.0" shipped a
+    /// hundred commits under one number (field report 2026-07-27).
     pub version: &'static str,
-    /// UTC compile stamp of the running binary — distinguishes Docker
-    /// builds, whose context has no `.git` to hash.
+    /// UTC compile stamp of the running binary — pins *when*, where the
+    /// version pins *what*.
     pub built: &'static str,
     pub up_since_unix: i64,
     pub download_rate_bps: u64,
@@ -431,8 +434,8 @@ pub fn status_dto(snap: &QueueSnapshot) -> StatusDto {
     let count =
         |pred: &dyn Fn(&JobSummary) -> bool| snap.jobs.iter().filter(|j| pred(j)).count() as u32;
     StatusDto {
-        version: env!("NZBD_VERSION_FULL"),
-        built: env!("NZBD_BUILT"),
+        version: version::full(),
+        built: version::BUILT,
         up_since_unix: snap.up_since_unix,
         download_rate_bps: snap.download_rate_bps,
         remaining_bytes: snap.remaining_bytes,
@@ -2778,18 +2781,35 @@ mod tests {
     /// claimed 56 — and 2026-07-26: a header window disagreeing with the
     /// chips by 2.5× — which is why the header is now literally the sum of
     /// the per-server EMAs, folded from one time-stamped drain).
-    /// The build identity the footer shows: the version always starts
-    /// with the Cargo version (plus `+g<hash>` when the build saw git),
-    /// and the compile stamp is a real UTC timestamp — a version string
-    /// that never changes across deploys identifies nothing.
+    /// The build identity the footer shows, as the *running build* sees
+    /// it — [`crate::version`] tests the composition, this tests that this
+    /// binary actually got one.
+    ///
+    /// A build from a checkout has no excuse: if `.git` is right there and
+    /// the version still says `+unknown`, the identity chain is broken and
+    /// every deploy from this tree would ship anonymous. A build from an
+    /// unpacked tarball genuinely cannot know, and says so; that is the
+    /// designed behaviour, not a failure.
     #[test]
     fn build_identity_is_populated() {
-        let v = env!("NZBD_VERSION_FULL");
+        let v = version::full();
         assert!(
             v.starts_with(env!("CARGO_PKG_VERSION")),
             "full version {v:?} extends the Cargo version"
         );
-        let b = env!("NZBD_BUILT");
+        let checkout = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.git")
+            .exists();
+        if checkout {
+            assert!(
+                !v.ends_with("+unknown"),
+                "built from a checkout but the version is {v:?} — the build \
+                 script saw neither git nor NZBD_GIT_DESCRIBE"
+            );
+        } else {
+            eprintln!("note: no checkout visible, build identity is {v:?}");
+        }
+        let b = version::BUILT;
         assert!(
             b.len() == 20 && b.ends_with(" UTC") && &b[4..5] == "-" && &b[13..14] == ":",
             "stamp shaped 'YYYY-MM-DD HH:MM UTC': {b:?}"

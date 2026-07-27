@@ -177,11 +177,54 @@ docker stop nzbd && docker rm nzbd
 # …then re-run the `docker run` block above (state is on the volumes)
 
 # Build the image from a checkout instead of pulling
-docker build -t nzbd . && docker run -d --name nzbd ... nzbd
+make docker-build && docker run -d --name nzbd ... nzbd
 ```
 
 Extension scripts: add `-v /opt/nzbd/scripts:/scripts:ro` and set
 `post.scripts_dir = "/scripts"` in the config.
+
+### Which build is this?
+
+The footer of the web UI, and `version` on `/api/v1/status`, name the
+running build: `0.2.0-7-g798b1a691` is seven commits past the `v0.2.0`
+tag, a `-dirty` suffix means it came from an unclean tree, and the
+`built` stamp beside it is the compile time.
+
+Building the image by hand needs one extra flag, because `.dockerignore`
+excludes `.git` (a build context carrying the whole history is slow) and
+the binary therefore cannot work out its own commit:
+
+```sh
+docker build -t nzbd \
+  --build-arg NZBD_GIT_DESCRIBE="$(git describe --tags --always --dirty --abbrev=9)" .
+
+# Compose, same idea:
+NZBD_GIT_DESCRIBE="$(git describe --tags --always --dirty --abbrev=9)" \
+  docker compose up -d --build
+```
+
+`make docker-build` and `make docker` fill it in for you, and `make
+version` prints what they would stamp. **A build that skips it reports
+`0.2.0+unknown`** — deliberately, so an anonymous image is visible at a
+glance instead of impersonating a release.
+
+### Cutting a release
+
+Versions come from git tags, so a release is a tag:
+
+```sh
+$EDITOR Cargo.toml                # bump [workspace.package] version
+cargo check --workspace           # refresh Cargo.lock
+git commit -am "release: v0.3.0"
+git tag -a v0.3.0 -m "v0.3.0"
+git push origin main --follow-tags
+```
+
+Tags must be `vMAJOR.MINOR.PATCH` and must match the `Cargo.toml`
+version — the build script only matches `v[0-9]*`, and a tag behind the
+crate version renders as `0.3.0+v0.2.0-4-gabc123def` rather than quietly
+claiming the wrong release. Between tags the version carries the commit
+count and hash, so it changes on **every** commit.
 
 ## Docker Compose
 
