@@ -29,7 +29,7 @@ being called.
    └───────────────┘
 ```
 
-Default ports: **nzbd 6789** · monarr 7676 · plurx 32600.
+Default ports: **nzbd 6789** · monarr 7676 · plurx 32400.
 
 ## Wiring the three together in Docker
 
@@ -59,6 +59,29 @@ networks:
 `docker compose up -d` in each directory. Monarr's nzbd client then points at
 host `nzbd`, port `6789` — no `host.docker.internal`, no published-port
 arithmetic.
+
+**Get the names from Docker, not from memory.** One command answers both "what
+hostname does my consumer use" and "are they on the same network":
+
+```bash
+docker ps --format '{{.Names}}\t{{.Networks}}'
+```
+
+```
+plurxd	media
+nzbd	media
+monarr	media
+```
+
+Column 1 is the hostname. Column 2 must contain the shared network for every
+container that has to reach another; `bridge` or `host` there means it cannot
+be resolved by name from the others.
+
+Read column 1 literally — a container called `plurxd` is not reachable as
+`plurx`. Docker's embedded resolver answers a name that does not exist on the
+network with `lookup <name> on 127.0.0.11:53: server misbehaving`, which reads
+like the far side is broken. It is not: nothing was dialled, and the port in
+that message is irrelevant.
 
 Two consequences worth knowing:
 

@@ -298,6 +298,21 @@ pub(crate) struct Owner {
     finalize_sent: HashSet<FileId>,
     pending_finalize: Vec<(JobId, FileId)>,
     file_sizes: HashMap<FileId, u64>,
+    /// Jobs whose bytes did not survive the trip to disk, and why.
+    ///
+    /// Health cannot express this. Health is computed from segment state —
+    /// how much of the article set arrived off the wire — and a file whose
+    /// segments all downloaded perfectly and then failed to `set_len`,
+    /// `sync_data` or `rename` has a PERFECT health score and a wrong file on
+    /// disk. On NFS in particular, a deferred writeback error (ENOSPC,
+    /// EDQUOT, EIO) surfaces at `sync_data()` and nowhere else, so this is
+    /// the ONLY place the daemon can learn the download did not land.
+    ///
+    /// Before this existed, `ok: false` from the writer set `finalized =
+    /// true`, touched no totals, and the job completed as SUCCESS with 500 MiB
+    /// of a 48 GiB remux on disk. A downloader may report that it failed. It
+    /// may not report that it succeeded when it did not.
+    write_failures: HashMap<JobId, String>,
     /// Jobs executing on another node (job → node name).
     delegated: HashMap<JobId, String>,
     mirror: HashMap<JobId, MirrorStats>,
@@ -460,6 +475,7 @@ impl Owner {
             finalize_sent: HashSet::new(),
             pending_finalize: Vec::new(),
             file_sizes,
+            write_failures: HashMap::new(),
             delegated: HashMap::new(),
             mirror: HashMap::new(),
             job_rates: HashMap::new(),
@@ -1498,17 +1514,25 @@ impl Owner {
         segs.sort_by_key(|(off, _, _)| *off);
         let combined_crc = if all_done { combine_crcs(&segs) } else { None };
 
+        // The yEnc-declared size, or nothing.
+        //
+        // This used to fall back to "the highest offset we actually wrote",
+        // which finalize then applied with set_len — a silent truncation to
+        // whatever happened to arrive, performed by the daemon itself, with
+        // health and totals left untouched. It is reachable whenever
+        // `file_sizes` has no entry for this file: the map is in-memory and
+        // rebuilt from journal records that carry a size, so a restart or an
+        // authority takeover mid-file lands squarely in it.
+        //
+        // A size we do not know is a size we must not invent. Zero means "do
+        // not resize", which leaves the preallocated length alone rather than
+        // cutting the file down to the part that made it.
         let file_size = self
             .file_sizes
             .get(&file)
             .copied()
             .filter(|s| *s > 0)
-            .unwrap_or_else(|| {
-                segs.iter()
-                    .map(|(o, l, _)| o + *l as u64)
-                    .max()
-                    .unwrap_or(0)
-            });
+            .unwrap_or(0);
 
         let tx = self.writer_for(job, file);
         match tx.try_send(WriteCmd::Finalize {
@@ -1547,6 +1571,16 @@ impl Owner {
             f.crc32 = combined_crc;
         }
         let filename = f.filename.clone();
+        if !ok {
+            // The bytes did not land. Record it against the job so that
+            // check_job_complete cannot call this a success — see the field's
+            // comment for why health is incapable of catching it.
+            tracing::error!(job = job.0, file = file.0, %filename,
+                "finalize failed; the job cannot be reported as successful");
+            self.write_failures
+                .entry(job)
+                .or_insert_with(|| format!("could not write {filename} to disk"));
+        }
         tracing::info!(job = job.0, file = file.0, %filename, ok, path = ?final_path, "file finished");
         self.emit(Event::FileFinished {
             job,
@@ -1579,8 +1613,20 @@ impl Owner {
         if !complete {
             return;
         }
-        let (status, health) = final_status(job);
-        job.status = status;
+        let (mut status, health) = final_status(job);
+        // A write that did not land overrides a healthy article set. The two
+        // measure different things: health says the bytes arrived off the
+        // wire, this says they reached the disk. Reporting SUCCESS on the
+        // strength of the first while the second failed is how a consumer
+        // ends up importing 500 MiB of a 48 GiB file.
+        if let Some(reason) = self.write_failures.remove(&job_id) {
+            status = JobStatus::Failed;
+            job.status = status;
+            tracing::error!(job = job_id.0, %reason,
+                "job failed: the download completed but the files did not");
+        } else {
+            job.status = status;
+        }
         let name = job.name.clone();
         let file_ids: Vec<FileId> = job.files.iter().map(|f| f.id).collect();
         tracing::info!(job = job_id.0, %name, ?status, health = health.0, "job finished");

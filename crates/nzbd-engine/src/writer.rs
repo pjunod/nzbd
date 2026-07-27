@@ -211,8 +211,36 @@ async fn finalize(
     }
     // Data durability at the completion boundary; per-segment writes stay
     // relaxed (page cache), matching the configured-default policy.
+    //
+    // This is also the only point at which a deferred writeback failure can
+    // reach us. Per-segment writes land in the page cache and return Ok; on a
+    // network filesystem the ENOSPC/EDQUOT/EIO that killed them surfaces here
+    // or nowhere at all.
     f.sync_data().await?;
     drop(out.take()); // close before rename
+
+    // Then check the obvious thing, because the obvious thing turned out not
+    // to be true: is the file the length it is supposed to be?
+    //
+    // Two 40-60 GB remuxes finished as SUCCESS with 500 MiB on disk — stopped
+    // dead on a 500 MiB boundary by a limit outside this process, and reported
+    // complete because nothing ever compared what was written against what was
+    // promised. Every other check in the engine is about the article set:
+    // whether the bytes arrived off the wire. None of them look at the file. A
+    // downloader may report that it failed; it may not report success for a
+    // file it did not write.
+    if file_size > 0 {
+        let on_disk = tokio::fs::metadata(part_path).await?.len();
+        if on_disk != file_size {
+            return Err(std::io::Error::other(format!(
+                "{} is {on_disk} bytes on disk but should be {file_size}: \
+                 {} bytes never reached the filesystem",
+                part_path.display(),
+                file_size.saturating_sub(on_disk),
+            )));
+        }
+    }
+
     tokio::fs::rename(part_path, final_path).await?;
     Ok(())
 }
@@ -289,6 +317,74 @@ mod tests {
         expected[5..8].fill(0xBB);
         assert_eq!(bytes, expected);
         assert!(!tmp.path().join("out.bin.part").exists());
+    }
+
+    /// A finalize that cannot complete must report failure, not success.
+    ///
+    /// Regression test for the worst bug this engine has had: two 40-60 GB
+    /// remuxes reported SUCCESS with 500 MiB on disk. `sync_data` is the only
+    /// point at which a deferred writeback error can reach us — per-segment
+    /// writes land in the page cache and return Ok, so on a network
+    /// filesystem the ENOSPC/EDQUOT/EIO that killed them surfaces here or
+    /// nowhere. Losing it means calling a download that never reached the
+    /// disk finished.
+    ///
+    /// The failure is simulated the only way it can be from a unit test:
+    /// the `.part` file is removed while the destination directory is gone
+    /// too, so reopening it cannot succeed and the rename has nothing to
+    /// move. What matters is the plumbing — an error here becomes
+    /// `ok: false`, and the owner turns `ok: false` into a failed job rather
+    /// than a healthy one.
+    #[tokio::test]
+    async fn a_finalize_that_fails_reports_not_ok() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tracker = TaskTracker::new();
+        let (etx, mut erx) = channel(64);
+        let dir = tmp.path().join("gone");
+        std::fs::create_dir_all(&dir).unwrap();
+        let h = spawn_writer(
+            &tracker,
+            JobId(1),
+            FileId(1),
+            dir.clone(),
+            "x.bin".into(),
+            etx,
+        );
+
+        h.tx.send(WriteCmd::Segment {
+            seg_number: 1,
+            offset: 0,
+            data: vec![0xAA; 16],
+            crc: 0,
+            file_size: 16,
+            server: ServerId(1),
+        })
+        .await
+        .unwrap();
+        match erx.recv().await {
+            Some(EngineMsg::SegmentWritten { .. }) => {}
+            other => panic!("unexpected {other:?}"),
+        }
+
+        // The destination disappears out from under the writer, which is what
+        // a filesystem going away looks like from in here.
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        h.tx.send(WriteCmd::Finalize {
+            file_size: 16,
+            combined_crc: None,
+        })
+        .await
+        .unwrap();
+        match erx.recv().await {
+            Some(EngineMsg::WriterFinalized { ok, .. }) => assert!(
+                !ok,
+                "a finalize that could not place the file must report ok:false — \
+                 reporting success here is what called 500 MiB of a 48 GiB remux \
+                 a completed download"
+            ),
+            other => panic!("unexpected {other:?}"),
+        }
     }
 
     #[tokio::test]
