@@ -13,9 +13,43 @@ pub struct ScriptHost {
     pub timeout: Duration,
 }
 
+/// Spawn a child, retrying briefly on `ETXTBSY` ("Text file busy").
+///
+/// A script that was JUST written is executable but not always
+/// exec-able: if any thread in this process still holds a write handle to
+/// the file when another thread forks, the child inherits that handle and
+/// its `execve` fails with `ETXTBSY`. Nothing about the script is wrong,
+/// and the same call succeeds milliseconds later — which is exactly the
+/// shape of failure that reads as "my post-processing script randomly
+/// doesn't run".
+///
+/// nzbd is squarely in the path of this: it runs operator scripts, and an
+/// operator who drops a new script into `scripts_dir` while a job is
+/// finishing is racing precisely this window. Retrying is the accepted
+/// mitigation (rust-lang/rust#114554); a handful of short waits covers
+/// the fork window without turning a genuinely missing interpreter into a
+/// long stall.
+async fn spawn_retrying_etxtbsy(
+    cmd: &mut tokio::process::Command,
+) -> std::io::Result<tokio::process::Child> {
+    const WAITS_MS: [u64; 4] = [1, 5, 20, 50];
+    for wait in WAITS_MS {
+        match cmd.spawn() {
+            Err(e) if e.raw_os_error() == Some(26) => {
+                tokio::time::sleep(Duration::from_millis(wait)).await;
+            }
+            other => return other,
+        }
+    }
+    cmd.spawn()
+}
+
 impl ScriptHost {
     /// Run one script with the given environment (`NZBOP_*`/`NZBPP_*`/…
     /// built by the caller). Stdout is parsed line-by-line.
+    ///
+    /// See [`spawn_retrying_etxtbsy`] for why the spawn is not a plain
+    /// `cmd.spawn()`.
     pub async fn run(
         &self,
         entry: &Path,
@@ -36,8 +70,8 @@ impl ScriptHost {
         for (k, v) in env {
             cmd.env(k, v);
         }
-        let mut child = cmd
-            .spawn()
+        let mut child = spawn_retrying_etxtbsy(&mut cmd)
+            .await
             .map_err(|e| PostError::ToolMissing(format!("{}: {e}", entry.display())))?;
 
         let stdout = child.stdout.take().unwrap();
