@@ -89,6 +89,7 @@ impl ClusterRuntime {
         tuning: Tuning,
         dest_dir: PathBuf,
         speed_limit_bps: Option<u64>,
+        max_active_downloads: Option<u32>,
         pp: Option<PpSetup>,
     ) -> Result<ClusterRuntime, ClusterError> {
         let layout = SharedLayout::new(&cfg.shared_dir, &cfg.node_name)?;
@@ -116,6 +117,7 @@ impl ClusterRuntime {
             dest_dir: dest_dir.clone(),
             tuning,
             speed_limit_bps,
+            max_active_downloads,
             persist_queue: false, // adopted on taking office
             journal_suffix: cfg.node_name.clone(),
             persist_guard: Some(guard),

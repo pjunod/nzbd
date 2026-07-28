@@ -90,6 +90,8 @@ pub struct QueueSnapshot {
     /// download will be cut off early or just run to completion.
     pub health_abort: bool,
     pub speed_limit_bps: Option<u64>,
+    /// How many jobs may download at once.
+    pub max_active_downloads: u32,
     pub download_rate_bps: u64,
     pub session_downloaded_bytes: u64,
     /// Bytes still to fetch across active jobs (non-paused files).

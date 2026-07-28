@@ -420,6 +420,9 @@ pub struct StatusDto {
     /// Critical-health abort armed (`[post] health_action` park/delete)?
     pub health_abort: bool,
     pub speed_limit_bps: Option<u64>,
+    /// How many jobs may download at once (1..=100). The queue page's
+    /// control reads back from here.
+    pub max_active_downloads: u32,
     /// Jobs waiting for a turn: `Queued` and `Paused`.
     pub jobs_queued: u32,
     /// Jobs the daemon is actively working on — downloading, fetching a
@@ -463,6 +466,7 @@ pub fn status_dto(snap: &QueueSnapshot) -> StatusDto {
         blocked_servers: snap.blocked_servers.clone(),
         health_abort: snap.health_abort,
         speed_limit_bps: snap.speed_limit_bps,
+        max_active_downloads: snap.max_active_downloads,
         jobs_queued: count(&|j| matches!(j.status, JobStatus::Queued | JobStatus::Paused)),
         jobs_downloading: count(&|j| {
             matches!(
@@ -1015,6 +1019,27 @@ async fn set_speed_limit(State(st): State<ApiState>, Json(body): Json<SpeedLimit
     }
 }
 
+#[derive(Debug, Deserialize)]
+struct MaxActiveBody {
+    n: u32,
+}
+
+/// `PUT /api/v1/queue/max-active-downloads` — how many jobs may download
+/// at once, changed while the daemon runs.
+///
+/// Answers with the value actually applied rather than echoing the
+/// request: it is clamped to 1..=100, and a caller that asked for 0 needs
+/// to be told it got 1, not left to assume the queue is now stopped.
+async fn set_max_active_downloads(
+    State(st): State<ApiState>,
+    Json(body): Json<MaxActiveBody>,
+) -> Response {
+    match st.engine.set_max_active_downloads(body.n).await {
+        Ok(n) => Json(json!({ "ok": true, "max_active_downloads": n })).into_response(),
+        Err(e) => error(StatusCode::SERVICE_UNAVAILABLE, &e.to_string()),
+    }
+}
+
 /// `POST /api/v1/servers/test` — live connectivity probe for a news
 /// server, exactly as the form describes it (saved or not): connect,
 /// greeting, optional AUTHINFO, through the production NNTP transport.
@@ -1398,6 +1423,7 @@ fn event_json(ev: &nzbd_engine::Event) -> (&'static str, serde_json::Value) {
             "speed_limit_changed",
             json!({"bytes_per_sec": bytes_per_sec}),
         ),
+        E::MaxActiveDownloadsChanged { n } => ("max_active_downloads_changed", json!({"n": n})),
         E::JobAssigned { job, node } => ("job_assigned", json!({"job": job.0, "node": node})),
         E::JobPpStage { job, name, stage } => (
             "job_pp_stage",
@@ -1472,6 +1498,8 @@ async fn metrics(State(st): State<ApiState>) -> Response {
         "nzbd_speed_limit_bytes_per_second {}",
         snap.speed_limit_bps.unwrap_or(0)
     );
+    let _ = writeln!(m, "# TYPE nzbd_max_active_downloads gauge");
+    let _ = writeln!(m, "nzbd_max_active_downloads {}", snap.max_active_downloads);
     let _ = writeln!(m, "# TYPE nzbd_jobs gauge");
     for (k, v) in by_status {
         let _ = writeln!(m, "nzbd_jobs{{status=\"{k}\"}} {v}");
@@ -2017,6 +2045,39 @@ async fn put_config(
         let bps = new_cfg.queue.speed_limit_kib.map(|k| k * 1024);
         let _ = st.engine.set_speed_limit(bps).await;
     }
+    if live.contains(&"max active downloads") {
+        let _ = st
+            .engine
+            .set_max_active_downloads(new_cfg.queue.max_active_downloads)
+            .await;
+    }
+    // Connection counts: applied live, but only down to the number of
+    // sockets that exist. Asking for more than a server spawned at boot
+    // writes to the file and takes effect on the next start — and says
+    // so, rather than leaving the operator with a saved setting and no
+    // change in behavior.
+    let mut conn_capped: Vec<String> = Vec::new();
+    if live.contains(&"connections") {
+        let caps: std::collections::HashMap<nzbd_types::ServerId, u16> = new_cfg
+            .servers
+            .iter()
+            .enumerate()
+            .map(|(i, s)| (nzbd_types::ServerId(i as u32), s.connections))
+            .collect();
+        if let Ok(applied) = st.engine.set_server_connection_caps(caps).await {
+            for (i, s) in new_cfg.servers.iter().enumerate() {
+                let got = applied.get(&nzbd_types::ServerId(i as u32)).copied();
+                if got.is_some_and(|g| g < s.connections) {
+                    conn_capped.push(format!(
+                        "{}: using {} of {} until restart",
+                        if s.name.is_empty() { &s.host } else { &s.name },
+                        got.unwrap_or(0),
+                        s.connections
+                    ));
+                }
+            }
+        }
+    }
     *h.current.lock().unwrap() = new_cfg;
     let pending: Vec<&str> = {
         let mut p = h.pending_restart.lock().unwrap();
@@ -2033,6 +2094,7 @@ async fn put_config(
         "ok": true,
         "applied_live": live,
         "restart_required": pending,
+        "connection_notes": conn_capped,
         "mirrored": mirrored.map(|p| p.display().to_string()),
     }))
     .into_response()
@@ -2215,6 +2277,10 @@ pub fn router_with(state: ApiState) -> Router {
         .route("/api/v1/jobs/{id}/actions/{action}", post(job_action))
         .route("/api/v1/queue/actions/{action}", post(queue_action))
         .route("/api/v1/queue/speed-limit", put(set_speed_limit))
+        .route(
+            "/api/v1/queue/max-active-downloads",
+            put(set_max_active_downloads),
+        )
         .route("/api/v1/servers/test", post(test_server))
         .route("/api/v1/history", get(get_history))
         .route(
@@ -2389,6 +2455,51 @@ mod tests {
         };
         let dto = status_dto(&snap);
         assert_eq!((dto.jobs_downloading, dto.jobs_queued), (1, 0));
+    }
+
+    /// The endpoint answers with the value it applied, not the one it was
+    /// handed. Someone who asks for 0 has to learn they got 1 — otherwise
+    /// they walk away believing they just stopped the queue.
+    #[tokio::test]
+    async fn the_concurrency_endpoint_reports_what_it_applied() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = test_engine(&tmp).await;
+        let app = router(engine.clone());
+
+        for (asked, want) in [(0u32, 1u32), (1, 1), (5, 5), (100, 100), (100_000, 100)] {
+            let resp = app
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("PUT")
+                        .uri("/api/v1/queue/max-active-downloads")
+                        .header("content-type", "application/json")
+                        .body(axum::body::Body::from(format!("{{\"n\":{asked}}}")))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let v = body_json(resp).await;
+            assert_eq!(
+                v["max_active_downloads"], want,
+                "asked for {asked}, should have been told {want}"
+            );
+        }
+
+        // And the value is readable back from status, which is what the
+        // queue page's box reads on every tick.
+        let resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/v1/status")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(body_json(resp).await["max_active_downloads"], 100);
+        engine.shutdown().await;
     }
 
     async fn body_json(resp: axum::response::Response) -> serde_json::Value {

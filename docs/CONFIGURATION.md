@@ -101,10 +101,33 @@ continue_partial = true      # resume partially-downloaded files on restart
 propagation_delay_mins = 0   # ignore posts younger than this
 min_free_disk_mb = 250       # pause grabbing new work below this free space
 # speed_limit_kib = 10240    # global rate cap (KiB/s); absent = unlimited
+max_active_downloads = 1     # how many jobs download at once (1..=100)
 daily_quota_mb = 0           # 0 = unlimited (NZBGet DailyQuota)
 monthly_quota_mb = 0         # NZBGet MonthlyQuota
 quota_start_day = 1          # day of month the monthly quota resets
 ```
+
+`max_active_downloads` decides how many jobs are worked on at the same
+time. At `1` — the default, and what nzbd has always done — the top job
+takes every connection until it has no segments left to hand out. Raising
+it splits the connection pool evenly between that many jobs; priority
+still decides *which* jobs are in the set, this decides how many.
+
+It does not make anything faster. The same connections move the same
+bytes either way; they simply arrive spread across several jobs instead
+of completing one at a time, so the first job finishes later and the last
+finishes at about the same moment. Raise it when you want several things
+moving at once — a small job not stuck behind a 60 GB remux — not when
+you want more throughput.
+
+Both this and the speed limit can be changed while nzbd runs, from the
+box on the Queue page or from Settings; the value in the file is the
+starting position after a restart.
+
+Per-server `connections` also applies without a restart when you *lower*
+it. Raising it above the number nzbd started with needs a restart, since
+the sockets are opened at boot — the settings page says so when it
+happens rather than pretending the new number is in force.
 
 When a quota is exhausted the queue soft-holds (downloads pause, the API
 stays up, the queue keeps accepting jobs); it releases automatically when

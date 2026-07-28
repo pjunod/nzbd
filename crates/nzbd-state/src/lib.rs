@@ -333,6 +333,11 @@ pub struct QueueSnapshotDoc {
     pub next_file_id: u32,
     pub download_paused: bool,
     pub speed_limit_bps: Option<u64>,
+    /// How many jobs may download at once. Absent in snapshots written
+    /// before the setting existed; `QueueState::from_doc` clamps the
+    /// resulting 0 up to 1 rather than treating it as "none may".
+    #[serde(default)]
+    pub max_active_downloads: u32,
 }
 
 pub struct SnapshotStore {
@@ -597,6 +602,7 @@ mod tests {
             next_file_id: 42,
             download_paused: true,
             speed_limit_bps: Some(1_000_000),
+            max_active_downloads: 3,
         };
         let bytes = store.save(&doc).unwrap();
         assert_eq!(
@@ -671,6 +677,7 @@ mod tests {
             next_file_id: 400,
             download_paused: false,
             speed_limit_bps: None,
+            max_active_downloads: 1,
         };
         // 4 jobs × 100 files × 500 segments = 200k segments.
         let bytes = store.save(&doc).unwrap();

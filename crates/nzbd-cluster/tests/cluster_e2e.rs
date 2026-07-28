@@ -132,6 +132,7 @@ async fn start_node(
         tuning,
         shared.join("complete"),
         None,
+        None,
         pp,
     )
     .await

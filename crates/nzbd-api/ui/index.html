@@ -484,6 +484,9 @@
     <button id="btn-addnzb" title="Upload .nzb files straight into the queue.">+ add nzb</button>
     <input type="file" id="nzb-file" accept=".nzb,application/x-nzb" multiple hidden>
     <span id="addnzb-msg"></span>
+    <label title="How many jobs download at the same time. The connections are split evenly between them — this does not add throughput, it spreads the same throughput over more jobs. 1 gives the whole pipe to the top job until it finishes.">At once
+      <input type="number" id="active" min="1" max="100" step="1" style="width: 62px">
+      <button class="small" id="btn-active">set</button></label>
     <label>Limit <input type="number" id="limit" min="0" step="128" placeholder="KiB/s">
       <button class="small" id="btn-limit">set</button></label>
     <span class="spacer" style="flex:1"></span>
@@ -1849,6 +1852,11 @@ function renderStatus() {
   setClass(hold, holds.length ? "show" : "");
   if (s.speed_limit_bps && !$("limit").matches(":focus"))
     $("limit").value = Math.round(s.speed_limit_bps / 1024);
+  // Unlike the limit this always has a value, so it is written on every
+  // tick — except while the box has focus, where overwriting what someone
+  // is halfway through typing is the rudest thing a live page can do.
+  if (s.max_active_downloads && !$("active").matches(":focus"))
+    $("active").value = s.max_active_downloads;
   reconcileRows($("srv-chips"), serverChipModels(s), dom);
   drawSparkline();
   updateTitle();
@@ -2499,6 +2507,29 @@ $("btn-limit").onclick = async () => {
   else toast({ text: kib > 0 ? "Speed limit set to " + kib + " KiB/s" : "Speed limit removed" });
   refreshAll();
 };
+$("btn-active").onclick = async () => {
+  const want = parseInt($("active").value || "1", 10);
+  const res = await post("/api/v1/queue/max-active-downloads", {
+    method: "PUT", headers: { "content-type": "application/json", ...CLIENT_HDRS },
+    body: JSON.stringify({ n: want }),
+  });
+  if (!res.ok) {
+    toast({ text: "could not change concurrency — " + res.error, kind: "error", ttlMs: 10000 });
+    return;
+  }
+  // Report what the daemon applied, not what was typed. The value is
+  // clamped to 1..=100, and someone who asked for 0 needs to know they
+  // got 1 rather than assuming they just stopped the queue.
+  const got = res.body && res.body.max_active_downloads;
+  const n = got == null ? want : got;
+  toast({
+    text: n === 1
+      ? "One job at a time — the top job gets every connection"
+      : n + " jobs download at once",
+  });
+  if (n !== want) $("active").value = n;
+  refreshAll();
+};
 for (const s of ["system", "job", "file"])
   $("lg-" + s).onchange = () => renderLogs();
 $("page-size").onchange = () => setPageSize(Number($("page-size").value));
@@ -2664,7 +2695,8 @@ function startStream() {
   // the CLI) land here immediately too.
   for (const ev of ["job_added", "job_finished", "job_deleted", "file_finished",
                     "segment_exhausted", "server_blocked",
-                    "speed_limit_changed", "job_assigned", "lagged"])
+                    "speed_limit_changed", "max_active_downloads_changed",
+                    "job_assigned", "lagged"])
     es.addEventListener(ev, nudge);
   // Pause changes carry WHO — the answer to "it keeps unpausing itself" is
   // always a client name, shown right on the paused badge.
@@ -2753,9 +2785,10 @@ const SETTINGS_SECTIONS = [
     ["paths.inter_dir", "intermediate dir (optional)", "text?"],
     ["paths.nzb_watch_dir", "watch dir for dropped .nzb (optional)", "text?"],
   ]},
-  { key: "servers", title: "News servers", desc: "Tier 0 is tried first; higher tiers are backups. Fill servers only see missing articles.", array: true },
-  { key: "queue", title: "Speed & queue", desc: "Speed limit applies immediately on save; the rest needs a restart.", fields: [
+  { key: "servers", title: "News servers", desc: "Tier 0 is tried first; higher tiers are backups. Fill servers only see missing articles. Connection counts apply immediately when lowered; raising one above what the daemon started with needs a restart.", array: true },
+  { key: "queue", title: "Speed & queue", desc: "Speed limit and simultaneous downloads apply immediately on save; the rest needs a restart.", fields: [
     ["queue.speed_limit_kib", "speed limit (KiB/s, empty = unlimited)", "num?"],
+    ["queue.max_active_downloads", "simultaneous downloads (1 = one job at a time)", "num"],
     ["queue.article_retries", "article retries", "num"],
     ["queue.retry_interval_secs", "retry interval (s)", "num"],
     ["queue.article_timeout_secs", "article timeout (s)", "num"],
@@ -3033,10 +3066,14 @@ $("cfg-save").onclick = async () => {
   const res = await saveSettings(JSON.stringify(collectSettingsForm()), "application/json");
   if (!res) return;
   const msg = $("cfg-msg");
-  msg.className = "ok";
-  msg.textContent = res.applied_live.length
+  // A connection count raised above the sockets that exist is saved but
+  // not in force. Saying "applied immediately" and leaving it there would
+  // be the settings page telling a comfortable lie.
+  const notes = res.connection_notes || [];
+  msg.className = notes.length ? "warn" : "ok";
+  msg.textContent = (res.applied_live.length
     ? "saved — applied immediately: " + res.applied_live.join(", ")
-    : "saved";
+    : "saved") + (notes.length ? " · " + notes.join("; ") : "");
   showRestartBanner(res.restart_required);
   cfgDirty = false; $("cfg-save").disabled = true;
   await loadSettings(true);

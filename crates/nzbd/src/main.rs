@@ -569,13 +569,14 @@ fn run(
         return Ok(RunOutcome::Exit);
     }
 
-    let engine_cfg = EngineConfig::single_node(
+    let mut engine_cfg = EngineConfig::single_node(
         servers,
         cfg.state_dir(),
         cfg.dest_dir(),
         tuning,
         cfg.speed_limit_bps(),
     );
+    engine_cfg.max_active_downloads = cfg.max_active_downloads();
 
     runtime.block_on(async move {
         let engine = Engine::spawn(engine_cfg).await.map_err(with_fs_hint)?;
@@ -855,6 +856,7 @@ async fn run_cluster(
         tuning,
         dest_dir,
         cfg.speed_limit_bps(),
+        cfg.max_active_downloads(),
         pp,
     )
     .await

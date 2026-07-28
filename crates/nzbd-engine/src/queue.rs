@@ -15,13 +15,51 @@ use nzbd_types::{
 };
 use std::collections::HashMap;
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct QueueState {
     pub jobs: Vec<Job>,
     pub next_job_id: u32,
     pub next_file_id: u32,
     pub download_paused: bool,
     pub speed_limit_bps: Option<u64>,
+    /// How many jobs may download at once. `1` is the historical
+    /// behavior: one job takes every connection until it runs out of
+    /// pending segments.
+    ///
+    /// Held here rather than on `Tuning` because it is adjustable while
+    /// the daemon runs, like the speed limit — and for the same reason,
+    /// it is the sort of thing you change *because* of what the queue is
+    /// doing right now, which is exactly when a restart is unwelcome.
+    pub max_active_downloads: u32,
+}
+
+/// The floor and ceiling for [`QueueState::max_active_downloads`]. Zero
+/// would be indistinguishable from a paused queue while presenting itself
+/// as a concurrency setting; the ceiling is high enough to be no real
+/// limit and low enough that a typo cannot ask for a rotation over ten
+/// thousand jobs on every lease.
+pub const MIN_ACTIVE_DOWNLOADS: u32 = 1;
+pub const MAX_ACTIVE_DOWNLOADS: u32 = 100;
+
+pub fn clamp_active_downloads(n: u32) -> u32 {
+    n.clamp(MIN_ACTIVE_DOWNLOADS, MAX_ACTIVE_DOWNLOADS)
+}
+
+impl Default for QueueState {
+    /// Hand-written rather than derived because `max_active_downloads`
+    /// must not default to zero: a derived `0` reads as "no job may
+    /// download" and would silently stop a daemon built from a default
+    /// state. The type has no safe zero, so it does not get one.
+    fn default() -> QueueState {
+        QueueState {
+            jobs: Vec::new(),
+            next_job_id: 0,
+            next_file_id: 0,
+            download_paused: false,
+            speed_limit_bps: None,
+            max_active_downloads: MIN_ACTIVE_DOWNLOADS,
+        }
+    }
 }
 
 /// Coordinates of one segment.
@@ -42,6 +80,10 @@ impl QueueState {
             next_file_id: doc.next_file_id,
             download_paused: doc.download_paused,
             speed_limit_bps: doc.speed_limit_bps,
+            // A snapshot written before this existed deserializes as 0,
+            // which would read as "no job may download". Clamp on the way
+            // in so an old queue.json cannot silently stop the daemon.
+            max_active_downloads: clamp_active_downloads(doc.max_active_downloads),
         };
         // Leases are transient; anything in flight at the crash re-leases.
         for job in &mut state.jobs {
@@ -66,6 +108,7 @@ impl QueueState {
             next_file_id: self.next_file_id,
             download_paused: self.download_paused,
             speed_limit_bps: self.speed_limit_bps,
+            max_active_downloads: self.max_active_downloads,
         }
     }
 
@@ -524,6 +567,12 @@ pub struct SelectionCtx<'a> {
     pub propagation_delay_secs: i64,
     /// Quota reached (or another soft hold): only force-priority jobs run.
     pub soft_hold: bool,
+    /// Which job in the active set to begin the scan at. The owner
+    /// advances this per granted lease, which is what turns a cap on
+    /// concurrent jobs into actual concurrency: without it the first job
+    /// in the set would still answer every request and the other slots
+    /// would be occupied by jobs receiving nothing.
+    pub rotate: usize,
 }
 
 pub struct SelectionResult {
@@ -549,10 +598,31 @@ pub fn next_for_server(
         .iter()
         .filter(|j| !ctx.delegated.contains_key(&j.id))
         .filter(|j| job_schedulable(j, state.download_paused || ctx.soft_hold))
+        // A job whose every remaining segment is already leased has no
+        // work to hand out. Letting it hold an active slot would spend
+        // the slot on nothing, and would stall the pipe at the tail of
+        // every job — which is the one place nzbd has always overlapped.
+        .filter(|j| has_pending(j))
         .collect();
     // Stable sort: equal priorities keep their queue-vec order, which is
     // user-controlled (move top/up/down/bottom) and persisted.
     order.sort_by_key(|j| std::cmp::Reverse(j.priority));
+
+    // The active set: the highest-priority jobs with work, at most
+    // `max_active_downloads` of them. Priority decides WHO downloads;
+    // within the set every job gets an equal share of the connections,
+    // because "three at once" that silently gave one of them 95% of the
+    // pipe would not be three at once.
+    let cap = clamp_active_downloads(state.max_active_downloads) as usize;
+    order.truncate(cap);
+
+    // Rotate so successive grants start at successive jobs. With a cap of
+    // 1 this is a no-op and selection is exactly the head-of-queue scan
+    // it has always been.
+    if order.len() > 1 {
+        let by = ctx.rotate % order.len();
+        order.rotate_left(by);
+    }
 
     for job in order {
         for file in &job.files {
@@ -599,6 +669,70 @@ pub fn next_for_server(
         lease: None,
         exhausted,
     }
+}
+
+/// Does this job have at least one segment that could be handed out?
+/// Short-circuits on the first hit, so the common "yes" case is cheap.
+fn has_pending(job: &Job) -> bool {
+    job.files.iter().any(|f| {
+        !f.paused
+            && !f.is_terminal()
+            && f.segments
+                .iter()
+                .any(|s| matches!(s.state, SegmentState::Pending))
+    })
+}
+
+/// Is any segment of this job currently out with a connection? A job with
+/// work in flight is downloading whatever its position says.
+pub fn has_leased(job: &Job) -> bool {
+    job.files.iter().any(|f| {
+        f.segments
+            .iter()
+            .any(|s| matches!(s.state, SegmentState::Leased { .. }))
+    })
+}
+
+/// The jobs that may download right now, highest priority first. Shares
+/// its filter and ordering with [`next_for_server`] so the set the
+/// scheduler feeds and the set the status labels reflect cannot drift.
+pub fn active_set(
+    state: &QueueState,
+    delegated: &HashMap<JobId, String>,
+    soft_hold: bool,
+) -> Vec<JobId> {
+    let mut order: Vec<&Job> = state
+        .jobs
+        .iter()
+        .filter(|j| !delegated.contains_key(&j.id))
+        .filter(|j| job_schedulable(j, state.download_paused || soft_hold))
+        .filter(|j| has_pending(j))
+        .collect();
+    order.sort_by_key(|j| std::cmp::Reverse(j.priority));
+    order.truncate(clamp_active_downloads(state.max_active_downloads) as usize);
+    order.iter().map(|j| j.id).collect()
+}
+
+/// Jobs claiming to download that are neither in the active set nor
+/// holding a lease — the ones whose label has outlived the fact.
+///
+/// Pure and separate from the owner so the rule can be tested without
+/// standing up an engine: it is a statement about queue state, not about
+/// scheduling machinery.
+pub fn jobs_to_requeue(
+    state: &QueueState,
+    delegated: &HashMap<JobId, String>,
+    soft_hold: bool,
+) -> Vec<JobId> {
+    let active: Vec<JobId> = active_set(state, delegated, soft_hold);
+    state
+        .jobs
+        .iter()
+        .filter(|j| matches!(j.status, JobStatus::Downloading))
+        .filter(|j| !active.contains(&j.id))
+        .filter(|j| !has_leased(j))
+        .map(|j| j.id)
+        .collect()
 }
 
 fn job_schedulable(job: &Job, download_paused: bool) -> bool {
@@ -855,6 +989,209 @@ mod tests {
         assert_eq!(job.totals.par_size, 3000);
     }
 
+    /// Helper: grant `n` leases the way the owner does — rotating the
+    /// cursor per lease and marking each segment Leased — and report
+    /// which job each went to.
+    fn grant(q: &mut QueueState, servers: &[ServerDef], n: usize) -> Vec<JobId> {
+        let ladder = Ladder::new(servers);
+        let mut attempts = HashMap::new();
+        let not_blocked = |_: ServerId| false;
+        let no_delegation: HashMap<JobId, String> = HashMap::new();
+        let mut out = Vec::new();
+        for i in 0..n {
+            let mut ctx = SelectionCtx {
+                ladder: &ladder,
+                attempts: &mut attempts,
+                is_blocked: &not_blocked,
+                delegated: &no_delegation,
+                article_retries: 3,
+                now_unix: 1_800_000_000,
+                propagation_delay_secs: 0,
+                soft_hold: false,
+                rotate: i,
+            };
+            let Some(r) = next_for_server(q, &servers[0], &mut ctx).lease else {
+                break;
+            };
+            if let Some(seg) = q.segment_mut(r) {
+                seg.state = SegmentState::Leased {
+                    server: servers[0].id,
+                };
+            }
+            out.push(r.job);
+        }
+        out
+    }
+
+    /// The default is the behavior nzbd has always had: one job takes
+    /// every connection until it has nothing left to hand out.
+    #[test]
+    fn one_active_download_is_head_of_queue() {
+        let mut q = QueueState::default();
+        assert_eq!(q.max_active_downloads, 1, "the default must not change");
+        let a = q.admit_nzb("a".into(), &sample_nzb(&[("a.bin", 4)]), None, 0, true);
+        q.admit_nzb("b".into(), &sample_nzb(&[("b.bin", 4)]), None, 0, true);
+
+        let servers = vec![server(1, 0)];
+        let got = grant(&mut q, &servers, 4);
+        assert_eq!(got, vec![a, a, a, a], "every lease goes to the head job");
+    }
+
+    /// Raising the cap actually spreads the connections. A cap that only
+    /// widened the eligible set would leave the head job answering every
+    /// request while the other slots sat on jobs receiving nothing —
+    /// three "active" downloads, one of them moving.
+    #[test]
+    fn raising_the_cap_spreads_leases_across_jobs() {
+        let mut q = QueueState {
+            max_active_downloads: 3,
+            ..Default::default()
+        };
+        let a = q.admit_nzb("a".into(), &sample_nzb(&[("a.bin", 6)]), None, 0, true);
+        let b = q.admit_nzb("b".into(), &sample_nzb(&[("b.bin", 6)]), None, 0, true);
+        let c = q.admit_nzb("c".into(), &sample_nzb(&[("c.bin", 6)]), None, 0, true);
+        let d = q.admit_nzb("d".into(), &sample_nzb(&[("d.bin", 6)]), None, 0, true);
+
+        let got = grant(&mut q, &[server(1, 0)], 9);
+        assert_eq!(got.len(), 9);
+        let count = |j: JobId| got.iter().filter(|&&g| g == j).count();
+        assert_eq!(count(a), 3, "an equal share, not a majority");
+        assert_eq!(count(b), 3);
+        assert_eq!(count(c), 3);
+        assert_eq!(count(d), 0, "the fourth job is outside the cap");
+    }
+
+    /// Priority decides WHO is in the active set; within it everyone gets
+    /// the same share.
+    #[test]
+    fn priority_picks_the_active_set_not_the_share() {
+        let mut q = QueueState {
+            max_active_downloads: 2,
+            ..Default::default()
+        };
+        let low = q.admit_nzb("low".into(), &sample_nzb(&[("l.bin", 4)]), None, 0, true);
+        let mid = q.admit_nzb("mid".into(), &sample_nzb(&[("m.bin", 4)]), None, 50, true);
+        let high = q.admit_nzb("high".into(), &sample_nzb(&[("h.bin", 4)]), None, 100, true);
+
+        let got = grant(&mut q, &[server(1, 0)], 4);
+        let count = |j: JobId| got.iter().filter(|&&g| g == j).count();
+        assert_eq!(count(high), 2);
+        assert_eq!(count(mid), 2);
+        assert_eq!(count(low), 0, "lowest priority waits its turn");
+    }
+
+    /// A job whose every remaining segment is already out with a
+    /// connection has nothing to hand out, so it must not hold a slot —
+    /// otherwise the pipe stalls at the tail of every job, which is the
+    /// one place nzbd has always overlapped.
+    #[test]
+    fn a_job_with_nothing_pending_does_not_hold_a_slot() {
+        let mut q = QueueState {
+            max_active_downloads: 1,
+            ..Default::default()
+        };
+        let a = q.admit_nzb("a".into(), &sample_nzb(&[("a.bin", 2)]), None, 0, true);
+        let b = q.admit_nzb("b".into(), &sample_nzb(&[("b.bin", 2)]), None, 0, true);
+
+        let servers = vec![server(1, 0)];
+        let got = grant(&mut q, &servers, 4);
+        assert_eq!(
+            got,
+            vec![a, a, b, b],
+            "once a is fully leased, b starts rather than the pipe idling"
+        );
+    }
+
+    /// Out-of-range values cannot stop the queue or ask for a rotation
+    /// over ten thousand jobs.
+    #[test]
+    fn the_cap_is_clamped_into_range() {
+        assert_eq!(clamp_active_downloads(0), 1, "zero is not a pause button");
+        assert_eq!(clamp_active_downloads(1), 1);
+        assert_eq!(clamp_active_downloads(100), 100);
+        assert_eq!(clamp_active_downloads(u32::MAX), 100);
+
+        // A queue.json written before the setting existed deserializes
+        // the field as 0; loading it must not stop the daemon.
+        let doc = nzbd_state::QueueSnapshotDoc {
+            jobs: vec![],
+            next_job_id: 1,
+            next_file_id: 1,
+            download_paused: false,
+            speed_limit_bps: None,
+            max_active_downloads: 0,
+        };
+        assert_eq!(QueueState::from_doc(doc).max_active_downloads, 1);
+    }
+
+    /// `active_set` is what the status labels are settled against, so it
+    /// must agree with what the scheduler actually feeds.
+    #[test]
+    fn the_active_set_matches_what_the_scheduler_serves() {
+        let mut q = QueueState {
+            max_active_downloads: 2,
+            ..Default::default()
+        };
+        let a = q.admit_nzb("a".into(), &sample_nzb(&[("a.bin", 4)]), None, 0, true);
+        let b = q.admit_nzb("b".into(), &sample_nzb(&[("b.bin", 4)]), None, 0, true);
+        q.admit_nzb("c".into(), &sample_nzb(&[("c.bin", 4)]), None, 0, true);
+
+        let no_delegation: HashMap<JobId, String> = HashMap::new();
+        assert_eq!(active_set(&q, &no_delegation, false), vec![a, b]);
+
+        let got = grant(&mut q, &[server(1, 0)], 4);
+        let served: std::collections::HashSet<JobId> = got.into_iter().collect();
+        assert_eq!(served, [a, b].into_iter().collect());
+    }
+
+    /// `Downloading` is set on a job's first lease and was never once
+    /// set back, so a job that caught a single segment during the
+    /// spill-over at the tail of another stayed labelled `Downloading`
+    /// forever while receiving no work — a permanent claim on the
+    /// strength of one article.
+    #[test]
+    fn a_job_that_stopped_getting_work_stops_claiming_to_download() {
+        let mut q = QueueState {
+            max_active_downloads: 1,
+            ..Default::default()
+        };
+        let a = q.admit_nzb("a".into(), &sample_nzb(&[("a.bin", 4)]), None, 0, true);
+        let b = q.admit_nzb("b".into(), &sample_nzb(&[("b.bin", 4)]), None, 0, true);
+        let none: HashMap<JobId, String> = HashMap::new();
+
+        // b caught one lease at a's tail and is now labelled Downloading.
+        q.job_mut(a).unwrap().status = JobStatus::Downloading;
+        q.job_mut(b).unwrap().status = JobStatus::Downloading;
+        assert_eq!(active_set(&q, &none, false), vec![a]);
+        assert_eq!(
+            jobs_to_requeue(&q, &none, false),
+            vec![b],
+            "b is outside the set and holds nothing, so it is not downloading"
+        );
+        assert!(
+            !jobs_to_requeue(&q, &none, false).contains(&a),
+            "the job actually being served keeps its label"
+        );
+
+        // While b still has a segment in flight it IS downloading,
+        // whatever its position says.
+        let r = {
+            let f = &q.jobs.iter().find(|j| j.id == b).unwrap().files[0];
+            SegRef {
+                job: b,
+                file: f.id,
+                seg_number: f.segments[0].number,
+            }
+        };
+        q.segment_mut(r).unwrap().state = SegmentState::Leased {
+            server: ServerId(1),
+        };
+        assert!(
+            jobs_to_requeue(&q, &none, false).is_empty(),
+            "a job with work in flight is never demoted"
+        );
+    }
+
     #[test]
     fn selection_respects_priority_pause_and_force() {
         let mut q = QueueState::default();
@@ -876,6 +1213,7 @@ mod tests {
             propagation_delay_secs: 0,
 
             soft_hold: false,
+            rotate: 0,
         };
 
         let r = next_for_server(&q, &servers[0], &mut ctx);
@@ -893,6 +1231,7 @@ mod tests {
             propagation_delay_secs: 0,
 
             soft_hold: false,
+            rotate: 0,
         };
         assert!(next_for_server(&q, &servers[0], &mut ctx).lease.is_none());
 
@@ -908,6 +1247,7 @@ mod tests {
             propagation_delay_secs: 0,
 
             soft_hold: false,
+            rotate: 0,
         };
         let r = next_for_server(&q, &servers[0], &mut ctx);
         assert_eq!(r.lease.unwrap().job, low, "force ignores global pause");
@@ -940,6 +1280,7 @@ mod tests {
             propagation_delay_secs: 0,
 
             soft_hold: false,
+            rotate: 0,
         };
         assert!(next_for_server(&q, &servers[1], &mut ctx).lease.is_none());
 
@@ -954,6 +1295,7 @@ mod tests {
             propagation_delay_secs: 0,
 
             soft_hold: false,
+            rotate: 0,
         };
         let r = next_for_server(&q, &servers[0], &mut ctx).lease.unwrap();
         assert_eq!(r.job, id);

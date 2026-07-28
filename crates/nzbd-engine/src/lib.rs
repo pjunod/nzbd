@@ -108,6 +108,11 @@ pub struct EngineConfig {
     pub dest_dir: PathBuf,
     pub tuning: Tuning,
     pub speed_limit_bps: Option<u64>,
+    /// How many jobs may download at once, from the config file. `None`
+    /// leaves whatever the persisted snapshot carries (or 1 on a fresh
+    /// install). Like the speed limit, this is runtime-adjustable, so the
+    /// config value is a starting position rather than a fixed ceiling.
+    pub max_active_downloads: Option<u32>,
     /// Queue-authority persistence (snapshot save + journal compaction +
     /// recovery-at-boot). `false` for cluster worker engines: they start
     /// empty and receive jobs as leases (journals stay on regardless).
@@ -133,6 +138,7 @@ impl EngineConfig {
             state_dir,
             dest_dir,
             tuning,
+            max_active_downloads: None,
             speed_limit_bps,
             persist_queue: true,
             journal_suffix: "local".into(),
@@ -186,6 +192,7 @@ impl Engine {
             meter.clone(),
             limiter.clone(),
             cfg.speed_limit_bps,
+            cfg.max_active_downloads,
             engine_tx.clone(),
             tracker.clone(),
             cancel.clone(),
@@ -533,6 +540,15 @@ impl EngineHandle {
         .await
     }
 
+    /// Set how many jobs may download at once. Returns the value applied
+    /// after clamping.
+    pub async fn set_max_active_downloads(&self, n: u32) -> Result<u32, EngineError> {
+        let (tx, rx) = oneshot::channel();
+        self.send(QueueCommand::SetMaxActiveDownloads { n, reply: tx })
+            .await?;
+        rx.await.map_err(|_| EngineError::Closed)
+    }
+
     // -- cluster operations (used by nzbd-cluster; harmless elsewhere) ------
 
     /// Insert or replace a job with ids preserved; optionally fold its
@@ -631,6 +647,21 @@ impl EngineHandle {
     ) -> Result<(), EngineError> {
         self.roundtrip_unit(|reply| QueueCommand::SetServerBudgets { budgets, reply })
             .await
+    }
+
+    /// Set the operator's per-server connection counts without a
+    /// restart. Returns what was actually applied — each value clamped to
+    /// the number of connection tasks that server spawned at boot, since
+    /// raising the count beyond that needs new sockets and therefore a
+    /// bounce.
+    pub async fn set_server_connection_caps(
+        &self,
+        caps: std::collections::HashMap<nzbd_types::ServerId, u16>,
+    ) -> Result<std::collections::HashMap<nzbd_types::ServerId, u16>, EngineError> {
+        let (tx, rx) = oneshot::channel();
+        self.send(QueueCommand::SetServerConnectionCaps { caps, reply: tx })
+            .await?;
+        rx.await.map_err(|_| EngineError::Closed)
     }
 
     /// Become the queue authority (cluster leader took office).

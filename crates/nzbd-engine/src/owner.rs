@@ -122,6 +122,16 @@ pub(crate) enum QueueCommand {
         bytes_per_sec: Option<u64>,
         reply: oneshot::Sender<()>,
     },
+    /// How many jobs may download at once. Replies with the value
+    /// actually applied, which is the request clamped into range — the
+    /// caller learns what happened rather than having to re-read.
+    SetMaxActiveDownloads { n: u32, reply: oneshot::Sender<u32> },
+    /// Operator-set per-server connection counts. Replies with the values
+    /// actually applied after clamping to each server's spawned ceiling.
+    SetServerConnectionCaps {
+        caps: HashMap<ServerId, u16>,
+        reply: oneshot::Sender<HashMap<ServerId, u16>>,
+    },
 
     // -- cluster commands (CLUSTERING.md §7) --------------------------------
     /// Insert (or replace) a job with its ids preserved — the cluster grant
@@ -394,6 +404,17 @@ pub(crate) struct Owner {
     persist: bool,
     persist_guard: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
     budget_tx: watch::Sender<HashMap<ServerId, u16>>,
+    /// Cluster's share-out of a provider's account-wide connection limit.
+    cluster_budgets: HashMap<ServerId, u16>,
+    /// The operator's per-server connection count, changed from Settings
+    /// without a restart.
+    ///
+    /// Kept apart from the cluster budget rather than both writing
+    /// `budget_tx`, because they answer different questions — "how many
+    /// may this NODE open" and "how many do I WANT open" — and whichever
+    /// wrote last would erase the other's answer. What the connection
+    /// tasks see is the smaller of the two.
+    user_conn_caps: HashMap<ServerId, u16>,
 
     shared: SharedSnapshot,
     events: broadcast::Sender<Event>,
@@ -418,6 +439,9 @@ pub(crate) struct Owner {
     quota_reached: bool,
     disk_low: bool,
     guard_tick: u32,
+    /// Round-robin cursor over the active set, advanced per granted
+    /// lease. See `SelectionCtx::rotate`.
+    rotate: usize,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -443,6 +467,7 @@ impl Owner {
         meter: Arc<SpeedMeter>,
         limiter: Arc<RateLimiter>,
         config_speed_limit: Option<u64>,
+        config_max_active: Option<u32>,
         engine_tx: mpsc::Sender<EngineMsg>,
         tracker: TaskTracker,
         cancel: CancellationToken,
@@ -509,6 +534,12 @@ impl Owner {
             state.speed_limit_bps = config_speed_limit;
         }
         limiter.set(state.speed_limit_bps);
+        // Same rule for concurrency: a value in the file is the operator
+        // stating an intent, and it outranks whatever the last runtime
+        // nudge happened to leave in the snapshot.
+        if let Some(n) = config_max_active {
+            state.max_active_downloads = crate::queue::clamp_active_downloads(n);
+        }
 
         Ok(Owner {
             state,
@@ -532,6 +563,8 @@ impl Owner {
             persist,
             persist_guard,
             budget_tx,
+            cluster_budgets: HashMap::new(),
+            user_conn_caps: HashMap::new(),
             shared,
             events,
             epoch_tx,
@@ -551,6 +584,7 @@ impl Owner {
             volumes: crate::volumes::VolumeBook::load(state_dir, journal_suffix),
             quota_reached: false,
             disk_low: false,
+            rotate: 0,
             guard_tick: 0,
         })
     }
@@ -588,6 +622,54 @@ impl Owner {
         }
         self.writers.clear(); // writers drain and exit
         tracing::info!("queue owner stopped");
+    }
+
+    /// Return jobs to `Queued` once they are neither in the active set
+    /// nor holding a lease.
+    ///
+    /// `Downloading` is set the moment a job receives its first lease and
+    /// was never once set back, so a job that caught a single segment
+    /// during the spill-over at the tail of another job stayed labelled
+    /// `Downloading` forever while receiving no work — a permanent claim
+    /// made on the strength of one article. Harmless while the UI showed
+    /// a flat list; the queue now groups rows by what they are doing, so
+    /// the label is a heading a job sits under, and a job sitting under
+    /// DOWNLOADING with no rate is the page telling a lie.
+    ///
+    /// Scans segments only for jobs currently claiming to download, and
+    /// only until the first lease is found, so the expensive full scan
+    /// happens once per stale job — after which it is `Queued` and no
+    /// longer a candidate.
+    fn settle_download_labels(&mut self) {
+        let demoted =
+            crate::queue::jobs_to_requeue(&self.state, &self.delegated, self.quota_reached);
+        if demoted.is_empty() {
+            return;
+        }
+        for id in demoted {
+            if let Some(job) = self.state.job_mut(id) {
+                job.status = JobStatus::Queued;
+            }
+        }
+        self.dirty = true;
+    }
+
+    /// Publish the effective per-server connection allowance: the smaller
+    /// of what the cluster grants this node and what the operator asked
+    /// for. An absent entry on either side means "no opinion".
+    fn publish_conn_budgets(&mut self) {
+        let mut out: HashMap<ServerId, u16> = self.cluster_budgets.clone();
+        for (id, want) in &self.user_conn_caps {
+            let eff = match out.get(id) {
+                Some(cluster) => (*cluster).min(*want),
+                None => *want,
+            };
+            out.insert(*id, eff);
+        }
+        let _ = self.budget_tx.send(out);
+        // Raising an allowance unparks tasks asleep on the budget
+        // channel; they also need telling there may be work.
+        self.bump_epoch();
     }
 
     fn startup_pass(&mut self) {
@@ -971,6 +1053,23 @@ impl Owner {
                 self.publish_now();
                 let _ = reply.send(());
             }
+            QueueCommand::SetMaxActiveDownloads { n, reply } => {
+                let n = crate::queue::clamp_active_downloads(n);
+                self.state.max_active_downloads = n;
+                self.dirty = true;
+                // Lowering the cap leaves jobs labelled Downloading that
+                // are no longer in the set; settle them now rather than
+                // up to a second later, so the queue redraws once with
+                // the right answer instead of twice.
+                self.settle_download_labels();
+                self.emit(Event::MaxActiveDownloadsChanged { n });
+                // Wake the parked connection tasks: raising the cap makes
+                // work available that the last scan said did not exist,
+                // and nothing else would tell them for up to `idle_hold`.
+                self.bump_epoch();
+                self.publish_now();
+                let _ = reply.send(n);
+            }
             QueueCommand::ImportJob {
                 job,
                 fold_journals,
@@ -1019,9 +1118,34 @@ impl Owner {
             }
             QueueCommand::SetServerBudgets { budgets, reply } => {
                 tracing::info!(?budgets, "connection budgets updated");
-                let _ = self.budget_tx.send(budgets);
-                self.bump_epoch();
+                self.cluster_budgets = budgets;
+                self.publish_conn_budgets();
                 let _ = reply.send(());
+            }
+            QueueCommand::SetServerConnectionCaps { caps, reply } => {
+                // Clamp to what was actually spawned at boot: there are
+                // `max_connections` tasks per server and no more, so a
+                // higher number here would be a promise nothing keeps.
+                // The caller is told the effective values, so the UI can
+                // say "restart to go above this" instead of showing a
+                // figure the daemon is quietly ignoring.
+                let mut applied = HashMap::new();
+                for (id, want) in caps {
+                    let ceiling = self
+                        .servers
+                        .iter()
+                        .find(|s| s.id == id)
+                        .map(|s| s.max_connections)
+                        .unwrap_or(0);
+                    if ceiling == 0 {
+                        continue;
+                    }
+                    applied.insert(id, want.clamp(1, ceiling));
+                }
+                tracing::info!(?applied, "connection counts updated");
+                self.user_conn_caps = applied.clone();
+                self.publish_conn_budgets();
+                let _ = reply.send(applied);
             }
             QueueCommand::AdoptAuthority { reply } => {
                 self.adopt_authority();
@@ -1309,6 +1433,7 @@ impl Owner {
                 now_unix: unix_now(),
                 propagation_delay_secs: self.tuning.propagation_delay.as_secs() as i64,
                 soft_hold: self.quota_reached,
+                rotate: self.rotate,
             };
             let result = next_for_server(&self.state, server, &mut ctx);
             let exhausted = result.exhausted;
@@ -1331,6 +1456,12 @@ impl Owner {
                     job.status = JobStatus::Downloading;
                 }
             }
+            // Advance the cursor for the NEXT lease, whichever connection
+            // asks for it. One counter for the whole owner, not one per
+            // server: the active set is a queue-wide notion, and per-
+            // server cursors would let two servers settle into lockstep
+            // on the same job.
+            self.rotate = self.rotate.wrapping_add(1);
             leases.push(Lease {
                 r,
                 message_id,
@@ -1951,6 +2082,7 @@ impl Owner {
     fn on_tick(&mut self) {
         let tick_started = Instant::now();
         self.guard_tick = self.guard_tick.wrapping_add(1);
+        self.settle_download_labels();
         // Guards on the FIRST tick and every 10th after (== 1, not == 0:
         // a fresh boot should know it is out of disk within a second, not
         // ten). NOT `is_multiple_of`: stabilized in 1.87, MSRV is 1.85.
@@ -2238,6 +2370,7 @@ impl Owner {
                 v
             },
             speed_limit_bps: self.state.speed_limit_bps,
+            max_active_downloads: self.state.max_active_downloads,
             download_rate_bps: rate,
             session_downloaded_bytes: self.meter.total(),
             remaining_bytes: self.state.remaining_bytes(),

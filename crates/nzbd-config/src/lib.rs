@@ -272,6 +272,19 @@ pub struct QueueConfig {
     pub propagation_delay_mins: u32,
     pub min_free_disk_mb: u64,
     pub speed_limit_kib: Option<u64>,
+    /// How many jobs may download at the same time (1..=100).
+    ///
+    /// `1` is nzbd's historical behavior and the default: the top job
+    /// takes every connection until it runs out of segments to hand out.
+    /// Raising it splits the connection pool evenly across that many
+    /// jobs — priority still decides WHICH jobs, this decides how many.
+    ///
+    /// It does not make anything faster. The same connections move the
+    /// same bytes; they arrive spread over several jobs instead of
+    /// finishing one at a time, so first-completion gets slower and
+    /// everything-completes stays put. Raise it when you want several
+    /// things moving, not when you want more throughput.
+    pub max_active_downloads: u32,
     /// Daily/monthly download quotas in MB (0 = unlimited); NZBGet
     /// `DailyQuota` / `MonthlyQuota` / `QuotaStartDay`.
     pub daily_quota_mb: u64,
@@ -293,6 +306,7 @@ impl Default for QueueConfig {
             propagation_delay_mins: 0,
             min_free_disk_mb: 250,
             speed_limit_kib: None,
+            max_active_downloads: 1,
             daily_quota_mb: 0,
             monthly_quota_mb: 0,
             quota_start_day: 1,
@@ -396,6 +410,15 @@ impl Config {
     /// Configured speed limit in bytes/sec.
     pub fn speed_limit_bps(&self) -> Option<u64> {
         self.queue.speed_limit_kib.map(|k| k * 1024)
+    }
+
+    /// The configured concurrent-download cap, clamped into range.
+    ///
+    /// Always `Some`: unlike the speed limit there is no "unset" — the
+    /// default of 1 is a real policy, so the file always outranks a
+    /// value left in the snapshot by a runtime nudge.
+    pub fn max_active_downloads(&self) -> Option<u32> {
+        Some(self.queue.max_active_downloads.clamp(1, 100))
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
@@ -1337,21 +1360,150 @@ Server2.Connections=0
     }
 }
 
+/// Did any server's `connections` count move?
+fn server_conns_changed(old: &Config, new: &Config) -> bool {
+    if old.servers.len() != new.servers.len() {
+        return false; // adding or removing a server is a restart anyway
+    }
+    old.servers
+        .iter()
+        .zip(new.servers.iter())
+        .any(|(o, n)| o.connections != n.connections)
+}
+
+/// Are the server lists the same apart from their connection counts?
+fn servers_equal_ignoring_connections(old: &Config, new: &Config) -> bool {
+    if old.servers.len() != new.servers.len() {
+        return false;
+    }
+    old.servers.iter().zip(new.servers.iter()).all(|(o, n)| {
+        let mut o = o.clone();
+        let mut n = n.clone();
+        o.connections = 0;
+        n.connections = 0;
+        o == n
+    })
+}
+
+#[cfg(test)]
+mod live_settings_tests {
+    use super::*;
+
+    fn base() -> Config {
+        let mut c = Config::default();
+        c.servers.push(ServerConfig {
+            name: "eweka".into(),
+            host: "news.example".into(),
+            connections: 8,
+            ..Default::default()
+        });
+        c
+    }
+
+    /// A live key must not also flag its section as restart-required.
+    /// `diff_sections` compares whole sections, so every key added to the
+    /// live list needs holding equal before that compare — forget it and
+    /// every save raises a restart banner nobody can clear.
+    #[test]
+    fn a_live_key_does_not_also_demand_a_restart() {
+        let old = base();
+        let mut new = base();
+        new.queue.max_active_downloads = 4;
+        let (live, restart) = diff_sections(&old, &new);
+        assert!(live.contains(&"max active downloads"));
+        assert!(
+            !restart.contains(&"queue"),
+            "changing only a live key must not ask for a bounce: {restart:?}"
+        );
+    }
+
+    /// Connection counts apply live; everything else about a server is
+    /// baked into a socket that already exists.
+    #[test]
+    fn connection_counts_are_live_but_the_rest_of_a_server_is_not() {
+        let old = base();
+        let mut new = base();
+        new.servers[0].connections = 4;
+        let (live, restart) = diff_sections(&old, &new);
+        assert!(live.contains(&"connections"));
+        assert!(
+            !restart.contains(&"servers"),
+            "only the count moved: {restart:?}"
+        );
+
+        let mut moved_host = base();
+        moved_host.servers[0].host = "other.example".into();
+        let (live, restart) = diff_sections(&old, &moved_host);
+        assert!(restart.contains(&"servers"), "a new host needs a reconnect");
+        assert!(!live.contains(&"connections"));
+
+        // Both at once: the host change still wins a restart.
+        let mut both = base();
+        both.servers[0].host = "other.example".into();
+        both.servers[0].connections = 2;
+        let (live, restart) = diff_sections(&old, &both);
+        assert!(live.contains(&"connections"));
+        assert!(restart.contains(&"servers"));
+    }
+
+    /// Adding or removing a server is structural, never live.
+    #[test]
+    fn adding_a_server_is_a_restart() {
+        let old = base();
+        let mut new = base();
+        new.servers.push(ServerConfig {
+            name: "block".into(),
+            host: "block.example".into(),
+            connections: 4,
+            ..Default::default()
+        });
+        let (live, restart) = diff_sections(&old, &new);
+        assert!(restart.contains(&"servers"));
+        assert!(!live.contains(&"connections"));
+    }
+
+    #[test]
+    fn an_unchanged_config_asks_for_nothing() {
+        let (live, restart) = diff_sections(&base(), &base());
+        assert!(live.is_empty(), "{live:?}");
+        assert!(restart.is_empty(), "{restart:?}");
+    }
+
+    #[test]
+    fn the_configured_cap_is_clamped() {
+        let mut c = Config::default();
+        c.queue.max_active_downloads = 0;
+        assert_eq!(c.max_active_downloads(), Some(1), "zero is not a pause");
+        c.queue.max_active_downloads = 9_999;
+        assert_eq!(c.max_active_downloads(), Some(100));
+        assert_eq!(Config::default().queue.max_active_downloads, 1);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Settings-editor support: masked secrets round-trip
 // ---------------------------------------------------------------------------
 
 /// Compare two configs section by section for the settings UI:
-/// returns (live_appliable, restart_required) section names. Only the
-/// global speed limit can be applied to a running daemon today; any
-/// other change needs a restart.
+/// returns (live_appliable, restart_required) section names.
+///
+/// A section listed as live must have a corresponding branch in
+/// `put_config`; the name is the contract between the two. Anything not
+/// named here needs a restart, which is the safe default.
 pub fn diff_sections(old: &Config, new: &Config) -> (Vec<&'static str>, Vec<&'static str>) {
     let mut live = Vec::new();
     let mut restart = Vec::new();
     if old.paths != new.paths {
         restart.push("paths");
     }
-    if old.servers != new.servers {
+    // Connection counts apply live; everything else about a server (host,
+    // credentials, TLS, tier) is baked into a socket that already exists.
+    // Compared with the counts held equal, so changing only those does
+    // not also flag the whole section as needing a bounce.
+    if server_conns_changed(old, new) {
+        live.push("connections");
+    }
+    if !servers_equal_ignoring_connections(old, new) {
         restart.push("servers");
     }
     if old.categories != new.categories {
@@ -1363,10 +1515,19 @@ pub fn diff_sections(old: &Config, new: &Config) -> (Vec<&'static str>, Vec<&'st
     if old.queue.speed_limit_kib != new.queue.speed_limit_kib {
         live.push("speed limit");
     }
+    if old.queue.max_active_downloads != new.queue.max_active_downloads {
+        live.push("max active downloads");
+    }
+    // Held equal before the rest of the section is compared, so a change
+    // to a live key does not also flag `queue` as restart-required. Every
+    // live key added above needs a line here or every save will claim a
+    // restart is pending.
     let mut oq = old.queue.clone();
     let mut nq = new.queue.clone();
     oq.speed_limit_kib = None;
     nq.speed_limit_kib = None;
+    oq.max_active_downloads = 0;
+    nq.max_active_downloads = 0;
     if oq != nq {
         restart.push("queue");
     }
