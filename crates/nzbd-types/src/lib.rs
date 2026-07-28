@@ -301,6 +301,28 @@ pub enum JobStatus {
     Deleted,
 }
 
+/// One stage a job passed through, and how long it stayed there.
+///
+/// The post manager has always measured this — `Stages::enter` stamps an
+/// `Instant` on every transition — and then banked it only into the
+/// process-wide histogram, so the per-job number was computed and thrown
+/// away at the same seam. "Why did THIS one take forty minutes" was
+/// unanswerable from a number that had already been averaged with every
+/// other job. Recording the span on the job is what makes the queue row's
+/// stage timer, the detail pipeline and the history breakdown possible;
+/// all three read this one list.
+///
+/// `ms` is `None` while the stage is still running: the UI shows a live
+/// timer from `started_at_unix` and switches to the banked figure when the
+/// stage closes, so a restart mid-repair does not invent a duration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StageSpan {
+    pub stage: PostStage,
+    pub started_at_unix: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ms: Option<u64>,
+}
+
 /// Job param stamped by post-processing when it finishes (value = final
 /// PP status). Its presence means "never post-process this job again" —
 /// across restarts, leader failovers and lease reclaims.
@@ -319,6 +341,13 @@ pub struct Job {
     pub files: Vec<FileEntry>,
     pub totals: JobTotals,
     pub status: JobStatus,
+    /// Post-processing stages this job has entered, in order. Appended on
+    /// every transition and persisted with the snapshot, so a daemon
+    /// restart mid-pipeline does not erase where the time went. Defaulted
+    /// on read: a queue.json written before this existed loads with an
+    /// empty timeline rather than failing to parse.
+    #[serde(default)]
+    pub stages: Vec<StageSpan>,
 }
 
 impl Job {
@@ -414,6 +443,7 @@ mod tests {
             files: vec![],
             totals: JobTotals::default(),
             status: JobStatus::Queued,
+            stages: Vec::new(),
         };
         assert!(!job.force_priority());
         job.priority = PRIORITY_FORCE;

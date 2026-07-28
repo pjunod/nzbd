@@ -59,6 +59,7 @@ fn completed_job(id: u32, name: &str, files: Vec<FileEntry>) -> Job {
         files,
         totals: JobTotals::default(),
         status: JobStatus::Completed,
+        stages: Vec::new(),
     }
 }
 
@@ -1170,4 +1171,104 @@ async fn a_multi_volume_archive_extracts_whole_or_fails() {
         }
         engine.shutdown().await;
     }
+}
+
+/// The stage timeline reaches history — every stage the job actually ran,
+/// in order, each with a duration.
+///
+/// The post manager has always measured this. `Stages::enter` stamps an
+/// `Instant` on every transition and `close` banks the elapsed time — into
+/// the process-wide `PpStageStats` histogram, and nowhere else. So "how
+/// long does unpack take across all jobs" was answerable from the same
+/// measurement that could not answer "how long did unpack take for THIS
+/// job". This test pins the second question.
+///
+/// The last stage matters most: it is closed by `Stages::finish` before
+/// the finalize export rather than by `Drop` after it, so the entry that
+/// lands in history does not show its final stage still running.
+#[tokio::test]
+async fn the_stage_timeline_reaches_history() {
+    if !require_tool("par2") {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let engine = spawn_engine(tmp.path()).await;
+    let dir = tmp.path().join("dest/timed");
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let data: Vec<u8> = (0..40_000u32).map(|i| (i % 251) as u8).collect();
+    std::fs::write(dir.join("payload.bin"), &data).unwrap();
+    par2_create(&dir, 8, &["payload.bin"]);
+
+    let mut files = vec![file_entry(1, "payload.bin", Some(crc(&data)), false)];
+    files.extend(par2_entries(&dir, 2));
+    engine
+        .import_job(completed_job(1, "timed", files), false, false)
+        .await
+        .unwrap();
+
+    let hist = history(tmp.path());
+    let out = process_job(
+        &engine,
+        &PostConfig::default(),
+        &hist,
+        &tmp.path().join("dest"),
+        JobId(1),
+    )
+    .await
+    .unwrap();
+    assert_eq!(out, PpFinal::Success);
+
+    let entries = hist.list(10).unwrap();
+    assert_eq!(entries.len(), 1);
+    let stages = &entries[0].stages;
+    assert!(
+        !stages.is_empty(),
+        "post-processing ran, so history must say where the time went"
+    );
+
+    // Every span is closed. An open span in history means the pipeline
+    // ended without the timeline being told — the exact failure that
+    // leaving this to `Drop` produces.
+    for s in stages {
+        assert!(
+            s.ms.is_some(),
+            "stage {:?} is still running in a finished job's history entry",
+            s.stage
+        );
+    }
+
+    let names: Vec<&str> = stages.iter().map(|s| s.stage.as_str()).collect();
+    assert!(
+        names.contains(&"par_verify"),
+        "a par set was present, so verify must appear: {names:?}"
+    );
+    // Only the stages that actually ran. This job needs no repair, has
+    // nothing to clean and is already in its destination, and the
+    // timeline reflects that rather than listing the whole pipeline with
+    // zeroes — an operator reading it should see what happened, not what
+    // could have.
+    assert!(
+        !names.contains(&"par_repair"),
+        "an intact job never entered repair: {names:?}"
+    );
+    assert!(
+        !names.contains(&"script"),
+        "no scripts were configured: {names:?}"
+    );
+    // Spans are appended in execution order, so their starts never go
+    // backwards.
+    let starts: Vec<i64> = stages.iter().map(|s| s.started_at_unix).collect();
+    assert!(
+        starts.windows(2).all(|w| w[0] <= w[1]),
+        "spans must be in pipeline order, got {starts:?}"
+    );
+    // None left open — including the last, which is the one
+    // `Stages::finish` exists to close in time.
+    assert!(stages.last().unwrap().ms.is_some());
+
+    // And the live queue view agrees with what history recorded.
+    let job = engine.export_job(JobId(1)).await.unwrap().unwrap();
+    assert_eq!(job.stages.len(), stages.len());
+    engine.shutdown().await;
 }

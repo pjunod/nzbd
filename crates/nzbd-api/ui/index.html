@@ -111,7 +111,14 @@
   td.num, th.num { text-align: right; }
   td .name { font-weight: 550; word-break: break-word; display: -webkit-box;
              -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
-  .st-inline { display: none; }
+  /* The status chip in the name cell is a PHONE fallback for the hidden
+     status column. It has to out-specify `.st` below, which sets
+     `display: inline-block` and, being later in the sheet at equal
+     specificity, was quietly winning — so the chip showed on desktop too.
+     Harmless-looking until the section heading above the row started
+     naming the same state, at which point the row said DOWNLOADING three
+     times. */
+  .st.st-inline { display: none; }
   td .sub { color: var(--muted); font-size: 12px; }
 
   .meter { min-width: 170px; }
@@ -193,6 +200,37 @@
   .btnlike { border: 1px solid var(--line); border-radius: 7px; padding: 2px 9px;
              color: var(--ink2); text-decoration: none; font-size: 12px; background: var(--panel); }
   .btnlike:hover { border-color: var(--accent); color: var(--ink); }
+  /* Section headings. A row in the same table as the jobs, so every
+     column still lines up down the page across sections. */
+  tr.section-tr > td.section { padding: 14px 10px 5px; border-bottom: none;
+    font-size: 11px; font-weight: 700; letter-spacing: .09em;
+    text-transform: uppercase; color: var(--muted); }
+  tr.section-tr:first-child > td.section { padding-top: 5px; }
+  .sec-count { margin-left: 7px; font-weight: 600; letter-spacing: normal;
+    opacity: .7; }
+  .sec-label { cursor: help; }
+  /* Where a finished job's post-processing time went, under its status. */
+  .pp-note { font-size: 10.5px; color: var(--muted); margin-top: 2px;
+    font-variant-numeric: tabular-nums; }
+  .pp-note:not(:empty) { cursor: help; }
+  /* The job-detail pipeline: stages left to right, wrapping on narrow
+     screens. Tabular figures so the durations stay comparable even when
+     the labels are different widths. */
+  .jd-pipe { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 9px; }
+  .jd-pipe:empty { display: none; }
+  .pipe-stage { display: inline-flex; align-items: baseline; gap: 6px;
+    border: 1px solid var(--line); border-radius: 7px; padding: 3px 9px;
+    font-size: 11.5px; color: var(--ink2); background: var(--panel);
+    font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .pipe-stage .ps-dur { color: var(--muted); font-size: 11px; }
+  /* Running: the one stage still costing time. */
+  .pipe-stage.running { border-color: var(--warn); color: var(--ink);
+    font-weight: 600; }
+  .pipe-stage.running .ps-dur { color: var(--warn); }
+  /* Slowest completed stage — the answer to "where did the time go",
+     marked only when there is more than one closed stage to compare. */
+  .pipe-stage.slow { border-color: color-mix(in srgb, var(--ink2) 45%, var(--line)); }
+  .pipe-stage.slow .ps-dur { color: var(--ink); font-weight: 650; }
   table.subtable { margin-top: 8px; border: 1px solid var(--line); }
   table.subtable th, table.subtable td { padding: 4px 8px; font-size: 12px; }
   .jd-logs { margin-top: 8px; max-height: 170px; overflow-y: auto;
@@ -336,7 +374,7 @@
     .stat .v { font-size: 16px; }
     th.num, td.num { display: none; }        /* size/health columns */
     th:nth-child(2), td:nth-child(2) { display: none; } /* status column */
-    .st-inline { display: inline-block; margin-top: 3px; }
+    .st.st-inline { display: inline-block; margin-top: 3px; }
     .acts .mv { display: none; }             /* move buttons: desktop only */
     .acts { flex-direction: column; align-items: stretch; }
     .meter { min-width: 110px; }
@@ -462,7 +500,7 @@
 
   <section id="tab-queue">
     <table>
-      <thead><tr><th>Job</th><th>Status</th><th style="width:250px">Progress</th>
+      <thead><tr><th>Job</th><th style="width:96px">Status</th><th style="width:250px">Progress</th>
         <th class="num">Size</th><th class="num">Health</th><th style="width:190px"></th></tr></thead>
       <tbody id="queue-body"><tr><td colspan="6" class="empty">Loading the queue…</td></tr></tbody>
     </table>
@@ -892,6 +930,102 @@ function statusName(st) {
   return (stage && STAGE_LABEL[stage]) || ("post: " + (stage || "…"));
 }
 
+/// What to SHOW for a status. `statusName` returns the wire-ish name
+/// because the pending-op overlay compares against it (`=== "paused"`),
+/// which means its output is not always something to put in front of a
+/// person: `post_queued` is a token, not a phrase, and it was reaching
+/// the screen verbatim.
+const STATUS_HUMAN = { post_queued: "waiting to post-process" };
+function statusLabel(st) {
+  const n = statusName(st);
+  return STATUS_HUMAN[n] || n;
+}
+
+// ---- sections -----------------------------------------------------------
+// The queue answers "what is this machine doing" before it answers "what is
+// next", so every job that is MOVING sits under a heading naming the thing
+// it is doing, and everything still waiting for a turn stays in one list in
+// the order you put it in.
+//
+// The split is not cosmetic. Only jobs in the download queue contend for
+// position, so only they need `move up` / `move down` — a job three
+// quarters of the way through a par repair has no position to argue about.
+// Grouping the active ones by stage and leaving the queue itself alone
+// means the order you control is still the order you see.
+//
+// `key` doubles as the section's reconcile key, so a job moving from
+// EXTRACTING to MOVING relocates one row and rewrites two counts instead of
+// rebuilding the table.
+const SECTIONS = [
+  { key: "downloading", label: "Downloading", ordered: true,
+    tip: "Pulling articles from your news servers." },
+  { key: "fetching", label: "Fetching NZB", ordered: true,
+    tip: "Retrieving the NZB from the indexer — the job has no files yet." },
+  { key: "post_queued", label: "Waiting to post-process",
+    tip: "Downloaded, waiting for a post-processing slot. Raise [post] strategy to run more at once." },
+  { key: "renaming", label: "Renaming",
+    tip: "Recovering real filenames from the par2 set or the archive headers." },
+  { key: "verifying", label: "Checking integrity",
+    tip: "Verifying the download against its par2 blocks." },
+  { key: "repairing", label: "Repairing",
+    tip: "Rebuilding damaged data from par2 recovery blocks. This is the slow one." },
+  { key: "extracting", label: "Extracting",
+    tip: "Unpacking the archive set." },
+  { key: "cleaning", label: "Cleaning up",
+    tip: "Removing par2 and archive parts now the payload is out." },
+  { key: "moving", label: "Moving",
+    tip: "Moving the finished files to their destination." },
+  { key: "scripting", label: "Running scripts",
+    tip: "Running your post-processing scripts." },
+  { key: "waiting", label: "Waiting", ordered: true,
+    tip: "In the queue, in your order. These are the jobs move up / move down act on." },
+];
+const STAGE_SECTION = {
+  par_rename: "renaming", rar_rename: "renaming", post_unpack_rename: "renaming",
+  par_verify: "verifying", par_repair: "repairing", unpack: "extracting",
+  cleanup: "cleaning", move: "moving", script: "scripting",
+};
+// Sections whose jobs are still in the download queue, so their position is
+// a real thing a person can change. Everywhere else the move buttons would
+// be levers attached to nothing.
+const ORDERED = new Set(SECTIONS.filter(s => s.ordered).map(s => s.key));
+
+function sectionOf(j) {
+  const st = j.status;
+  if (typeof st !== "string")
+    return STAGE_SECTION[st && st.post ? st.post.stage : null] || "post_queued";
+  if (st === "downloading") return "downloading";
+  if (st === "fetching") return "fetching";
+  if (st === "post_queued") return "post_queued";
+  return "waiting"; // queued, paused — and anything new, which belongs in a
+                    // list you can see rather than in no list at all
+}
+
+/// A coarse duration for stage timings: never more precision than the
+/// figure deserves, and never a bare "0s" for something still starting.
+function fmtDur(ms) {
+  if (ms == null) return "";
+  const sec = Math.floor(ms / 1000);
+  if (sec < 1) return "<1s";
+  if (sec < 60) return sec + "s";
+  const m = Math.floor(sec / 60), s = sec % 60;
+  if (m < 60) return m + "m" + (s ? " " + s + "s" : "");
+  const h = Math.floor(m / 60);
+  return h + "h" + (m % 60 ? " " + (m % 60) + "m" : "");
+}
+
+/// How long a job has been in its current stage, from the open span on its
+/// timeline. Computed here from the wall clock rather than read off the
+/// server, because the 1 Hz tick is suppressed when its payload has not
+/// changed — and during a repair nothing changes, so a server-side timer
+/// would be the one number guaranteed to freeze exactly when you are
+/// watching it.
+function stageElapsedMs(j, nowMs) {
+  const last = j.stages && j.stages.length ? j.stages[j.stages.length - 1] : null;
+  if (!last || last.ms != null) return null;
+  return Math.max(0, (nowMs == null ? Date.now() : nowMs) - last.started_at_unix * 1000);
+}
+
 // Health color: green at 100% fading to red at the par-repair limit
 // (critical health). Below it the job is unrepairable — full red.
 function healthColor(health, critical) {
@@ -915,8 +1049,12 @@ function rowModel(j, ctx) {
   const total = j.size_bytes || 0;
   const done = Math.min(j.downloaded_bytes || 0, total);
   const pct = total ? Math.floor(done * 100 / total) : 0;
-  const isPost = typeof j.status !== "string";
   const st = statusName(j.status);
+  // Everything past the download: the stages proper, and the wait for a
+  // post slot. `post_queued` is a plain string status, so testing only for
+  // the nested `Post { stage }` shape misses it — and its bar is just as
+  // finished, and just as misleading under its own heading.
+  const isPost = typeof j.status !== "string" || st === "post_queued";
   const cls = isPost ? "warn" : (STATUS_CLASS[st] || "dim");
   const paused = st === "paused";
   const dl = st === "downloading";
@@ -933,7 +1071,18 @@ function rowModel(j, ctx) {
     rest.push(" · " + fmtRate(j.rate_bps));
     rest.push(" · ~" + fmtEta(Math.max(0, j.remaining_bytes), j.rate_bps));
   }
-  if (isPost) rest.push(" · " + st + "…");
+  // A post-processing row's own heading already names the stage, so the
+  // line under the bar answers the question the heading raises instead:
+  // how long it has been doing that. Twenty minutes into a repair is the
+  // difference between "working" and "wedged", and it is the only number
+  // on the row that is still moving.
+  if (isPost) {
+    const el = stageElapsedMs(j, ctx.nowMs);
+    // No open span means no stage has started (waiting for a post slot).
+    // The heading above the row already says so; repeating it here in the
+    // daemon's own vocabulary would be worse than saying nothing.
+    if (el != null) rest.push(" · " + fmtDur(el) + " in " + st);
+  }
 
   const crit = j.critical_health || 850;
   const doomed = j.health < crit;
@@ -967,10 +1116,21 @@ function rowModel(j, ctx) {
     nameTip: j.name + " — click for details",
     sub: "#" + j.id + (j.category ? " · " + j.category : "") +
          (j.assigned_node ? " · on " + j.assigned_node : "") + " ",
-    st: shownSt.toUpperCase(),
+    st: (STATUS_HUMAN[shownSt] || shownSt).toUpperCase(),
     stCls: "st " + shownCls,
+    // Under a heading that names the stage, a pill repeating it is the
+    // same word twice on one line. Only the waiting list mixes states
+    // (queued sitting next to paused), so only there does the pill still
+    // say something the heading did not.
+    stHidden: ctx.mixedSection === false,
     stInlineCls: "st st-inline " + shownCls,
-    pct: fetching ? "" : pct + "%",
+    // A post-processing job has already downloaded every byte, so its bar
+    // sits at a full 100% — which in a section headed REPAIRING reads as
+    // "finished" for a job that has nineteen minutes of work left. The
+    // percentage is answering a question nobody is asking any more. No
+    // bar; the stage and its timer carry the row.
+    barHidden: isPost,
+    pct: fetching || isPost ? "" : pct + "%",
     fill: pct + "%",
     fillCls: pct >= 100 ? "fill done" : "fill",
     dBold: fetching ? "" : fmtBytes(done),
@@ -989,6 +1149,10 @@ function rowModel(j, ctx) {
     hNoteTip: hNoteTip,
     upDisabled: ctx.idx === 0,
     downDisabled: ctx.idx === (ctx.count || 0) - 1,
+    // `movable` defaults to true so a caller that renders a row outside
+    // the sectioned queue (the DOM harness, a future flat view) keeps the
+    // controls it always had.
+    moveHidden: ctx.movable === false,
     pauseHidden: fetching,
     pauseLabel: (over || st) === "paused" ? "resume" : "pause",
     pauseAction: (over || st) === "paused" ? "resume" : "pause",
@@ -1016,7 +1180,7 @@ function buildJobRow(d) {
 
   const td3 = d.append(tr, d.create("td"));
   const meter = d.append(td3, d.create("div", "meter"));
-  const bar = d.append(meter, d.create("div", "bar"));
+  const bar = c.bar = d.append(meter, d.create("div", "bar"));
   const track = d.append(bar, d.create("div", "track"));
   c.fill = d.append(track, d.create("div", "fill"));
   c.pct = d.append(bar, d.create("span", "pct"));
@@ -1064,7 +1228,9 @@ function applyRow(tr, m, d) {
   w("sub", m.sub, v => d.text(c.sub, v));
   w("st", m.st, v => { d.text(c.st, v); d.text(c.stInline, v); });
   w("stCls", m.stCls, v => d.cls(c.st, v));
+  w("stHidden", m.stHidden, v => d.prop(c.st, "hidden", v));
   w("stInlineCls", m.stInlineCls, v => d.cls(c.stInline, v));
+  w("barHidden", m.barHidden, v => d.prop(c.bar, "hidden", v));
   w("pct", m.pct, v => d.text(c.pct, v));
   w("fill", m.fill, v => d.style(c.fill, "width", v));
   w("fillCls", m.fillCls, v => d.cls(c.fill, v));
@@ -1084,6 +1250,9 @@ function applyRow(tr, m, d) {
   });
   w("downDisabled", m.downDisabled, v => {
     d.prop(c.down, "disabled", v); d.prop(c.bottom, "disabled", v);
+  });
+  w("moveHidden", m.moveHidden, v => {
+    for (const b of [c.top, c.up, c.down, c.bottom]) d.prop(b, "hidden", v);
   });
   w("pauseHidden", m.pauseHidden, v => d.prop(c.pause, "hidden", v));
   w("pauseLabel", m.pauseLabel, v => d.text(c.pause, v));
@@ -1106,6 +1275,30 @@ function applyEmptyRow(tr, m, d) {
   differ(tr)("text", m.text, v => d.text(tr.__c.td, v));
 }
 KINDS.empty = { build: buildEmptyRow, apply: applyEmptyRow };
+
+// ---- section header ------------------------------------------------------
+// A `<tr>` rather than a caption between tables, so the columns underneath
+// stay in one grid: two tables side by side would let "Size" sit at a
+// different x for a repairing job than for a downloading one, and the
+// comparison down the column is most of what the queue is for.
+function buildSectionRow(d) {
+  const tr = d.create("tr", "section-tr");
+  const td = d.append(tr, d.create("td", "section"));
+  d.attr(td, "colspan", "6");
+  const c = {};
+  c.label = d.append(td, d.create("span", "sec-label"));
+  c.count = d.append(td, d.create("span", "sec-count"));
+  tr.__c = c;
+  return tr;
+}
+function applySectionRow(tr, m, d) {
+  d = d || dom;
+  const c = tr.__c, w = differ(tr);
+  w("label", m.label, v => d.text(c.label, v));
+  w("count", m.count, v => d.text(c.count, v));
+  w("tip", m.tip || "", v => d.prop(c.label, "title", v));
+}
+KINDS.section = { build: buildSectionRow, apply: applySectionRow };
 
 // ---- job detail panel ---------------------------------------------------
 // A stable subtree: the files table is reconciled by file id, the activity
@@ -1137,6 +1330,11 @@ function buildDetailRow(d) {
   d.data(c.close, "action", "detail-close");
   d.text(c.close, "close");
 
+  // The pipeline sits above the files: what happened to this job, in
+  // order, is the first thing you want when you open it — the file list
+  // answers a narrower question and can wait its turn.
+  c.pipe = d.append(wrap, d.create("div", "jd-pipe"));
+
   c.filesTable = d.append(wrap, d.create("table", "subtable"));
   const thead = d.append(c.filesTable, d.create("thead"));
   const htr = d.append(thead, d.create("tr"));
@@ -1150,14 +1348,54 @@ function buildDetailRow(d) {
   return tr;
 }
 
-function detailModel(j) {
+/// The job's post-processing pipeline, as stage rows.
+///
+/// Only the stages that actually ran. A job that needed no repair does not
+/// get a greyed-out "repairing 0s" — listing every stage the software
+/// COULD have run buries the three it did, and the whole reason to open a
+/// job is to find the one that took the time.
+///
+/// The running stage is marked, and carries a live elapsed figure rather
+/// than a banked one; everything before it is closed and shows what it
+/// cost. `slow` marks the longest closed stage once there is more than one
+/// to compare, which is the answer to the question people actually open
+/// this panel with.
+function pipelineModels(j, nowMs) {
+  const spans = j.stages || [];
+  if (!spans.length) return [];
+  let slowest = -1, slowestMs = -1;
+  spans.forEach((s, i) => {
+    if (s.ms != null && s.ms > slowestMs) { slowestMs = s.ms; slowest = i; }
+  });
+  const closed = spans.filter(s => s.ms != null).length;
+  return spans.map((s, i) => {
+    const running = s.ms == null;
+    const ms = running ? stageElapsedMs(j, nowMs) : s.ms;
+    return {
+      key: "st" + i + ":" + s.stage,
+      kind: "stage",
+      label: STAGE_LABEL[s.stage] || s.stage,
+      dur: fmtDur(ms),
+      cls: "pipe-stage" + (running ? " running" : "")
+         + (!running && i === slowest && closed > 1 ? " slow" : ""),
+      tip: running
+        ? "Running now — the daemon entered this stage at "
+          + new Date(s.started_at_unix * 1000).toLocaleTimeString() + "."
+        : "Took " + fmtDur(s.ms) + ", starting "
+          + new Date(s.started_at_unix * 1000).toLocaleTimeString() + ".",
+    };
+  });
+}
+
+function detailModel(j, nowMs) {
   const st = statusName(j.status);
   const cls = typeof j.status !== "string" ? "warn" : (STATUS_CLASS[st] || "dim");
   const files = store.jobFiles && store.jobFiles.job === j.id ? store.jobFiles.files : null;
   const logs = store.jobLogs && store.jobLogs.job === j.id ? store.jobLogs.entries : null;
   return {
     key: "__detail", kind: "detail", id: j.id,
-    st: st.toUpperCase(), stCls: "st " + cls,
+    pipe: pipelineModels(j, nowMs),
+    st: statusLabel(j.status).toUpperCase(), stCls: "st " + cls,
     articles: "articles " + j.done_articles + "/" + j.total_articles +
       (j.failed_articles ? " · " + j.failed_articles + " failed" : "") +
       (j.retried_articles ? " · " + j.retried_articles + " retried" : ""),
@@ -1233,6 +1471,10 @@ function applyDetail(tr, m, d) {
   w("health", m.health, v => d.text(c.health, v));
   w("dupe", m.dupe, v => d.text(c.dupe, v));
   w("nzbHref", m.nzbHref, v => d.attr(c.nzb, "href", v));
+  // Pipeline: keyed by position + stage, so a job that enters the same
+  // stage twice (a repair that runs, fetches more par blocks, and runs
+  // again) gets two rows rather than one that overwrites itself.
+  reconcileRows(c.pipe, m.pipe || [], d);
   // Files: keyed by file id, so a file that only gained segments keeps its
   // node — and the table does not jump under the pointer.
   const fileModels = m.files
@@ -1255,6 +1497,25 @@ function applyDetail(tr, m, d) {
   reconcileRows(c.logs, logModels, d);
 }
 KINDS.detail = { build: buildDetailRow, apply: applyDetail };
+
+// One stage in the job detail pipeline.
+function buildStage(d) {
+  const el = d.create("div", "pipe-stage");
+  const c = {};
+  c.label = d.append(el, d.create("span", "ps-label"));
+  c.dur = d.append(el, d.create("span", "ps-dur"));
+  el.__c = c;
+  return el;
+}
+function applyStage(el, m, d) {
+  d = d || dom;
+  const c = el.__c, w = differ(el);
+  w("label", m.label, v => d.text(c.label, v));
+  w("dur", m.dur, v => d.text(c.dur, v));
+  w("cls", m.cls, v => d.cls(el, v));
+  w("tip", m.tip || "", v => d.prop(el, "title", v));
+}
+KINDS.stage = { build: buildStage, apply: applyStage };
 
 function buildNote(d) { return d.create("div", "empty"); }
 function applyNote(node, m, d) {
@@ -1348,21 +1609,45 @@ function queueModels() {
       key: "__empty", kind: "empty", span: 6,
       text: "No downloads in the queue. Drop one in with “+ add nzb”.",
     }];
+  // Index the page BEFORE grouping. `move up` is a queue operation on the
+  // job's global position, and the section a row is drawn under must not
+  // change what the arrow next to it does.
+  const shown = p.shown.map((j, i) => ({ j, idx: p.start + i }));
+  const groups = new Map();
+  for (const x of shown) {
+    const k = sectionOf(x.j);
+    const g = groups.get(k);
+    if (g) g.push(x); else groups.set(k, [x]);
+  }
+  const nowMs = Date.now();
   const out = [];
-  p.shown.forEach((j, i) => {
-    out.push(rowModel(j, {
-      // GLOBAL position, not the position on this page: "move up" is a
-      // queue operation, so the first row of page 2 can still move up.
-      idx: p.start + i,
-      count: p.total,
-      healthAbortArmed: store.healthAbort,
-      pendingOps: pending,
-    }));
-    // The detail panel belongs to its row, so it only exists while that
-    // row is on screen. Reopening on the way back is instant — `openJob`
-    // is not cleared by paging.
-    if (j.id === openJob) out.push(detailModel(j));
-  });
+  for (const sec of SECTIONS) {
+    const g = groups.get(sec.key);
+    if (!g || !g.length) continue; // a stage nothing is in gets no heading
+    out.push({
+      key: "sec:" + sec.key, kind: "section",
+      label: sec.label, count: String(g.length), tip: sec.tip,
+    });
+    for (const x of g) {
+      out.push(rowModel(x.j, {
+        idx: x.idx,
+        count: p.total,
+        healthAbortArmed: store.healthAbort,
+        pendingOps: pending,
+        // Off the download queue, position means nothing and the arrows
+        // say so by not being there.
+        movable: ORDERED.has(sec.key),
+        // Only the waiting list holds jobs whose statuses differ from one
+        // another; every other section's heading IS its rows' status.
+        mixedSection: sec.key === "waiting",
+        nowMs,
+      }));
+      // The detail panel belongs to its row, so it only exists while that
+      // row is on screen. Reopening on the way back is instant — `openJob`
+      // is not cleared by paging.
+      if (x.j.id === openJob) out.push(detailModel(x.j, nowMs));
+    }
+  }
   return out;
 }
 function renderQueue() {
@@ -1538,7 +1823,19 @@ function renderStatus() {
     : fmtEta(s.remaining_bytes, s.download_rate_bps));
   setText($("s-remaining"), fmtBytes(s.remaining_bytes));
   setText($("s-session"), fmtBytes(s.session_downloaded_bytes));
-  setText($("s-active"), s.jobs_downloading + " / " + s.jobs_queued);
+  // "active" is every job the daemon is working on, post-processing
+  // included. It used to be `Downloading` alone, so a job spending twenty
+  // minutes in a par repair made this tile read 0 / 0 while the machine
+  // was busy. The parenthetical says how many of the active ones are past
+  // the download, because "3 active" and "3 active, 2 of them repairing"
+  // are different situations.
+  const post = s.jobs_post || 0;
+  setText($("s-active"),
+    s.jobs_downloading + (post ? " (" + post + " pp)" : "") + " / " + s.jobs_queued);
+  setProp($("s-active"), "title", post
+    ? post + " of the " + s.jobs_downloading
+      + " active job(s) are in post-processing — repairing, extracting or moving."
+    : "Jobs being worked on right now, over jobs waiting their turn.");
   reconcileRows($("badges"), statusModels(s), dom);
   // Why is nothing downloading? Say so instead of sitting silently.
   const holds = [];
@@ -1559,6 +1856,7 @@ function renderStatus() {
 // Scalar tiles get the same "only write when it changed" treatment as rows.
 function setText(el, v) { if (el && el.__t !== v) { el.__t = v; el.textContent = v; } }
 function setClass(el, v) { if (el && el.__c !== v) { el.__c = v; el.className = v; } }
+function setProp(el, k, v) { if (el && el["__p_" + k] !== v) { el["__p_" + k] = v; el[k] = v; } }
 
 // The button matching the current state latches (disabled + amber) so the
 // pair reads as a state indicator, and a click flips it before the server
@@ -1603,8 +1901,33 @@ function handoffModel(e) {
            tip: "no client has polled history since this finished — if your *arr is down, it will pick this up when it returns" };
 }
 
+/// Where a finished job's post-processing time went, as a row-sized fact
+/// plus the full breakdown in the tooltip.
+///
+/// One line has room for one number, so it is the one that answers the
+/// question: which stage took the longest, and how long. "40m repairing"
+/// explains a job that finished an hour after it downloaded; a total would
+/// not, because the total is never the surprise — the distribution is.
+///
+/// Silent when there is nothing to explain: a job with no timeline (failed
+/// before post-processing, or recorded by an older nzbd) and one whose
+/// stages were all trivial get no note rather than a decorative "0s".
+function ppSummary(stages) {
+  const spans = (stages || []).filter(s => s.ms != null);
+  if (!spans.length) return { note: "", tip: "" };
+  const total = spans.reduce((a, s) => a + s.ms, 0);
+  const top = spans.reduce((a, s) => (s.ms > a.ms ? s : a));
+  const label = st => STAGE_LABEL[st] || st;
+  const tip = "post-processing took " + fmtDur(total) + " — "
+    + spans.map(s => label(s.stage) + " " + fmtDur(s.ms)).join(", ");
+  // Under two seconds of total work is not where anyone's time went.
+  if (total < 2000) return { note: "", tip };
+  return { note: fmtDur(top.ms) + " " + label(top.stage), tip };
+}
+
 function histModel(e) {
   const ho = handoffModel(e);
+  const pp = ppSummary(e.stages);
   const key = "h" + e.job;
   const isArmed = armIsSet(key);
   return {
@@ -1612,6 +1935,7 @@ function histModel(e) {
     name: e.name, nameTip: e.final_dir || "",
     sub: "#" + e.job + (e.category ? " · " + e.category : ""),
     st: e.status, stCls: "st " + histClass(e.status),
+    ppNote: pp.note, ppTip: pp.tip,
     hoText: ho.text, hoCls: ho.cls, hoTip: ho.tip,
     size: fmtBytes(e.size), finished: fmtTime(e.completed_at_unix),
     rowCls: e.hidden ? "hidden-row" : "",
@@ -1641,6 +1965,7 @@ function buildHistRow(d) {
   c.sub = d.append(td1, d.create("div", "sub"));
   const td2 = d.append(tr, d.create("td"));
   c.st = d.append(td2, d.create("span", "st"));
+  c.pp = d.append(td2, d.create("div", "pp-note"));
   const td3 = d.append(tr, d.create("td"));
   c.ho = d.append(td3, d.create("span", "ho"));
   c.size = d.append(tr, d.create("td", "num"));
@@ -1675,6 +2000,8 @@ function applyHistRow(tr, m, d) {
   w("sub", m.sub, v => d.text(c.sub, v));
   w("st", m.st, v => d.text(c.st, v));
   w("stCls", m.stCls, v => d.cls(c.st, v));
+  w("ppNote", m.ppNote, v => d.text(c.pp, v));
+  w("ppTip", m.ppTip || "", v => d.prop(c.pp, "title", v));
   w("hoText", m.hoText, v => d.text(c.ho, v));
   w("hoCls", m.hoCls, v => d.cls(c.ho, v));
   w("hoTip", m.hoTip, v => d.prop(c.ho, "title", v));
@@ -2990,6 +3317,16 @@ function pollPass() {
   // The pending-op grace period has to expire even when nothing is arriving
   // — a dead stream must never leave a row invisible forever.
   setInterval(() => pending.sweep(), 1000);
+  // Stage timers advance on the wall clock, not on data arriving. A job in
+  // post-processing moves no bytes, so its tick payload is byte-identical
+  // second to second and the server suppresses it — meaning the one number
+  // still worth watching would be the one that stops. Repaint only while
+  // something is actually in a stage; an idle queue stays idle.
+  setInterval(() => {
+    if (activeTab !== "queue" || document.hidden) return;
+    if (store.jobs && store.jobs.some(j => typeof j.status !== "string"))
+      renderQueue();
+  }, 1000);
   // Coming back to the tab: repaint now, not at the next timer — and give a
   // stream the browser tore down in the background its rebuild immediately.
   document.addEventListener("visibilitychange", () => {
@@ -3007,7 +3344,8 @@ if (typeof __nzbd_test_enable !== "undefined") {
   window.__nzbd_test = {
     rowModel, reconcileRows, applyRow, differ, KINDS, store,
     histModel, fileModel, statusModels, queueModels, detailModel,
-    statusName, healthColor, fmtBytes, fmtRate, fmtEta,
+    statusName, statusLabel, healthColor, fmtBytes, fmtRate, fmtEta, fmtDur, ppSummary,
+    sectionOf, pipelineModels, stageElapsedMs, SECTIONS, ORDERED,
     pending, satisfied, toast, connState, pollResult,
     connFromGaps, activeWire, applyTick, applyHb, pollPass,
     startStream, ensureStream,

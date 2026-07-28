@@ -420,8 +420,25 @@ pub struct StatusDto {
     /// Critical-health abort armed (`[post] health_action` park/delete)?
     pub health_abort: bool,
     pub speed_limit_bps: Option<u64>,
+    /// Jobs waiting for a turn: `Queued` and `Paused`.
     pub jobs_queued: u32,
+    /// Jobs the daemon is actively working on — downloading, fetching a
+    /// URL's NZB, waiting for a post slot, or in a post-processing stage.
+    ///
+    /// This deliberately counts more than `Downloading`. It used to count
+    /// only that, so `PostQueued`, `Post { .. }` and `Fetching` fell into
+    /// neither bucket and a job that spent twenty minutes repairing
+    /// reported as `0 / 0` — the daemon claiming to be idle while grinding
+    /// through a par set. A job in the queue is in exactly one of these
+    /// three numbers now, which is the property that makes them worth
+    /// showing at all.
     pub jobs_downloading: u32,
+    /// Of those active jobs, how many are past the download and in the
+    /// post-processing pipeline — including the ones queued for a post
+    /// slot, matching what the compat layer already reports as
+    /// `PostJobCount`. A subset of `jobs_downloading`, not a fourth
+    /// bucket, so the three top-level counts still partition the queue.
+    pub jobs_post: u32,
     pub jobs_finished: u32,
     /// Per-news-server wire rates and volumes. Same counters as
     /// `download_rate_bps`, so the chips the UI draws from these sum to the
@@ -447,7 +464,16 @@ pub fn status_dto(snap: &QueueSnapshot) -> StatusDto {
         health_abort: snap.health_abort,
         speed_limit_bps: snap.speed_limit_bps,
         jobs_queued: count(&|j| matches!(j.status, JobStatus::Queued | JobStatus::Paused)),
-        jobs_downloading: count(&|j| matches!(j.status, JobStatus::Downloading)),
+        jobs_downloading: count(&|j| {
+            matches!(
+                j.status,
+                JobStatus::Downloading
+                    | JobStatus::Fetching
+                    | JobStatus::PostQueued
+                    | JobStatus::Post { .. }
+            )
+        }),
+        jobs_post: count(&|j| matches!(j.status, JobStatus::PostQueued | JobStatus::Post { .. })),
         jobs_finished: count(&|j| {
             matches!(
                 j.status,
@@ -853,6 +879,7 @@ async fn park_snapshot(st: &ApiState, job: JobId) -> Option<Parked> {
             seen_count: 0,
             removed_at_unix: None,
             picked_up_by: None,
+            stages: Vec::new(),
             seq: 0,
         },
         nzb,
@@ -2265,6 +2292,104 @@ mod tests {
 <groups><group>a.b</group></groups>
 <segments><segment bytes="1000" number="1">m1@x</segment></segments>
 </file></nzb>"#;
+
+    fn summary(id: u32, status: JobStatus) -> JobSummary {
+        JobSummary {
+            id: nzbd_types::JobId(id),
+            name: format!("job {id}"),
+            status,
+            category: None,
+            priority: 0,
+            size_bytes: 0,
+            downloaded_bytes: 0,
+            failed_bytes: 0,
+            remaining_bytes: 0,
+            total_articles: 0,
+            done_articles: 0,
+            failed_articles: 0,
+            files_total: 0,
+            files_done: 0,
+            health: 1000,
+            critical_health: 850,
+            rate_bps: 0,
+            retried_articles: 0,
+            assigned_node: None,
+            pp_done: false,
+            dupe_key: String::new(),
+            dupe_score: 0,
+            params: vec![],
+            stages: vec![],
+        }
+    }
+
+    /// Every job in the queue lands in exactly one of the three counts.
+    ///
+    /// It did not used to: `jobs_downloading` counted only `Downloading`,
+    /// so a job in any post-processing stage — or fetching a URL's NZB —
+    /// fell into neither bucket, and the header tile read `0 / 0` while
+    /// the daemon ground through a par repair. The partition IS the
+    /// feature; a status tile that can silently omit a job is worse than
+    /// no tile at all.
+    #[test]
+    fn status_counts_partition_the_queue() {
+        let snap = QueueSnapshot {
+            jobs: vec![
+                summary(1, JobStatus::Queued),
+                summary(2, JobStatus::Paused),
+                summary(3, JobStatus::Downloading),
+                summary(4, JobStatus::Fetching),
+                summary(5, JobStatus::PostQueued),
+                summary(
+                    6,
+                    JobStatus::Post {
+                        stage: nzbd_types::PostStage::ParRepair,
+                    },
+                ),
+                summary(
+                    7,
+                    JobStatus::Post {
+                        stage: nzbd_types::PostStage::Unpack,
+                    },
+                ),
+                summary(8, JobStatus::Completed),
+                summary(9, JobStatus::Failed),
+                summary(10, JobStatus::Deleted),
+            ],
+            ..Default::default()
+        };
+        let dto = status_dto(&snap);
+        assert_eq!(dto.jobs_queued, 2, "queued + paused");
+        assert_eq!(
+            dto.jobs_downloading, 5,
+            "downloading + fetching + post_queued + 2 post stages"
+        );
+        assert_eq!(
+            dto.jobs_post, 3,
+            "post_queued counts as post-processing, as it does in compat"
+        );
+        assert_eq!(dto.jobs_finished, 3);
+        assert_eq!(
+            dto.jobs_queued + dto.jobs_downloading + dto.jobs_finished,
+            snap.jobs.len() as u32,
+            "no job may fall between the buckets"
+        );
+    }
+
+    /// A job repairing on its own is visible work, not an idle daemon.
+    #[test]
+    fn a_lone_repairing_job_is_not_reported_as_idle() {
+        let snap = QueueSnapshot {
+            jobs: vec![summary(
+                1,
+                JobStatus::Post {
+                    stage: nzbd_types::PostStage::ParRepair,
+                },
+            )],
+            ..Default::default()
+        };
+        let dto = status_dto(&snap);
+        assert_eq!((dto.jobs_downloading, dto.jobs_queued), (1, 0));
+    }
 
     async fn body_json(resp: axum::response::Response) -> serde_json::Value {
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();

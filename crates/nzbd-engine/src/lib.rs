@@ -563,6 +563,39 @@ impl EngineHandle {
             .map_err(|_| EngineError::Closed)
     }
 
+    /// Enter a post-processing stage. Sets the status *and* appends the
+    /// stage to the job's timeline in one command, closing the span being
+    /// left with `prev_ms` — the caller's monotonic measurement of it.
+    ///
+    /// `set_job_status` deliberately does NOT do this: it is the terminal
+    /// and PostQueued path, and a stage entered through it would leave the
+    /// timeline silently one entry short.
+    pub async fn enter_post_stage(
+        &self,
+        job: JobId,
+        stage: nzbd_types::PostStage,
+        at_unix: i64,
+        prev_ms: Option<u64>,
+    ) -> Result<bool, EngineError> {
+        self.roundtrip_bool(|reply| QueueCommand::EnterPostStage {
+            job,
+            stage,
+            at_unix,
+            prev_ms,
+            reply,
+        })
+        .await
+    }
+
+    /// Close the running stage span — the pipeline ended, by success,
+    /// failure or an early return. No reply: the job is already on its way
+    /// to history and nothing downstream waits on the timing.
+    pub async fn close_post_stage(&self, job: JobId, at_unix: i64, ms: Option<u64>) {
+        let _ = self
+            .send(QueueCommand::ClosePostStage { job, at_unix, ms })
+            .await;
+    }
+
     pub async fn remove_job_silent(&self, job: JobId) -> Result<bool, EngineError> {
         self.roundtrip_bool(|reply| QueueCommand::RemoveJobSilent { job, reply })
             .await

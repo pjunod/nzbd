@@ -203,7 +203,7 @@ function job(id, over) {
     total_articles: 10, done_articles: 1, failed_articles: 0,
     files_total: 2, files_done: 0, health: 1000, critical_health: 850,
     rate_bps: 1024, retried_articles: 0, assigned_node: null, pp_done: false,
-    dupe_key: "", dupe_score: 0,
+    dupe_key: "", dupe_score: 0, stages: [],
   }, over || {});
 }
 const models = (jobs) => jobs.map((j, i) => T.rowModel(j, { idx: i, count: jobs.length }));
@@ -347,10 +347,11 @@ const models = (jobs) => jobs.map((j, i) => T.rowModel(j, { idx: i, count: jobs.
   T.reconcileRows(tbody, withDetail(), fake);
   eq(tbody.children.length, 2, "detail row sits under its job row");
   const detail = tbody.children[1];
-  const filesBody = detail.children[0].children[0].children[1].children[1];
+  // wrap children: head, pipeline, files table, activity
+  const filesBody = detail.children[0].children[0].children[2].children[1];
   eq(filesBody.children.length, 2, "one row per file");
   const fileRow = filesBody.children[0];
-  const logsBox = detail.children[0].children[0].children[2];
+  const logsBox = detail.children[0].children[0].children[3];
   eq(logsBox.children.length, 1, "one activity line");
   const logLine = logsBox.children[0];
 
@@ -1188,6 +1189,162 @@ const models = (jobs) => jobs.map((j, i) => T.rowModel(j, { idx: i, count: jobs.
     const [none] = T.clientChipModels([], now);
     ok(none.text.length < 30, "the empty-state chip is a chip, not a paragraph");
     ok(none.tip.includes("/api/v1/events"), "…with the explanation moved to its tooltip");
+  }
+
+  // --- sections: what it is doing, above what is waiting ------------------
+  {
+    const post = (stage, over) =>
+      job(0, Object.assign({ status: { post: { stage } } }, over || {}));
+
+    eq(T.sectionOf(job(1, { status: "downloading" })), "downloading", "");
+    eq(T.sectionOf(job(1, { status: "queued" })), "waiting", "");
+    eq(T.sectionOf(job(1, { status: "paused" })), "waiting",
+      "a paused job is still waiting its turn, not doing something");
+    eq(T.sectionOf(post("par_repair")), "repairing", "");
+    eq(T.sectionOf(post("unpack")), "extracting", "");
+    eq(T.sectionOf(post("par_rename")), "renaming", "");
+    eq(T.sectionOf(post("rar_rename")), "renaming",
+      "both rename stages read as one thing to a person");
+    // An unknown stage from a newer daemon must land in a visible section
+    // rather than vanish between the buckets.
+    eq(T.sectionOf(post("teleporting")), "post_queued",
+      "an unrecognised stage is still shown somewhere");
+
+    // Every section a status can produce has a heading defined for it.
+    const keys = new Set(T.SECTIONS.map(x => x.key));
+    for (const st of ["queued", "downloading", "paused", "fetching", "post_queued"])
+      ok(keys.has(T.sectionOf(job(1, { status: st }))), "section exists for " + st);
+    for (const st of ["par_rename", "par_verify", "par_repair", "rar_rename",
+                      "unpack", "cleanup", "move", "post_unpack_rename", "script"])
+      ok(keys.has(T.sectionOf(post(st))), "section exists for stage " + st);
+
+    // Only the download queue keeps its move controls: off it, the arrows
+    // would be attached to nothing.
+    ok(T.ORDERED.has("waiting"), "waiting jobs can be reordered");
+    ok(T.ORDERED.has("downloading"), "so can downloading ones — same queue");
+    ok(!T.ORDERED.has("repairing"), "a repairing job has no queue position");
+    const fixed = T.rowModel(post("par_repair"), { idx: 0, count: 3, movable: false });
+    eq(fixed.moveHidden, true, "…so its move buttons are hidden");
+    const movable = T.rowModel(job(1), { idx: 1, count: 3, movable: true });
+    eq(movable.moveHidden, false, "a queued job keeps them");
+    eq(T.rowModel(job(1), { idx: 0, count: 1 }).moveHidden, false,
+      "a caller that says nothing about movability keeps the old controls");
+  }
+
+  // --- the stage timer -----------------------------------------------------
+  {
+    const running = job(1, {
+      status: { post: { stage: "par_repair" } },
+      stages: [
+        { stage: "par_verify", started_at_unix: 1000, ms: 12000 },
+        { stage: "par_repair", started_at_unix: 1012 },
+      ],
+    });
+    eq(T.stageElapsedMs(running, 1_312_000), 300_000, "elapsed comes off the open span");
+    eq(T.stageElapsedMs(job(1, { stages: [] })), null, "no timeline, no timer");
+    eq(T.stageElapsedMs(job(1, {
+      stages: [{ stage: "move", started_at_unix: 1000, ms: 5 }],
+    }), 9_000_000), null, "a closed span is not still running");
+    // A clock that disagrees with the server must not print a negative age.
+    eq(T.stageElapsedMs(running, 1_000_000), 0, "a skewed clock clamps at zero");
+
+    const m = T.rowModel(running, { idx: 0, count: 1, movable: false, nowMs: 1_312_000 });
+    ok(m.detail.includes("5m in repairing"),
+      "the row says how long it has been repairing, got: " + m.detail);
+
+    eq(T.fmtDur(0), "<1s", "a stage that just started is not '0s'");
+    eq(T.fmtDur(4200), "4s", "");
+    eq(T.fmtDur(65000), "1m 5s", "");
+    eq(T.fmtDur(120000), "2m", "no dangling '0s'");
+    eq(T.fmtDur(3600000), "1h", "");
+    eq(T.fmtDur(5460000), "1h 31m", "");
+    eq(T.fmtDur(null), "", "nothing to say about a stage with no duration");
+
+    // The bytes are all in, so the bar would sit at a full 100% under a
+    // heading that says REPAIRING — reading as "done" for a job with
+    // nineteen minutes left. A stage with no byte progress draws no bar.
+    eq(m.barHidden, true, "a post-processing row has no progress bar");
+    eq(m.pct, "", "…and no percentage either");
+    const dl = T.rowModel(job(1, { downloaded_bytes: 500 }), { idx: 0, count: 1 });
+    eq(dl.barHidden, false, "a downloading row keeps its bar");
+    eq(dl.pct, "50%", "…and its percentage");
+
+    // A job waiting for a post slot has no stage running yet, so there is
+    // no timer — and the daemon's own token must not stand in for one.
+    const pq = T.rowModel(job(1, { status: "post_queued", downloaded_bytes: 1000 }),
+      { idx: 0, count: 1, movable: false });
+    ok(!pq.detail.includes("post_queued"),
+      "the wire token does not reach the screen, got: " + pq.detail);
+    eq(pq.st, "WAITING TO POST-PROCESS", "the pill says it in words");
+    eq(pq.barHidden, true, "its download is finished, so its bar says nothing");
+    eq(T.statusLabel("post_queued"), "waiting to post-process", "");
+    eq(T.statusName("post_queued"), "post_queued",
+      "…while the wire name is unchanged, because pending-ops compare on it");
+    eq(T.statusLabel({ post: { stage: "par_repair" } }), "repairing", "");
+  }
+
+  // --- the job-detail pipeline --------------------------------------------
+  {
+    const j = job(1, {
+      status: { post: { stage: "unpack" } },
+      stages: [
+        { stage: "par_verify", started_at_unix: 1000, ms: 12000 },
+        { stage: "par_repair", started_at_unix: 1012, ms: 2400000 },
+        { stage: "unpack", started_at_unix: 3412 },
+      ],
+    });
+    const pipe = T.pipelineModels(j, 3_442_000);
+    eq(pipe.length, 3, "one entry per stage that ran");
+    eq(pipe[0].label, "checking integrity", "stages read in words, not enum names");
+    eq(pipe[1].dur, "40m", "a closed stage shows what it cost");
+    ok(pipe[2].cls.includes("running"), "the current stage is marked running");
+    eq(pipe[2].dur, "30s", "…and its figure is live, not banked");
+    ok(pipe[1].cls.includes("slow"), "the longest closed stage is called out");
+    ok(!pipe[0].cls.includes("slow"), "…and only that one");
+    // Distinct keys, so two visits to the same stage are two rows.
+    const twice = T.pipelineModels(job(1, { stages: [
+      { stage: "par_repair", started_at_unix: 1, ms: 10 },
+      { stage: "unpack", started_at_unix: 2, ms: 10 },
+      { stage: "par_repair", started_at_unix: 3, ms: 10 },
+    ] }), 9000);
+    eq(new Set(twice.map(x => x.key)).size, 3,
+      "a stage entered twice gets two rows, not one that overwrites itself");
+    // Only what ran.
+    ok(!pipe.some(x => x.label === "moving"), "stages that never ran are not listed");
+    eq(T.pipelineModels(job(1, { stages: [] }), 0).length, 0,
+      "a job that never post-processed shows no pipeline");
+    // A single closed stage has nothing to be slower than.
+    const one = T.pipelineModels(job(1, { stages: [
+      { stage: "unpack", started_at_unix: 1, ms: 500 },
+    ] }), 9000);
+    ok(!one[0].cls.includes("slow"), "one stage is not 'the slow one'");
+  }
+
+  // --- history says where the post-processing time went -------------------
+  {
+    const s = (stage, ms) => ({ stage, started_at_unix: 1000, ms });
+    const a = T.ppSummary([s("par_verify", 12000), s("par_repair", 2400000), s("unpack", 63000)]);
+    eq(a.note, "40m repairing", "the row names the stage that took the time");
+    ok(a.tip.includes("post-processing took 41m"), "the tooltip has the total: " + a.tip);
+    ok(a.tip.includes("checking integrity 12s"), "…and every stage: " + a.tip);
+
+    eq(T.ppSummary([]).note, "", "no timeline, no note");
+    eq(T.ppSummary(undefined).note, "", "an entry from an older nzbd is silent");
+    eq(T.ppSummary([s("move", 40)]).note, "",
+      "a job whose post-processing was instant explains nothing by saying so");
+    // A still-open span cannot be part of a finished job's accounting.
+    eq(T.ppSummary([s("unpack", 9000), { stage: "move", started_at_unix: 1, ms: null }]).note,
+      "9s extracting", "an unclosed span is skipped rather than counted as zero");
+
+    const m = T.histModel({
+      job: 3, name: "x", status: "SUCCESS", size: 10, completed_at_unix: 1,
+      stages: [s("par_repair", 300000), s("unpack", 5000)],
+    });
+    eq(m.ppNote, "5m repairing", "the history row carries it");
+    const bare = T.histModel({
+      job: 4, name: "y", status: "SUCCESS", size: 10, completed_at_unix: 1,
+    });
+    eq(bare.ppNote, "", "a pre-upgrade history row renders without one");
   }
 
   if (failures.length) {

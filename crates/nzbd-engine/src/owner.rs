@@ -20,7 +20,9 @@ use crate::writer::{spawn_writer, WriteCmd, WriterHandle};
 use crate::Tuning;
 use nzbd_nzb::ParsedNzb;
 use nzbd_state::{FsJournal, JobJournals, JournalRecord, SnapshotStore, UncleanMarker};
-use nzbd_types::{FileId, Health, Job, JobId, JobStatus, SegmentState, ServerDef, ServerId};
+use nzbd_types::{
+    FileId, Health, Job, JobId, JobStatus, PostStage, SegmentState, ServerDef, ServerId, StageSpan,
+};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -183,6 +185,26 @@ pub(crate) enum QueueCommand {
         status: JobStatus,
         reply: oneshot::Sender<bool>,
     },
+    /// Enter a post-processing stage: set `Post { stage }` AND append the
+    /// stage span, closing the previous one. Separate from `SetJobStatus`
+    /// because the status and the timeline must not be settable apart —
+    /// see [`close_span`].
+    EnterPostStage {
+        job: JobId,
+        stage: PostStage,
+        at_unix: i64,
+        /// The manager's monotonic measurement of the stage being left.
+        prev_ms: Option<u64>,
+        reply: oneshot::Sender<bool>,
+    },
+    /// Close the running stage span without opening another — the pipeline
+    /// ended (success, failure, or an early return). Fire-and-forget: the
+    /// job is on its way to history and nothing waits on the timing.
+    ClosePostStage {
+        job: JobId,
+        at_unix: i64,
+        ms: Option<u64>,
+    },
     /// Delayed-par download (§3.2): unpause the smallest set of paused
     /// `*.volXX+NN.par2` files covering `blocks`. Replies with the number
     /// of recovery blocks now downloading (0 = nothing left to unpause).
@@ -191,6 +213,27 @@ pub(crate) enum QueueCommand {
         blocks: u32,
         reply: oneshot::Sender<u32>,
     },
+}
+
+/// Bank the running stage's duration onto the job's timeline.
+///
+/// `measured` is the post manager's monotonic figure and is preferred
+/// whenever it exists: wall-clock subtraction is subject to NTP steps, and
+/// a repair that reads as negative time is worse than no figure at all.
+/// The wall-clock fallback covers the one case the manager cannot measure
+/// — a span that outlived the process, where the `Instant` is gone but
+/// `started_at_unix` survived in the snapshot.
+///
+/// Idempotent: a span that already has a duration keeps it, so a close
+/// following a close cannot overwrite a good measurement with a stale one.
+fn close_span(job: &mut Job, measured: Option<u64>, at_unix: i64) {
+    if let Some(prev) = job.stages.last_mut() {
+        if prev.ms.is_none() {
+            prev.ms = Some(measured.unwrap_or_else(|| {
+                at_unix.saturating_sub(prev.started_at_unix).max(0) as u64 * 1000
+            }));
+        }
+    }
 }
 
 /// Queue reorder operations (NZBGet GroupMoveTop/Up/Down/Bottom).
@@ -1005,6 +1048,44 @@ impl Owner {
                     self.publish_now();
                 }
                 let _ = reply.send(ok);
+            }
+            QueueCommand::EnterPostStage {
+                job,
+                stage,
+                at_unix,
+                prev_ms,
+                reply,
+            } => {
+                let ok = match self.state.job_mut(job) {
+                    Some(j) => {
+                        close_span(j, prev_ms, at_unix);
+                        j.stages.push(StageSpan {
+                            stage,
+                            started_at_unix: at_unix,
+                            ms: None,
+                        });
+                        // Status and timeline move together, under the
+                        // owner task's single mutable borrow. That is what
+                        // makes "one stage at a time" structural: a caller
+                        // cannot enter a stage without leaving the previous
+                        // one, because it never gets to do only half of it.
+                        j.status = JobStatus::Post { stage };
+                        true
+                    }
+                    None => false,
+                };
+                if ok {
+                    self.dirty = true;
+                    self.publish_now();
+                }
+                let _ = reply.send(ok);
+            }
+            QueueCommand::ClosePostStage { job, at_unix, ms } => {
+                if let Some(j) = self.state.job_mut(job) {
+                    close_span(j, ms, at_unix);
+                    self.dirty = true;
+                    self.publish_now();
+                }
             }
             QueueCommand::UnpauseParBlocks { job, blocks, reply } => {
                 let unpaused = self.unpause_par_blocks(job, blocks);
@@ -2043,6 +2124,7 @@ impl Owner {
                         .collect(),
                     rate_bps: 0,
                     retried_articles: 0,
+                    stages: j.stages.clone(),
                 };
                 // Delegated jobs progress remotely; overlay heartbeat stats.
                 if let Some(m) = self.mirror.get(&j.id) {
@@ -2312,6 +2394,89 @@ pub(crate) fn plan_url_refetches(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn bare_job() -> Job {
+        Job {
+            id: JobId(1),
+            kind: nzbd_types::JobKind::Nzb,
+            name: "x".into(),
+            category: None,
+            priority: 0,
+            dupe: Default::default(),
+            params: vec![],
+            files: vec![],
+            totals: Default::default(),
+            status: JobStatus::PostQueued,
+            stages: vec![],
+        }
+    }
+
+    /// The monotonic figure the post manager measured is what lands on the
+    /// span. Wall-clock is a fallback, not the primary — an NTP step
+    /// during a long repair must not produce a duration nobody can trust.
+    #[test]
+    fn close_span_prefers_the_measured_duration() {
+        let mut j = bare_job();
+        j.stages.push(StageSpan {
+            stage: PostStage::ParRepair,
+            started_at_unix: 1_000,
+            ms: None,
+        });
+        // Wall clock says 60s; the manager measured 4500ms.
+        close_span(&mut j, Some(4500), 1_060);
+        assert_eq!(j.stages[0].ms, Some(4500));
+    }
+
+    /// A span that outlived the process has no `Instant` left to consult,
+    /// so the seconds that survived in the snapshot are all there is.
+    #[test]
+    fn close_span_falls_back_to_wall_clock() {
+        let mut j = bare_job();
+        j.stages.push(StageSpan {
+            stage: PostStage::Unpack,
+            started_at_unix: 1_000,
+            ms: None,
+        });
+        close_span(&mut j, None, 1_007);
+        assert_eq!(j.stages[0].ms, Some(7_000));
+    }
+
+    /// `Stages::finish` closes the span and `Drop` closes it again. The
+    /// second close must not overwrite the first — otherwise every job's
+    /// last stage would report the few milliseconds between the two.
+    #[test]
+    fn close_span_is_idempotent() {
+        let mut j = bare_job();
+        j.stages.push(StageSpan {
+            stage: PostStage::Move,
+            started_at_unix: 1_000,
+            ms: None,
+        });
+        close_span(&mut j, Some(9_000), 1_009);
+        close_span(&mut j, Some(3), 1_009);
+        assert_eq!(j.stages[0].ms, Some(9_000));
+    }
+
+    /// A clock that went backwards between entering and leaving a stage
+    /// yields 0, never a wrapped-around u64.
+    #[test]
+    fn close_span_survives_a_backwards_clock() {
+        let mut j = bare_job();
+        j.stages.push(StageSpan {
+            stage: PostStage::ParVerify,
+            started_at_unix: 2_000,
+            ms: None,
+        });
+        close_span(&mut j, None, 1_900);
+        assert_eq!(j.stages[0].ms, Some(0));
+    }
+
+    #[test]
+    fn close_span_on_a_job_that_never_post_processed() {
+        let mut j = bare_job();
+        close_span(&mut j, Some(5), 1_000);
+        assert!(j.stages.is_empty());
+    }
 
     #[test]
     fn url_refetch_plan_keeps_first_fails_dupes() {

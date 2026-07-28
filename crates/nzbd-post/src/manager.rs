@@ -285,6 +285,10 @@ async fn manager_task(
                             seen_count: 0,
                             removed_at_unix: None,
                             picked_up_by: None,
+                            stages: exported
+                                .as_ref()
+                                .map(|j| j.stages.clone())
+                                .unwrap_or_default(),
                             seq: 0,
                         };
                         let h = history.clone();
@@ -516,10 +520,13 @@ impl<'a> Stages<'a> {
     }
 
     async fn enter(&mut self, stage: PostStage) {
-        self.close();
+        let prev_ms = self.close();
+        // Status, timeline and event in that order. The first two are one
+        // command precisely so a consumer that reacts to the event can
+        // read the job back and find the stage already on it.
         let _ = self
             .engine
-            .set_job_status(self.job, JobStatus::Post { stage })
+            .enter_post_stage(self.job, stage, now(), prev_ms)
             .await;
         self.engine.emit(Event::JobPpStage {
             job: self.job,
@@ -529,21 +536,54 @@ impl<'a> Stages<'a> {
         self.current = Some((stage, std::time::Instant::now()));
     }
 
-    /// Bank the running stage's duration. Called on every transition and
-    /// once when the pipeline ends, so the last stage is measured too.
-    fn close(&mut self) {
-        if let (Some((stage, started)), Some(stats)) = (self.current.take(), self.stats.as_ref()) {
-            stats.record(stage, started.elapsed());
+    /// Bank the running stage's duration into the process histogram and
+    /// hand the same measurement back for the job's own timeline.
+    ///
+    /// Returning it is the whole point: this figure used to be computed
+    /// here, averaged into `PpStageStats`, and dropped — so "how long does
+    /// unpack take across every job" was answerable and "how long did
+    /// unpack take for THIS job" was not, from the same measurement.
+    fn close(&mut self) -> Option<u64> {
+        let (stage, started) = self.current.take()?;
+        let elapsed = started.elapsed();
+        if let Some(stats) = self.stats.as_ref() {
+            stats.record(stage, elapsed);
         }
+        Some(elapsed.as_millis() as u64)
+    }
+
+    /// End the pipeline cleanly: close the last span on the job and wait
+    /// for the engine to have applied it.
+    ///
+    /// Called before the finalize export, so the `Job` that becomes the
+    /// history entry carries a *closed* final stage. Leaving it to `Drop`
+    /// would be too late by exactly one export — history would show the
+    /// last stage of every successful job as still running, which is the
+    /// one entry you are most likely to be reading.
+    ///
+    /// Commands reach the owner task on one ordered channel, so the export
+    /// queued after this observes the close. Safe to call more than once.
+    async fn finish(&mut self) {
+        let ms = self.close();
+        self.engine.close_post_stage(self.job, now(), ms).await;
     }
 }
 
 impl Drop for Stages<'_> {
     /// A job that returns early (lease lost, tool error, cancelled) still
     /// spent time in its last stage. Closing on drop means "how long does
-    /// unpack take" is not silently biased toward the runs that succeeded.
+    /// unpack take" is not silently biased toward the runs that succeeded
+    /// — and now that the span is on the job too, an abandoned job's last
+    /// stage does not sit in history looking like it never ended.
+    ///
+    /// Drop cannot await, so the engine half is spawned. It is ordered
+    /// behind nothing: the span is already closed in the histogram, and
+    /// `close_span` on the owner side is idempotent, so a late arrival
+    /// cannot overwrite a good measurement.
     fn drop(&mut self) {
-        self.close();
+        let ms = self.close();
+        let (engine, job) = (self.engine.clone(), self.job);
+        tokio::spawn(async move { engine.close_post_stage(job, now(), ms).await });
     }
 }
 
@@ -880,6 +920,10 @@ pub async fn process_job_ctx(
             "pp lease lost before finalize".into(),
         ));
     }
+    // Close the last stage span BEFORE the export below reads the job:
+    // the timeline that lands in history has to be complete, and the
+    // final stage is the one an operator looks at first.
+    stages.finish().await;
     // Stamp + set final status in one import (replaces the job atomically).
     if let Ok(Some(mut fin)) = engine.export_job(job_id).await {
         fin.params
@@ -929,6 +973,7 @@ pub async fn process_job_ctx(
             seen_count: 0,
             removed_at_unix: None,
             picked_up_by: None,
+            stages: fin.stages.clone(),
             seq: 0,
         };
         // History first, stamp second: a crash in between re-runs PP (the

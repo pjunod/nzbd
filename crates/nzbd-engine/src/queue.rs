@@ -119,6 +119,7 @@ impl QueueState {
             files,
             totals: Default::default(),
             status: JobStatus::Queued,
+            stages: Vec::new(),
         };
         recompute_job_totals(&mut job);
         self.jobs.push(job);
@@ -147,6 +148,7 @@ impl QueueState {
             files: Vec::new(),
             totals: Default::default(),
             status: JobStatus::Fetching,
+            stages: Vec::new(),
         });
         job_id
     }

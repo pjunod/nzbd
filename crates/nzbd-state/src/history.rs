@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 /// did not renumber the existing indices.
 const COLUMNS: &str = "job_id, name, category, final_dir, status, size, health, params,
                        dupe_key, dupe_score, completed_at, hidden, first_seen, last_seen,
-                       seen_count, removed_at, picked_up_by, id";
+                       seen_count, removed_at, picked_up_by, id, stages";
 
 pub struct HistoryDb {
     conn: Mutex<Connection>,
@@ -93,6 +93,7 @@ impl HistoryDb {
             "ALTER TABLE history ADD COLUMN seen_count INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE history ADD COLUMN removed_at INTEGER",
             "ALTER TABLE history ADD COLUMN picked_up_by TEXT",
+            "ALTER TABLE history ADD COLUMN stages TEXT NOT NULL DEFAULT '[]'",
         ] {
             let _ = conn.execute(ddl, []);
         }
@@ -207,8 +208,9 @@ impl HistoryDb {
             .execute(
                 "INSERT INTO history
                  (job_id, name, category, final_dir, status, size, health, params,
-                  dupe_key, dupe_score, completed_at, hidden, removed_at, picked_up_by)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+                  dupe_key, dupe_score, completed_at, hidden, removed_at, picked_up_by,
+                  stages)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
                  ON CONFLICT(job_id, completed_at) DO UPDATE SET
                    hidden = excluded.hidden,
                    removed_at = COALESCE(excluded.removed_at, history.removed_at),
@@ -228,6 +230,7 @@ impl HistoryDb {
                     entry.hidden as i64,
                     entry.removed_at_unix,
                     entry.picked_up_by,
+                    serde_json::to_string(&entry.stages).unwrap_or_else(|_| "[]".into()),
                 ],
             )
             .map_err(|e| StateError::Corrupt(format!("sqlite insert: {e}")))?;
@@ -340,6 +343,12 @@ impl HistoryDb {
                     removed_at_unix: r.get(15)?,
                     picked_up_by: r.get(16)?,
                     seq: r.get(17)?,
+                    // A row written before the column existed reads back
+                    // as an empty timeline, never as a failed query.
+                    stages: r
+                        .get::<_, Option<String>>(18)?
+                        .and_then(|s| serde_json::from_str(&s).ok())
+                        .unwrap_or_default(),
                 })
             })
             .map_err(|e| StateError::Corrupt(e.to_string()))?;
@@ -569,8 +578,118 @@ mod tests {
             seen_count: 0,
             removed_at_unix: None,
             picked_up_by: None,
+            stages: Vec::new(),
             seq: 0,
         }
+    }
+
+    /// The stage timeline survives the round-trip through SQLite. That is
+    /// the whole point of persisting it: "why did that one take forty
+    /// minutes" is a question you ask the next morning, about a job that
+    /// left the queue hours ago.
+    #[test]
+    fn the_stage_timeline_survives_a_round_trip() {
+        use nzbd_types::{PostStage, StageSpan};
+        let tmp = tempfile::tempdir().unwrap();
+        let db = HistoryDb::open(&tmp.path().join("history.sqlite"), None).unwrap();
+        let mut e = entry(1, 1_000);
+        e.stages = vec![
+            StageSpan {
+                stage: PostStage::ParVerify,
+                started_at_unix: 900,
+                ms: Some(12_000),
+            },
+            StageSpan {
+                stage: PostStage::ParRepair,
+                started_at_unix: 912,
+                ms: Some(2_400_000),
+            },
+            StageSpan {
+                stage: PostStage::Unpack,
+                started_at_unix: 3_312,
+                ms: Some(63_000),
+            },
+        ];
+        db.record(&e).unwrap();
+
+        let got = db.list(10).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].stages.len(), 3);
+        assert_eq!(got[0].stages[1].stage, PostStage::ParRepair);
+        assert_eq!(got[0].stages[1].ms, Some(2_400_000));
+        // The forty minutes were the repair, and the row now says so.
+        let slowest = got[0]
+            .stages
+            .iter()
+            .max_by_key(|s| s.ms.unwrap_or(0))
+            .unwrap();
+        assert_eq!(slowest.stage, PostStage::ParRepair);
+    }
+
+    /// An index written by an older nzbd upgrades in place and its rows
+    /// still read — with an empty timeline, not an error.
+    ///
+    /// This builds the genuine pre-migration schema and a row in it, then
+    /// opens `HistoryDb` over the top so the real `ALTER TABLE` runs. A
+    /// test that instead forced `stages = NULL` would be testing a state
+    /// SQLite will not produce: `ADD COLUMN … NOT NULL DEFAULT '[]'`
+    /// backfills existing rows with the default and then refuses NULL. The
+    /// row mapper still reads the column as optional, which costs nothing
+    /// and covers an index rebuilt by something other than this code.
+    #[test]
+    fn an_index_from_before_the_column_upgrades_in_place() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("history.sqlite");
+        {
+            // The schema exactly as it shipped before `stages` existed.
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE history (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     job_id INTEGER NOT NULL,
+                     name TEXT NOT NULL,
+                     category TEXT,
+                     final_dir TEXT,
+                     status TEXT NOT NULL,
+                     size INTEGER NOT NULL,
+                     health INTEGER NOT NULL DEFAULT 1000,
+                     params TEXT NOT NULL DEFAULT '[]',
+                     dupe_key TEXT NOT NULL DEFAULT '',
+                     dupe_score INTEGER NOT NULL DEFAULT 0,
+                     completed_at INTEGER NOT NULL,
+                     hidden INTEGER NOT NULL DEFAULT 0,
+                     first_seen INTEGER,
+                     last_seen INTEGER,
+                     seen_count INTEGER NOT NULL DEFAULT 0,
+                     removed_at INTEGER,
+                     picked_up_by TEXT,
+                     UNIQUE(job_id, completed_at)
+                 );
+                 INSERT INTO history (job_id, name, status, size, completed_at)
+                 VALUES (7, 'job-7', 'SUCCESS', 1000, 2000);",
+            )
+            .unwrap();
+        }
+        let db = HistoryDb::open(&path, None).unwrap();
+        let got = db.list(10).unwrap();
+        assert_eq!(got.len(), 1, "the pre-upgrade row is still readable");
+        assert_eq!(got[0].name, "job-7");
+        assert!(
+            got[0].stages.is_empty(),
+            "no timeline was recorded, and none is invented"
+        );
+
+        // And the upgraded index accepts a timeline on the next write.
+        let mut fresh = entry(8, 3_000);
+        fresh.stages = vec![nzbd_types::StageSpan {
+            stage: nzbd_types::PostStage::Unpack,
+            started_at_unix: 2_900,
+            ms: Some(1_500),
+        }];
+        db.record(&fresh).unwrap();
+        let got = db.list(10).unwrap();
+        let eight = got.iter().find(|e| e.job.0 == 8).unwrap();
+        assert_eq!(eight.stages.len(), 1);
     }
 
     #[test]

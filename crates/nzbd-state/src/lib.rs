@@ -487,6 +487,16 @@ pub struct HistoryEntry {
     /// User-Agent of the polling/deleting client (Sonarr/x, Radarr/x…).
     #[serde(default)]
     pub picked_up_by: Option<String>,
+    /// Where the post-processing time went, stage by stage, copied off the
+    /// job as it finished.
+    ///
+    /// History is where that question actually gets asked — "why did that
+    /// one take forty minutes" is something you wonder the next morning,
+    /// about a job that left the queue hours ago. Empty for entries
+    /// written before this column existed, and for jobs that failed before
+    /// post-processing began.
+    #[serde(default)]
+    pub stages: Vec<nzbd_types::StageSpan>,
     /// Read-side cursor: this node's SQLite rowid, ascending and monotone.
     /// Populated on read, ignored on write, and deliberately **not**
     /// persisted to the JSONL — the JSONL is the portable source of truth
@@ -654,6 +664,7 @@ mod tests {
                     files: (j * 100..j * 100 + 100).map(file).collect(),
                     totals: JobTotals::default(),
                     status: JobStatus::Downloading,
+                    stages: Vec::new(),
                 })
                 .collect(),
             next_job_id: 5,

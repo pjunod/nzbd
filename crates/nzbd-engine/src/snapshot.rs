@@ -4,7 +4,7 @@
 //! engine (ARCHITECTURE.md §8.1).
 
 use arc_swap::ArcSwap;
-use nzbd_types::{JobId, JobStatus};
+use nzbd_types::{JobId, JobStatus, StageSpan};
 use serde::Serialize;
 use std::sync::Arc;
 
@@ -48,6 +48,11 @@ pub struct JobSummary {
     /// export round-trip: the whole value of a transfer id is that you can
     /// SEE it on the job it belongs to. `*`-internal params stay out.
     pub params: Vec<(String, String)>,
+    /// Post-processing stages this job has passed through, in order, with
+    /// the wall time each took (`ms` absent = the stage is still running).
+    /// Rides the existing 1 Hz tick, so the queue row's stage timer and
+    /// the detail pipeline cost no extra request.
+    pub stages: Vec<StageSpan>,
 }
 
 #[derive(Debug, Clone, Serialize)]

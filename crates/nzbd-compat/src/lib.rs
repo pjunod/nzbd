@@ -689,6 +689,7 @@ async fn record_dupe_reject(state: &CompatState, filename: &str, d: &nzbd_types:
         seen_count: 0,
         removed_at_unix: None,
         picked_up_by: None,
+        stages: Vec::new(),
         seq: 0,
     };
     let db = db.clone();
@@ -981,6 +982,9 @@ async fn delete_to_history(state: &CompatState, id: JobId, with_files: bool) -> 
                 seen_count: 0,
                 removed_at_unix: None,
                 picked_up_by: None,
+                // A job deleted mid-pipeline keeps the stages it did
+                // reach — that is often exactly why it was deleted.
+                stages: job.stages.clone(),
                 seq: 0,
             };
             let db = db.clone();
@@ -1353,6 +1357,7 @@ mod tests {
             seen_count: 0,
             removed_at_unix: None,
             picked_up_by: None,
+            stages: Vec::new(),
             seq: 0,
         })
         .unwrap();
@@ -1438,6 +1443,7 @@ mod tests {
                 seen_count: 0,
                 removed_at_unix: None,
                 picked_up_by: None,
+                stages: Vec::new(),
                 seq: 0,
             })
             .unwrap();
@@ -1524,6 +1530,7 @@ mod tests {
                 seen_count: 0,
                 removed_at_unix: None,
                 picked_up_by: None,
+                stages: Vec::new(),
                 seq: 0,
             })
             .unwrap();
