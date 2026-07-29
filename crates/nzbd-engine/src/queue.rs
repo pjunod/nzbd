@@ -98,7 +98,57 @@ impl QueueState {
                 job.status = JobStatus::Queued;
             }
         }
+        state.repair_names_and_directories();
         state
+    }
+
+    /// Boot repair for a queue admitted by a daemon that let two jobs
+    /// share a name and a directory (field report 2026-07-29).
+    ///
+    /// Two things, both from the job's own stored file list, which is all
+    /// the evidence the NZB ever had:
+    ///
+    /// 1. A job still carrying an open name gets the name its files
+    ///    imply. The queue is full of jobs whose par2 set names them
+    ///    perfectly and whose title says who asked for them instead.
+    /// 2. A duplicate `dir_name` is broken apart — but **only for a job
+    ///    that has not written anything yet**. Moving the directory of a
+    ///    job with bytes on disk orphans them; those keep the folder they
+    ///    have already used and only their display name improves.
+    fn repair_names_and_directories(&mut self) {
+        for i in 0..self.jobs.len() {
+            if !name_is_open(&self.jobs[i]) {
+                continue;
+            }
+            let names: Vec<String> = self.jobs[i]
+                .files
+                .iter()
+                .map(|f| f.filename.clone())
+                .collect();
+            let Some(real) = name_from_files(&names) else {
+                continue;
+            };
+            let untouched = self.jobs[i].totals.success_articles == 0;
+            let was = self.jobs[i].name.clone();
+            rename_job(&mut self.jobs[i], real, untouched, false);
+            tracing::info!(job = self.jobs[i].id.0, from = %was, to = %self.jobs[i].name,
+                "job renamed at boot from its own file list");
+        }
+        for i in 0..self.jobs.len() {
+            let (id, want, untouched) = {
+                let j = &self.jobs[i];
+                (j.id, j.dir_name.clone(), j.totals.success_articles == 0)
+            };
+            if want.is_empty() || !untouched {
+                continue;
+            }
+            let unique = self.unique_dir_name(id, want.clone());
+            if unique != want {
+                tracing::warn!(job = id.0, from = %want, to = %unique,
+                    "two jobs shared one download directory; separating them");
+                self.jobs[i].dir_name = unique;
+            }
+        }
     }
 
     pub fn to_doc(&self) -> QueueSnapshotDoc {
@@ -151,7 +201,7 @@ impl QueueState {
         let category = category.or_else(|| parsed.meta.category.clone());
         let files = self.build_files(parsed, pause_extra_pars);
 
-        let dir_name = sanitize_name(&name);
+        let dir_name = self.unique_dir_name(job_id, sanitize_name(&name));
         let mut job = Job {
             id: job_id,
             kind: JobKind::Nzb,
@@ -174,6 +224,42 @@ impl QueueState {
         job_id
     }
 
+    /// A storage directory belongs to exactly one job.
+    ///
+    /// Two jobs sharing a `dir_name` write into ONE directory: two
+    /// releases interleaved in a folder, post-processing verifying and
+    /// renaming them as though they were one release, and whichever
+    /// finishes second moving the other's files into its category
+    /// destination. It happened (field report 2026-07-29): sixteen jobs
+    /// all landed in
+    /// `/working/monarr/completed/monarr_0.11.0 · drunkenslug · monarr_0/`.
+    ///
+    /// Names cannot be relied on to be distinct — a provisional name is
+    /// built from the client and the indexer, which are *identical* for
+    /// every job a given \*arr adds, and two adds of the same release are
+    /// legitimate anyway — so the directory is disambiguated by the one
+    /// thing that is unique by construction.
+    fn unique_dir_name(&self, id: JobId, want: String) -> String {
+        if self.jobs.iter().any(|j| j.id != id && j.dir_name == want) {
+            format!("{want}.{}", id.0)
+        } else {
+            want
+        }
+    }
+
+    /// [`rename_job`] with the directory-uniqueness invariant applied.
+    /// The owner loop renames through this, never the free function.
+    pub fn set_job_name(&mut self, id: JobId, name: String, storage_too: bool, provisional: bool) {
+        let Some(pos) = self.jobs.iter().position(|j| j.id == id) else {
+            return;
+        };
+        rename_job(&mut self.jobs[pos], name, storage_too, provisional);
+        if storage_too {
+            let want = self.jobs[pos].dir_name.clone();
+            self.jobs[pos].dir_name = self.unique_dir_name(id, want);
+        }
+    }
+
     /// Register a URL job: no files yet, `Fetching` until the NZB arrives
     /// (then [`QueueState::complete_url_fetch`] fills it in).
     pub fn admit_url(
@@ -185,7 +271,7 @@ impl QueueState {
     ) -> JobId {
         self.next_job_id += 1;
         let job_id = JobId(self.next_job_id);
-        let dir_name = sanitize_name(&name);
+        let dir_name = self.unique_dir_name(job_id, sanitize_name(&name));
         self.jobs.push(Job {
             id: job_id,
             kind: JobKind::Url,
@@ -226,7 +312,33 @@ impl QueueState {
         }
         // URL jobs were named from the URL tail; re-clean now that the
         // NZB's own metadata (meta title, par2 set name) is available.
-        job.name = clean_job_name(&job.name, parsed);
+        //
+        // A provisional name offers NO hint — ask the NZB alone.
+        //
+        // It reads as perfectly informative (that is its design: it is
+        // built from the client and the indexer), so passing it as the
+        // hint short-circuits `name_from_evidence`, which hands it
+        // straight back and the NZB's own naming never gets a hearing.
+        // That is how sixteen jobs with correct par2 sets sitting right
+        // there ended up titled `monarr/0.11.0 · drunkenslug · monarr/0`
+        // (field report 2026-07-29). Passing the client's ORIGINAL name
+        // instead is no better: a placeholder only exists because that
+        // name was already judged not good enough to keep.
+        let hint = if job.name_provisional {
+            String::new()
+        } else {
+            job.name.clone()
+        };
+        match name_from_evidence(&hint, parsed) {
+            // A name out of the job's own documents settles it, and no
+            // file has been written yet, so the directory follows.
+            Some(real) => rename_job(job, real, true, false),
+            // Nothing better in the NZB either: a provisional name stays
+            // provisional (the owner loop re-offers one), and a job that
+            // never had one keeps the old behaviour.
+            None if !job.name_provisional => job.name = clean_job_name(&hint, parsed),
+            None => {}
+        }
         job.files = files;
         job.status = JobStatus::Queued;
         recompute_job_totals(job);
@@ -422,9 +534,26 @@ pub fn requestor_name(job: &Job) -> Option<String> {
     }
     // A short id so two of these are still tellable apart, and so the row
     // can be matched back to the indexer link by eye.
-    let ident = strip_name_junk(&job.name);
+    //
+    // Read from what the CLIENT called this job, never from `job.name` —
+    // which is the field this function's own result overwrites. Fed its
+    // own output it converges: the first eight characters of
+    // `monarr/0.11.0 · drunkenslug · e44dbc35` are `monarr/0`, so the
+    // second call produces `monarr/0.11.0 · drunkenslug · monarr/0`, and
+    // so does every call after it — for every job from that client and
+    // indexer. Sixteen jobs with one name, and one directory between them
+    // (field report 2026-07-29).
+    let ident = strip_name_junk(if job.original_name.is_empty() {
+        &job.name
+    } else {
+        &job.original_name
+    });
     let short: String = ident.chars().take(8).collect();
-    if !short.is_empty() {
+    // The client's label may be missing, generic, or the same word we
+    // already used. The job id is none of those.
+    if short.is_empty() || parts.iter().any(|p| p.eq_ignore_ascii_case(&short)) {
+        parts.push(format!("#{}", job.id.0));
+    } else {
         parts.push(short);
     }
     Some(parts.join(" · "))
@@ -680,9 +809,30 @@ fn is_posting_artifact(name: &str) -> bool {
 
 /// Recovery-set base: the main `<base>.par2` (not `.volXX+YY`) filename.
 fn par2_base_name(nzb: &nzbd_nzb::ParsedNzb) -> Option<String> {
+    let names: Vec<String> = nzb.files.iter().map(|f| f.filename_hint()).collect();
+    par2_base_of(&names)
+}
+
+/// The best name a set of *filenames* supports — the recovery-set base
+/// first, then their common stem.
+///
+/// The same evidence pass [`name_from_evidence`] runs, asked of a job's
+/// own stored file list rather than of a parsed NZB. That list survives a
+/// restart, so a job admitted under a name it should never have kept can
+/// still be told what it is (see `repair_names_and_directories`).
+pub fn name_from_files(names: &[String]) -> Option<String> {
+    [par2_base_of(names), common_stem(names)]
+        .into_iter()
+        .flatten()
+        .find_map(|candidate| {
+            let c = strip_name_junk(&candidate);
+            (!c.is_empty() && !is_uninformative(&c)).then_some(c)
+        })
+}
+
+fn par2_base_of(names: &[String]) -> Option<String> {
     let mut best: Option<String> = None;
-    for f in &nzb.files {
-        let hint = f.filename_hint();
+    for hint in names {
         let lower = hint.to_ascii_lowercase();
         if !lower.ends_with(".par2") {
             continue;
@@ -1893,5 +2043,207 @@ mod tests {
         ] {
             assert!(!is_uninformative_name(real), "{real:?} should be kept");
         }
+    }
+
+    // ---- the requestor placeholder must not eat its own tail ----------
+
+    fn url_job(id: u32, client: &str, url: &str, name: &str) -> Job {
+        let mut j = job_with(name, &[(CLIENT_PARAM, client), ("*URL", url)], None);
+        j.id = JobId(id);
+        j
+    }
+
+    /// Field report 2026-07-29: sixteen queued jobs, every one titled
+    /// `monarr/0.11.0 · drunkenslug · monarr/0`, all writing into one
+    /// directory.
+    ///
+    /// `requestor_name` took its discriminator from `job.name` — the field
+    /// the rename it feeds then overwrites. Run twice (admission, then
+    /// again when the URL fetch completes) it read its own output: the
+    /// first eight characters of `monarr/0.11.0 · …` are `monarr/0`. That
+    /// is a fixed point, and the same one for every job from that client.
+    #[test]
+    fn the_requestor_placeholder_is_stable_under_repetition() {
+        let mut j = url_job(
+            187,
+            "monarr/0.11.0",
+            "https://drunkenslug.com/getnzb/e44dbc357d05b55850a76028a6efec9f5ef893b0",
+            "e44dbc357d05b55850a76028a6efec9f5ef893b0",
+        );
+        let first = requestor_name(&j).expect("client and indexer are both known");
+        assert_eq!(first, "monarr/0.11.0 · drunkenslug · e44dbc35");
+
+        rename_job(&mut j, first.clone(), true, true);
+        let second = requestor_name(&j).expect("still nameable");
+        assert_eq!(second, first, "a second pass must not consume the first");
+
+        // …and a third, because the real daemon calls it once per add and
+        // once per completed fetch, with restarts in between.
+        rename_job(&mut j, second.clone(), true, true);
+        assert_eq!(requestor_name(&j).as_deref(), Some(first.as_str()));
+    }
+
+    /// Two jobs from one client and one indexer are the normal case, not
+    /// the exotic one. Their placeholders must still differ.
+    #[test]
+    fn two_jobs_from_one_requestor_are_still_tellable_apart() {
+        let a = url_job(187, "monarr/0.11.0", "https://drunkenslug.com/x", "");
+        let b = url_job(188, "monarr/0.11.0", "https://drunkenslug.com/x", "");
+        let (na, nb) = (requestor_name(&a).unwrap(), requestor_name(&b).unwrap());
+        assert_ne!(na, nb, "{na} and {nb} would share a directory");
+        assert!(na.ends_with("#187") && nb.ends_with("#188"));
+
+        // A client label that happens to repeat a part we already used is
+        // no discriminator either.
+        let mut c = url_job(190, "monarr", "https://drunkenslug.com/x", "monarr");
+        c.name = "monarr".into();
+        assert_eq!(
+            requestor_name(&c).as_deref(),
+            Some("monarr · drunkenslug · #190")
+        );
+    }
+
+    /// A provisional name reads as informative — that is its whole design
+    /// — so handing it back to the evidence pass as the *hint* short-
+    /// circuits the pass and the NZB never gets asked. Sixteen jobs whose
+    /// par2 sets named them perfectly were titled after their requestor.
+    #[test]
+    fn a_provisional_name_does_not_mask_the_nzb() {
+        let mut q = QueueState::default();
+        let id = q.admit_url(
+            "e44dbc357d05b55850a76028a6efec9f5ef893b0".into(),
+            "https://drunkenslug.com/getnzb/e44dbc35",
+            Some("monarr".into()),
+            0,
+        );
+        q.set_job_name(
+            id,
+            "monarr/0.11.0 · drunkenslug · e44dbc35".into(),
+            true,
+            true,
+        );
+
+        let nzb = nzb_with(
+            &[
+                "72.Hours.2026.2160p.NF.WEB-DL.DV.HDR.MULTi.mp4.vol000+01.par2",
+                "72.Hours.2026.2160p.NF.WEB-DL.DV.HDR.MULTi.mp4.vol001+02.par2",
+            ],
+            None,
+        );
+        assert!(q.complete_url_fetch(id, &nzb, false));
+
+        let j = q.job(id).unwrap();
+        assert_eq!(j.name, "72.Hours.2026.2160p.NF.WEB-DL.DV.HDR.MULTi.mp4");
+        assert!(!j.name_provisional, "the NZB's own naming is final");
+        assert_eq!(
+            j.dir_name, "72.Hours.2026.2160p.NF.WEB-DL.DV.HDR.MULTi.mp4",
+            "nothing is on disk yet, so the directory follows"
+        );
+        assert_eq!(
+            j.original_name, "e44dbc357d05b55850a76028a6efec9f5ef893b0",
+            "what the client called it is still findable"
+        );
+    }
+
+    /// A job whose NZB really has nothing keeps its placeholder — the
+    /// fallback still works, it just no longer overwrites better answers.
+    #[test]
+    fn a_fetch_with_no_evidence_leaves_the_placeholder_alone() {
+        let mut q = QueueState::default();
+        let id = q.admit_url("cc310b99017579".into(), "https://x.example/a", None, 0);
+        q.set_job_name(id, "monarr · x · cc310b99".into(), true, true);
+        let nzb = nzb_with(&["XyfmaV5wXwfrrrqbVHgvsqC8b2ztZK"], None);
+        assert!(q.complete_url_fetch(id, &nzb, false));
+        let j = q.job(id).unwrap();
+        assert_eq!(j.name, "monarr · x · cc310b99");
+        assert!(j.name_provisional, "still open to a par2 answer later");
+    }
+
+    /// One directory, one job. Two releases interleaved in a folder is not
+    /// a cosmetic defect: post-processing verifies and moves them as one.
+    #[test]
+    fn two_jobs_never_share_a_download_directory() {
+        let mut q = QueueState::default();
+        let nzb = nzb_with(&["Same.Release.2024-GRP.par2"], None);
+        let a = q.admit_nzb("Same.Release.2024-GRP".into(), &nzb, None, 0, false);
+        let b = q.admit_nzb("Same.Release.2024-GRP".into(), &nzb, None, 0, false);
+        assert_ne!(
+            q.job(a).unwrap().dir_name,
+            q.job(b).unwrap().dir_name,
+            "a duplicate add must not clobber the first one's files"
+        );
+
+        // And a rename that collides is separated the same way.
+        q.set_job_name(b, "Same.Release.2024-GRP".into(), true, false);
+        assert_ne!(q.job(a).unwrap().dir_name, q.job(b).unwrap().dir_name);
+    }
+
+    /// The queue that is already broken must not stay broken. On boot a
+    /// job with an open name is told what it is by its own file list, and
+    /// a shared directory is split — but only for a job that has not
+    /// written anything, because moving the folder of one that has orphans
+    /// the bytes already in it.
+    #[test]
+    fn boot_repairs_the_names_and_directories_it_finds() {
+        let nzb = nzb_with(&["The.Dink.2026.2160p-PiRaTeS.mkv.vol000+01.par2"], None);
+        let mut q = QueueState::default();
+        let a = q.admit_nzb("x".into(), &nzb, None, 0, false);
+        let b = q.admit_nzb("x".into(), &nzb, None, 0, false);
+        for id in [a, b] {
+            let j = q.job_mut(id).unwrap();
+            j.name = "monarr/0.11.0 · drunkenslug · monarr/0".into();
+            j.name_provisional = true;
+            j.dir_name = "monarr_0.11.0 · drunkenslug · monarr_0".into();
+        }
+        // One of them has already written; its directory must not move.
+        q.job_mut(b).unwrap().totals.success_articles = 3;
+
+        let doc = q.to_doc();
+        let q = QueueState::from_doc(doc);
+
+        for id in [a, b] {
+            assert_eq!(
+                q.job(id).unwrap().name,
+                "The.Dink.2026.2160p-PiRaTeS.mkv",
+                "the file list knew all along"
+            );
+            assert!(!q.job(id).unwrap().name_provisional);
+        }
+        assert_eq!(
+            q.job(b).unwrap().dir_name,
+            "monarr_0.11.0 · drunkenslug · monarr_0",
+            "bytes on disk: the folder stays where they are"
+        );
+        assert_ne!(
+            q.job(a).unwrap().dir_name,
+            q.job(b).unwrap().dir_name,
+            "nothing written: this one moves out of the shared folder"
+        );
+    }
+
+    #[test]
+    fn a_file_list_names_a_job_the_same_way_an_nzb_does() {
+        let names = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            name_from_files(&names(&["Cool.Movie.2024-GRP.par2", "abc.part01.rar"])).as_deref(),
+            Some("Cool.Movie.2024-GRP")
+        );
+        assert_eq!(
+            name_from_files(&names(&[
+                "Show.S01E02.part01.rar",
+                "Show.S01E02.part02.rar"
+            ]))
+            .as_deref(),
+            Some("Show.S01E02")
+        );
+        // All obfuscated: say nothing rather than hand back a hash.
+        assert_eq!(
+            name_from_files(&names(&[
+                "XyfmaV5wXwfrrrqbVHgvsqC8b2ztZK",
+                "XyfmaV5wXwfrrrqbVHgvsqC8b2ztZL",
+            ])),
+            None
+        );
+        assert_eq!(name_from_files(&[]), None);
     }
 }

@@ -1872,7 +1872,13 @@ impl Owner {
         let was = j.name.clone();
         // Provisional: this says who asked, not what arrived. The job's own
         // par2 metadata supersedes it the moment that lands.
-        crate::queue::rename_job(j, better.clone(), storage_too, true);
+        //
+        // Through `set_job_name`, not the free function: a requestor name
+        // is built from the client and the indexer and so is *shared* by
+        // every job that client adds — exactly the shape that must never
+        // be allowed to become a shared download directory.
+        self.state
+            .set_job_name(job, better.clone(), storage_too, true);
         tracing::info!(job = job.0, from = %was, to = %better,
             "job named from its requestor — the NZB carried no name of its own");
         Some(better)
@@ -1898,7 +1904,7 @@ impl Owner {
         }
         let was = j.name.clone();
         // Final: the recovery set is the document naming itself.
-        crate::queue::rename_job(j, name.clone(), false, false);
+        self.state.set_job_name(job, name.clone(), false, false);
         tracing::info!(job = job.0, from = %was, to = %name,
             "job named from its own par2 metadata");
         self.dirty = true;
