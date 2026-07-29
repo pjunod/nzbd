@@ -32,7 +32,46 @@ pub struct Config {
     #[serde(default)]
     pub post: PostSection,
     #[serde(default)]
+    pub history: HistorySection,
+    #[serde(default)]
     pub cluster: ClusterConfig,
+}
+
+/// `[history]` — how much finished-job history to keep (ARCHITECTURE.md
+/// §8.6).
+///
+/// History was unbounded, and unbounded is not free even when the row
+/// count looks small. Every read re-unions the authoritative JSONL from
+/// the state volume, so the file's *length* — not the number of rows you
+/// asked for — sets what a history page costs: 179 entries took 3.1 s on
+/// nuc3's network state mount (field report 2026-07-29). Trimming is what
+/// keeps that bounded; paging alone would not have.
+///
+/// Two bounds, because they answer different questions and either one
+/// alone leaves a hole. A count bound answers "how big may this get" and
+/// holds even when a burst arrives in a day; an age bound answers "how far
+/// back do I care" and holds even when the daemon is quiet for months.
+/// Whichever bites first wins. `0` disables that bound.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields, default)]
+pub struct HistorySection {
+    /// Keep at most this many entries (0 = unlimited).
+    pub keep_max: u32,
+    /// Drop entries finished more than this many days ago (0 = forever).
+    /// NZBGet `KeepHistory`, which is days and means the same thing.
+    pub keep_days: u32,
+}
+
+impl Default for HistorySection {
+    fn default() -> Self {
+        // A thousand entries is more than a year of a busy *arr setup and
+        // still a JSONL small enough to re-read on a slow mount; ninety
+        // days is the window in which anyone asks "did that ever come in?"
+        HistorySection {
+            keep_max: 1000,
+            keep_days: 90,
+        }
+    }
 }
 
 /// `[post]` — post-processing (ARCHITECTURE.md §9): par verify/repair,
@@ -876,6 +915,13 @@ pub fn import_nzbget_conf(content: &str) -> Result<(Config, ImportReport), Confi
                 cfg.queue.quota_start_day = v.parse().unwrap_or(1);
                 Some("queue.quota_start_day".into())
             }
+            // Was on the "recognized but skipped" list because nzbd kept
+            // history forever and had nothing to map it onto. It does now,
+            // and the units already agree: NZBGet's KeepHistory is days.
+            "keephistory" => {
+                cfg.history.keep_days = v.parse().unwrap_or(0);
+                Some("history.keep_days".into())
+            }
             "downloadrate" => {
                 let kib: u64 = v.parse().unwrap_or(0);
                 cfg.queue.speed_limit_kib = (kib > 0).then_some(kib);
@@ -981,7 +1027,6 @@ pub fn import_nzbget_conf(content: &str) -> Result<(Config, ImportReport), Confi
             | "flushqueue"
             | "dupecheck"
             | "tempdircleanup"
-            | "keephistory"
             | "feedhistory"
             | "skipwrite"
             | "rawarticle"
@@ -1290,6 +1335,21 @@ FutureOption=whatever
             .any(|(k, t)| k == "Server1.Host" && t == "server[1].host"));
         assert!(report.skipped.iter().any(|k| k == "ControlPassword"));
         assert!(report.skipped.iter().any(|k| k == "ParCheck"));
+
+        // KeepHistory used to land on the skipped list because nzbd kept
+        // history forever and had nothing to map it onto. It has bounds
+        // now, and NZBGet's units are already days — so an import carries
+        // the operator's retention window across instead of silently
+        // handing them ours.
+        assert_eq!(cfg.history.keep_days, 30);
+        assert!(
+            !report.skipped.iter().any(|k| k == "KeepHistory"),
+            "KeepHistory is mapped now, not skipped"
+        );
+        assert!(report
+            .mapped
+            .iter()
+            .any(|(k, v)| k == "KeepHistory" && v == "history.keep_days"));
         assert!(report.unknown.iter().any(|k| k == "FutureOption"));
         assert!(report.warnings.is_empty(), "{:?}", report.warnings);
 

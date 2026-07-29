@@ -267,12 +267,21 @@ fn feed_defs(cfg: &nzbd_config::Config) -> Vec<nzbd_feed::FeedDef> {
         .collect()
 }
 
+/// The `[history]` bounds, in the form the store takes them.
+fn history_retention(cfg: &nzbd_config::Config) -> nzbd_state::history::Retention {
+    nzbd_state::history::Retention {
+        keep_max: cfg.history.keep_max,
+        keep_days: cfg.history.keep_days,
+    }
+}
+
 /// Open the history store: SQLite index in a node-local dir, authoritative
 /// JSONL wherever `jsonl_dir` points (shared volume in cluster mode).
 fn open_history(
     local_dir: &std::path::Path,
     jsonl_dir: &std::path::Path,
     node_tag: Option<&str>,
+    retention: nzbd_state::history::Retention,
 ) -> anyhow_lite::Result<Arc<nzbd_state::history::HistoryDb>> {
     for dir in [local_dir, jsonl_dir] {
         std::fs::create_dir_all(dir).map_err(|e| {
@@ -282,13 +291,25 @@ fn open_history(
             ))
         })?;
     }
-    nzbd_state::history::HistoryDb::open_tagged(
+    let db = nzbd_state::history::HistoryDb::open_tagged(
         &local_dir.join("history.sqlite"),
         Some(jsonl_dir),
         node_tag,
     )
     .map(Arc::new)
-    .map_err(|e| anyhow_lite::Error::msg(format!("history db: {}", with_fs_hint(e))))
+    .map_err(|e| anyhow_lite::Error::msg(format!("history db: {}", with_fs_hint(e))))?;
+    // Trim at boot, not just when the next job finishes: lowering the
+    // bound on a running install should take effect when you restart it,
+    // and an install upgrading into retention for the first time has its
+    // whole backlog to work through before it serves a single page.
+    match db.set_retention(retention) {
+        Ok(0) => {}
+        Ok(n) => tracing::info!(dropped = n, "history trimmed at startup"),
+        // Retention is a housekeeping bound, not a correctness one. A
+        // daemon that cannot trim still has every entry it ever had.
+        Err(e) => tracing::warn!(error = %with_fs_hint(e), "history retention trim failed"),
+    }
+    Ok(db)
 }
 
 /// Watch-dir scanner: `.nzb` files dropped into `NzbDir` are added and
@@ -591,7 +612,12 @@ fn run(
         let mut pp_stats = None;
         if cfg.post.enabled {
             let state_dir = cfg.state_dir();
-            let db = open_history(&state_dir, &state_dir.join("history"), None)?;
+            let db = open_history(
+                &state_dir,
+                &state_dir.join("history"),
+                None,
+                history_retention(&cfg),
+            )?;
             history = Some(db.clone());
             let slots = nzbd_post::manager::strategy_slots(&cfg.post.strategy);
             let stats = Arc::new(nzbd_types::metrics::PpStageStats::new());
@@ -837,7 +863,12 @@ async fn run_cluster(
     // authoritative JSONL lives on the shared volume.
     let pp = if cfg.post.enabled && cfg.cluster.post_process {
         let jsonl_dir = shared_dir.join(".nzbd-cluster/history");
-        let history = open_history(&cfg.state_dir(), &jsonl_dir, Some(&c.node_name))?;
+        let history = open_history(
+            &cfg.state_dir(),
+            &jsonl_dir,
+            Some(&c.node_name),
+            history_retention(&cfg),
+        )?;
         Some(nzbd_cluster::PpSetup {
             // Cluster PP stage timings are not wired to this node's
             // /metrics: the leases run wherever the scheduler puts them,

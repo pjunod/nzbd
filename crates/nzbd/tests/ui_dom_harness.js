@@ -77,11 +77,21 @@ const fake = {
 // stack and the pending overlay get exercised for real.
 const failures = [];
 const ids = new Set([...html.matchAll(/id="([^"]+)"/g)].map((m) => m[1]));
+// Checkboxes start where the MARKUP says they start. The scope toggles ship
+// with per-file off, and the Logs backfill now asks only for the scopes
+// that are ticked — a harness that defaulted every box to false would have
+// the page fetching nothing and call it a pass.
+const checkedIds = new Set(
+  [...html.matchAll(/<input\b[^>]*>/g)]
+    .filter((m) => /\bchecked\b/.test(m[0]))
+    .map((m) => (m[0].match(/id="([^"]+)"/) || [])[1])
+    .filter(Boolean),
+);
 function stubEl(id) {
   const t = {
     id, style: {}, dataset: {}, attrs: {}, hidden: false, disabled: false,
     value: "", textContent: "", innerHTML: "", className: "", title: "",
-    checked: false, scrollTop: 0, clientHeight: 0, scrollHeight: 0,
+    checked: checkedIds.has(id), scrollTop: 0, clientHeight: 0, scrollHeight: 0,
     children: [], parentNode: null,
     classList: { toggle() {}, add() {}, remove() {} },
     querySelectorAll: () => [], querySelector: () => null,
@@ -133,9 +143,12 @@ const routes = new Map();
 const seen = [];
 async function routeFetch(url, init) {
   seen.push({ url, method: (init && init.method) || "GET" });
-  for (const [frag, res] of routes) {
-    if (String(url).includes(frag))
-      return { ok: res.status < 400, status: res.status, json: async () => res.body, text: async () => "" };
+  for (const [frag, entry] of routes) {
+    if (!String(url).includes(frag)) continue;
+    // A route may be a function when a test needs consecutive calls to
+    // answer differently (a page that empties out under the reader).
+    const res = typeof entry === "function" ? entry(url, init) : entry;
+    return { ok: res.status < 400, status: res.status, json: async () => res.body, text: async () => "" };
   }
   return { ok: false, status: 503, json: async () => ({}), text: async () => "" };
 }
@@ -1345,6 +1358,169 @@ const models = (jobs) => jobs.map((j, i) => T.rowModel(j, { idx: i, count: jobs.
       job: 4, name: "y", status: "SUCCESS", size: 10, completed_at_unix: 1,
     });
     eq(bare.ppNote, "", "a pre-upgrade history row renders without one");
+  }
+
+  // --- history paging: the request IS the page ---------------------------
+  // Server-side, unlike the queue's: `total` comes off the wire because the
+  // page in hand cannot say how long the list is.
+  {
+    const bar = sandbox.document.getElementById("history-pager");
+    const info = sandbox.document.getElementById("history-pager-info");
+    const hist = (n, base) => Array.from({ length: n }, (_, i) => ({
+      job: base + i, name: "h" + (base + i), status: "SUCCESS", size: 10,
+      completed_at_unix: 1000 - i, stages: [],
+    }));
+
+    eq(T.HISTORY_PAGE_SIZE_DEFAULT, 20, "20 history rows per page by default");
+    ok(!T.HISTORY_PAGE_SIZES.includes(0),
+      "no 'all' option — 'all' is the thing this exists to stop asking for");
+
+    routes.clear();
+    seen.length = 0;
+    routes.set("/api/v1/clients", { status: 200, body: { clients: [] } });
+    routes.set("/api/v1/history", { status: 200, body: { entries: hist(20, 1), total: 179 } });
+    T.setHistoryPagingForTest(0, 20, 0);
+    await T.refreshHistory();
+
+    const asked = seen.filter(r => r.url.includes("/api/v1/history")).map(r => r.url);
+    eq(asked.length, 1, "one history request per page");
+    ok(asked[0].includes("limit=20"), `the page size is on the wire (got ${asked[0]})`);
+    ok(asked[0].includes("offset=0"), "…and so is the offset");
+    eq(T.getHistoryPaging().total, 179, "total comes from the server, not from the page");
+    eq(T.historyPages(), 9, "179 rows at 20/page is nine pages");
+    eq(bar.hidden, false, "the pager appears once there is more than one page");
+    ok(info.textContent.includes("1–20 of 179"),
+      `the range names the whole list (got ${info.textContent})`);
+    ok(info.textContent.includes("page 1/9"), "…and the position in it");
+
+    // Page 3 asks for offset 40 — the browser never sees rows 1–40 at all.
+    seen.length = 0;
+    routes.set("/api/v1/history", { status: 200, body: { entries: hist(20, 41), total: 179 } });
+    await T.setHistoryPage(2);
+    const p3 = seen.filter(r => r.url.includes("/api/v1/history")).map(r => r.url)[0];
+    ok(p3.includes("offset=40"), `page 3 asks the server for offset 40 (got ${p3})`);
+    ok(info.textContent.includes("41–60 of 179"), "the range follows the request");
+
+    // Changing the size keeps the row you were looking at in view.
+    seen.length = 0;
+    routes.set("/api/v1/history", { status: 200, body: { entries: hist(50, 41), total: 179 } });
+    await T.setHistoryPageSize(50);
+    eq(T.getHistoryPaging().page, 0, "row 41 lives on page 1 at 50/page");
+
+    // History shrinking under you — a retention trim is exactly this — must
+    // not strand the view on a page that no longer exists.
+    seen.length = 0;
+    let call = 0;
+    routes.set("/api/v1/history", () => {
+      call++;
+      return call === 1
+        ? { status: 200, body: { entries: [], total: 30 } }
+        : { status: 200, body: { entries: hist(30, 1), total: 30 } };
+    });
+    T.setHistoryPagingForTest(5, 50, 400);
+    await T.refreshHistory();
+    eq(call, 2, "an empty page past the end is retried, not shown");
+    eq(T.getHistoryPaging().page, 0, "…from the last page that exists");
+
+    // A daemon too old to send `total` must not make the pager invent one.
+    routes.set("/api/v1/history", { status: 200, body: { entries: hist(20, 1) } });
+    T.setHistoryPagingForTest(1, 20, 0);
+    await T.refreshHistory();
+    eq(T.getHistoryPaging().total, 40,
+      "with no total, the pager describes what it can reach and no more");
+
+    T.setHistoryPagingForTest(0, 20, 0);
+    routes.clear();
+    seen.length = 0;
+  }
+
+  // --- the log ring keeps a budget per class ------------------------------
+  // The defect: one shared 500-line ring means a per-file flood evicts every
+  // system and job line, so the Logs tab goes blank exactly when a download
+  // is running — the one time anyone opens it.
+  {
+    const line = (id, scope, text) => ({
+      id, scope, kind: "INFO", time_unix: 1_700_000_000, text,
+      job: scope === "system" ? undefined : 7,
+    });
+    T.store.logs = [];
+    T.appendLogs([line(1, "system", "nzbd starting"), line(2, "job", "job finished")], 0);
+    for (let i = 0; i < T.LOG_RING_MAX * 3; i++)
+      T.appendLogs([line(100 + i, "file", "file finished " + i)], 0);
+
+    const kept = T.store.logs;
+    const mains = kept.filter(e => T.logClass(e) === "main");
+    const files = kept.filter(e => T.logClass(e) === "file");
+    eq(mains.length, 2, "the boot banner and the job line survived the flood");
+    eq(mains[0].text, "nzbd starting", "…in order");
+    eq(files.length, T.LOG_RING_MAX, "per-file lines rolled against their OWN budget");
+    eq(files[files.length - 1].text, "file finished " + (T.LOG_RING_MAX * 3 - 1),
+      "…keeping the newest");
+    ok(kept.every((e, i) => i === 0 || kept[i - 1].id <= e.id),
+      "the ring stays in arrival order across both budgets");
+
+    // A skip marker is a statement about the stream, so it rides with main
+    // and a file flood cannot evict it either.
+    T.store.logs = [];
+    T.appendLogs([line(1, "system", "boot")], 0);
+    T.appendLogs([line(2, "job", "job")], 9);
+    for (let i = 0; i < T.LOG_RING_MAX + 50; i++) T.appendLogs([line(500 + i, "file", "f")], 0);
+    ok(T.store.logs.some(e => e.skipped === 9), "the skipped-line marker survived");
+
+    // The rendered line is memoised, not rebuilt per frame.
+    const rec = line(1, "system", "hello");
+    const first = T.logLineText(rec);
+    rec.text = "changed underneath";
+    eq(T.logLineText(rec), first, "a record's rendered line is computed once");
+    ok(first.includes("INFO"), "…and carries the level");
+
+    T.store.logs = [];
+  }
+
+  // --- the Logs backfill asks for what is shown ---------------------------
+  // It used to fetch all three scopes and throw two thirds away: per-file
+  // lines outnumber the rest ~2:1 even on an idle daemon, and the default
+  // view hides them.
+  {
+    const doc = sandbox.document;
+    routes.clear();
+    seen.length = 0;
+    routes.set("/api/v1/logs", { status: 200, body: { entries: [] } });
+
+    // The default lives in the markup, and earlier blocks have ticked
+    // boxes since — assert the markup, then set the state it describes.
+    const boxChecked = (id) =>
+      /\bchecked\b/.test((html.match(new RegExp(`<input\\b[^>]*id="${id}"[^>]*>`)) || [""])[0]);
+    ok(boxChecked("lg-system"), "system is on by default");
+    ok(boxChecked("lg-job"), "jobs are on by default");
+    ok(!boxChecked("lg-file"), "per-file is off by default — it is the noisy one");
+    for (const s of ["system", "job", "file"])
+      doc.getElementById("lg-" + s).checked = boxChecked("lg-" + s);
+
+    await T.refreshLogs();
+    let url = seen.filter(r => r.url.includes("/api/v1/logs")).map(r => r.url)[0];
+    ok(url.includes("scope=system,job"), `only the ticked scopes are asked for (got ${url})`);
+    ok(!url.includes("file"), "…and the noisy one the view hides is not fetched");
+
+    seen.length = 0;
+    doc.getElementById("lg-file").checked = true;
+    await T.refreshLogs();
+    url = seen.filter(r => r.url.includes("/api/v1/logs")).map(r => r.url)[0];
+    ok(url.includes("scope=system,job,file"), `ticking per-file widens the fetch (got ${url})`);
+
+    // Every box off means there is nothing to show, so nothing is fetched.
+    seen.length = 0;
+    for (const s of ["system", "job", "file"]) doc.getElementById("lg-" + s).checked = false;
+    await T.refreshLogs();
+    eq(seen.filter(r => r.url.includes("/api/v1/logs")).length, 0,
+      "no ticked scopes, no request");
+
+    doc.getElementById("lg-system").checked = true;
+    doc.getElementById("lg-job").checked = true;
+    doc.getElementById("lg-file").checked = false;
+    T.store.logs = [];
+    routes.clear();
+    seen.length = 0;
   }
 
   if (failures.length) {

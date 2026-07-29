@@ -1581,6 +1581,9 @@ async fn get_logs(State(st): State<ApiState>, Query(q): Query<LogsQuery>) -> Res
 #[derive(Debug, Deserialize)]
 struct HistoryQuery {
     limit: Option<usize>,
+    /// Page form: skip this many of the newest-first list. Ignored on the
+    /// cursor path, which already has a position of its own.
+    offset: Option<usize>,
     /// Cursor form: entries with `seq > since_seq`, oldest first. This is
     /// the catch-up path after a consumer was away, and the poll path's
     /// way to fetch only what is new. It exists because SSE is lossy by
@@ -1592,10 +1595,17 @@ struct HistoryQuery {
 /// jobs leave the queue and live here).
 ///
 /// Two shapes, kept separate rather than merged into one clever query:
-/// `?limit=` is newest-first for the UI and byte-for-byte what it always
-/// was, and `?since_seq=` is oldest-first for a consumer walking forward
-/// (so the last row's `seq` is its next cursor). Mixing the two orders in
-/// one response is how cursors quietly start skipping rows.
+/// `?limit=`/`?offset=` is newest-first for the UI, and `?since_seq=` is
+/// oldest-first for a consumer walking forward (so the last row's `seq` is
+/// its next cursor). Mixing the two orders in one response is how cursors
+/// quietly start skipping rows. `offset` belongs only to the first shape —
+/// a cursor already carries a position, and combining the two would give a
+/// consumer two ways to say where it is and no rule for which wins.
+///
+/// The response carries `total` (matching rows, not rows in this page) so
+/// the pager can say "1–20 of 179" without a second round trip. Every
+/// shape still answers under `entries`, so nothing that reads this today
+/// has to change.
 ///
 /// The read is also the handoff signal. A consumer listing history is the
 /// only evidence nzbd has that anyone came for the files, and until this was
@@ -1614,6 +1624,7 @@ async fn get_history(
     };
     let db = db.clone();
     let limit = q.limit.unwrap_or(200).min(10_000);
+    let offset = q.offset.unwrap_or(0);
     let since = q.since_seq;
     let consumer = consumer_name(&headers);
     let now = unix_now();
@@ -1621,8 +1632,9 @@ async fn get_history(
         let _ = db.refresh(); // pick up other nodes' appends (throttled)
         let rows = match since {
             Some(seq) => db.list_since(seq, limit),
-            None => db.list_filtered(limit, true),
+            None => db.list_page(limit, offset, true),
         };
+        let total = db.count_filtered(true).unwrap_or(0);
         rows.map(|entries| {
             // Record the pull before decorating: this poll SAW these
             // entries. Both shapes count — a `since_seq` catch-up walk is
@@ -1638,22 +1650,36 @@ async fn get_history(
             // `can_requeue` is derived, not stored: it answers "is the
             // requeue source still on this node?", which only a look at the
             // spool (or the parked `*URL`) can honestly say.
-            entries
+            //
+            // ONE directory listing for the page, not one `stat` per row:
+            // the spool lives beside the state dir, which on a network
+            // mount made this loop the bulk of a history read (250 ms for
+            // 179 rows, nuc3 2026-07-29).
+            let spooled = db.spooled_ids();
+            let entries = entries
                 .into_iter()
                 .map(|e| {
-                    let can = db.has_spool(e.job) || e.params.iter().any(|(k, _)| k == "*URL");
+                    let can =
+                        spooled.contains(&e.job.0) || e.params.iter().any(|(k, _)| k == "*URL");
                     let mut v = serde_json::to_value(&e).unwrap_or_else(|_| json!({}));
                     if let Some(o) = v.as_object_mut() {
                         o.insert("can_requeue".into(), json!(can));
                     }
                     v
                 })
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>();
+            (entries, total)
         })
     })
     .await;
     match entries {
-        Ok(Ok(entries)) => Json(json!({ "entries": entries })).into_response(),
+        Ok(Ok((entries, total))) => Json(json!({
+            "entries": entries,
+            "total": total,
+            "offset": offset,
+            "limit": limit,
+        }))
+        .into_response(),
         Ok(Err(e)) => error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
         Err(e) => error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     }
@@ -1689,9 +1715,11 @@ async fn openapi() -> Response {
             "/api/v1/servers/test": { "post": { "summary": "Live news-server connectivity probe (connect + greeting + AUTHINFO)" } },
             "/api/v1/jobs/{id}/files": { "get": { "summary": "Per-file detail (segments done/failed, sizes, paused, par2)" } },
             "/api/v1/jobs/{id}/nzb": { "get": { "summary": "Download the job's NZB (regenerated from queue state)" } },
-            "/api/v1/history": { "get": { "summary": "Finished and deleted jobs (entries carry can_requeue and seq)",
+            "/api/v1/history": { "get": { "summary": "Finished and deleted jobs (entries carry can_requeue and seq; response carries total/offset/limit)",
                                           "parameters": [
                                               {"name": "limit", "in": "query"},
+                                              {"name": "offset", "in": "query",
+                                               "description": "Page: skip N of the newest-first list; ignored with since_seq"},
                                               {"name": "since_seq", "in": "query",
                                                "description": "Cursor: entries with seq > N, ascending"}
                                           ] } },
@@ -2974,6 +3002,121 @@ mod tests {
     }
 
     /// Daemon log lines reach the page over the same stream, batched onto
+    /// History paging is server-side because the cost it bounds is
+    /// server-side (see `HistoryDb::list_page`). The wire contract the
+    /// pager needs: a page holds only its own rows, `total` counts ALL
+    /// matching rows rather than the page, and consecutive pages tile the
+    /// list without overlap or gap.
+    #[tokio::test]
+    async fn history_pages_carry_their_own_rows_and_the_whole_total() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = test_engine(&tmp).await;
+        let db = Arc::new(
+            HistoryDb::open(
+                &tmp.path().join("history.sqlite"),
+                Some(&tmp.path().join("hjsonl")),
+            )
+            .unwrap(),
+        );
+        let now = 1_800_000_000;
+        for i in 0..25u32 {
+            db.record(&nzbd_state::HistoryEntry {
+                job: JobId(i),
+                name: format!("job-{i}"),
+                category: None,
+                final_dir: None,
+                status: "SUCCESS".into(),
+                size: 10,
+                health: 1000,
+                params: vec![],
+                dupe_key: String::new(),
+                dupe_score: 0,
+                completed_at_unix: now - (25 - i as i64) * 60,
+                hidden: false,
+                first_seen_at_unix: None,
+                last_seen_at_unix: None,
+                seen_count: 0,
+                removed_at_unix: None,
+                picked_up_by: None,
+                stages: vec![],
+                seq: 0,
+            })
+            .unwrap();
+        }
+        let app = router_with(ApiState {
+            engine: engine.clone(),
+            history: Some(db.clone()),
+            log: None,
+            setup: None,
+            clients: None,
+            shutdown: None,
+            pp_stats: None,
+            events: None,
+        });
+        let page = |offset: usize, limit: usize| {
+            let app = app.clone();
+            async move {
+                let resp = app
+                    .oneshot(
+                        axum::http::Request::get(format!(
+                            "/api/v1/history?limit={limit}&offset={offset}"
+                        ))
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(resp.status(), StatusCode::OK);
+                body_json(resp).await
+            }
+        };
+
+        let first = page(0, 10).await;
+        assert_eq!(first["entries"].as_array().unwrap().len(), 10);
+        assert_eq!(first["total"], 25, "total counts the list, not the page");
+        assert_eq!(first["offset"], 0);
+        assert_eq!(first["limit"], 10);
+        assert_eq!(first["entries"][0]["name"], "job-24", "newest first");
+
+        let ids = |v: &serde_json::Value| -> Vec<String> {
+            v["entries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|e| e["name"].as_str().unwrap().to_string())
+                .collect()
+        };
+        let mut tiled = ids(&first);
+        tiled.extend(ids(&page(10, 10).await));
+        let last = page(20, 10).await;
+        assert_eq!(last["entries"].as_array().unwrap().len(), 5, "short tail");
+        assert_eq!(last["total"], 25, "total does not shrink on the last page");
+        tiled.extend(ids(&last));
+        let expected: Vec<String> = (0..25u32).rev().map(|i| format!("job-{i}")).collect();
+        assert_eq!(tiled, expected, "the pages reassemble the list exactly");
+
+        // Off the end is an empty page, not an error and not a wrap-around.
+        let past = page(100, 10).await;
+        assert!(past["entries"].as_array().unwrap().is_empty());
+        assert_eq!(past["total"], 25);
+
+        // The cursor shape is untouched by offset: it has a position of
+        // its own, and honouring both would give a consumer two.
+        let resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::get("/api/v1/history?since_seq=0&limit=3&offset=99")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let v = body_json(resp).await;
+        let names = ids(&v);
+        assert_eq!(names.len(), 3);
+        assert_eq!(names[0], "job-0", "cursor walk is oldest-first from seq 0");
+    }
+
     /// the 1 Hz loop. A `tail -f` that updates once a second is the right
     /// cost/fidelity trade; the alternative is one frame per line.
     #[tokio::test]

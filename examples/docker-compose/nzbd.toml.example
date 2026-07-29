@@ -41,3 +41,9 @@ password = "CHANGE-ME"          # web UI + API auth (user "nzbd")
 [post]
 deobfuscate_final = true
 # scripts_dir = "/scripts"      # mount a scripts volume to use this
+
+[history]
+keep_max = 1000                 # keep at most this many finished jobs
+keep_days = 90                  # …and drop anything older (0 = forever)
+# Trimming keeps the History tab fast: the whole history log is re-read on
+# every history request, so its LENGTH is what a page costs.

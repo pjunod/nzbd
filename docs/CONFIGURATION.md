@@ -201,6 +201,38 @@ extension scripts. Scripts get NZBGet's exact `NZBPP_*` environment and
 `[NZB] KEY=value` command channel; exit codes 92–95 mean what they mean
 in NZBGet.
 
+## `[history]` — how much finished-job history to keep
+
+```toml
+[history]
+keep_max = 1000    # keep at most this many entries (0 = unlimited)
+keep_days = 90     # drop entries finished longer ago than this (0 = forever)
+```
+
+Both bounds apply and whichever is reached first wins. They answer
+different questions, which is why neither one alone is enough: `keep_max`
+answers *how big may this get* and holds when a week's backlog lands in a
+day; `keep_days` answers *how far back do I care* and holds when the
+daemon sits quiet for months.
+
+Trimming is not tidiness. The authoritative history log
+(`state/history/history.jsonl`) is re-read end to end on every history
+read, so the **log's length** — not the number of rows you asked for — is
+what a history page costs. On a network state volume that showed up as
+179 entries taking 3.1 s (nuc3, 2026-07-29); paging the UI would not have
+fixed it, because the expensive part happened before the page was chosen.
+A trim deletes the index rows, compacts the log to the survivors, and
+raises a watermark so a later rebuild will not re-import what went.
+
+Trimming runs at startup and on a 60-second throttle as jobs finish, so
+lowering a bound takes effect when you restart, not when the next job
+happens to complete. Nothing else changes: an entry's parked NZB is
+reaped with it, exactly as `forget` already does.
+
+Importing an `nzbget.conf` maps `KeepHistory` onto `keep_days` — the units
+already agree, so your existing retention window comes across rather than
+being replaced by nzbd's default.
+
 ## `[[feed]]` — RSS/Atom indexer feeds
 
 ```toml

@@ -22,6 +22,44 @@ const COLUMNS: &str = "job_id, name, category, final_dir, status, size, health, 
                        dupe_key, dupe_score, completed_at, hidden, first_seen, last_seen,
                        seen_count, removed_at, picked_up_by, id, stages";
 
+/// How much history to keep. `0` disables that bound; whichever bound
+/// bites first wins. See [`nzbd_config::HistorySection`] for why there are
+/// two of them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Retention {
+    pub keep_max: u32,
+    pub keep_days: u32,
+}
+
+impl Retention {
+    pub const UNLIMITED: Retention = Retention {
+        keep_max: 0,
+        keep_days: 0,
+    };
+
+    pub fn is_unlimited(&self) -> bool {
+        self.keep_max == 0 && self.keep_days == 0
+    }
+
+    /// Entries completed before this instant are out of the age window.
+    fn age_cutoff(&self, now: i64) -> Option<i64> {
+        (self.keep_days > 0).then(|| now - (self.keep_days as i64) * 86_400)
+    }
+}
+
+impl Default for Retention {
+    fn default() -> Self {
+        Retention::UNLIMITED
+    }
+}
+
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
 pub struct HistoryDb {
     conn: Mutex<Connection>,
     jsonl: Option<PathBuf>,
@@ -30,6 +68,17 @@ pub struct HistoryDb {
     /// undoing a delete on the node that served the click, not cluster state.
     spool: Option<PathBuf>,
     last_refresh: Mutex<Option<Instant>>,
+    /// Serializes appends against compaction. The JSONL has exactly one
+    /// appending *process* (its own node), but several threads inside it;
+    /// a tmp+rename landing between a thread's `open_append` and its write
+    /// would drop that line into the unlinked old inode.
+    jsonl_write: Mutex<()>,
+    retention: Mutex<Retention>,
+    last_prune: Mutex<Option<Instant>>,
+    /// Cached listing of the parked-NZB spool, so deriving `can_requeue`
+    /// for a page of history costs ONE `read_dir` instead of one `stat`
+    /// per row. See [`HistoryDb::spooled_ids`].
+    spool_cache: Mutex<Option<(Instant, std::collections::HashSet<u32>)>>,
 }
 
 impl HistoryDb {
@@ -97,6 +146,12 @@ impl HistoryDb {
         ] {
             let _ = conn.execute(ddl, []);
         }
+        // Node-local scalars that are NOT part of the portable log. The
+        // retention floor lives here: see `retention_floor`.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value INTEGER NOT NULL);",
+        )
+        .map_err(|e| StateError::Corrupt(format!("sqlite meta schema: {e}")))?;
 
         let jsonl = jsonl_dir.map(|d| {
             let file = match tag {
@@ -110,10 +165,33 @@ impl HistoryDb {
             jsonl,
             spool: db_path.parent().map(|d| d.join("nzbs")),
             last_refresh: Mutex::new(None),
+            jsonl_write: Mutex::new(()),
+            retention: Mutex::new(Retention::UNLIMITED),
+            last_prune: Mutex::new(None),
+            spool_cache: Mutex::new(None),
         };
         db.rebuild_from_jsonl(false)?;
         db.sweep_spool();
         Ok(db)
+    }
+
+    /// Apply retention bounds and trim immediately, reporting how many
+    /// entries went. Called once at boot with the configured `[history]`
+    /// section; `record` re-trims on a throttle after that.
+    ///
+    /// Retention is deliberately NOT a constructor argument. `open` runs
+    /// the first JSONL rebuild before anyone has said what the bounds are,
+    /// so the honest sequence is "load everything the log holds, then trim
+    /// it once we're told" — which is also what makes lowering the bound
+    /// on an existing install take effect on the next boot rather than
+    /// waiting for the next completed job.
+    pub fn set_retention(&self, retention: Retention) -> Result<usize, StateError> {
+        *self.retention.lock().unwrap() = retention;
+        self.prune(unix_now())
+    }
+
+    fn retention(&self) -> Retention {
+        *self.retention.lock().unwrap()
     }
 
     /// Pull in rows other nodes appended since open (cluster: call before
@@ -140,6 +218,14 @@ impl HistoryDb {
     /// 5 s history poll log "index rebuilt imported=57" forever (field
     /// report 2026-07-25). New-row counts come from a real before/after
     /// row count; the poll path logs at debug even then.
+    ///
+    /// **Ingest honours the retention floor**, which is what makes a prune
+    /// stick. Without it the rebuild is a machine for undoing retention:
+    /// this node's own file is compacted, but another node's is not, and
+    /// every poll would re-import what the last prune just dropped —
+    /// exactly the resurrect-with-a-new-cursor shape that
+    /// `docs/DEFECT_HISTORY_DELETE.md` documents for `delete`. The floor
+    /// only ever rises, so it can't flap.
     fn rebuild_from_jsonl(&self, quiet: bool) -> Result<(), StateError> {
         let Some(own) = &self.jsonl else {
             return Ok(());
@@ -160,7 +246,9 @@ impl HistoryDb {
             Err(e) => return Err(e),
         };
         files.sort();
+        let floor = self.ingest_floor()?;
         let before = self.row_count()?;
+        let mut dropped = 0usize;
         for path in files {
             let Ok(file) = fsx::open(&path) else {
                 continue;
@@ -173,6 +261,10 @@ impl HistoryDb {
                 let Ok(entry) = serde_json::from_slice::<HistoryEntry>(&line) else {
                     continue; // torn tail / old format
                 };
+                if entry.completed_at_unix < floor {
+                    dropped += 1;
+                    continue; // outside retention — a prune already dropped it
+                }
                 self.insert(&entry, false)?;
             }
         }
@@ -184,6 +276,41 @@ impl HistoryDb {
                 tracing::info!(imported, "history index rebuilt from JSONL");
             }
         }
+        if dropped > 0 {
+            tracing::debug!(dropped, floor, "history ingest skipped pre-retention rows");
+        }
+        Ok(())
+    }
+
+    /// The oldest `completed_at` ingest will accept: the higher of the
+    /// stored prune watermark and the live age bound. Zero means "accept
+    /// everything", which is what an install with retention off gets.
+    fn ingest_floor(&self) -> Result<i64, StateError> {
+        let stored = self.meta_get("retention_floor")?.unwrap_or(0);
+        let age = self.retention().age_cutoff(unix_now()).unwrap_or(0);
+        Ok(stored.max(age))
+    }
+
+    fn meta_get(&self, key: &str) -> Result<Option<i64>, StateError> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row("SELECT value FROM meta WHERE key = ?1", [key], |r| r.get(0))
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                e => Err(StateError::Corrupt(format!("sqlite meta get: {e}"))),
+            })
+    }
+
+    /// Raise a monotone watermark. A floor that could fall would let the
+    /// next rebuild re-import what the last prune dropped.
+    fn meta_raise(&self, key: &str, value: i64) -> Result<(), StateError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO meta (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = MAX(meta.value, excluded.value)",
+            rusqlite::params![key, value],
+        )
+        .map_err(|e| StateError::Corrupt(format!("sqlite meta set: {e}")))?;
         Ok(())
     }
 
@@ -191,6 +318,212 @@ impl HistoryDb {
         let conn = self.conn.lock().unwrap();
         conn.query_row("SELECT COUNT(*) FROM history", [], |r| r.get::<_, u64>(0))
             .map_err(|e| StateError::Corrupt(format!("sqlite count: {e}")))
+    }
+
+    /// Visible row count — what the pager divides into pages.
+    pub fn count_filtered(&self, include_hidden: bool) -> Result<u64, StateError> {
+        let conn = self.conn.lock().unwrap();
+        let sql = format!(
+            "SELECT COUNT(*) FROM history {}",
+            if include_hidden {
+                ""
+            } else {
+                "WHERE hidden = 0"
+            }
+        );
+        conn.query_row(&sql, [], |r| r.get::<_, u64>(0))
+            .map_err(|e| StateError::Corrupt(format!("sqlite count: {e}")))
+    }
+
+    // -----------------------------------------------------------------
+    // Retention
+    // -----------------------------------------------------------------
+
+    /// Trim history to the configured bounds, returning how many entries
+    /// were dropped.
+    ///
+    /// Three things move together, and skipping any one of them leaves the
+    /// entry half-deleted:
+    ///
+    /// 1. **The index rows go**, by whichever bound bites — age first
+    ///    (cheap, indexed), then count.
+    /// 2. **This node's JSONL is compacted** to the surviving keys. Without
+    ///    this the log grows forever and the *log's length*, not the row
+    ///    count, is what makes a history read slow: every refresh re-reads
+    ///    it end to end. 179 rows cost 3.1 s on nuc3 because of this.
+    /// 3. **The watermark rises**, so ingest refuses to re-import what just
+    ///    went (see `rebuild_from_jsonl`).
+    ///
+    /// `docs/DEFECT_HISTORY_DELETE.md` rejects "delete the JSONL line" as a
+    /// fix for `delete`, and rightly: rewriting an append-only log on a
+    /// shared volume *under other nodes' concurrent appends* to service a
+    /// UI click. Compaction is not that. A node rewrites only the file it
+    /// alone appends to (`history.<node>.jsonl` in a cluster, `history.jsonl`
+    /// single-node), never a peer's; the swap is tmp+rename, so a concurrent
+    /// reader on another node sees the whole old file or the whole new one;
+    /// and `jsonl_write` serializes it against this process's own appends.
+    /// The semantic question that defect is blocked on — does "forget" mean
+    /// here or everywhere — is not answered here and not touched.
+    pub fn prune(&self, now: i64) -> Result<usize, StateError> {
+        let r = self.retention();
+        if r.is_unlimited() {
+            return Ok(0);
+        }
+        let removed_jobs: Vec<u32> = {
+            let conn = self.conn.lock().unwrap();
+            let mut gone: Vec<u32> = Vec::new();
+            if let Some(cutoff) = r.age_cutoff(now) {
+                let mut stmt = conn
+                    .prepare("SELECT job_id FROM history WHERE completed_at < ?1")
+                    .map_err(|e| StateError::Corrupt(e.to_string()))?;
+                let ids = stmt
+                    .query_map([cutoff], |row| row.get::<_, u32>(0))
+                    .map_err(|e| StateError::Corrupt(e.to_string()))?;
+                for id in ids {
+                    gone.push(id.map_err(|e| StateError::Corrupt(e.to_string()))?);
+                }
+                drop(stmt);
+                conn.execute("DELETE FROM history WHERE completed_at < ?1", [cutoff])
+                    .map_err(|e| StateError::Corrupt(e.to_string()))?;
+            }
+            if r.keep_max > 0 {
+                // Rank by the same order the UI lists in, so "the newest
+                // keep_max" means the first keep_max rows of page one.
+                let sql = "SELECT job_id FROM history WHERE id NOT IN
+                             (SELECT id FROM history
+                               ORDER BY completed_at DESC, id DESC LIMIT ?1)";
+                let mut stmt = conn
+                    .prepare(sql)
+                    .map_err(|e| StateError::Corrupt(e.to_string()))?;
+                let ids = stmt
+                    .query_map([r.keep_max as i64], |row| row.get::<_, u32>(0))
+                    .map_err(|e| StateError::Corrupt(e.to_string()))?;
+                for id in ids {
+                    gone.push(id.map_err(|e| StateError::Corrupt(e.to_string()))?);
+                }
+                drop(stmt);
+                conn.execute(
+                    "DELETE FROM history WHERE id NOT IN
+                       (SELECT id FROM history ORDER BY completed_at DESC, id DESC LIMIT ?1)",
+                    [r.keep_max as i64],
+                )
+                .map_err(|e| StateError::Corrupt(e.to_string()))?;
+            }
+            gone
+        };
+        *self.last_prune.lock().unwrap() = Some(Instant::now());
+        if removed_jobs.is_empty() {
+            return Ok(0);
+        }
+        // The parked NZB dies with the entry, same rule `delete` follows.
+        for job in &removed_jobs {
+            self.drop_spool(crate::JobId(*job));
+        }
+        // Raise the watermark to the oldest survivor. With no survivors
+        // left, everything the log holds is out of bounds, so the age
+        // cutoff is the honest floor.
+        let floor = {
+            let conn = self.conn.lock().unwrap();
+            conn.query_row("SELECT MIN(completed_at) FROM history", [], |r| {
+                r.get::<_, Option<i64>>(0)
+            })
+            .unwrap_or(None)
+        }
+        .or_else(|| r.age_cutoff(now));
+        if let Some(floor) = floor {
+            self.meta_raise("retention_floor", floor)?;
+        }
+        let compacted = self.compact_jsonl()?;
+        tracing::info!(
+            dropped = removed_jobs.len(),
+            keep_max = r.keep_max,
+            keep_days = r.keep_days,
+            lines_dropped = compacted,
+            "history trimmed to its retention bounds"
+        );
+        Ok(removed_jobs.len())
+    }
+
+    /// Prune on a throttle — `record` calls this, so a burst of finished
+    /// jobs costs one trim, not one per job.
+    fn maybe_prune(&self) {
+        if self.retention().is_unlimited() {
+            return;
+        }
+        {
+            let last = self.last_prune.lock().unwrap();
+            if last.is_some_and(|t| t.elapsed() < Duration::from_secs(60)) {
+                return;
+            }
+        }
+        // A failed trim is not worth failing the job that finished.
+        if let Err(e) = self.prune(unix_now()) {
+            tracing::warn!(error = %e, "history retention trim failed");
+        }
+    }
+
+    /// Rewrite this node's own JSONL with only the lines whose entry still
+    /// exists in the index. Returns how many lines were dropped.
+    ///
+    /// Every surviving line is kept, not just the newest per key. The
+    /// reader is not purely last-line-wins — `removed_at` and
+    /// `picked_up_by` merge with `COALESCE`, so collapsing a key's history
+    /// to its final line would silently change what a rebuild reconstructs.
+    /// Compaction is a size optimisation and must not be a semantic one.
+    fn compact_jsonl(&self) -> Result<usize, StateError> {
+        let Some(path) = &self.jsonl else {
+            return Ok(0);
+        };
+        let live: std::collections::HashSet<(u32, i64)> = {
+            let conn = self.conn.lock().unwrap();
+            let mut stmt = conn
+                .prepare("SELECT job_id, completed_at FROM history")
+                .map_err(|e| StateError::Corrupt(e.to_string()))?;
+            let rows = stmt
+                .query_map([], |r| Ok((r.get::<_, u32>(0)?, r.get::<_, i64>(1)?)))
+                .map_err(|e| StateError::Corrupt(e.to_string()))?;
+            rows.filter_map(Result::ok).collect()
+        };
+
+        let _guard = self.jsonl_write.lock().unwrap();
+        let file = match fsx::open(path) {
+            Ok(f) => f,
+            Err(e) if e.is_not_found() => return Ok(0),
+            Err(e) => return Err(e),
+        };
+        let mut kept: Vec<u8> = Vec::new();
+        let mut dropped = 0usize;
+        for line in BufReader::new(file).split(b'\n') {
+            let line = fsx::ctx(line, "read", path)?;
+            if line.is_empty() {
+                continue;
+            }
+            match serde_json::from_slice::<HistoryEntry>(&line) {
+                Ok(e) if live.contains(&(e.job.0, e.completed_at_unix)) => {
+                    kept.extend_from_slice(&line);
+                    kept.push(b'\n');
+                }
+                Ok(_) => dropped += 1,
+                // A torn tail is not evidence to delete by. Keep it: the
+                // reader already skips what it cannot parse.
+                Err(_) => {
+                    kept.extend_from_slice(&line);
+                    kept.push(b'\n');
+                }
+            }
+        }
+        if dropped == 0 {
+            return Ok(0);
+        }
+        // tmp+rename in the same directory: a reader (this node or a peer)
+        // sees the whole old file or the whole new one, never a torn one.
+        let tmp = path.with_extension("jsonl.compact");
+        let mut f = fsx::create(&tmp)?;
+        fsx::write_whole(&mut f, &kept, &tmp)?;
+        fsx::sync_data(&f, &tmp)?;
+        drop(f);
+        fsx::rename(&tmp, path)?;
+        Ok(dropped)
     }
 
     fn insert(&self, entry: &HistoryEntry, and_jsonl: bool) -> Result<bool, StateError> {
@@ -250,6 +583,7 @@ impl HistoryDb {
 
     pub fn record(&self, entry: &HistoryEntry) -> Result<(), StateError> {
         self.insert(entry, true)?;
+        self.maybe_prune();
         Ok(())
     }
 
@@ -259,7 +593,11 @@ impl HistoryDb {
     /// ordering guarantee usable: the consumer gets the event *and* the
     /// exact cursor, and never has to guess how far to page back.
     pub fn record_seq(&self, entry: &HistoryEntry) -> Result<i64, StateError> {
-        self.insert_seq(entry, true).map(|(_, seq)| seq)
+        let seq = self.insert_seq(entry, true).map(|(_, seq)| seq)?;
+        // After the seq is in hand: a trim must never be able to change
+        // the cursor value this call is about to publish.
+        self.maybe_prune();
+        Ok(seq)
     }
 
     /// Visible (non-hidden) entries — what NZBGet-compat clients see.
@@ -272,15 +610,38 @@ impl HistoryDb {
         limit: usize,
         include_hidden: bool,
     ) -> Result<Vec<HistoryEntry>, StateError> {
+        self.list_page(limit, 0, include_hidden)
+    }
+
+    /// One page of the newest-first view: `limit` entries starting at
+    /// `offset`.
+    ///
+    /// Paging is server-side because the cost this bounds is server-side.
+    /// The browser fetching 200 rows was never the expensive part — the
+    /// expensive part is what the daemon does per row before it can answer
+    /// (a spool lookup each, on a network state mount) and per request
+    /// (re-union the JSONL). A page of 20 does 20 rows' worth of that; a
+    /// client-side slice of a 200-row fetch does 200.
+    ///
+    /// The order is `completed_at DESC, id DESC` — the same order
+    /// [`prune`](Self::prune) ranks by, so "kept by retention" and "on the
+    /// first pages" mean the same thing.
+    pub fn list_page(
+        &self,
+        limit: usize,
+        offset: usize,
+        include_hidden: bool,
+    ) -> Result<Vec<HistoryEntry>, StateError> {
         let sql = format!(
-            "SELECT {COLUMNS} FROM history {} ORDER BY completed_at DESC, id DESC LIMIT ?1",
+            "SELECT {COLUMNS} FROM history {} ORDER BY completed_at DESC, id DESC
+             LIMIT ?1 OFFSET ?2",
             if include_hidden {
                 ""
             } else {
                 "WHERE hidden = 0"
             }
         );
-        self.query(&sql, rusqlite::params![limit as i64])
+        self.query(&sql, rusqlite::params![limit as i64, offset as i64])
     }
 
     /// The cursor form: every entry newer than `since_seq`, oldest first.
@@ -438,6 +799,9 @@ impl HistoryDb {
             if let Some(parent) = path.parent() {
                 fsx::create_dir_all(parent)?;
             }
+            // Held across open+write+fsync: a compaction's rename landing
+            // mid-append would write this line into the unlinked old inode.
+            let _guard = self.jsonl_write.lock().unwrap();
             let mut f = fsx::open_append(path)?;
             // The JSONL is the portable, mergeable source of truth and is
             // re-imported into indices that assign their own rowids —
@@ -500,6 +864,7 @@ impl HistoryDb {
             fsx::create_dir_all(parent)?;
         }
         fsx::write(&path, bytes)?;
+        self.invalidate_spool_cache();
         Ok(())
     }
 
@@ -510,14 +875,64 @@ impl HistoryDb {
     }
 
     /// Can this entry be put back in the queue from local state?
+    ///
+    /// One `stat`. Correct for the one-off check the requeue path makes;
+    /// use [`spooled_ids`](Self::spooled_ids) to decorate a list, or this
+    /// becomes one syscall per row (measured: ~250 ms for 179 rows on a
+    /// network state mount, nuc3 2026-07-29).
     pub fn has_spool(&self, job: crate::JobId) -> bool {
         self.spool_path(job).is_some_and(|p| p.is_file())
+    }
+
+    /// Every job id with a parked NZB, from ONE directory listing, cached
+    /// for a few seconds.
+    ///
+    /// This is the list-decoration form of [`has_spool`](Self::has_spool).
+    /// The set is a display snapshot — `can_requeue` on a history row is
+    /// telling the operator whether the Undo button is worth showing — so
+    /// a few seconds of staleness is free, while a stale *answer* to an
+    /// actual requeue is not: that path still stats the file, and the
+    /// requeue itself fails honestly if the spool went in between.
+    /// Invalidated on every spool write and drop, so it is only ever stale
+    /// with respect to another node, which cannot write this node's spool
+    /// anyway.
+    pub fn spooled_ids(&self) -> std::collections::HashSet<u32> {
+        const TTL: Duration = Duration::from_secs(5);
+        let mut cache = self.spool_cache.lock().unwrap();
+        if let Some((at, ids)) = cache.as_ref() {
+            if at.elapsed() < TTL {
+                return ids.clone();
+            }
+        }
+        let ids: std::collections::HashSet<u32> = self
+            .spool
+            .as_ref()
+            .and_then(|d| fsx::read_dir(d).ok())
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .filter_map(|e| {
+                        let p = e.path();
+                        (p.extension().and_then(|s| s.to_str()) == Some("nzb"))
+                            .then(|| p.file_stem()?.to_str()?.parse::<u32>().ok())
+                            .flatten()
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        *cache = Some((Instant::now(), ids.clone()));
+        ids
+    }
+
+    fn invalidate_spool_cache(&self) {
+        *self.spool_cache.lock().unwrap() = None;
     }
 
     pub fn drop_spool(&self, job: crate::JobId) {
         if let Some(path) = self.spool_path(job) {
             let _ = fsx::remove_file(&path);
         }
+        self.invalidate_spool_cache();
     }
 
     /// Reap spooled NZBs whose history entry is gone — an index wiped out
@@ -907,5 +1322,290 @@ mod tests {
             "the parked entry keeps its NZB"
         );
         assert!(!db.has_spool(crate::JobId(2)), "the orphan is reaped");
+    }
+
+    // -----------------------------------------------------------------
+    // Retention
+    // -----------------------------------------------------------------
+
+    const DAY: i64 = 86_400;
+
+    /// The count bound keeps the NEWEST `keep_max` and drops the rest —
+    /// ranked in the same order the UI's first page shows, so "kept" and
+    /// "near the top" never disagree.
+    #[test]
+    fn the_count_bound_keeps_the_newest_and_drops_the_rest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = HistoryDb::open(
+            &tmp.path().join("history.sqlite"),
+            Some(&tmp.path().join("h")),
+        )
+        .unwrap();
+        let now = 1_800_000_000;
+        for i in 0..25u32 {
+            db.record(&entry(i, now - (25 - i as i64) * 60)).unwrap();
+        }
+        assert_eq!(db.count_filtered(true).unwrap(), 25);
+
+        let dropped = db
+            .set_retention(Retention {
+                keep_max: 10,
+                keep_days: 0,
+            })
+            .unwrap();
+        assert_eq!(dropped, 15);
+        let kept = db.list_filtered(100, true).unwrap();
+        assert_eq!(kept.len(), 10);
+        assert_eq!(kept[0].job.0, 24, "newest first, and it survived");
+        assert_eq!(kept[9].job.0, 15, "the tenth-newest is the oldest kept");
+    }
+
+    /// The age bound answers a different question and has to hold on its
+    /// own: a quiet daemon never reaches a count bound, and a year-old row
+    /// is still a year old.
+    #[test]
+    fn the_age_bound_drops_what_is_older_than_the_window() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = HistoryDb::open(
+            &tmp.path().join("history.sqlite"),
+            Some(&tmp.path().join("h")),
+        )
+        .unwrap();
+        let now = 1_800_000_000;
+        db.record(&entry(1, now - 200 * DAY)).unwrap();
+        db.record(&entry(2, now - 100 * DAY)).unwrap();
+        db.record(&entry(3, now - 10 * DAY)).unwrap();
+        db.record(&entry(4, now - 1)).unwrap();
+
+        *db.retention.lock().unwrap() = Retention {
+            keep_max: 0,
+            keep_days: 90,
+        };
+        assert_eq!(db.prune(now).unwrap(), 2, "the 200- and 100-day rows go");
+        let kept: Vec<u32> = db
+            .list_filtered(100, true)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.job.0)
+            .collect();
+        assert_eq!(kept, vec![4, 3]);
+
+        // Whichever bound bites first wins: tightening the count bound
+        // trims further, and the age bound alone would not have.
+        *db.retention.lock().unwrap() = Retention {
+            keep_max: 1,
+            keep_days: 90,
+        };
+        assert_eq!(db.prune(now).unwrap(), 1);
+        assert_eq!(db.count_filtered(true).unwrap(), 1);
+    }
+
+    /// The one that makes retention *mean* something. Trimming the index
+    /// alone leaves the JSONL — the file every read re-unions — growing
+    /// forever, and the next refresh imports the dropped rows straight
+    /// back. Compaction plus the ingest floor is what makes a trim stick.
+    #[test]
+    fn a_trim_shrinks_the_log_and_survives_every_later_refresh() {
+        let tmp = tempfile::tempdir().unwrap();
+        let jsonl_dir = tmp.path().join("h");
+        let db = HistoryDb::open(&tmp.path().join("history.sqlite"), Some(&jsonl_dir)).unwrap();
+        let now = 1_800_000_000;
+        for i in 0..20u32 {
+            db.record(&entry(i, now - (20 - i as i64) * DAY)).unwrap();
+        }
+        let log = jsonl_dir.join("history.jsonl");
+        let lines = |p: &Path| std::fs::read_to_string(p).unwrap().lines().count();
+        assert_eq!(lines(&log), 20);
+
+        db.set_retention(Retention {
+            keep_max: 5,
+            keep_days: 0,
+        })
+        .unwrap();
+        assert_eq!(lines(&log), 5, "the log itself shrank, not just the index");
+
+        // Three refresh cycles: the throttle is bypassed by calling the
+        // rebuild directly, which is what refresh does once it fires.
+        for _ in 0..3 {
+            db.rebuild_from_jsonl(true).unwrap();
+            assert_eq!(db.count_filtered(true).unwrap(), 5, "nothing came back");
+        }
+
+        // And a peer's file, still holding the old rows, cannot resurrect
+        // them either — the ingest floor is what stops it.
+        let peer = jsonl_dir.join("history.peer.jsonl");
+        let mut buf = String::new();
+        for i in 0..20u32 {
+            let mut e = entry(i, now - (20 - i as i64) * DAY);
+            e.seq = 0;
+            buf.push_str(&serde_json::to_string(&e).unwrap());
+            buf.push('\n');
+        }
+        std::fs::write(&peer, buf).unwrap();
+        db.rebuild_from_jsonl(true).unwrap();
+        assert_eq!(
+            db.count_filtered(true).unwrap(),
+            5,
+            "a peer's uncompacted log does not undo this node's trim"
+        );
+    }
+
+    /// Compaction keeps EVERY surviving line, not the newest per key. The
+    /// reader merges `removed_at`/`picked_up_by` with COALESCE, so
+    /// collapsing a key's lines would quietly change what a rebuild
+    /// reconstructs — a size optimisation must not be a semantic one.
+    #[test]
+    fn compaction_preserves_the_full_history_of_a_surviving_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let jsonl_dir = tmp.path().join("h");
+        let db = HistoryDb::open(&tmp.path().join("history.sqlite"), Some(&jsonl_dir)).unwrap();
+        let now = 1_800_000_000;
+        db.record(&entry(1, now - 10 * DAY)).unwrap();
+        db.record(&entry(2, now - 1)).unwrap();
+        // `hide` re-appends, so job 2 now owns two lines in the log.
+        db.hide(crate::JobId(2), Some("sonarr"), now).unwrap();
+        let log = jsonl_dir.join("history.jsonl");
+        assert_eq!(std::fs::read_to_string(&log).unwrap().lines().count(), 3);
+
+        db.set_retention(Retention {
+            keep_max: 1,
+            keep_days: 0,
+        })
+        .unwrap();
+        let text = std::fs::read_to_string(&log).unwrap();
+        assert_eq!(
+            text.lines().count(),
+            2,
+            "job 1's line went, job 2's both stayed"
+        );
+        assert!(!text.contains("job-1"));
+
+        // Rebuild from the compacted log alone: the hidden state and the
+        // consumer that set it are still reconstructible.
+        let db2 = HistoryDb::open(&tmp.path().join("h2.sqlite"), Some(&jsonl_dir)).unwrap();
+        let rows = db2.list_filtered(10, true).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].hidden);
+        assert_eq!(rows[0].picked_up_by.as_deref(), Some("sonarr"));
+    }
+
+    /// Retention off is retention off: an install that never sets bounds
+    /// keeps behaving exactly as it did before this existed.
+    #[test]
+    fn unlimited_retention_touches_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let jsonl_dir = tmp.path().join("h");
+        let db = HistoryDb::open(&tmp.path().join("history.sqlite"), Some(&jsonl_dir)).unwrap();
+        let now = 1_800_000_000;
+        for i in 0..10u32 {
+            db.record(&entry(i, now - (500 - i as i64) * DAY)).unwrap();
+        }
+        assert_eq!(db.set_retention(Retention::UNLIMITED).unwrap(), 0);
+        assert_eq!(db.count_filtered(true).unwrap(), 10);
+        assert_eq!(
+            std::fs::read_to_string(jsonl_dir.join("history.jsonl"))
+                .unwrap()
+                .lines()
+                .count(),
+            10
+        );
+    }
+
+    /// A trim must take the parked NZB with it. The spool is reaped by
+    /// `sweep_spool` only at open; an entry pruned at runtime would
+    /// otherwise leave a file nobody can reach from the UI.
+    #[test]
+    fn a_pruned_entry_takes_its_parked_nzb_with_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = HistoryDb::open(
+            &tmp.path().join("history.sqlite"),
+            Some(&tmp.path().join("h")),
+        )
+        .unwrap();
+        let now = 1_800_000_000;
+        db.record(&entry(1, now - 300 * DAY)).unwrap();
+        db.record(&entry(2, now - 1)).unwrap();
+        db.spool_nzb(crate::JobId(1), b"<nzb/>").unwrap();
+        db.spool_nzb(crate::JobId(2), b"<nzb/>").unwrap();
+
+        db.set_retention(Retention {
+            keep_max: 0,
+            keep_days: 90,
+        })
+        .unwrap();
+        assert!(!db.has_spool(crate::JobId(1)), "pruned entry's NZB is gone");
+        assert!(db.has_spool(crate::JobId(2)), "the survivor keeps its NZB");
+    }
+
+    /// `spooled_ids` is the list-decoration form of `has_spool`: one
+    /// directory read for a whole page instead of one stat per row. It has
+    /// to agree with `has_spool` exactly, or `can_requeue` starts lying.
+    #[test]
+    fn one_listing_answers_can_requeue_for_a_whole_page() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = HistoryDb::open(&tmp.path().join("history.sqlite"), None).unwrap();
+        for i in [3u32, 7, 11] {
+            db.spool_nzb(crate::JobId(i), b"<nzb/>").unwrap();
+        }
+        let ids = db.spooled_ids();
+        assert_eq!(ids.len(), 3);
+        for i in 0..15u32 {
+            assert_eq!(
+                ids.contains(&i),
+                db.has_spool(crate::JobId(i)),
+                "job {i}: the batched answer must match the per-row one"
+            );
+        }
+        // A write invalidates the cache rather than serving a stale set.
+        db.drop_spool(crate::JobId(7));
+        assert!(!db.spooled_ids().contains(&7));
+        db.spool_nzb(crate::JobId(9), b"<nzb/>").unwrap();
+        assert!(db.spooled_ids().contains(&9));
+    }
+
+    /// Paging is over the same newest-first order the unpaged list used,
+    /// so page 2 continues exactly where page 1 stopped — no overlap, no
+    /// gap.
+    #[test]
+    fn pages_tile_the_newest_first_view_without_overlap_or_gap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = HistoryDb::open(&tmp.path().join("history.sqlite"), None).unwrap();
+        let now = 1_800_000_000;
+        for i in 0..25u32 {
+            db.record(&entry(i, now - (25 - i as i64) * 60)).unwrap();
+        }
+        let all: Vec<u32> = db
+            .list_filtered(100, true)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.job.0)
+            .collect();
+        assert_eq!(db.count_filtered(true).unwrap() as usize, all.len());
+
+        let mut tiled: Vec<u32> = Vec::new();
+        for page in 0..3 {
+            tiled.extend(
+                db.list_page(10, page * 10, true)
+                    .unwrap()
+                    .into_iter()
+                    .map(|e| e.job.0),
+            );
+        }
+        assert_eq!(tiled, all, "the pages reassemble the whole list, in order");
+        assert_eq!(
+            db.list_page(10, 20, true).unwrap().len(),
+            5,
+            "short last page"
+        );
+        assert!(
+            db.list_page(10, 100, true).unwrap().is_empty(),
+            "past the end"
+        );
+
+        // Hidden rows are excluded from both the page and its total, or
+        // the pager would show pages that render empty.
+        db.hide(crate::JobId(24), Some("sonarr"), now).unwrap();
+        assert_eq!(db.count_filtered(false).unwrap(), 24);
+        assert_eq!(db.list_page(10, 0, false).unwrap()[0].job.0, 23);
     }
 }

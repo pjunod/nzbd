@@ -532,6 +532,22 @@
         <th>Finished</th><th style="width:170px"></th></tr></thead>
       <tbody id="history-body"><tr><td colspan="6" class="empty">loading…</td></tr></tbody>
     </table>
+    <div class="pager" id="history-pager" hidden>
+      <button class="small" data-action="h-page-first" title="first page">⤒</button>
+      <button class="small" data-action="h-page-prev" title="previous page">‹ prev</button>
+      <span id="history-pager-info"></span>
+      <button class="small" data-action="h-page-next" title="next page">next ›</button>
+      <button class="small" data-action="h-page-last" title="last page">⤓</button>
+      <span class="spacer" style="flex:1"></span>
+      <label>rows per page
+        <select id="history-page-size">
+          <option value="20">20</option>
+          <option value="50">50</option>
+          <option value="100">100</option>
+          <option value="200">200</option>
+        </select>
+      </label>
+    </div>
   </section>
 
   <section id="tab-logs" hidden>
@@ -2025,6 +2041,79 @@ function applyHistRow(tr, m, d) {
 }
 KINDS.hist = { build: buildHistRow, apply: applyHistRow };
 
+// ---- history paging -----------------------------------------------------
+// Unlike the queue pager, this one is SERVER-side, and the difference is
+// not stylistic. The tick already carries the whole queue, so slicing it
+// in the browser costs nothing. History is a fetch, and the expensive part
+// of that fetch is per-row work the daemon does before it can answer — a
+// spool lookup each, on a network state mount. Measured on nuc3:
+// 179 rows, 3.1 s cold. Asking for 20 rows asks for 20 rows' worth of it;
+// slicing a 200-row fetch in JS asks for all of it and then throws most
+// of it away.
+//
+// So `page` and `pageSize` here are REQUEST parameters, and `total` comes
+// back from the server rather than from `store.history.length` — the page
+// in hand cannot tell you how long the list is.
+const HISTORY_PAGE_SIZES = [20, 50, 100, 200];
+const HISTORY_PAGE_SIZE_DEFAULT = 20;
+let historyPageSize = HISTORY_PAGE_SIZE_DEFAULT;
+let historyPage = 0;   // zero-based
+let historyTotal = 0;  // rows the server says match, not rows in hand
+
+function loadHistoryPageSize() {
+  let n = HISTORY_PAGE_SIZE_DEFAULT;
+  try {
+    const v = localStorage.getItem("nzbd-history-page-size");
+    if (v !== null && HISTORY_PAGE_SIZES.includes(Number(v))) n = Number(v);
+  } catch { /* private mode: the default is fine */ }
+  historyPageSize = n;
+  const sel = $("history-page-size");
+  if (sel) sel.value = String(n);
+}
+function setHistoryPageSize(n) {
+  if (!HISTORY_PAGE_SIZES.includes(n)) return;
+  // Keep the row you were looking at in view, same rule as the queue.
+  const anchor = historyPage * historyPageSize;
+  historyPageSize = n;
+  historyPage = Math.floor(anchor / n);
+  try { localStorage.setItem("nzbd-history-page-size", String(n)); } catch {}
+  return refreshHistory().catch(() => {});
+}
+/// Move to a page. Clamped against the last known total so "last page"
+/// can be a plain MAX_SAFE_INTEGER and history shrinking under you (a
+/// retention trim, a forget) cannot strand the view past the end.
+function setHistoryPage(n) {
+  historyPage = Math.max(0, Math.min(n, historyPages() - 1));
+  return refreshHistory().catch(() => {});
+}
+function historyPages() {
+  return Math.max(1, Math.ceil(historyTotal / historyPageSize));
+}
+
+function renderHistoryPager() {
+  const bar = $("history-pager");
+  if (!bar) return;
+  // No chrome for a history that fits on one page — but once someone has
+  // chosen a non-default size, the control stays reachable.
+  const relevant = store.history !== "off" && store.history != null &&
+    (historyTotal > HISTORY_PAGE_SIZES[0] || historyPageSize !== HISTORY_PAGE_SIZE_DEFAULT);
+  bar.hidden = !relevant;
+  if (!relevant) return;
+  const pages = historyPages();
+  const start = historyPage * historyPageSize;
+  const shown = Array.isArray(store.history) ? store.history.length : 0;
+  setText($("history-pager-info"), pages > 1
+    ? (historyTotal ? start + 1 : 0) + "–" + (start + shown) + " of " + historyTotal +
+      " · page " + (historyPage + 1) + "/" + pages
+    : historyTotal + (historyTotal === 1 ? " entry" : " entries"));
+  const atFirst = historyPage === 0, atLast = historyPage >= pages - 1;
+  for (const [sel, off] of [["h-page-first", atFirst], ["h-page-prev", atFirst],
+                            ["h-page-next", atLast], ["h-page-last", atLast]]) {
+    const b = bar.querySelector('[data-action="' + sel + '"]');
+    if (b) b.disabled = off;
+  }
+}
+
 function renderHistory() {
   const h = store.history;
   let models;
@@ -2033,9 +2122,13 @@ function renderHistory() {
   else if (h == null)
     models = [{ key: "__loading", kind: "empty", span: 6, text: "loading…" }];
   else if (!h.length)
-    models = [{ key: "__empty", kind: "empty", span: 6, text: "no finished jobs yet" }];
+    models = [{
+      key: "__empty", kind: "empty", span: 6,
+      text: historyTotal ? "nothing on this page" : "no finished jobs yet",
+    }];
   else models = h.map(histModel);
   reconcileRows($("history-body"), models, dom);
+  renderHistoryPager();
   renderClients();
 }
 
@@ -2150,8 +2243,16 @@ function logScopes() {
 // `tail -f`. Scope filtering happens HERE, not on the server: the daemon
 // would otherwise have to keep per-connection filter state, and toggling
 // "per-file" on would cost a round trip instead of a re-render.
+// Budgeted PER CLASS, exactly like the daemon's own ring and for the same
+// reason: one shared 500-line FIFO lets a per-file flood evict every
+// system and job line the moment a download starts, so the tab a reader
+// opens to find out what happened shows the last few seconds of
+// `file finished … ok=true` and nothing else. The daemon now keeps the
+// two apart (see logbuf.rs); a client ring that re-merges them into one
+// budget would hand the defect straight back.
 const LOG_RING_MAX = 500;
-/// Append a batch, keeping the ring bounded and marking anything the
+const logClass = (e) => (e.scope === "file" ? "file" : "main");
+/// Append a batch, keeping each class bounded and marking anything the
 /// server's own cap skipped — "the tail is complete" is a claim the UI
 /// should only make when it is true.
 function appendLogs(entries, dropped) {
@@ -2159,9 +2260,25 @@ function appendLogs(entries, dropped) {
   if (dropped > 0 && entries.length)
     store.logs.push({ id: "skip-" + entries[0].id, skipped: dropped });
   for (const e of entries) store.logs.push(e);
-  if (store.logs.length > LOG_RING_MAX)
-    store.logs.splice(0, store.logs.length - LOG_RING_MAX);
+  store.logs = trimLogRing(store.logs);
   return store.logs;
+}
+/// Keep the newest LOG_RING_MAX of each class, in arrival order. Skip
+/// markers ride with the main budget: they are a statement about the
+/// stream, not about a file.
+function trimLogRing(logs) {
+  if (logs.length <= LOG_RING_MAX) return logs;
+  const kept = [];
+  let main = 0, file = 0;
+  for (let i = logs.length - 1; i >= 0; i--) {
+    const e = logs[i];
+    const cls = e.skipped ? "main" : logClass(e);
+    if (cls === "file") { if (file >= LOG_RING_MAX) continue; file++; }
+    else { if (main >= LOG_RING_MAX) continue; main++; }
+    kept.push(e);
+  }
+  kept.reverse();
+  return kept;
 }
 function logMatches(e, scopes) {
   if (e.skipped) return true;               // markers are never filtered out
@@ -2190,8 +2307,7 @@ function renderLogs() {
           }
         : {
             key: "l" + e.id, kind: "log", cls: "lg k-" + e.kind,
-            text: new Date(e.time_unix * 1000).toLocaleTimeString() + "  " +
-                  e.kind.padEnd(7) + " " + e.text,
+            text: logLineText(e),
           });
   }
   // Keep the view pinned to the tail only when it already was — a reader
@@ -2199,6 +2315,36 @@ function renderLogs() {
   const stick = box.scrollTop + box.clientHeight >= box.scrollHeight - 8;
   reconcileRows(box, models, dom);
   if (stick) box.scrollTop = box.scrollHeight;
+}
+
+/// A record's rendered line, memoised on the record.
+///
+/// `toLocaleTimeString` is the expensive part of building a log model, and
+/// a record's timestamp never changes — but a render pass rebuilt every
+/// visible line's text from scratch, and under a live tail there is a
+/// render pass per frame. Formatting the same 500 timestamps again every
+/// frame is work with a known answer.
+function logLineText(e) {
+  if (e.__line === undefined)
+    e.__line = new Date(e.time_unix * 1000).toLocaleTimeString() + "  " +
+               e.kind.padEnd(7) + " " + e.text;
+  return e.__line;
+}
+
+/// Coalesce renders to one per frame.
+///
+/// The log stream is the one input that can arrive faster than the screen
+/// refreshes, and `renderLogs` is O(ring): it rebuilds every visible model
+/// and reconciles the whole list. Calling it straight from the SSE handler
+/// meant a burst of frames each paid for a full pass whose result the next
+/// one immediately replaced. Only the last one in a frame was ever seen.
+let logRenderPending = false;
+function scheduleLogRender() {
+  if (logRenderPending) return;
+  logRenderPending = true;
+  const run = () => { logRenderPending = false; renderLogs(); };
+  if (typeof requestAnimationFrame === "function") requestAnimationFrame(run);
+  else setTimeout(run, 16);
 }
 
 // ---- data fetches: they write the store, they never render ---------------
@@ -2231,11 +2377,27 @@ async function refreshQueue() {
 }
 async function refreshHistory() {
   refreshClients().catch(() => {});
-  const r = await jfetch("/api/v1/history?limit=200");
+  const r = await jfetch("/api/v1/history?limit=" + historyPageSize +
+                         "&offset=" + (historyPage * historyPageSize));
   if (r.status === 501) { store.history = "off"; renderHistory(); return; }
   if (!r.ok) throw new Error("history " + r.status);
-  const { entries } = await r.json();
+  const body = await r.json();
+  const entries = body.entries;
   if (!Array.isArray(entries)) throw new Error("history: malformed response");
+  // `total` is the server's count of matching rows. An older daemon that
+  // does not send it leaves the pager describing the page it has, which
+  // is the honest fallback — never a guess dressed up as a total.
+  historyTotal = Number.isFinite(body.total)
+    ? body.total
+    : historyPage * historyPageSize + entries.length;
+  // The page may have moved out from under us (a trim, a forget, another
+  // client's delete). Landing on an empty page past the end reads as "my
+  // history vanished", so step back and re-ask once.
+  const pages = historyPages();
+  if (!entries.length && historyTotal > 0 && historyPage > pages - 1) {
+    historyPage = pages - 1;
+    return refreshHistory();
+  }
   store.history = entries;
   renderHistory();
 }
@@ -2249,8 +2411,22 @@ async function refreshClients() {
 }
 /// Backfill only. All three scopes are fetched — the toggles filter what is
 /// already in hand, so flipping "per-file" on is a re-render, not a fetch.
+/// Backfill. Asks for the scopes that are actually ticked.
+///
+/// It used to ask for all three and filter client-side, on the reasoning
+/// that flipping "per-file" on should be a re-render rather than a fetch.
+/// That reasoning had the cost backwards: per-file lines outnumber the
+/// rest roughly two to one even on an idle daemon (662 of 1000 on nuc3),
+/// so a 300-line backfill spent most of its budget on lines the default
+/// view then threw away — the tab paid for 300 and showed about 100, and
+/// the busier the daemon the worse the ratio. A scope toggle now costs one
+/// round trip, measured at 11 ms, which is cheaper than the waste it
+/// replaces. Live tailing is unaffected: the SSE stream still carries
+/// every scope and `logMatches` still filters it in the browser.
 async function refreshLogs() {
-  const r = await jfetch("/api/v1/logs?limit=300&scope=system,job,file");
+  const scopes = logScopes();
+  if (!scopes.length) { store.logs = []; renderLogs(); return; }
+  const r = await jfetch("/api/v1/logs?limit=300&scope=" + scopes.join(","));
   if (r.status === 501) { store.logs = "off"; renderLogs(); return; }
   if (!r.ok) throw new Error("logs " + r.status);
   const { entries } = await r.json();
@@ -2477,6 +2653,12 @@ const PAGE_MOVES = {
   "page-prev": () => setPage(page - 1),
   "page-next": () => setPage(page + 1),
   "page-last": () => setPage(Number.MAX_SAFE_INTEGER), // pageSlice clamps
+  // History paging IS a request, so these are not free the way the queue's
+  // are — but they are still just navigation, with nothing to revert.
+  "h-page-first": () => setHistoryPage(0),
+  "h-page-prev": () => setHistoryPage(historyPage - 1),
+  "h-page-next": () => setHistoryPage(historyPage + 1),
+  "h-page-last": () => setHistoryPage(Number.MAX_SAFE_INTEGER), // clamped
 };
 
 // ---- controls -----------------------------------------------------------
@@ -2530,9 +2712,14 @@ $("btn-active").onclick = async () => {
   if (n !== want) $("active").value = n;
   refreshAll();
 };
+// A scope toggle changes what the backfill covers, not just what is
+// drawn, so it re-fetches. Render first so the box reacts instantly; the
+// fetch fills in the history the browser never asked for before.
 for (const s of ["system", "job", "file"])
-  $("lg-" + s).onchange = () => renderLogs();
+  $("lg-" + s).onchange = () => { renderLogs(); refreshLogs().catch(() => {}); };
 $("page-size").onchange = () => setPageSize(Number($("page-size").value));
+$("history-page-size").onchange = () =>
+  setHistoryPageSize(Number($("history-page-size").value));
 
 // ---- add NZBs from disk ---------------------------------------------------
 $("btn-addnzb").onclick = () => $("nzb-file").click();
@@ -2724,7 +2911,7 @@ function startStream() {
       const d = JSON.parse(e.data);
       if (!Array.isArray(d.entries) || !d.entries.length) return;
       if (store.logs !== "off") appendLogs(d.entries, d.dropped || 0);
-      if (activeTab === "logs") renderLogs();
+      if (activeTab === "logs") scheduleLogRender();
       if (openJob != null && store.jobLogs && store.jobLogs.job === openJob) {
         const mine = d.entries.filter(x => x.job === openJob);
         if (mine.length) {
@@ -2827,6 +3014,14 @@ const SETTINGS_SECTIONS = [
     ["post.sevenzip_cmd", "7z command", "text"],
     ["post.tool_timeout_secs", "tool timeout (s)", "num"],
     ["post.script_timeout_secs", "script timeout (s)", "num"],
+  ]},
+  { key: "history", title: "History", desc: "How much finished-job history to keep. Trimming is not just tidiness \u2014 every history read re-reads the whole log from the state volume, so the log's length is what makes the History tab slow. Both bounds apply; whichever is reached first wins. Takes effect on save and again at every restart.", fields: [
+    ["history.keep_max", "keep at most (entries, 0 = unlimited)", "num",
+      null,
+      "Counted newest-first, so the entries you keep are the ones on the first pages."],
+    ["history.keep_days", "keep for (days, 0 = forever)", "num",
+      null,
+      "NZBGet calls this KeepHistory. An entry older than this goes even if the count bound is nowhere near."],
   ]},
   { key: "categories", title: "Categories", desc: "Per-category destination and unpack overrides (what the *arrs select).", array: true },
 ];
@@ -3331,6 +3526,7 @@ async function checkSetup() {
 
 initTheme();
 loadPageSize();
+loadHistoryPageSize();
 // The 5 s pass. Poll fallback engages whenever ticks are stale AND the
 // verdict is not "healthy idle stream": a dead stream is carried by polls
 // while it rebuilds, and a stalled engine is polled too (the poll returns
@@ -3394,6 +3590,13 @@ if (typeof __nzbd_test_enable !== "undefined") {
     deleteJob, requeueJob, jobAction, histAction, post,
     pushRate, pushRateSampled, rateSeries, spark, SPARK_N, titleFor,
     appendLogs, logMatches, renderLogs, serverChipModels, LOG_RING_MAX,
+    trimLogRing, logClass, logLineText, scheduleLogRender, refreshLogs,
+    refreshHistory, renderHistoryPager, setHistoryPage, setHistoryPageSize, historyPages,
+    HISTORY_PAGE_SIZES, HISTORY_PAGE_SIZE_DEFAULT,
+    getHistoryPaging: () => ({ page: historyPage, size: historyPageSize, total: historyTotal }),
+    setHistoryPagingForTest: (p, size, total) => {
+      historyPage = p; historyPageSize = size; historyTotal = total;
+    },
     clientLabel, clientChipModels, UA_MAX,
     pageSlice, setPage, setPageSize, renderPager, PAGE_SIZES, PAGE_SIZE_DEFAULT,
     pageState: () => ({ page, pageSize }),
