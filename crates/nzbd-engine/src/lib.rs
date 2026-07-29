@@ -327,6 +327,25 @@ pub struct AddOpts {
     /// `Parameters` with no second write path. `*`-prefixed keys are
     /// reserved for internals and are rejected at the API edge.
     pub params: Vec<(String, String)>,
+    /// Who asked for this job (`monarr`, `Sonarr`, `web-ui`), from the
+    /// request's client header. Stored as the reserved `*Client` param and
+    /// used to name a job whose own documents name it nothing —
+    /// `queue::requestor_name`. `None` when the caller is anonymous.
+    pub client: Option<String>,
+}
+
+/// Carry the requesting client alongside the caller's params, under the
+/// reserved `*Client` key. Reserved so a client cannot claim to be someone
+/// else through the public params surface, and a param so it rides the
+/// snapshot and history with everything else the job knows about itself.
+fn with_client(mut params: Vec<(String, String)>, client: Option<String>) -> Vec<(String, String)> {
+    if let Some(c) = client
+        .map(|c| c.trim().to_string())
+        .filter(|c| !c.is_empty())
+    {
+        params.push((crate::queue::CLIENT_PARAM.to_string(), c));
+    }
+    params
 }
 
 /// Cloneable handle to a running engine.
@@ -397,7 +416,7 @@ impl EngineHandle {
             priority: opts.priority,
             dupe: opts.dupe,
             paused: opts.paused,
-            params: opts.params,
+            params: with_client(opts.params, opts.client),
             reply: tx,
         })
         .await?;
@@ -473,7 +492,7 @@ impl EngineHandle {
             priority: opts.priority,
             dupe: opts.dupe,
             paused: opts.paused,
-            params: opts.params,
+            params: with_client(opts.params, opts.client),
             reply: tx,
         })
         .await?;

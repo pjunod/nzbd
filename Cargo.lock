@@ -927,6 +927,7 @@ dependencies = [
  "nzbd-nntp",
  "nzbd-nserv",
  "nzbd-nzb",
+ "nzbd-par2",
  "nzbd-state",
  "nzbd-types",
  "nzbd-yenc",
@@ -987,6 +988,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "nzbd-par2"
+version = "0.2.0"
+
+[[package]]
 name = "nzbd-post"
 version = "0.2.0"
 dependencies = [
@@ -994,6 +999,7 @@ dependencies = [
  "md-5",
  "nzbd-engine",
  "nzbd-nserv",
+ "nzbd-par2",
  "nzbd-state",
  "nzbd-types",
  "nzbd-yenc",

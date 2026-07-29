@@ -9,6 +9,7 @@ license.workspace = true
 nzbd-types = { workspace = true }
 nzbd-nzb = { workspace = true }
 nzbd-yenc = { workspace = true }
+nzbd-par2 = { workspace = true }
 nzbd-nntp = { workspace = true }
 nzbd-state = { workspace = true }
 tokio = { workspace = true }

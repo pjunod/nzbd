@@ -484,7 +484,7 @@
     <button id="btn-addnzb" title="Upload .nzb files straight into the queue.">+ add nzb</button>
     <input type="file" id="nzb-file" accept=".nzb,application/x-nzb" multiple hidden>
     <span id="addnzb-msg"></span>
-    <label title="How many jobs download at the same time. The connections are split evenly between them — this does not add throughput, it spreads the same throughput over more jobs. 1 gives the whole pipe to the top job until it finishes.">At once
+    <label title="How many jobs download at the same time. The connections are split evenly between them — this does not add throughput, it spreads the same throughput over more jobs. 1 gives the whole pipe to the top job until it finishes.">Downloads at once
       <input type="number" id="active" min="1" max="100" step="1" style="width: 62px">
       <button class="small" id="btn-active">set</button></label>
     <label>Limit <input type="number" id="limit" min="0" step="128" placeholder="KiB/s">

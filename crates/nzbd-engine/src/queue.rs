@@ -151,10 +151,13 @@ impl QueueState {
         let category = category.or_else(|| parsed.meta.category.clone());
         let files = self.build_files(parsed, pause_extra_pars);
 
+        let dir_name = sanitize_name(&name);
         let mut job = Job {
             id: job_id,
             kind: JobKind::Nzb,
             name,
+            dir_name,
+            name_provisional: false,
             category,
             priority,
             dupe: DupeInfo::default(),
@@ -180,10 +183,13 @@ impl QueueState {
     ) -> JobId {
         self.next_job_id += 1;
         let job_id = JobId(self.next_job_id);
+        let dir_name = sanitize_name(&name);
         self.jobs.push(Job {
             id: job_id,
             kind: JobKind::Url,
             name,
+            dir_name,
+            name_provisional: false,
             category,
             priority,
             dupe: DupeInfo::default(),
@@ -338,25 +344,217 @@ pub fn recompute_job_totals(job: &mut Job) {
 /// its par2 recovery-set base, then the common stem of its payload files.
 pub fn clean_job_name(raw: &str, nzb: &nzbd_nzb::ParsedNzb) -> String {
     let cleaned = strip_name_junk(raw);
+    match name_from_evidence(raw, nzb) {
+        Some(name) => name,
+        None if cleaned.is_empty() => "download".into(),
+        None => cleaned,
+    }
+}
+
+/// The best name the hint and the NZB *between them* can support, or
+/// `None` when neither carries any information.
+///
+/// Separated from [`clean_job_name`] so a caller that has more context —
+/// who asked for this job, and where it came from — can supply a better
+/// last resort than the hash it was handed. See [`requestor_name`].
+pub fn name_from_evidence(raw: &str, nzb: &nzbd_nzb::ParsedNzb) -> Option<String> {
+    let cleaned = strip_name_junk(raw);
     if !cleaned.is_empty() && !is_uninformative(&cleaned) {
-        return cleaned;
+        return Some(cleaned);
     }
     let evidence = [
         nzb.meta.title.as_deref().map(str::to_string),
         par2_base_name(nzb),
         common_file_stem(nzb),
     ];
-    for candidate in evidence.into_iter().flatten() {
+    evidence.into_iter().flatten().find_map(|candidate| {
         let c = strip_name_junk(&candidate);
-        if !c.is_empty() && !is_uninformative(&c) {
-            return c;
+        (!c.is_empty() && !is_uninformative(&c)).then_some(c)
+    })
+}
+
+/// Is this name one a human learns nothing from? Public so the owner loop
+/// can ask before overwriting a name with better evidence.
+pub fn is_uninformative_name(name: &str) -> bool {
+    let c = strip_name_junk(name);
+    c.is_empty() || is_uninformative(&c)
+}
+
+/// A name for a job whose own documents gave nothing: say **who asked for
+/// it and where it came from**.
+///
+/// Field report 2026-07-29, job #182: a 4.8 GiB download titled
+/// `cc310b9901757996b0bdfd880c666e3812e6531d`, every payload file inside
+/// it obfuscated too, so there was no evidence anywhere to name it by —
+/// "that is not useful at all". It is not useful, and the honest reason is
+/// that at admission nobody knows what it is yet. But somebody *asked* for
+/// it, from *somewhere*, and both of those are facts we hold. `monarr ·
+/// drunkenslug · cc310b99` answers "what is this and why is it here" well
+/// enough to act on, which a bare hash never does.
+///
+/// This is a placeholder and is meant to be replaced: the job renames
+/// itself the moment its par2 metadata arrives (see
+/// `Owner::on_writer_finalized`). Returns `None` when there is no context
+/// either — then the hash is genuinely all anyone has, and inventing
+/// something would be worse.
+pub fn requestor_name(job: &Job) -> Option<String> {
+    let param = |k: &str| {
+        job.params
+            .iter()
+            .find(|(pk, _)| pk == k)
+            .map(|(_, v)| v.as_str())
+    };
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(client) = param(CLIENT_PARAM).filter(|c| !c.is_empty()) {
+        parts.push(client.to_string());
+    } else if let Some(cat) = job.category.as_deref().filter(|c| !c.is_empty()) {
+        parts.push(cat.to_string());
+    }
+    if let Some(host) = param("*URL").and_then(url_host) {
+        parts.push(host);
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    // A short id so two of these are still tellable apart, and so the row
+    // can be matched back to the indexer link by eye.
+    let ident = strip_name_junk(&job.name);
+    let short: String = ident.chars().take(8).collect();
+    if !short.is_empty() {
+        parts.push(short);
+    }
+    Some(parts.join(" · "))
+}
+
+/// `https://drunkenslug.com/getnzb/…` → `drunkenslug`. The registrable
+/// label, not the full host: `api.indexer.example.co.uk` reads as
+/// `indexer`, which is the part an operator recognises.
+///
+/// `None` for an IP literal. `127.0.0.1` has no label that means anything
+/// to a human, and picking one out of it yields `0` — which is how this
+/// first went wrong.
+fn url_host(url: &str) -> Option<String> {
+    let rest = url.split("://").nth(1).unwrap_or(url);
+    let host = rest.split(['/', '?', '#']).next()?;
+    let host = host.rsplit('@').next()?;
+    if host.starts_with('[') || host.matches(':').count() > 1 {
+        return None; // IPv6 literal
+    }
+    let host = host.split(':').next()?;
+    let labels: Vec<&str> = host
+        .split('.')
+        .filter(|l| !l.is_empty() && !l.eq_ignore_ascii_case("www"))
+        .collect();
+    if labels.is_empty() || labels.iter().all(|l| l.parse::<u32>().is_ok()) {
+        return None; // empty, or an IPv4 literal
+    }
+    // Drop the TLD (and a two-part public suffix like `co.uk`).
+    let drop = if labels.len() >= 3 && labels[labels.len() - 2].len() <= 3 {
+        2
+    } else {
+        1
+    };
+    let idx = labels.len().saturating_sub(drop + 1);
+    labels
+        .get(idx)
+        .filter(|l| l.parse::<u32>().is_err())
+        .map(|s| s.to_string())
+}
+
+/// The job param carrying the client that asked for this job.
+///
+/// Reserved (`*`-prefixed) like `*URL`, so a client cannot set it on
+/// itself through the public params surface.
+pub const CLIENT_PARAM: &str = "*Client";
+
+/// Adopt a better name.
+///
+/// `storage_too` moves the on-disk directory name with it, which is only
+/// safe before any file has been written — at admission, or when a URL
+/// job's NZB lands. Once writers exist the display name may still improve,
+/// but the path it writes to must not move underneath them.
+pub fn rename_job(job: &mut Job, new_name: String, storage_too: bool, provisional: bool) {
+    if new_name.is_empty() || new_name == job.name {
+        return;
+    }
+    job.name = new_name;
+    job.name_provisional = provisional;
+    if storage_too {
+        job.dir_name = sanitize_name(&job.name);
+    }
+}
+
+/// Is this job still waiting for a name it can call its own?
+///
+/// Two ways to be: nothing has replaced the junk it was admitted with, or
+/// something has but only provisionally. Both are open to a better answer;
+/// a real name from the job's own documents closes it for good.
+pub fn name_is_open(job: &Job) -> bool {
+    job.name_provisional || is_uninformative_name(&job.name)
+}
+
+/// The name a set of real filenames implies: their common stem, cut back
+/// off the volume counter. `X.part01.rar` + `X.part02.rar` → `X`.
+///
+/// Shared by the NZB-time guess (payload subjects) and the par2-time
+/// answer (FileDesc packets), because it is the same question asked of two
+/// different sources.
+pub fn common_stem(names: &[String]) -> Option<String> {
+    let names: Vec<&String> = names
+        .iter()
+        .filter(|n| {
+            let l = n.to_ascii_lowercase();
+            !(l.ends_with(".par2") || l.ends_with(".nfo") || l.ends_with(".sfv"))
+        })
+        .collect();
+    if names.is_empty() {
+        return None;
+    }
+    if names.len() == 1 {
+        // One payload file names the job by itself, minus its extension —
+        // a single .mkv is the commonest shape there is.
+        let n = names[0];
+        let stem = n.rsplit_once('.').map_or(n.as_str(), |(base, ext)| {
+            if ext.len() <= 4 && ext.chars().all(|c| c.is_ascii_alphanumeric()) {
+                base
+            } else {
+                n.as_str()
+            }
+        });
+        return (stem.chars().count() >= 4).then(|| stem.to_string());
+    }
+    let mut prefix: Vec<char> = names[0].chars().collect();
+    for n in &names[1..] {
+        let common = prefix
+            .iter()
+            .zip(n.chars())
+            .take_while(|(a, b)| **a == *b)
+            .count();
+        prefix.truncate(common);
+        if prefix.is_empty() {
+            return None;
         }
     }
-    if cleaned.is_empty() {
-        "download".into()
-    } else {
-        cleaned
-    }
+    // `Show.part0` → drop the counter, the volume word, then the separator.
+    let s: String = prefix.into_iter().collect();
+    let s = s.trim_end_matches(|c: char| c.is_ascii_digit());
+    let s = s.trim_end_matches(['.', '-', '_', ' ']);
+    let lower = s.to_ascii_lowercase();
+    let s = [".part", ".vol", ".disc", ".cd", ".r", ".s"]
+        .iter()
+        .find(|w| lower.ends_with(*w))
+        .map_or(s, |w| &s[..s.len() - w.len()]);
+    let s = s.trim_end_matches(['.', '-', '_', ' ']);
+    (s.chars().count() >= 4).then(|| s.to_string())
+}
+
+/// The name a par2 recovery set gives its own contents, if it is one a
+/// human learns anything from.
+pub fn name_from_par2(descs: &[nzbd_par2::FileDesc]) -> Option<String> {
+    let names: Vec<String> = descs.iter().map(|d| d.name.clone()).collect();
+    let candidate = common_stem(&names)?;
+    let c = strip_name_junk(&candidate);
+    (!c.is_empty() && !is_uninformative(&c)).then_some(c)
 }
 
 /// URL tail → name: cut glued query params, drop the extension, decode.
@@ -495,41 +693,24 @@ fn par2_base_name(nzb: &nzbd_nzb::ParsedNzb) -> Option<String> {
 /// prefix of the payload filenames, cut back off the volume counter.
 /// `X.part01.rar` + `X.part02.rar` → `X`.
 fn common_file_stem(nzb: &nzbd_nzb::ParsedNzb) -> Option<String> {
-    let names: Vec<String> = nzb
-        .files
-        .iter()
-        .map(|f| f.filename_hint())
-        .filter(|n| {
-            let l = n.to_ascii_lowercase();
-            !(l.ends_with(".par2") || l.ends_with(".nfo") || l.ends_with(".sfv"))
-        })
-        .collect();
-    if names.len() < 2 {
-        return None;
+    let names: Vec<String> = nzb.files.iter().map(|f| f.filename_hint()).collect();
+    common_stem(&names)
+}
+
+/// The directory a job's files live under, relative to the destination.
+///
+/// Always go through this rather than `sanitize_name(&job.name)`. The two
+/// agree for every job admitted since `dir_name` existed, and for jobs
+/// restored from an older snapshot this falls back to exactly what they
+/// already used — but only this one honours a job that has since renamed
+/// itself, and a writer that disagrees with the rest of the daemon about
+/// where a file goes is the bug the split exists to prevent.
+pub fn job_dir_name(job: &Job) -> String {
+    if job.dir_name.is_empty() {
+        sanitize_name(&job.name)
+    } else {
+        job.dir_name.clone()
     }
-    let mut prefix: Vec<char> = names[0].chars().collect();
-    for n in &names[1..] {
-        let common = prefix
-            .iter()
-            .zip(n.chars())
-            .take_while(|(a, b)| **a == *b)
-            .count();
-        prefix.truncate(common);
-        if prefix.is_empty() {
-            return None;
-        }
-    }
-    // `Show.part0` → drop the counter, the volume word, then the separator.
-    let s: String = prefix.into_iter().collect();
-    let s = s.trim_end_matches(|c: char| c.is_ascii_digit());
-    let s = s.trim_end_matches(['.', '-', '_', ' ']);
-    let lower = s.to_ascii_lowercase();
-    let s = [".part", ".vol", ".disc", ".cd", ".r", ".s"]
-        .iter()
-        .find(|w| lower.ends_with(*w))
-        .map_or(s, |w| &s[..s.len() - w.len()]);
-    let s = s.trim_end_matches(['.', '-', '_', ' ']);
-    (s.chars().count() >= 4).then(|| s.to_string())
 }
 
 /// Filesystem-safe job/file names (path separators and control chars out).
@@ -1404,5 +1585,234 @@ mod tests {
         let (status, health) = final_status(job);
         assert_eq!(status, JobStatus::Failed);
         assert_eq!(health.0, 200);
+    }
+
+    // ---- naming an obfuscated post ------------------------------------
+
+    fn job_with(name: &str, params: &[(&str, &str)], category: Option<&str>) -> Job {
+        Job {
+            id: JobId(182),
+            kind: JobKind::Url,
+            name: name.into(),
+            dir_name: String::new(),
+            name_provisional: false,
+            category: category.map(str::to_string),
+            priority: 0,
+            dupe: DupeInfo::default(),
+            params: params
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            files: vec![],
+            totals: Default::default(),
+            status: JobStatus::Fetching,
+            stages: vec![],
+        }
+    }
+
+    /// Field report 2026-07-29, job #182: a 4.8 GiB download titled
+    /// `cc310b99…`, everything inside it obfuscated too, so no evidence
+    /// anywhere. "That is not useful at all." What we DO know is who asked
+    /// and where from.
+    #[test]
+    fn a_job_with_no_evidence_is_named_by_who_asked_for_it() {
+        let job = job_with(
+            "cc310b9901757996b0bdfd880c666e3812e6531d",
+            &[
+                (CLIENT_PARAM, "monarr"),
+                (
+                    "*URL",
+                    "https://drunkenslug.com/getnzb/cc310b99.nzb&i=1&r=KEY",
+                ),
+            ],
+            Some("monarr"),
+        );
+        assert_eq!(
+            requestor_name(&job).as_deref(),
+            Some("monarr · drunkenslug · cc310b99")
+        );
+    }
+
+    /// With no client the category still says something, and with neither
+    /// there is nothing honest to say — inventing a name would be worse
+    /// than the hash.
+    #[test]
+    fn the_requestor_name_says_only_what_is_actually_known() {
+        let cat_only = job_with(
+            "cc310b9901757996b0bdfd880c666e3812e6531d",
+            &[("*URL", "https://api.nzbgeek.info/api?t=get&id=1")],
+            Some("movies"),
+        );
+        assert_eq!(
+            requestor_name(&cat_only).as_deref(),
+            Some("movies · nzbgeek · cc310b99"),
+            "the registrable label, not the api subdomain"
+        );
+
+        // A two-part public suffix resolves to the registered domain —
+        // `example.co.uk`, so `example`, not the `indexer` subdomain.
+        let couk = job_with(
+            "cc310b9901757996b0bdfd880c666e3812e6531d",
+            &[("*URL", "https://api.indexer.example.co.uk/get?id=1")],
+            Some("movies"),
+        );
+        assert_eq!(
+            requestor_name(&couk).as_deref(),
+            Some("movies · example · cc310b99")
+        );
+
+        let nothing = job_with("cc310b9901757996b0bdfd880c666e3812e6531d", &[], None);
+        assert_eq!(requestor_name(&nothing), None, "no context, no invention");
+
+        // An IP literal has no label a human recognises. Picking one out
+        // of it produced "0 · af51ab64" — worse than the hash it replaced.
+        let ip = job_with(
+            "af51ab64582e226f4bc8de91b7b757d8067ba8e6",
+            &[("*URL", "http://127.0.0.1:8080/getnzb/af51ab64.nzb")],
+            None,
+        );
+        assert_eq!(requestor_name(&ip), None);
+        let ip6 = job_with(
+            "af51ab64",
+            &[("*URL", "http://[::1]:8080/getnzb/x.nzb")],
+            Some("tv"),
+        );
+        assert_eq!(requestor_name(&ip6).as_deref(), Some("tv · af51ab64"));
+    }
+
+    /// The real answer, and the one worth waiting a minute for: par2
+    /// FileDesc packets carry the true filenames even when every NZB
+    /// subject is obfuscated.
+    #[test]
+    fn par2_metadata_names_the_job_its_nzb_could_not() {
+        let descs = |names: &[&str]| -> Vec<nzbd_par2::FileDesc> {
+            names
+                .iter()
+                .enumerate()
+                .map(|(i, n)| nzbd_par2::FileDesc {
+                    id: [i as u8; 16],
+                    name: (*n).to_string(),
+                    length: 100,
+                    md5_16k: [0; 16],
+                })
+                .collect()
+        };
+        assert_eq!(
+            name_from_par2(&descs(&[
+                "Some.Movie.2024.1080p.WEB-DL.DDP5.1-GRP.part01.rar",
+                "Some.Movie.2024.1080p.WEB-DL.DDP5.1-GRP.part02.rar",
+                "Some.Movie.2024.1080p.WEB-DL.DDP5.1-GRP.par2",
+            ]))
+            .as_deref(),
+            Some("Some.Movie.2024.1080p.WEB-DL.DDP5.1-GRP")
+        );
+        // A single payload file names the job by itself, minus extension.
+        assert_eq!(
+            name_from_par2(&descs(&["Show.S01E07.720p.WEB-DL-KiNGS.mkv"])).as_deref(),
+            Some("Show.S01E07.720p.WEB-DL-KiNGS")
+        );
+        // A par2 set whose own contents are obfuscated names nothing, and
+        // must say so rather than hand back another hash.
+        assert_eq!(
+            name_from_par2(&descs(&[
+                "XyfmaV5wXwfrrrqbVHgvsqC8b2ztZK",
+                "XyfmaV5wXwfrrrqbVHgvsqC8b2ztZL",
+            ])),
+            None
+        );
+        assert_eq!(name_from_par2(&[]), None);
+    }
+
+    /// A rename may move the storage directory only while nothing has been
+    /// written. Getting this wrong splits a job's files across two
+    /// directories, because the writer recomputes its target from the job
+    /// every time one spawns.
+    #[test]
+    fn only_a_pre_download_rename_moves_the_directory() {
+        let mut j = job_with("cc310b99", &[], None);
+        j.dir_name = "cc310b99".into();
+
+        rename_job(&mut j, "Real.Name.2024".into(), true, false);
+        assert_eq!(j.name, "Real.Name.2024");
+        assert_eq!(
+            j.dir_name, "Real.Name.2024",
+            "pre-download: the path follows"
+        );
+
+        rename_job(&mut j, "Even.Better.Name".into(), false, false);
+        assert_eq!(j.name, "Even.Better.Name");
+        assert_eq!(
+            j.dir_name, "Real.Name.2024",
+            "mid-download: the display name moves, the path must not"
+        );
+
+        // A no-op rename never touches anything.
+        rename_job(&mut j, String::new(), true, false);
+        assert_eq!(j.name, "Even.Better.Name");
+    }
+
+    /// The trap a good placeholder sets for itself: `monarr · drunkenslug ·
+    /// cc310b99` is deliberately readable, so a gate that asks "does this
+    /// look like junk?" says no — and refuses the real name when the par2
+    /// index finally supplies it. The provisional flag is what keeps the
+    /// question answerable.
+    #[test]
+    fn a_provisional_name_still_yields_to_the_real_one() {
+        let mut j = job_with("cc310b9901757996b0bdfd880c666e3812e6531d", &[], None);
+        assert!(name_is_open(&j), "raw junk is open to anything better");
+
+        rename_job(&mut j, "monarr · drunkenslug · cc310b99".into(), true, true);
+        assert!(
+            !is_uninformative_name(&j.name),
+            "the placeholder reads as a real name — that is the point of it"
+        );
+        assert!(name_is_open(&j), "…but it is still only a stand-in");
+
+        rename_job(&mut j, "Some.Movie.2024.1080p-GRP".into(), false, false);
+        assert!(
+            !name_is_open(&j),
+            "a name from the job's own documents is final"
+        );
+
+        // And nothing may overwrite it afterwards — a second par2 volume
+        // carrying the same packets must not restart the churn.
+        rename_job(&mut j, "Something.Else".into(), false, false);
+        assert_eq!(j.name, "Something.Else", "rename_job itself does not gate");
+        // The gate lives at the call sites, which consult name_is_open.
+    }
+
+    /// `job_dir_name` has to keep answering for jobs written before
+    /// `dir_name` existed, or a restart relocates every in-flight download.
+    #[test]
+    fn a_pre_split_job_still_finds_its_own_directory() {
+        let old = job_with("Some Movie: 2024/HDR", &[], None); // dir_name empty
+        assert_eq!(job_dir_name(&old), sanitize_name("Some Movie: 2024/HDR"));
+        let mut new = old.clone();
+        new.dir_name = "explicit-dir".into();
+        assert_eq!(job_dir_name(&new), "explicit-dir");
+    }
+
+    /// The gate every rename path consults.
+    #[test]
+    fn uninformative_names_are_the_ones_worth_replacing() {
+        for junk in [
+            "cc310b9901757996b0bdfd880c666e3812e6531d",
+            "UcsRDCyhGHPCP2TqBJWrnUg",
+            "yEnc",
+            "",
+            "   ",
+        ] {
+            assert!(
+                is_uninformative_name(junk),
+                "{junk:?} should be replaceable"
+            );
+        }
+        for real in [
+            "Some.Movie.2024.1080p.WEB-DL-GRP",
+            "Jim Jefferies - Alcoholocaust (2010) 1080p",
+            "Show.S01E07",
+        ] {
+            assert!(!is_uninformative_name(real), "{real:?} should be kept");
+        }
     }
 }

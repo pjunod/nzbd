@@ -4,6 +4,7 @@ members = [
     "crates/nzbd-types",
     "crates/nzbd-nzb",
     "crates/nzbd-yenc",
+    "crates/nzbd-par2",
     "crates/nzbd-nntp",
     "crates/nzbd-engine",
     "crates/nzbd-feed",
@@ -34,6 +35,7 @@ repository = "https://example.invalid/nzbd"
 nzbd-types = { path = "crates/nzbd-types" }
 nzbd-nzb = { path = "crates/nzbd-nzb" }
 nzbd-yenc = { path = "crates/nzbd-yenc" }
+nzbd-par2 = { path = "crates/nzbd-par2" }
 nzbd-nntp = { path = "crates/nzbd-nntp" }
 nzbd-engine = { path = "crates/nzbd-engine" }
 nzbd-feed = { path = "crates/nzbd-feed" }

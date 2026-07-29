@@ -780,3 +780,126 @@ async fn disk_low_guard_flips_from_the_cached_probe() {
     }
     engine.shutdown().await;
 }
+
+// ---------------------------------------------------------------------------
+// Naming an obfuscated post from its own metadata
+// ---------------------------------------------------------------------------
+
+/// Minimal par2 file carrying only what naming needs: a Main packet (so it
+/// is a well-formed set) and one FileDesc per real filename.
+fn par2_bytes(names: &[&str]) -> Vec<u8> {
+    fn packet(ptype: &[u8; 16], body: &[u8]) -> Vec<u8> {
+        let len = 64 + body.len();
+        let mut p = Vec::with_capacity(len);
+        p.extend_from_slice(b"PAR2\0PKT");
+        p.extend_from_slice(&(len as u64).to_le_bytes());
+        p.extend_from_slice(&[0u8; 16]); // packet md5 (unchecked by the scanner)
+        p.extend_from_slice(&[0u8; 16]); // recovery set id
+        p.extend_from_slice(ptype);
+        p.extend_from_slice(body);
+        p
+    }
+    let mut main = 384_000u64.to_le_bytes().to_vec();
+    main.extend_from_slice(&(names.len() as u32).to_le_bytes());
+    main.extend_from_slice(&[0u8; 8]);
+    let mut out = packet(b"PAR 2.0\0Main\0\0\0\0", &main);
+    for (i, n) in names.iter().enumerate() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&[i as u8; 16]); // file id
+        body.extend_from_slice(&[0u8; 16]); // full md5
+        body.extend_from_slice(&[i as u8; 16]); // md5 of first 16k
+        body.extend_from_slice(&1_000u64.to_le_bytes());
+        body.extend_from_slice(n.as_bytes());
+        while body.len() % 4 != 0 {
+            body.push(0);
+        }
+        out.extend(packet(b"PAR 2.0\0FileDesc", &body));
+    }
+    out
+}
+
+/// Field report 2026-07-29 (job #182): a 4.8 GiB download whose title,
+/// whose every payload filename, and whose par2 files were all random
+/// tokens — "that is not useful at all". Nothing in the NZB names it.
+///
+/// But the recovery index does, and it lands early: #182's was 20.5 KiB
+/// and finished one minute into the download. This asserts the whole arc —
+/// the placeholder says who asked, the par2 file renames the job as soon
+/// as it hits disk, and the storage directory does NOT move underneath the
+/// writers when it happens.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_obfuscated_job_names_itself_from_its_par2_metadata() {
+    let real = "Some.Movie.2024.1080p.WEB-DL.DDP5.1-GRP";
+    let post = build_post(
+        "obfuscated",
+        &[
+            // The recovery index is FIRST and tiny, so it finalizes while
+            // the payload is still arriving — the whole point of doing this
+            // during the download rather than at post-processing.
+            (
+                "LKKp171CWZ3IrtvUyiLuNWIqWtos",
+                par2_bytes(&[&format!("{real}.part01.rar"), &format!("{real}.part02.rar")]),
+            ),
+            ("XyfmaV5wXwfrrrqbVHgvsqC8b2ztZK", prng_bytes(31, 120_000)),
+        ],
+        16_000,
+    );
+    let ns = NservBuilder::new().with_post(&post).start().await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let engine = spawn_engine(tmp.path(), vec![server_def(1, ns.port(), 0, 4, 2)]).await;
+    let mut rx = engine.subscribe();
+
+    let hash = "cc310b9901757996b0bdfd880c666e3812e6531d";
+    let id = engine
+        .add_nzb_opts(
+            hash,
+            post.nzb.as_bytes(),
+            nzbd_engine::AddOpts {
+                client: Some("monarr".into()),
+                ..nzbd_engine::AddOpts::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    // Before any file lands there is no evidence at all, so the job is
+    // named by who asked for it — not by the hash.
+    let snap = engine.snapshot();
+    let job = snap.jobs.iter().find(|j| j.id == id).unwrap();
+    assert_eq!(
+        job.name, "monarr · cc310b99",
+        "with no evidence, say who asked (got {:?})",
+        job.name
+    );
+
+    let (status, _health) = wait_finished(&mut rx, id, 60).await;
+    assert!(matches!(status, JobStatus::Completed), "{status:?}");
+
+    // The par2 index named it, and it did so from metadata the NZB never
+    // carried.
+    let snap = engine.snapshot();
+    let job = snap.jobs.iter().find(|j| j.id == id).unwrap();
+    assert_eq!(job.name, real, "the job named itself from its par2 packets");
+
+    // …and every file is in ONE directory, the one it started in. A rename
+    // that moved the storage name would have split them.
+    let exported = engine.export_job(id).await.unwrap().unwrap();
+    assert_eq!(
+        exported.dir_name,
+        nzbd_engine::queue::sanitize_name("monarr · cc310b99"),
+        "the storage directory must not move under the writers"
+    );
+    let dir = tmp.path().join("dest").join(&exported.dir_name);
+    let on_disk: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(
+        on_disk.len(),
+        2,
+        "both files landed in one directory: {on_disk:?}"
+    );
+
+    engine.shutdown().await;
+}

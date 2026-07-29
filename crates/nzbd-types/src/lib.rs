@@ -332,7 +332,36 @@ pub const PP_DONE_PARAM: &str = "*PP:done";
 pub struct Job {
     pub id: JobId,
     pub kind: JobKind,
+    /// The **display** name. Free to change after admission: an obfuscated
+    /// post names itself from its own par2 metadata the moment that lands,
+    /// so this is not a stable identifier and nothing on disk may be keyed
+    /// to it. Use [`Job::dir_name`] for storage.
     pub name: String,
+    /// The **storage** name: the directory this job's files live under,
+    /// fixed at admission and never changed.
+    ///
+    /// Split from `name` because renaming a job mid-download used to move
+    /// its destination out from under the writers — the directory is
+    /// recomputed from the name every time a writer spawns, so half the
+    /// files would land in the old directory and half in the new one. A
+    /// display name that can improve and a path that must not are two
+    /// different things.
+    ///
+    /// Empty on a snapshot written before this existed; read it through
+    /// `queue::job_dir_name`, which falls back to sanitizing `name` — the
+    /// exact behaviour those jobs already had.
+    #[serde(default)]
+    pub dir_name: String,
+    /// True while `name` is a stand-in rather than something the job's own
+    /// documents said.
+    ///
+    /// Tracked as a flag instead of re-derived from the string, because a
+    /// good placeholder is indistinguishable from a real title by
+    /// inspection — `monarr · drunkenslug · cc310b99` reads as informative,
+    /// which is the point of it, and a gate that asked "does this look
+    /// like junk?" would refuse the real name when it finally arrived.
+    #[serde(default)]
+    pub name_provisional: bool,
     pub category: Option<String>,
     pub priority: i32,
     pub dupe: DupeInfo,
@@ -436,6 +465,8 @@ mod tests {
             id: JobId(1),
             kind: JobKind::Nzb,
             name: "x".into(),
+            dir_name: String::new(),
+            name_provisional: false,
             category: None,
             priority: 100,
             dupe: DupeInfo::default(),

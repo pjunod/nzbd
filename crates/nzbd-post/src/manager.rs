@@ -619,7 +619,12 @@ pub async fn process_job_ctx(
     else {
         return Err(PostError::Subprocess("job vanished".into()));
     };
-    let sanitized = nzbd_engine::queue::sanitize_name(&job.name);
+    // The SOURCE directory is the job's storage name, which never changes;
+    // `job.name` is a display name that a job can improve on itself (par2
+    // metadata naming an obfuscated post). Deriving the input directory
+    // from a mutable name is how the pipeline would come looking for a
+    // directory the engine never wrote.
+    let sanitized = nzbd_engine::queue::job_dir_name(&job);
     // The engine always writes downloads under the global destination;
     // a `[[category]] dest_dir` is a *move* at the end of the pipeline
     // (PostStage::Move), not a different download target.

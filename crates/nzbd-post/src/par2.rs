@@ -13,8 +13,6 @@ use nzbd_yenc::crc32_combine;
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
-const MAGIC: &[u8; 8] = b"PAR2\0PKT";
-
 #[derive(Debug, Clone)]
 pub struct Par2File {
     pub id: [u8; 16],
@@ -35,6 +33,12 @@ pub struct Par2Set {
 }
 
 /// Parse every readable `*.par2` in a directory into one set.
+///
+/// The packet walking itself lives in `nzbd-par2`, a leaf crate, because
+/// the download engine needs the same FileDesc names *during* a download
+/// and cannot depend on this crate (`nzbd-post` depends on `nzbd-engine`).
+/// One parser, two callers — the alternative was a second copy that would
+/// drift.
 pub fn load_dir(dir: &Path) -> Result<Option<Par2Set>, PostError> {
     let mut par_files: Vec<PathBuf> = std::fs::read_dir(dir)?
         .flatten()
@@ -52,6 +56,7 @@ pub fn load_dir(dir: &Path) -> Result<Option<Par2Set>, PostError> {
 
     let mut slice_size = 0u64;
     let mut descs: HashMap<[u8; 16], (String, u64, [u8; 16])> = HashMap::new();
+    let mut order: Vec<[u8; 16]> = Vec::new();
     let mut crcs: HashMap<[u8; 16], Vec<u32>> = HashMap::new();
     let mut exponents: BTreeSet<u32> = BTreeSet::new();
     let mut main_path: Option<PathBuf> = None;
@@ -61,56 +66,25 @@ pub fn load_dir(dir: &Path) -> Result<Option<Par2Set>, PostError> {
         let Ok(bytes) = std::fs::read(path) else {
             continue; // unreadable / still paused-not-downloaded
         };
-        // The main file is conventionally the smallest one with FileDesc packets.
-        let mut has_desc = false;
-        let mut pos = 0usize;
-        while pos + 64 <= bytes.len() {
-            if &bytes[pos..pos + 8] != MAGIC {
-                pos += 4;
-                continue;
-            }
-            let len = u64::from_le_bytes(bytes[pos + 8..pos + 16].try_into().unwrap()) as usize;
-            if len < 64 || pos + len > bytes.len() {
-                break; // torn / partial file
-            }
-            let ptype = &bytes[pos + 48..pos + 64];
-            let body = &bytes[pos + 64..pos + len];
-            match ptype {
-                b"PAR 2.0\0Main\0\0\0\0" if body.len() >= 12 => {
-                    slice_size = u64::from_le_bytes(body[0..8].try_into().unwrap());
-                }
-                b"PAR 2.0\0FileDesc" => {
-                    has_desc = true;
-                    if body.len() >= 56 {
-                        let mut id = [0u8; 16];
-                        id.copy_from_slice(&body[0..16]);
-                        let mut md5_16k = [0u8; 16];
-                        md5_16k.copy_from_slice(&body[32..48]);
-                        let length = u64::from_le_bytes(body[48..56].try_into().unwrap());
-                        let name = String::from_utf8_lossy(&body[56..])
-                            .trim_end_matches('\0')
-                            .to_string();
-                        descs.entry(id).or_insert((name, length, md5_16k));
-                    }
-                }
-                b"PAR 2.0\0IFSC\0\0\0\0" if body.len() >= 16 => {
-                    let mut id = [0u8; 16];
-                    id.copy_from_slice(&body[0..16]);
-                    let entry = crcs.entry(id).or_default();
-                    if entry.is_empty() {
-                        for chunk in body[16..].chunks_exact(20) {
-                            entry.push(u32::from_le_bytes(chunk[16..20].try_into().unwrap()));
-                        }
-                    }
-                }
-                b"PAR 2.0\0RecvSlic" if body.len() >= 4 => {
-                    exponents.insert(u32::from_le_bytes(body[0..4].try_into().unwrap()));
-                }
-                _ => {}
-            }
-            pos += len;
+        let scan = nzbd_par2::scan(&bytes);
+        if scan.slice_size > 0 {
+            slice_size = scan.slice_size;
         }
-        if has_desc && bytes.len() as u64 <= main_size {
+        let has_descs = scan.has_descs();
+        for d in &scan.descs {
+            if descs
+                .insert(d.id, (d.name.clone(), d.length, d.md5_16k))
+                .is_none()
+            {
+                order.push(d.id);
+            }
+        }
+        for (id, v) in scan.crcs {
+            crcs.entry(id).or_insert(v);
+        }
+        exponents.extend(scan.exponents);
+        // The main file is conventionally the smallest one with FileDesc packets.
+        if has_descs && bytes.len() as u64 <= main_size {
             main_size = bytes.len() as u64;
             main_path = Some(path.clone());
         }
@@ -119,14 +93,17 @@ pub fn load_dir(dir: &Path) -> Result<Option<Par2Set>, PostError> {
     if descs.is_empty() || slice_size == 0 {
         return Ok(None);
     }
-    let files = descs
+    let files = order
         .into_iter()
-        .map(|(id, (name, length, md5_16k))| Par2File {
-            id,
-            name,
-            length,
-            md5_16k,
-            slice_crcs: crcs.get(&id).cloned().unwrap_or_default(),
+        .map(|id| {
+            let (name, length, md5_16k) = descs.remove(&id).expect("id came from descs");
+            Par2File {
+                id,
+                name,
+                length,
+                md5_16k,
+                slice_crcs: crcs.get(&id).cloned().unwrap_or_default(),
+            }
         })
         .collect();
     Ok(Some(Par2Set {

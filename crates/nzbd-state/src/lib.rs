@@ -663,6 +663,8 @@ mod tests {
                     id: JobId(j),
                     kind: JobKind::Nzb,
                     name: format!("job {j}"),
+                    dir_name: String::new(),
+                    name_provisional: false,
                     category: Some("tv".into()),
                     priority: 0,
                     dupe: DupeInfo::default(),

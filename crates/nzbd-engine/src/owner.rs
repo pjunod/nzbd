@@ -11,7 +11,7 @@
 use crate::events::Event;
 use crate::failover::{AttemptOutcome, Ladder, SegmentAttempt, Verdict};
 use crate::queue::{
-    final_status, next_for_server, pick_par_files, recompute_job_totals, sanitize_name,
+    final_status, job_dir_name, next_for_server, pick_par_files, recompute_job_totals,
     vol_par_blocks, QueueState, SegRef, SelectionCtx,
 };
 use crate::rate::{RateLimiter, SpeedMeter};
@@ -336,6 +336,13 @@ pub(crate) enum EngineMsg {
         job: JobId,
         file: FileId,
         error: String,
+    },
+    /// A completed par2 file told us what this job really is. Cosmetic and
+    /// best-effort: dropped freely under load, and ignored if the job has
+    /// meanwhile acquired a real name by any other route.
+    LearnedJobName {
+        job: JobId,
+        name: String,
     },
 }
 
@@ -746,6 +753,7 @@ impl Owner {
                 final_path,
                 combined_crc,
             } => self.on_writer_finalized(job, file, ok, final_path, combined_crc),
+            EngineMsg::LearnedJobName { job, name } => self.adopt_learned_name(job, name),
             EngineMsg::WriterError { job, file, error } => {
                 tracing::warn!(job = job.0, file = file.0, %error, "writer error; failing file");
                 self.fail_whole_file(job, file);
@@ -781,6 +789,9 @@ impl Owner {
                     }
                     j.params.extend(params);
                 }
+                // Nothing has been written yet, so a better name may take
+                // the directory with it.
+                let name = self.name_from_requestor(id, true).unwrap_or(name);
                 tracing::info!(job = id.0, %name, "job added");
                 self.save_snapshot(); // adds are durable immediately
                 self.publish_now();
@@ -850,6 +861,7 @@ impl Owner {
                     }
                     j.params.extend(params);
                 }
+                let name = self.name_from_requestor(id, true).unwrap_or(name);
                 tracing::info!(job = id.0, %name, %url, "url job added (fetching)");
                 self.save_snapshot();
                 self.publish_now();
@@ -868,6 +880,11 @@ impl Owner {
                             j.status = JobStatus::Paused;
                         }
                     }
+                    // `complete_url_fetch` has just re-run the evidence
+                    // pass against the fetched NZB. If that still came up
+                    // with nothing, fall back to who asked. Still no files
+                    // on disk, so the directory follows the name.
+                    self.name_from_requestor(job, true);
                     tracing::info!(job = job.0, "url fetch complete; queued");
                     self.save_snapshot();
                     self.publish_now();
@@ -1794,6 +1811,14 @@ impl Owner {
                 .or_insert_with(|| format!("could not write {filename} to disk"));
         }
         tracing::info!(job = job.0, file = file.0, %filename, ok, path = ?final_path, "file finished");
+        // A completed file may be the recovery index that knows what this
+        // whole job actually is. Only worth asking when the job still has
+        // no real name.
+        if ok {
+            if let Some(path) = final_path.clone() {
+                self.maybe_learn_name_from(job, path);
+            }
+        }
         self.emit(Event::FileFinished {
             job,
             file,
@@ -1802,6 +1827,83 @@ impl Owner {
         });
         self.dirty = true;
         self.check_job_complete(job);
+    }
+
+    /// Ask a just-completed file whether it is a par2 index, and if so
+    /// whether it names the job.
+    ///
+    /// This is the "as soon as possible" half of naming an obfuscated
+    /// post. The evidence exists from the moment the recovery index lands
+    /// — for the 4.8 GiB job #182 that was **one minute** into the
+    /// download — and waiting for post-processing to discover it means the
+    /// queue shows a 40-character hash for the entire hour it runs.
+    ///
+    /// Content-sniffed, never extension-matched: an obfuscated post hides
+    /// its par2 files exactly like everything else (#182's index arrived
+    /// as `LKKp171CWZ3IrtvUyiLuNWIqWtos`), so `is_par2` — which is a guess
+    /// off the NZB subject — is `false` for precisely the files this needs
+    /// to read. The read happens on a blocking thread: the owner loop is
+    /// the single writer for the whole queue and must never sit on a
+    /// network mount's I/O.
+    fn maybe_learn_name_from(&mut self, job: JobId, path: PathBuf) {
+        let Some(j) = self.state.job(job) else { return };
+        if !crate::queue::name_is_open(j) {
+            return; // already named by something real
+        }
+        let tx = self.engine_tx.clone();
+        self.tracker.spawn_blocking(move || {
+            let Some(name) = read_par2_name(&path) else {
+                return;
+            };
+            // Best effort: a full channel means the owner is busy, and a
+            // cosmetic rename is not worth blocking a writer thread for.
+            let _ = tx.try_send(EngineMsg::LearnedJobName { job, name });
+        });
+    }
+
+    /// Fall back to naming a job by who asked for it, when its own
+    /// documents named it nothing. Returns the new name if it changed.
+    fn name_from_requestor(&mut self, job: JobId, storage_too: bool) -> Option<String> {
+        let j = self.state.job_mut(job)?;
+        if !crate::queue::name_is_open(j) {
+            return None;
+        }
+        let better = crate::queue::requestor_name(j)?;
+        let was = j.name.clone();
+        // Provisional: this says who asked, not what arrived. The job's own
+        // par2 metadata supersedes it the moment that lands.
+        crate::queue::rename_job(j, better.clone(), storage_too, true);
+        tracing::info!(job = job.0, from = %was, to = %better,
+            "job named from its requestor — the NZB carried no name of its own");
+        Some(better)
+    }
+
+    /// Adopt a name recovered from par2 metadata mid-download.
+    ///
+    /// The DISPLAY name only: files are already on disk under the storage
+    /// name, and moving that out from under the writers is the bug the
+    /// `name`/`dir_name` split exists to prevent. Post-processing moves
+    /// the finished job into a directory named from the display name, so
+    /// what lands in the destination still reads correctly.
+    fn adopt_learned_name(&mut self, job: JobId, name: String) {
+        let Some(j) = self.state.job_mut(job) else {
+            return;
+        };
+        // The race this closes: between the blocking read and this turn,
+        // the job may have been named by its own NZB metadata or by a
+        // second par2 file. First real name wins; a rename that flickers
+        // is worse than one that is late.
+        if !crate::queue::name_is_open(j) {
+            return;
+        }
+        let was = j.name.clone();
+        // Final: the recovery set is the document naming itself.
+        crate::queue::rename_job(j, name.clone(), false, false);
+        tracing::info!(job = job.0, from = %was, to = %name,
+            "job named from its own par2 metadata");
+        self.dirty = true;
+        self.publish_now();
+        self.bump_epoch();
     }
 
     fn check_job_complete(&mut self, job_id: JobId) {
@@ -1894,9 +1996,9 @@ impl Owner {
                 return h.tx.clone();
             }
         }
-        let (job_name, filename) = match self.state.job(job) {
+        let (job_dir, filename) = match self.state.job(job) {
             Some(j) => (
-                j.name.clone(),
+                job_dir_name(j),
                 j.files
                     .iter()
                     .find(|f| f.id == file)
@@ -1905,7 +2007,10 @@ impl Owner {
             ),
             None => (format!("job-{}", job.0), format!("file-{}", file.0)),
         };
-        let dir = self.dest_dir.join(sanitize_name(&job_name));
+        // `job_dir`, never `job.name`: a job that renamed itself from its
+        // par2 metadata mid-download must not split its files across two
+        // directories.
+        let dir = self.dest_dir.join(job_dir);
         let h = spawn_writer(
             &self.tracker,
             job,
@@ -1990,7 +2095,7 @@ impl Owner {
             }
         }
         if delete_files {
-            let dir = self.dest_dir.join(sanitize_name(&job.name));
+            let dir = self.dest_dir.join(job_dir_name(&job));
             tokio::spawn(async move {
                 if let Err(e) = tokio::fs::remove_dir_all(&dir).await {
                     if e.kind() != std::io::ErrorKind::NotFound {
@@ -2524,6 +2629,39 @@ pub(crate) fn plan_url_refetches(
     (refetch, duplicates)
 }
 
+/// The recovery-set name a par2 file implies, or `None` if this file is
+/// not a par2 file or its packets name nothing useful.
+///
+/// Reads the head first so that the overwhelmingly common case — a payload
+/// file, not a par2 file — costs 8 bytes rather than a whole rar volume.
+fn read_par2_name(path: &Path) -> Option<String> {
+    use std::io::Read as _;
+    let mut f = std::fs::File::open(path).ok()?;
+    let mut head = [0u8; 8];
+    let mut got = 0;
+    while got < head.len() {
+        match f.read(&mut head[got..]) {
+            Ok(0) => break,
+            Ok(n) => got += n,
+            Err(_) => return None,
+        }
+    }
+    if !nzbd_par2::is_par2(&head[..got]) {
+        return None;
+    }
+    // par2 index files are small (job #182's was 20.5 KiB). Cap the read
+    // anyway: a recovery VOLUME carries the same FileDesc packets up front
+    // and can be hundreds of MiB, and we only ever want its header.
+    const MAX: u64 = 8 * 1024 * 1024;
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)
+        .ok()?
+        .take(MAX)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    crate::queue::name_from_par2(&nzbd_par2::scan(&bytes).descs)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2533,6 +2671,8 @@ mod tests {
             id: JobId(1),
             kind: nzbd_types::JobKind::Nzb,
             name: "x".into(),
+            dir_name: String::new(),
+            name_provisional: false,
             category: None,
             priority: 0,
             dupe: Default::default(),

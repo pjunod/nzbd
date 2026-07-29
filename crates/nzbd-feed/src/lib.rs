@@ -187,6 +187,7 @@ pub async fn poll_feed(
                     mode: Some(nzbd_types::DupeMode::Score),
                 }),
                 params: Vec::new(), // feeds add on their own behalf
+                client: Some(format!("feed:{}", feed.name)),
             };
             match engine.add_url(&item.title, &item.url, add).await {
                 Ok(id) => {

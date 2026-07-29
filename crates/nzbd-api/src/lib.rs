@@ -791,6 +791,7 @@ fn parse_add_params(raw: &str) -> Result<Vec<(String, String)>, String> {
 async fn add_job(
     State(st): State<ApiState>,
     Query(q): Query<AddJobQuery>,
+    headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
     let name = q.name.unwrap_or_default();
@@ -808,6 +809,9 @@ async fn add_job(
             mode: None,
         }),
         params,
+        // Who asked. Only used when the job's own documents name it
+        // nothing — see `queue::requestor_name`.
+        client: consumer_name(&headers).or_else(|| client_name(&headers)),
     };
     if let Some(url) = &q.url {
         return match st.engine.add_url(&name, url, opts).await {
@@ -2183,6 +2187,7 @@ async fn history_requeue(st: &ApiState, db: Arc<HistoryDb>, job: JobId) -> Respo
     let opts = nzbd_engine::AddOpts {
         category: entry.category.clone(),
         priority: 0,
+        client: None, // a requeue re-uses the name the entry already has
         dupe: (!entry.dupe_key.is_empty()).then(|| nzbd_types::DupeInfo {
             key: entry.dupe_key.clone(),
             score: entry.dupe_score,
