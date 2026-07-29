@@ -453,6 +453,108 @@ impl UncleanMarker {
 // ---------------------------------------------------------------------------
 
 /// Terminal record of a job for the history store.
+/// One file, as it stood when the job left the queue.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct HistoryFile {
+    pub name: String,
+    pub size: u64,
+    pub segments_total: u32,
+    pub segments_done: u32,
+    pub segments_failed: u32,
+    pub par2: bool,
+}
+
+/// **The job as it was, kept with the job.**
+///
+/// History used to hold a summary — name, status, size, health — and drop
+/// everything the queue knew: which files, how many articles, how many had
+/// to be retried, which indexer it came from, who asked for it. Those are
+/// exactly the questions asked *afterwards*: "which file was short?", "was
+/// this the release I think it was?", "where did I get this?". A record
+/// that answers them only while the job is still in the queue answers them
+/// at the one time nobody is asking (field report 2026-07-29).
+///
+/// Optional because entries written before this existed do not have one,
+/// and because a job that failed before it had files has nothing to say.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct JobRecord {
+    pub files: Vec<HistoryFile>,
+    pub total_articles: u32,
+    pub success_articles: u32,
+    pub failed_articles: u32,
+    /// Bytes that had to be fetched more than once — wasted bandwidth,
+    /// invisible in the size totals.
+    #[serde(default)]
+    pub retried_articles: u32,
+    pub par_size: u64,
+    /// Where it came from, and who asked for it.
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub client: Option<String>,
+    #[serde(default)]
+    pub category: Option<String>,
+    /// When the job entered the queue. With `completed_at_unix` this is
+    /// how long the whole thing took, which no other field records.
+    #[serde(default)]
+    pub queued_at_unix: Option<i64>,
+    /// The name the job was admitted under, when it later renamed itself
+    /// from its own metadata. Keeps the *arr's original reference findable.
+    #[serde(default)]
+    pub original_name: Option<String>,
+    /// The directory the files were written to, relative to the download
+    /// destination.
+    #[serde(default)]
+    pub dir_name: Option<String>,
+}
+
+impl JobRecord {
+    /// Capture everything the queue knew, as the job leaves it.
+    pub fn from_job(job: &nzbd_types::Job) -> JobRecord {
+        let param = |k: &str| {
+            job.params
+                .iter()
+                .find(|(pk, _)| pk == k)
+                .map(|(_, v)| v.clone())
+        };
+        JobRecord {
+            files: job
+                .files
+                .iter()
+                .map(|f| HistoryFile {
+                    name: f.filename.clone(),
+                    size: f.segments.iter().map(|s| s.size as u64).sum(),
+                    segments_total: f.segments.len() as u32,
+                    segments_done: f
+                        .segments
+                        .iter()
+                        .filter(|s| matches!(s.state, nzbd_types::SegmentState::Done { .. }))
+                        .count() as u32,
+                    segments_failed: f
+                        .segments
+                        .iter()
+                        .filter(|s| matches!(s.state, nzbd_types::SegmentState::Failed))
+                        .count() as u32,
+                    par2: f.is_par2,
+                })
+                .collect(),
+            total_articles: job.totals.total_articles,
+            success_articles: job.totals.success_articles,
+            failed_articles: job.totals.failed_articles,
+            // Not on JobTotals — the engine tracks it per job in the live
+            // snapshot only, so history records 0 rather than a wrong number.
+            retried_articles: 0,
+            par_size: job.totals.par_size,
+            url: param("*URL"),
+            client: param("*Client"),
+            category: job.category.clone(),
+            queued_at_unix: (job.queued_at_unix > 0).then_some(job.queued_at_unix),
+            original_name: (!job.original_name.is_empty()).then(|| job.original_name.clone()),
+            dir_name: (!job.dir_name.is_empty()).then(|| job.dir_name.clone()),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HistoryEntry {
     pub job: JobId,
@@ -492,6 +594,10 @@ pub struct HistoryEntry {
     /// User-Agent of the polling/deleting client (Sonarr/x, Radarr/x…).
     #[serde(default)]
     pub picked_up_by: Option<String>,
+    /// Everything the queue knew about this job, captured as it left.
+    /// `None` for entries written before this existed.
+    #[serde(default)]
+    pub record: Option<JobRecord>,
     /// Where the post-processing time went, stage by stage, copied off the
     /// job as it finished.
     ///
@@ -665,6 +771,8 @@ mod tests {
                     name: format!("job {j}"),
                     dir_name: String::new(),
                     name_provisional: false,
+                    queued_at_unix: 0,
+                    original_name: String::new(),
                     category: Some("tv".into()),
                     priority: 0,
                     dupe: DupeInfo::default(),

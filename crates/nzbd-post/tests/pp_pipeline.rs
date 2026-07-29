@@ -54,6 +54,8 @@ fn completed_job(id: u32, name: &str, files: Vec<FileEntry>) -> Job {
         name: name.into(),
         dir_name: String::new(),
         name_provisional: false,
+        queued_at_unix: 0,
+        original_name: String::new(),
         category: Some("test".into()),
         priority: 0,
         dupe: DupeInfo::default(),

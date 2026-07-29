@@ -2673,6 +2673,8 @@ mod tests {
             name: "x".into(),
             dir_name: String::new(),
             name_provisional: false,
+            queued_at_unix: 0,
+            original_name: String::new(),
             category: None,
             priority: 0,
             dupe: Default::default(),

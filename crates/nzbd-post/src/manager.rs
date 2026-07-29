@@ -285,6 +285,7 @@ async fn manager_task(
                             seen_count: 0,
                             removed_at_unix: None,
                             picked_up_by: None,
+                            record: exported.as_ref().map(nzbd_state::JobRecord::from_job),
                             stages: exported
                                 .as_ref()
                                 .map(|j| j.stages.clone())
@@ -978,9 +979,37 @@ pub async fn process_job_ctx(
             seen_count: 0,
             removed_at_unix: None,
             picked_up_by: None,
+            // The job as it was, kept with the job: which files, how many
+            // articles, where it came from, who asked. Those questions are
+            // asked AFTER it leaves the queue, which is the one moment the
+            // old summary stopped being able to answer them.
+            record: Some(nzbd_state::JobRecord::from_job(&fin)),
             stages: fin.stages.clone(),
             seq: 0,
         };
+        // Park the NZB with the entry, so a finished job can be put back.
+        //
+        // Until now `spool_nzb` had exactly ONE caller — the delete path —
+        // so a job that completed normally kept no requeue source and its
+        // history row reported `can_requeue: false` forever. "That nzb for
+        // that job can be downloaded again if necessary" (field report
+        // 2026-07-29) was simply not true of any job that succeeded.
+        // Gzipped, and reaped with its entry by retention, so keeping one
+        // per job stays bounded.
+        if !fin.files.is_empty() {
+            let h = history.clone();
+            let nzb = nzbd_engine::queue::job_to_nzb(&fin).into_bytes();
+            let _ = tokio::task::spawn_blocking(move || {
+                if let Err(e) = h.spool_nzb(job_id, &nzb) {
+                    // Not worth failing the job over: the files are
+                    // downloaded and post-processed either way. It costs
+                    // the undo, and it says so.
+                    tracing::warn!(job = job_id.0, error = %e,
+                        "could not park the finished job's NZB — it will not be re-downloadable from history");
+                }
+            })
+            .await;
+        }
         // History first, stamp second: a crash in between re-runs PP (the
         // stages are idempotent) — the reverse would lose the entry forever.
         let h = history.clone();

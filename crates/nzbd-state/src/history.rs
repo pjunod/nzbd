@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 /// did not renumber the existing indices.
 const COLUMNS: &str = "job_id, name, category, final_dir, status, size, health, params,
                        dupe_key, dupe_score, completed_at, hidden, first_seen, last_seen,
-                       seen_count, removed_at, picked_up_by, id, stages";
+                       seen_count, removed_at, picked_up_by, id, stages, record";
 
 /// How much history to keep. `0` disables that bound; whichever bound
 /// bites first wins. See [`nzbd_config::HistorySection`] for why there are
@@ -143,6 +143,7 @@ impl HistoryDb {
             "ALTER TABLE history ADD COLUMN removed_at INTEGER",
             "ALTER TABLE history ADD COLUMN picked_up_by TEXT",
             "ALTER TABLE history ADD COLUMN stages TEXT NOT NULL DEFAULT '[]'",
+            "ALTER TABLE history ADD COLUMN record TEXT",
         ] {
             let _ = conn.execute(ddl, []);
         }
@@ -542,12 +543,15 @@ impl HistoryDb {
                 "INSERT INTO history
                  (job_id, name, category, final_dir, status, size, health, params,
                   dupe_key, dupe_score, completed_at, hidden, removed_at, picked_up_by,
-                  stages)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+                  stages, record)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
                  ON CONFLICT(job_id, completed_at) DO UPDATE SET
                    hidden = excluded.hidden,
                    removed_at = COALESCE(excluded.removed_at, history.removed_at),
-                   picked_up_by = COALESCE(excluded.picked_up_by, history.picked_up_by)",
+                   picked_up_by = COALESCE(excluded.picked_up_by, history.picked_up_by),
+                   -- A later line that carries a record fills one in; one
+                   -- that does not (a `hide` re-append) must not erase it.
+                   record = COALESCE(excluded.record, history.record)",
                 rusqlite::params![
                     entry.job.0,
                     entry.name,
@@ -564,6 +568,10 @@ impl HistoryDb {
                     entry.removed_at_unix,
                     entry.picked_up_by,
                     serde_json::to_string(&entry.stages).unwrap_or_else(|_| "[]".into()),
+                    entry
+                        .record
+                        .as_ref()
+                        .and_then(|r| serde_json::to_string(r).ok()),
                 ],
             )
             .map_err(|e| StateError::Corrupt(format!("sqlite insert: {e}")))?;
@@ -710,6 +718,11 @@ impl HistoryDb {
                         .get::<_, Option<String>>(18)?
                         .and_then(|s| serde_json::from_str(&s).ok())
                         .unwrap_or_default(),
+                    // Same rule: a pre-upgrade row has no record, which is
+                    // a fact about the row, not a parse failure.
+                    record: r
+                        .get::<_, Option<String>>(19)?
+                        .and_then(|s| serde_json::from_str(&s).ok()),
                 })
             })
             .map_err(|e| StateError::Corrupt(e.to_string()))?;
@@ -856,6 +869,13 @@ impl HistoryDb {
     /// Park `bytes` as this job's requeue source. Overwrites any previous
     /// spool for the same id (job ids are reused only after a restart, and
     /// the newer job is the one worth keeping).
+    ///
+    /// **Stored gzipped.** An NZB is XML and compresses about ten to one,
+    /// which is what makes keeping one for *every* finished job affordable:
+    /// a thousand entries costs a couple of hundred MB instead of a couple
+    /// of gigabytes on the state volume. [`read_spool`](Self::read_spool)
+    /// transparently reads both, so spools written before this change are
+    /// still readable and no migration is needed.
     pub fn spool_nzb(&self, job: crate::JobId, bytes: &[u8]) -> Result<(), StateError> {
         let Some(path) = self.spool_path(job) else {
             return Ok(());
@@ -863,15 +883,39 @@ impl HistoryDb {
         if let Some(parent) = path.parent() {
             fsx::create_dir_all(parent)?;
         }
-        fsx::write(&path, bytes)?;
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        let packed = std::io::Write::write_all(&mut enc, bytes)
+            .and_then(|()| enc.finish())
+            .map_err(|e| StateError::Corrupt(format!("gzip nzb for job {}: {e}", job.0)))?;
+        fsx::write(&path, &packed)?;
         self.invalidate_spool_cache();
         Ok(())
     }
 
     /// The spooled NZB for a parked job, if it is still on this node.
+    ///
+    /// Reads gzipped or plain: the file is sniffed for the gzip magic
+    /// rather than trusted by name, so a spool written before compression
+    /// existed still requeues.
     pub fn read_spool(&self, job: crate::JobId) -> Option<Vec<u8>> {
         let path = self.spool_path(job)?;
-        fsx::read(&path).ok()
+        let raw = fsx::read(&path).ok()?;
+        if raw.starts_with(&[0x1f, 0x8b]) {
+            let mut out = Vec::new();
+            let mut dec = flate2::read::GzDecoder::new(&raw[..]);
+            match std::io::Read::read_to_end(&mut dec, &mut out) {
+                Ok(_) => Some(out),
+                // A truncated spool is not a usable requeue source, and
+                // pretending the compressed bytes are an NZB would hand the
+                // parser garbage instead of an honest "gone".
+                Err(e) => {
+                    tracing::warn!(job = job.0, error = %e, "parked NZB is unreadable");
+                    None
+                }
+            }
+        } else {
+            Some(raw)
+        }
     }
 
     /// Can this entry be put back in the queue from local state?
@@ -993,6 +1037,7 @@ mod tests {
             seen_count: 0,
             removed_at_unix: None,
             picked_up_by: None,
+            record: None,
             stages: Vec::new(),
             seq: 0,
         }
@@ -1607,5 +1652,199 @@ mod tests {
         db.hide(crate::JobId(24), Some("sonarr"), now).unwrap();
         assert_eq!(db.count_filtered(false).unwrap(), 24);
         assert_eq!(db.list_page(10, 0, false).unwrap()[0].job.0, 23);
+    }
+
+    // ---- the job record travels with the job --------------------------
+
+    fn job_for_record() -> nzbd_types::Job {
+        use nzbd_types::{FileEntry, FileId, Segment, SegmentState};
+        let seg = |n: u32, state: SegmentState| Segment {
+            number: n,
+            message_id: format!("m{n}@x").into(),
+            size: 1000,
+            state,
+        };
+        nzbd_types::Job {
+            id: crate::JobId(182),
+            kind: nzbd_types::JobKind::Url,
+            name: "Some.Movie.2024.1080p-GRP".into(),
+            dir_name: "monarr · drunkenslug · cc310b99".into(),
+            name_provisional: false,
+            queued_at_unix: 1_799_999_000,
+            original_name: "cc310b9901757996b0bdfd880c666e3812e6531d".into(),
+            category: Some("monarr".into()),
+            priority: 0,
+            dupe: Default::default(),
+            params: vec![
+                ("*URL".into(), "https://drunkenslug.com/getnzb/x.nzb".into()),
+                ("*Client".into(), "monarr".into()),
+                ("monarr-transfer".into(), "t-124-27117f".into()),
+            ],
+            files: vec![
+                FileEntry {
+                    id: FileId(1),
+                    subject: "s".into(),
+                    filename: "movie.part01.rar".into(),
+                    filename_confirmed: true,
+                    is_par2: false,
+                    paused: false,
+                    groups: vec!["a.b".into()],
+                    date: None,
+                    segments: vec![
+                        seg(
+                            1,
+                            SegmentState::Done {
+                                offset: 0,
+                                len: 1000,
+                                crc: 1,
+                            },
+                        ),
+                        seg(2, SegmentState::Failed),
+                    ],
+                    crc32: None,
+                    finalized: true,
+                },
+                FileEntry {
+                    id: FileId(2),
+                    subject: "s".into(),
+                    filename: "movie.par2".into(),
+                    filename_confirmed: true,
+                    is_par2: true,
+                    paused: false,
+                    groups: vec!["a.b".into()],
+                    date: None,
+                    segments: vec![seg(
+                        1,
+                        SegmentState::Done {
+                            offset: 0,
+                            len: 1000,
+                            crc: 1,
+                        },
+                    )],
+                    crc32: None,
+                    finalized: true,
+                },
+            ],
+            totals: nzbd_types::JobTotals {
+                size: 3000,
+                par_size: 1000,
+                total_articles: 3,
+                success_articles: 2,
+                failed_articles: 1,
+                ..Default::default()
+            },
+            status: nzbd_types::JobStatus::Completed,
+            stages: vec![],
+        }
+    }
+
+    /// The whole point: what the queue knew survives into history, because
+    /// that is when the questions get asked. Field report 2026-07-29 —
+    /// "I want all of that info kept with the job as it moves to history,
+    /// so it can be looked back upon if needed."
+    #[test]
+    fn the_job_record_survives_the_trip_into_history() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = HistoryDb::open(
+            &tmp.path().join("history.sqlite"),
+            Some(&tmp.path().join("h")),
+        )
+        .unwrap();
+        let job = job_for_record();
+        let mut e = entry(182, 1_800_000_000);
+        e.record = Some(crate::JobRecord::from_job(&job));
+        db.record(&e).unwrap();
+
+        let got = db.list_filtered(10, true).unwrap();
+        let r = got[0].record.as_ref().expect("the record came back");
+        assert_eq!(r.files.len(), 2, "the file table survived");
+        assert_eq!(r.files[0].name, "movie.part01.rar");
+        assert_eq!(r.files[0].segments_total, 2);
+        assert_eq!(r.files[0].segments_done, 1);
+        assert_eq!(r.files[0].segments_failed, 1);
+        assert!(r.files[1].par2, "par2 files are marked as such");
+        assert_eq!(
+            (r.total_articles, r.success_articles, r.failed_articles),
+            (3, 2, 1)
+        );
+        assert_eq!(r.par_size, 1000);
+        assert_eq!(
+            r.url.as_deref(),
+            Some("https://drunkenslug.com/getnzb/x.nzb")
+        );
+        assert_eq!(r.client.as_deref(), Some("monarr"));
+        assert_eq!(r.queued_at_unix, Some(1_799_999_000));
+        assert_eq!(
+            r.original_name.as_deref(),
+            Some("cc310b9901757996b0bdfd880c666e3812e6531d"),
+            "the name the *arr added it under stays findable"
+        );
+
+        // And it survives a rebuild from the portable log, which is the
+        // copy that outlives this node's index.
+        let db2 =
+            HistoryDb::open(&tmp.path().join("h2.sqlite"), Some(&tmp.path().join("h"))).unwrap();
+        let rebuilt = db2.list_filtered(10, true).unwrap();
+        assert_eq!(rebuilt[0].record.as_ref().unwrap().files.len(), 2);
+    }
+
+    /// An entry written before records existed reads back as "no record",
+    /// never as a failed query — and a later `hide` re-append, which
+    /// carries no record, must not erase the one already stored.
+    #[test]
+    fn a_record_is_never_erased_by_a_line_that_lacks_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = HistoryDb::open(
+            &tmp.path().join("history.sqlite"),
+            Some(&tmp.path().join("h")),
+        )
+        .unwrap();
+        let mut e = entry(1, 1_800_000_000);
+        e.record = Some(crate::JobRecord::from_job(&job_for_record()));
+        db.record(&e).unwrap();
+
+        db.hide(crate::JobId(1), Some("sonarr"), 1_800_000_100)
+            .unwrap();
+        let got = db.list_filtered(10, true).unwrap();
+        assert!(got[0].hidden);
+        assert!(
+            got[0].record.is_some(),
+            "hide re-appends without a record; that must not wipe it"
+        );
+
+        let mut bare = entry(2, 1_800_000_000);
+        bare.record = None;
+        db.record(&bare).unwrap();
+        let got = db.list_filtered(10, true).unwrap();
+        let two = got.iter().find(|e| e.job.0 == 2).unwrap();
+        assert!(two.record.is_none(), "no record is a fact, not an error");
+    }
+
+    /// The NZB is kept gzipped so one per finished job is affordable, and
+    /// a spool written before compression still reads.
+    #[test]
+    fn a_parked_nzb_round_trips_compressed_and_plain() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = HistoryDb::open(&tmp.path().join("history.sqlite"), None).unwrap();
+        let nzb = format!(
+            "<?xml version=\"1.0\"?><nzb>{}</nzb>",
+            "<file subject=\"x\"><segments><segment>m@x</segment></segments></file>".repeat(200)
+        );
+        db.spool_nzb(crate::JobId(5), nzb.as_bytes()).unwrap();
+
+        let on_disk = std::fs::read(tmp.path().join("nzbs/5.nzb")).unwrap();
+        assert_eq!(&on_disk[..2], &[0x1f, 0x8b], "stored gzipped");
+        assert!(
+            on_disk.len() * 4 < nzb.len(),
+            "an NZB compresses hard: {} -> {}",
+            nzb.len(),
+            on_disk.len()
+        );
+        assert_eq!(db.read_spool(crate::JobId(5)).unwrap(), nzb.as_bytes());
+        assert!(db.spooled_ids().contains(&5));
+
+        // A spool from before compression is still a valid requeue source.
+        std::fs::write(tmp.path().join("nzbs/6.nzb"), b"<nzb>plain</nzb>").unwrap();
+        assert_eq!(db.read_spool(crate::JobId(6)).unwrap(), b"<nzb>plain</nzb>");
     }
 }

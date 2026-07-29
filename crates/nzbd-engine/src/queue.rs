@@ -158,6 +158,8 @@ impl QueueState {
             name,
             dir_name,
             name_provisional: false,
+            queued_at_unix: unix_now(),
+            original_name: String::new(),
             category,
             priority,
             dupe: DupeInfo::default(),
@@ -190,6 +192,8 @@ impl QueueState {
             name,
             dir_name,
             name_provisional: false,
+            queued_at_unix: unix_now(),
+            original_name: String::new(),
             category,
             priority,
             dupe: DupeInfo::default(),
@@ -477,6 +481,12 @@ pub fn rename_job(job: &mut Job, new_name: String, storage_too: bool, provisiona
     if new_name.is_empty() || new_name == job.name {
         return;
     }
+    // Remember what the client called it the FIRST time it changes. An
+    // *arr that added `cc310b99…` and later reads history looking for it
+    // must still be able to find the row.
+    if job.original_name.is_empty() {
+        job.original_name = job.name.clone();
+    }
     job.name = new_name;
     job.name_provisional = provisional;
     if storage_too {
@@ -711,6 +721,13 @@ pub fn job_dir_name(job: &Job) -> String {
     } else {
         job.dir_name.clone()
     }
+}
+
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 /// Filesystem-safe job/file names (path separators and control chars out).
@@ -969,6 +986,66 @@ pub fn final_status(job: &Job) -> (JobStatus, Health) {
     } else {
         (JobStatus::Completed, health)
     }
+}
+
+/// Regenerate a job's NZB from queue state.
+///
+/// Lives here rather than in the API because two callers need it and they
+/// are in different crates: the API's `GET /jobs/{id}/nzb` and delete-park,
+/// and post-processing, which spools every finished job's NZB so history
+/// can put it back. `nzbd-post` cannot reach `nzbd-api`.
+///
+/// Round-trips through the real parser (asserted in the API's tests): what
+/// comes out is a document nzbd itself would accept.
+pub fn job_to_nzb(job: &nzbd_types::Job) -> String {
+    use std::fmt::Write as _;
+    let esc = |s: &str| {
+        s.replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+            .replace('"', "&quot;")
+    };
+    let mut x = String::from(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<nzb xmlns=\"http://www.newzbin.com/DTD/2003/nzb\">\n",
+    );
+    let _ = writeln!(x, "  <head>");
+    let _ = writeln!(x, "    <meta type=\"title\">{}</meta>", esc(&job.name));
+    if let Some(c) = &job.category {
+        let _ = writeln!(x, "    <meta type=\"category\">{}</meta>", esc(c));
+    }
+    let _ = writeln!(x, "  </head>");
+    for f in &job.files {
+        let subject = if f.subject.trim().is_empty() {
+            &f.filename
+        } else {
+            &f.subject
+        };
+        let _ = writeln!(
+            x,
+            "  <file poster=\"nzbd\" date=\"{}\" subject=\"{}\">",
+            f.date.unwrap_or(0),
+            esc(subject)
+        );
+        let _ = writeln!(x, "    <groups>");
+        for g in &f.groups {
+            let _ = writeln!(x, "      <group>{}</group>", esc(g));
+        }
+        let _ = writeln!(x, "    </groups>");
+        let _ = writeln!(x, "    <segments>");
+        for s in &f.segments {
+            let _ = writeln!(
+                x,
+                "      <segment bytes=\"{}\" number=\"{}\">{}</segment>",
+                s.size,
+                s.number,
+                esc(&s.message_id)
+            );
+        }
+        let _ = writeln!(x, "    </segments>");
+        let _ = writeln!(x, "  </file>");
+    }
+    x.push_str("</nzb>\n");
+    x
 }
 
 #[cfg(test)]
@@ -1596,6 +1673,8 @@ mod tests {
             name: name.into(),
             dir_name: String::new(),
             name_provisional: false,
+            queued_at_unix: 0,
+            original_name: String::new(),
             category: category.map(str::to_string),
             priority: 0,
             dupe: DupeInfo::default(),

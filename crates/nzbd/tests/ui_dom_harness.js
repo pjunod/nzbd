@@ -397,11 +397,69 @@ const models = (jobs) => jobs.map((j, i) => T.rowModel(j, { idx: i, count: jobs.
   const tbody = node("tbody");
   T.reconcileRows(tbody, [m], fake);
   const acts = tbody.children[0].children[5].children[0];
-  eq(acts.children.length, 4, "requeue / hide / forget / delete-files");
-  eq(acts.children[3].dataset.action, "h-delete-files", "destructive action is data-driven");
-  eq(acts.children[0].hidden, true, "requeue is hidden unless the entry is parked");
+  const byAction = (a) => [...acts.children].find(b => b.dataset.action === a);
+  eq(acts.children.length, 5, "details / requeue / hide / forget / delete-files");
+  ok(byAction("h-delete-files"), "destructive action is data-driven");
+  eq(acts.children[acts.children.length - 1].dataset.action, "h-delete-files",
+    "…and it is last, where a misaimed click is least likely to land on it");
+  eq(byAction("h-requeue").hidden, true, "requeue is hidden unless the entry is parked");
   T.reconcileRows(tbody, [T.histModel(Object.assign({}, e, { status: "DELETED", can_requeue: true }))], fake);
-  eq(acts.children[0].hidden, false, "a parked entry can go back to the queue");
+  eq(byAction("h-requeue").hidden, false, "a parked entry can go back to the queue");
+}
+
+// --- 10b. the job record travels with the job into history ---------------
+// Field report 2026-07-29: "I want all of that info kept with the job as it
+// moves to history, so it can be looked back upon if needed." The detail
+// panel needs no fetch — a record you have to ask the queue for is one that
+// stops existing when the queue forgets the job.
+{
+  const withRecord = {
+    job: 182, name: "Some.Movie.2024.1080p-GRP", category: "monarr",
+    status: "SUCCESS", size: 5_153_960_755, health: 1000, hidden: false,
+    completed_at_unix: 1_800_003_600, final_dir: "/working/monarr/completed/Some.Movie",
+    stages: [], can_requeue: true,
+    record: {
+      client: "monarr",
+      url: "https://drunkenslug.com/getnzb/cc310b99.nzb",
+      original_name: "cc310b9901757996b0bdfd880c666e3812e6531d",
+      total_articles: 6449, success_articles: 6448, failed_articles: 1,
+      par_size: 210_000_000, queued_at_unix: 1_800_000_000,
+      files: [
+        { name: "movie.part01.rar", size: 1000, segments_total: 10, segments_done: 10, segments_failed: 0, par2: false },
+        { name: "movie.part02.rar", size: 1000, segments_total: 10, segments_done: 9, segments_failed: 1, par2: false },
+        { name: "movie.par2", size: 500, segments_total: 2, segments_done: 2, segments_failed: 0, par2: true },
+      ],
+    },
+  };
+  const d = T.histDetailModel(withRecord);
+  ok(d.meta.includes("added by monarr"), `who asked (got ${d.meta})`);
+  ok(d.meta.includes("drunkenslug"), "where it came from");
+  ok(d.meta.includes("cc310b99017"), "the name the *arr added it under stays findable");
+  ok(d.meta.includes("6448/6449 articles"), "article counts survive the trip");
+  ok(d.meta.includes("1 failed"), "…including what did not arrive");
+  ok(d.meta.includes("took "), "queued-to-finished duration is recoverable");
+  eq(d.files.length, 3, "the file table survives");
+  eq(d.files[1].short, true, "a file that lost segments is marked");
+  eq(d.files[2].par2, true, "par2 files are distinguishable");
+
+  // An entry from before records existed says so, rather than rendering an
+  // empty panel that looks like a bug.
+  const old = T.histDetailModel({ job: 7, name: "x", status: "SUCCESS", completed_at_unix: 1, stages: [] });
+  ok(old.meta.includes("predates"), `pre-upgrade entries say so (got ${old.meta})`);
+  eq(old.files.length, 0);
+
+  // The panel is a toggle, and opening one does not fetch anything.
+  routes.clear(); seen.length = 0;
+  T.store.history = [withRecord];
+  T.toggleHist(182);
+  eq(T.getOpenHist(), 182, "details open");
+  eq(seen.length, 0, "no request — the record is already in hand");
+  const body = sandbox.document.getElementById("history-body");
+  eq(body.children.length, 2, "the detail row renders under its own row");
+  T.toggleHist(182);
+  eq(T.getOpenHist(), null, "and closes");
+  T.store.history = null;
+  routes.clear(); seen.length = 0;
 }
 
 // --- 11. laws #1 and #4 as grep-able properties of the source -------------
@@ -779,7 +837,10 @@ const models = (jobs) => jobs.map((j, i) => T.rowModel(j, { idx: i, count: jobs.
   // written straight onto the node would be wiped by the next tick.
   const tbody = node("tbody");
   T.reconcileRows(tbody, [T.histModel(e)], fake);
-  const btn = tbody.children[0].children[5].children[0].children[3];
+  // Located by data-action, not index: the action set grows over time and
+  // a positional lookup silently starts asserting about a different button.
+  const btn = [...tbody.children[0].children[5].children[0].children]
+    .find(b => b.dataset.action === "h-delete-files");
   eq(btn.textContent, "sure?", "armed state renders");
   T.reconcileRows(tbody, [T.histModel(e)], fake);
   eq(btn.textContent, "sure?", "…and survives a re-render");

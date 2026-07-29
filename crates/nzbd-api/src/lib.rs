@@ -669,7 +669,7 @@ async fn get_job_files(State(st): State<ApiState>, Path(id): Path<u32>) -> Respo
 async fn get_job_nzb(State(st): State<ApiState>, Path(id): Path<u32>) -> Response {
     match st.engine.export_job(JobId(id)).await {
         Ok(Some(job)) => {
-            let xml = job_to_nzb(&job);
+            let xml = nzbd_engine::queue::job_to_nzb(&job);
             let fname = nzbd_engine::queue::sanitize_name(&job.name);
             (
                 [
@@ -689,57 +689,6 @@ async fn get_job_nzb(State(st): State<ApiState>, Path(id): Path<u32>) -> Respons
         Ok(None) => not_found(),
         Err(e) => error(StatusCode::SERVICE_UNAVAILABLE, &e.to_string()),
     }
-}
-
-fn job_to_nzb(job: &nzbd_types::Job) -> String {
-    use std::fmt::Write as _;
-    let esc = |s: &str| {
-        s.replace('&', "&amp;")
-            .replace('<', "&lt;")
-            .replace('>', "&gt;")
-            .replace('"', "&quot;")
-    };
-    let mut x = String::from(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<nzb xmlns=\"http://www.newzbin.com/DTD/2003/nzb\">\n",
-    );
-    let _ = writeln!(x, "  <head>");
-    let _ = writeln!(x, "    <meta type=\"title\">{}</meta>", esc(&job.name));
-    if let Some(c) = &job.category {
-        let _ = writeln!(x, "    <meta type=\"category\">{}</meta>", esc(c));
-    }
-    let _ = writeln!(x, "  </head>");
-    for f in &job.files {
-        let subject = if f.subject.trim().is_empty() {
-            &f.filename
-        } else {
-            &f.subject
-        };
-        let _ = writeln!(
-            x,
-            "  <file poster=\"nzbd\" date=\"{}\" subject=\"{}\">",
-            f.date.unwrap_or(0),
-            esc(subject)
-        );
-        let _ = writeln!(x, "    <groups>");
-        for g in &f.groups {
-            let _ = writeln!(x, "      <group>{}</group>", esc(g));
-        }
-        let _ = writeln!(x, "    </groups>");
-        let _ = writeln!(x, "    <segments>");
-        for s in &f.segments {
-            let _ = writeln!(
-                x,
-                "      <segment bytes=\"{}\" number=\"{}\">{}</segment>",
-                s.size,
-                s.number,
-                esc(&s.message_id)
-            );
-        }
-        let _ = writeln!(x, "    </segments>");
-        let _ = writeln!(x, "  </file>");
-    }
-    x.push_str("</nzb>\n");
-    x
 }
 
 #[derive(Debug, Deserialize)]
@@ -853,7 +802,7 @@ async fn park_snapshot(st: &ApiState, job: JobId) -> Option<Parked> {
     let nzb = if j.files.is_empty() {
         None
     } else {
-        Some(job_to_nzb(&j).into_bytes())
+        Some(nzbd_engine::queue::job_to_nzb(&j).into_bytes())
     };
     if nzb.is_none() && url.is_none() {
         return None; // nothing to put back: don't promise an undo
@@ -887,7 +836,8 @@ async fn park_snapshot(st: &ApiState, job: JobId) -> Option<Parked> {
             seen_count: 0,
             removed_at_unix: None,
             picked_up_by: None,
-            stages: Vec::new(),
+            record: Some(nzbd_state::JobRecord::from_job(&j)),
+            stages: j.stages.clone(),
             seq: 0,
         },
         nzb,
@@ -3043,6 +2993,7 @@ mod tests {
                 seen_count: 0,
                 removed_at_unix: None,
                 picked_up_by: None,
+                record: None,
                 stages: vec![],
                 seq: 0,
             })

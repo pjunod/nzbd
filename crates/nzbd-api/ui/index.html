@@ -1971,12 +1971,77 @@ function histModel(e) {
     // A parked delete can go straight back to the queue, long after the
     // Undo toast has faded.
     requeueHidden: !e.can_requeue,
+    detailsLabel: e.job === openHist ? "close" : "details",
     // The only destructive action on the page arms first (§ two-step).
     delLabel: isArmed ? "sure?" : "delete files",
     delCls: isArmed ? "del armed" : "del",
     delTip: isArmed
       ? "click again to delete the downloaded files — this one cannot be undone"
       : "remove the record AND delete the downloaded files",
+  };
+}
+
+// ---- history detail: the job as it was ----------------------------------
+// The queue's detail panel answers "what is this doing"; this one answers
+// "what WAS this" — which file was short, which indexer it came from, who
+// asked for it, how long it took. Those questions get asked afterwards, so
+// the answers have to survive the trip out of the queue (see JobRecord).
+let openHist = null;
+
+function buildHistDetail(d) {
+  const tr = d.create("tr", "detail");
+  const td = d.append(tr, d.create("td"));
+  d.prop(td, "colSpan", 6);
+  const c = {};
+  c.meta = d.append(td, d.create("div", "jd-meta"));
+  c.files = d.append(td, d.create("table", "jd-files"));
+  tr.__c = c;
+  return tr;
+}
+function applyHistDetail(node, m, d) {
+  d = d || dom;
+  const c = node.__c;
+  const w = differ(node);
+  w("meta", m.meta, v => d.text(c.meta, v));
+  const fileModels = m.files.length
+    ? m.files.map(f => ({
+        key: "hf" + f.name, kind: "note",
+        text: f.name + "  ·  " + f.size + "  ·  " + f.segs + (f.par2 ? "  ·  par2" : ""),
+        cls: f.short ? "jd-file short" : "jd-file",
+      }))
+    : [{ key: "hf__none", kind: "note", text: "no file list recorded for this entry" }];
+  reconcileRows(c.files, fileModels, d);
+}
+KINDS.histdetail = { build: buildHistDetail, apply: applyHistDetail };
+
+/// What the stored record can say, in one line, plus the file table.
+function histDetailModel(e) {
+  const r = e.record || {};
+  const bits = [];
+  if (r.client) bits.push("added by " + r.client);
+  if (r.url) bits.push("from " + r.url);
+  if (r.original_name && r.original_name !== e.name)
+    bits.push("added as “" + r.original_name + "”");
+  if (r.total_articles)
+    bits.push(r.success_articles + "/" + r.total_articles + " articles" +
+      (r.failed_articles ? " · " + r.failed_articles + " failed" : ""));
+  if (r.par_size) bits.push(fmtBytes(r.par_size) + " par2");
+  if (r.queued_at_unix && e.completed_at_unix > r.queued_at_unix)
+    bits.push("took " + fmtDur((e.completed_at_unix - r.queued_at_unix) * 1000));
+  if (e.final_dir) bits.push("in " + e.final_dir);
+  if (!bits.length)
+    bits.push("this entry predates the stored job record — nothing was kept but the summary");
+  return {
+    key: "hd" + e.job, kind: "histdetail",
+    meta: bits.join("  ·  "),
+    files: (r.files || []).map(f => ({
+      name: f.name,
+      size: fmtBytes(f.size),
+      segs: f.segments_done + "/" + f.segments_total + " segments" +
+            (f.segments_failed ? " · " + f.segments_failed + " failed" : ""),
+      par2: f.par2,
+      short: f.segments_failed > 0,
+    })),
   };
 }
 
@@ -2003,6 +2068,8 @@ function buildHistRow(d) {
     d.prop(b, "title", title);
     return b;
   };
+  c.details = mk("", "h-details", "details",
+    "what this job was: files, articles, where it came from");
   c.requeue = mk("", "h-requeue", "requeue",
     "put this job back in the queue from its parked NZB");
   c.vis = mk("", "h-hide", "hide", "");
@@ -2035,6 +2102,7 @@ function applyHistRow(tr, m, d) {
   w("visLabel", m.visLabel, v => d.text(c.vis, v));
   w("visTip", m.visTip, v => d.prop(c.vis, "title", v));
   w("requeueHidden", m.requeueHidden, v => d.prop(c.requeue, "hidden", v));
+  w("detailsLabel", m.detailsLabel, v => d.text(c.details, v));
   w("delLabel", m.delLabel, v => d.text(c.delFiles, v));
   w("delCls", m.delCls, v => d.cls(c.delFiles, v));
   w("delTip", m.delTip, v => d.prop(c.delFiles, "title", v));
@@ -2126,7 +2194,13 @@ function renderHistory() {
       key: "__empty", kind: "empty", span: 6,
       text: historyTotal ? "nothing on this page" : "no finished jobs yet",
     }];
-  else models = h.map(histModel);
+  else {
+    models = [];
+    for (const e of h) {
+      models.push(histModel(e));
+      if (e.job === openHist) models.push(histDetailModel(e));
+    }
+  }
   reconcileRows($("history-body"), models, dom);
   renderHistoryPager();
   renderClients();
@@ -2512,6 +2586,15 @@ function toggleJob(id) {
   refreshJobDetail();
 }
 
+/// Open/close a history entry's detail panel. No fetch: everything it
+/// shows was captured into the entry when the job left the queue, which is
+/// the point — a record you have to go and ask the queue for is a record
+/// that stops existing when the queue forgets the job.
+function toggleHist(id) {
+  openHist = openHist === id ? null : id;
+  renderHistory();
+}
+
 // ---- one delegated click listener ---------------------------------------
 // Every actionable element carries `data-action` (plus `data-job` or a
 // `data-job-id` row), so no markup is generated with an inline `onclick`
@@ -2599,6 +2682,7 @@ document.addEventListener("click", (ev) => {
   }
   const name = row && row.__prev ? row.__prev.name : "this job";
   if (scope === "history") {
+    if (action === "h-details") { toggleHist(id); return; }
     if (action === "h-requeue") { requeueJob(id, name); return; }
     // "delete files" is the one genuinely destructive action in the page,
     // so it arms in place instead of firing on the first click. Two-step,
@@ -3591,6 +3675,7 @@ if (typeof __nzbd_test_enable !== "undefined") {
     pushRate, pushRateSampled, rateSeries, spark, SPARK_N, titleFor,
     appendLogs, logMatches, renderLogs, serverChipModels, LOG_RING_MAX,
     trimLogRing, logClass, logLineText, scheduleLogRender, refreshLogs,
+    histDetailModel, toggleHist, getOpenHist: () => openHist,
     refreshHistory, renderHistoryPager, setHistoryPage, setHistoryPageSize, historyPages,
     HISTORY_PAGE_SIZES, HISTORY_PAGE_SIZE_DEFAULT,
     getHistoryPaging: () => ({ page: historyPage, size: historyPageSize, total: historyTotal }),

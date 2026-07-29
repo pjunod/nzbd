@@ -362,6 +362,17 @@ pub struct Job {
     /// like junk?" would refuse the real name when it finally arrived.
     #[serde(default)]
     pub name_provisional: bool,
+    /// When this job entered the queue. With the history entry's
+    /// completion time this is how long the whole thing took — the one
+    /// duration nothing else records. `0` on snapshots written before it
+    /// existed.
+    #[serde(default)]
+    pub queued_at_unix: i64,
+    /// The name the job was admitted under, kept when it later renames
+    /// itself from its own metadata so the *arr's original reference stays
+    /// findable. Empty when the job never renamed.
+    #[serde(default)]
+    pub original_name: String,
     pub category: Option<String>,
     pub priority: i32,
     pub dupe: DupeInfo,
@@ -467,6 +478,8 @@ mod tests {
             name: "x".into(),
             dir_name: String::new(),
             name_provisional: false,
+            queued_at_unix: 0,
+            original_name: String::new(),
             category: None,
             priority: 100,
             dupe: DupeInfo::default(),

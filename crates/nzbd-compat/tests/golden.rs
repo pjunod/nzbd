@@ -159,6 +159,7 @@ async fn golden_history_fields() {
             seen_count: 0,
             removed_at_unix: None,
             picked_up_by: None,
+            record: None,
             stages: Vec::new(),
             seq: 0,
         })
