@@ -1144,18 +1144,32 @@ async fn repair_loop(
                 return Ok(par.repair(main).await? == RepairResult::Repaired);
             }
             VerifyResult::NeedMoreBlocks { blocks_needed } => {
+                let block_size = par2_block_size(main).await;
                 tracing::info!(
                     job = job_id.0,
                     blocks_needed,
                     round,
+                    block_size,
                     "requesting delayed par blocks"
                 );
                 let freed = engine
-                    .unpause_par_blocks(job_id, blocks_needed)
+                    .unpause_par_blocks(job_id, blocks_needed, block_size)
                     .await
                     .unwrap_or(0);
                 if freed == 0 {
-                    return Ok(false); // nothing left to fetch
+                    // Not "nothing left to fetch" until it says so out
+                    // loud: this branch was silent, and a repair that
+                    // never started reads exactly like a repair that ran
+                    // and failed.
+                    tracing::warn!(
+                        job = job_id.0,
+                        blocks_needed,
+                        round,
+                        block_size,
+                        "repair needs recovery blocks and none could be unpaused — giving up; \
+                         the engine log names which paused par2 files it could not price"
+                    );
+                    return Ok(false);
                 }
                 if !wait_par_files(engine, job_id, cfg.par_fetch_timeout).await {
                     return Ok(false);
@@ -1165,6 +1179,32 @@ async fn repair_loop(
         }
     }
     Ok(false)
+}
+
+/// The recovery-set slice size from the job's main par2 index, if it can
+/// be read.
+///
+/// This is what prices a hash-named recovery volume: no `.volXX+NN` marker
+/// exists on an obfuscated post, but `bytes / slice_size` is a good enough
+/// block count to pick with. The index is small (tens of KiB) and the read
+/// is capped and off the async threads regardless.
+async fn par2_block_size(main: &Path) -> Option<u64> {
+    let path = main.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        use std::io::Read as _;
+        const MAX: u64 = 8 * 1024 * 1024;
+        let mut bytes = Vec::new();
+        std::fs::File::open(&path)
+            .ok()?
+            .take(MAX)
+            .read_to_end(&mut bytes)
+            .ok()?;
+        let slice = nzbd_par2::scan(&bytes).slice_size;
+        (slice > 0).then_some(slice)
+    })
+    .await
+    .ok()
+    .flatten()
 }
 
 /// Wait until every non-paused par2 file of the job is terminal again

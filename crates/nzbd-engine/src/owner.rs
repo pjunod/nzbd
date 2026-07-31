@@ -11,8 +11,8 @@
 use crate::events::Event;
 use crate::failover::{AttemptOutcome, Ladder, SegmentAttempt, Verdict};
 use crate::queue::{
-    final_status, job_dir_name, next_for_server, pick_par_files, recompute_job_totals,
-    vol_par_blocks, QueueState, SegRef, SelectionCtx,
+    final_status, job_dir_name, next_for_server, pick_par_files, recompute_job_totals, QueueState,
+    SegRef, SelectionCtx,
 };
 use crate::rate::{RateLimiter, SpeedMeter};
 use crate::snapshot::{JobSummary, QueueSnapshot, SharedSnapshot};
@@ -216,11 +216,16 @@ pub(crate) enum QueueCommand {
         ms: Option<u64>,
     },
     /// Delayed-par download (§3.2): unpause the smallest set of paused
-    /// `*.volXX+NN.par2` files covering `blocks`. Replies with the number
-    /// of recovery blocks now downloading (0 = nothing left to unpause).
+    /// par2 files covering `blocks`. Replies with the number of recovery
+    /// blocks now downloading (0 = nothing left to unpause).
+    ///
+    /// `block_size` is the recovery-set slice size read from the job's own
+    /// par2 index, and is what lets a hash-named volume — no `.volXX+NN`
+    /// marker anywhere — be priced by its size.
     UnpauseParBlocks {
         job: JobId,
         blocks: u32,
+        block_size: Option<u64>,
         reply: oneshot::Sender<u32>,
     },
 }
@@ -1228,8 +1233,13 @@ impl Owner {
                     self.publish_now();
                 }
             }
-            QueueCommand::UnpauseParBlocks { job, blocks, reply } => {
-                let unpaused = self.unpause_par_blocks(job, blocks);
+            QueueCommand::UnpauseParBlocks {
+                job,
+                blocks,
+                block_size,
+                reply,
+            } => {
+                let unpaused = self.unpause_par_blocks(job, blocks, block_size);
                 let _ = reply.send(unpaused);
             }
             QueueCommand::RetainJobs { keep, reply } => {
@@ -2033,28 +2043,85 @@ impl Owner {
     // -- jobs ----------------------------------------------------------------
 
     /// Delayed-par: unpause the smallest covering set; returns blocks freed.
-    fn unpause_par_blocks(&mut self, job_id: JobId, blocks: u32) -> u32 {
+    ///
+    /// Returning 0 here is what repair reads as "nothing left to fetch",
+    /// so every path that can return 0 while paused recovery data is
+    /// sitting in the queue says why — that branch was silent through
+    /// months of PAR_FAILUREs on jobs with 5 GB of recovery blocks on hand.
+    fn unpause_par_blocks(&mut self, job_id: JobId, blocks: u32, block_size: Option<u64>) -> u32 {
         let Some(job) = self.state.job_mut(job_id) else {
+            tracing::warn!(
+                job = job_id.0,
+                "delayed par blocks requested for a job that is no longer in the queue"
+            );
             return 0;
         };
-        let candidates: Vec<(FileId, u32)> = job
-            .files
-            .iter()
-            .filter(|f| f.paused && f.is_par2)
-            .filter_map(|f| vol_par_blocks(&f.filename).map(|b| (f.id, b)))
-            .collect();
-        if candidates.is_empty() {
+        let paused_pars = job.files.iter().filter(|f| f.paused && f.is_par2).count();
+        if paused_pars == 0 {
+            tracing::info!(
+                job = job_id.0,
+                blocks,
+                "no paused par2 files left — every recovery volume this job has is already fetched"
+            );
             return 0;
         }
-        let picked = pick_par_files(&candidates, blocks.max(1));
+        let (priced, unpriceable) = crate::queue::price_paused_pars(job, block_size);
+        let (candidates, last_resort) = if priced.is_empty() {
+            // Nothing carried a vol marker and no block size was available:
+            // unpause the cheapest volume rather than give up. One round
+            // costs one file; the next round prices better or escalates.
+            tracing::warn!(
+                job = job_id.0,
+                blocks,
+                paused_pars,
+                "no paused par2 file could be priced in recovery blocks (no .volXX+NN marker, \
+                 no par2 block size) — unpausing the smallest one as a probe"
+            );
+            (Vec::new(), crate::queue::smallest_paused_par(job))
+        } else {
+            if !unpriceable.is_empty() {
+                tracing::warn!(
+                    job = job_id.0,
+                    unpriced = unpriceable.len(),
+                    "some paused par2 files could not be priced and were left paused"
+                );
+            }
+            let pairs: Vec<(FileId, u32)> = priced.iter().map(|c| (c.id, c.blocks)).collect();
+            (pick_par_files(&pairs, blocks.max(1)), None)
+        };
+        let estimated = priced.iter().any(|c| c.estimated);
         let mut freed = 0u32;
-        for (id, b) in &candidates {
-            if picked.contains(id) {
-                if let Some(f) = job.files.iter_mut().find(|f| f.id == *id) {
+        for c in &priced {
+            if candidates.contains(&c.id) {
+                if let Some(f) = job.files.iter_mut().find(|f| f.id == c.id) {
                     f.paused = false;
-                    freed += b;
+                    freed += c.blocks;
                 }
             }
+        }
+        if let Some(id) = last_resort {
+            if let Some(f) = job.files.iter_mut().find(|f| f.id == id) {
+                f.paused = false;
+                freed = freed.max(1);
+            }
+        }
+        if freed == 0 {
+            tracing::warn!(
+                job = job_id.0,
+                blocks,
+                paused_pars,
+                priced = priced.len(),
+                "repair asked for recovery blocks and nothing could be unpaused — the paused par2 \
+                 files were priced but none were selected"
+            );
+        } else if estimated {
+            tracing::info!(
+                job = job_id.0,
+                freed,
+                block_size,
+                "delayed par blocks priced by file size — this post's recovery volumes carry no \
+                 .volXX+NN marker"
+            );
         }
         if freed > 0 {
             // The job likely finished its download phase; make it

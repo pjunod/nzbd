@@ -1091,17 +1091,91 @@ fn job_schedulable(job: &Job, download_paused: bool) -> bool {
     }
 }
 
-/// Parse the recovery-block count from a `*.volXX+NN.par2` filename.
+/// Parse the recovery-block count from a `*.volXX+NN.par2` filename, or
+/// from the older `*.volAAA-BBB.par2` range form (inclusive, so `+1`).
 pub fn vol_par_blocks(filename: &str) -> Option<u32> {
     let lower = filename.to_ascii_lowercase();
     let vol = lower.rfind(".vol")?;
     let rest = &lower[vol + 4..];
-    let plus = rest.find('+')?;
-    let end = rest[plus + 1..]
-        .find(|c: char| !c.is_ascii_digit())
-        .map(|i| plus + 1 + i)
-        .unwrap_or(rest.len());
-    rest[plus + 1..end].parse().ok()
+    let digits = |s: &str| -> Option<u32> {
+        let end = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
+        s[..end].parse().ok()
+    };
+    let sep = rest.find(['+', '-'])?;
+    let count = digits(&rest[sep + 1..])?;
+    if rest.as_bytes()[sep] == b'+' {
+        return Some(count);
+    }
+    // Range form: the first number is the starting block.
+    let start = digits(rest)?;
+    count.checked_sub(start).map(|n| n + 1)
+}
+
+/// A paused par2 file of a job, priced in recovery blocks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParCandidate {
+    pub id: FileId,
+    /// Recovery blocks this file is believed to carry. Never 0 for a
+    /// priced candidate; `None`-priced files are reported separately.
+    pub blocks: u32,
+    /// Bytes the NZB says this file is, from its segment sizes.
+    pub bytes: u64,
+    /// True when `blocks` is a size-derived estimate rather than a count
+    /// read out of the filename.
+    pub estimated: bool,
+}
+
+/// Price every paused par2 file of a job in recovery blocks.
+///
+/// The fast path is the `*.volXX+NN.par2` marker, which states the block
+/// count outright. It is also useless on this indexer: an obfuscated post
+/// names its recovery volumes `<32-hex>.par2` like everything else, so the
+/// marker is absent on precisely the jobs that need repair — and a filter
+/// that drops unpriceable files made `unpause_par_blocks` return 0 for
+/// months, turning every repairable download into a PAR_FAILURE.
+///
+/// So the fallback: a recovery volume of `bytes` bytes carries about
+/// `bytes / block_size` blocks (the packet overhead makes that an
+/// over-estimate of a block or two, which only costs an extra round). When
+/// even the block size is unknown the file is returned unpriced — the
+/// caller's last resort is to unpause the smallest one and let the next
+/// round escalate.
+///
+/// Returns (priced, unpriceable), both in job file order.
+pub fn price_paused_pars(job: &Job, block_size: Option<u64>) -> (Vec<ParCandidate>, Vec<FileId>) {
+    let mut priced = Vec::new();
+    let mut unpriceable = Vec::new();
+    for f in job.files.iter().filter(|f| f.paused && f.is_par2) {
+        let bytes: u64 = f.segments.iter().map(|s| s.size as u64).sum();
+        match vol_par_blocks(&f.filename) {
+            Some(blocks) => priced.push(ParCandidate {
+                id: f.id,
+                blocks: blocks.max(1),
+                bytes,
+                estimated: false,
+            }),
+            None => match block_size.filter(|b| *b > 0) {
+                Some(bs) => priced.push(ParCandidate {
+                    id: f.id,
+                    blocks: (bytes / bs).max(1).min(u32::MAX as u64) as u32,
+                    bytes,
+                    estimated: true,
+                }),
+                None => unpriceable.push(f.id),
+            },
+        }
+    }
+    (priced, unpriceable)
+}
+
+/// The paused par2 file with the fewest bytes — the cheapest probe when
+/// nothing could be priced at all.
+pub fn smallest_paused_par(job: &Job) -> Option<FileId> {
+    job.files
+        .iter()
+        .filter(|f| f.paused && f.is_par2)
+        .min_by_key(|f| f.segments.iter().map(|s| s.size as u64).sum::<u64>())
+        .map(|f| f.id)
 }
 
 /// Choose the smallest set of paused par files covering `needed` recovery
@@ -1379,6 +1453,68 @@ mod tests {
         }
         xml.push_str("</nzb>");
         nzbd_nzb::parse(xml.as_bytes()).unwrap()
+    }
+
+    /// The re-grab loop's first defect: every paused recovery volume of an
+    /// obfuscated post is hash-named, `vol_par_blocks` prices none of them,
+    /// and the old filter dropped what it could not price — so repair asked
+    /// for one block, was told zero were available, and failed with 5 GB of
+    /// recovery data sitting paused in the queue.
+    #[test]
+    fn hash_named_paused_vols_are_priced_by_size() {
+        let mut q = QueueState::default();
+        // 4 segments × 1000 bytes each; block size 1000 ⇒ 4 blocks apiece.
+        let parsed = sample_nzb(&[
+            ("data.rar", 3),
+            ("aa11bb22.par2", 1),
+            ("cc33dd44.par2", 4),
+            ("ee55ff66.par2", 8),
+        ]);
+        let id = q.admit_nzb("job".into(), &parsed, None, 0, true);
+        {
+            // Admission cannot tell a hash-named volume from a hash-named
+            // index, so stand in for what the field shows: the volumes are
+            // paused and carry no `.volXX+NN` marker.
+            let job = q.job_mut(id).unwrap();
+            for f in job.files.iter_mut().skip(2) {
+                f.paused = true;
+            }
+        }
+        let job = q.job(id).unwrap();
+
+        // No block size: nothing is priceable, and the caller is told so
+        // rather than handed an empty list that reads as "all fetched".
+        let (priced, unpriced) = price_paused_pars(job, None);
+        assert!(priced.is_empty());
+        assert_eq!(unpriced.len(), 2);
+        assert_eq!(smallest_paused_par(job), Some(job.files[2].id));
+
+        // With the block size from the job's own par2 index, they price.
+        let (priced, unpriced) = price_paused_pars(job, Some(1000));
+        assert!(unpriced.is_empty());
+        assert_eq!(priced.len(), 2);
+        assert_eq!(priced[0].blocks, 4);
+        assert_eq!(priced[1].blocks, 8);
+        assert!(priced.iter().all(|c| c.estimated));
+        // …and pricing feeds selection: one block wanted, cheapest volume
+        // that covers it, not the whole 5 GB.
+        let pairs: Vec<_> = priced.iter().map(|c| (c.id, c.blocks)).collect();
+        assert_eq!(pick_par_files(&pairs, 1), vec![job.files[2].id]);
+    }
+
+    /// A file whose name does state its block count keeps stating it — the
+    /// estimate is a fallback, never an override.
+    #[test]
+    fn vol_marker_still_wins_over_the_size_estimate() {
+        let mut q = QueueState::default();
+        let parsed = sample_nzb(&[("data.rar", 3), ("data.vol00+07.par2", 2)]);
+        let id = q.admit_nzb("job".into(), &parsed, None, 0, true);
+        let job = q.job(id).unwrap();
+        let (priced, unpriced) = price_paused_pars(job, Some(1000));
+        assert!(unpriced.is_empty());
+        assert_eq!(priced.len(), 1);
+        assert_eq!(priced[0].blocks, 7, "the filename said 7, not 2");
+        assert!(!priced[0].estimated);
     }
 
     #[test]
@@ -1723,6 +1859,9 @@ mod tests {
         assert_eq!(vol_par_blocks("Show.S01.vol127+64.PAR2"), Some(64));
         assert_eq!(vol_par_blocks("x.par2"), None);
         assert_eq!(vol_par_blocks("x.vol7.par2"), None);
+        // The range form is inclusive: 000-003 is four blocks.
+        assert_eq!(vol_par_blocks("x.vol000-003.par2"), Some(4));
+        assert_eq!(vol_par_blocks("x.vol004-004.par2"), Some(1));
 
         let c = [
             (FileId(1), 1),

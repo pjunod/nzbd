@@ -733,11 +733,21 @@ impl EngineHandle {
     }
 
     /// Delayed-par download: returns recovery blocks now fetching.
-    pub async fn unpause_par_blocks(&self, job: JobId, blocks: u32) -> Result<u32, EngineError> {
+    ///
+    /// `block_size` is the recovery-set slice size from the job's par2
+    /// index; pass it whenever it is known, or hash-named volumes (every
+    /// obfuscated post) cannot be priced and repair starves.
+    pub async fn unpause_par_blocks(
+        &self,
+        job: JobId,
+        blocks: u32,
+        block_size: Option<u64>,
+    ) -> Result<u32, EngineError> {
         let (tx, rx) = oneshot::channel();
         self.send(QueueCommand::UnpauseParBlocks {
             job,
             blocks,
+            block_size,
             reply: tx,
         })
         .await?;
