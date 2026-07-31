@@ -231,11 +231,30 @@
      marked only when there is more than one closed stage to compare. */
   .pipe-stage.slow { border-color: color-mix(in srgb, var(--ink2) 45%, var(--line)); }
   .pipe-stage.slow .ps-dur { color: var(--ink); font-weight: 650; }
+  /* Provenance: who added it, where it came from, how long it took. Empty
+     for a job that has nothing extra to say, and then it takes no room. */
+  .jd-meta { margin-top: 9px; font-size: 12px; color: var(--muted);
+             word-break: break-word; }
+  .jd-meta:empty { display: none; }
+  /* The file list folds. Open in the queue (you opened the job to watch
+     the files fill in) and closed in history (the job is over; the
+     question there is usually "what WAS this", not "which part 47"). */
+  details.jd-files { margin-top: 8px; }
+  details.jd-files > summary { list-style: none; cursor: pointer; width: fit-content;
+    font-size: 11.5px; color: var(--ink2); padding: 2px 0;
+    display: inline-flex; align-items: baseline; gap: 6px; }
+  details.jd-files > summary::-webkit-details-marker { display: none; }
+  details.jd-files > summary::before { content: "▸"; color: var(--muted); font-size: 10px; }
+  details.jd-files[open] > summary::before { content: "▾"; }
+  details.jd-files > summary:hover { color: var(--ink); }
+  details.jd-files > summary .jd-fcount { color: var(--muted); }
+  details.jd-files > summary + table.subtable { margin-top: 6px; }
   table.subtable { margin-top: 8px; border: 1px solid var(--line); }
   table.subtable th, table.subtable td { padding: 4px 8px; font-size: 12px; }
   .jd-logs { margin-top: 8px; max-height: 170px; overflow-y: auto;
              font: 11px/1.55 ui-monospace, SFMono-Regular, Menlo, monospace;
              border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; }
+  .jd-logs:empty { display: none; }
   .jd-logs .lg { white-space: pre-wrap; word-break: break-word; }
   .chk-inline { display: inline-flex; align-items: center; gap: 5px; font-size: 12px;
                 color: var(--ink2); }
@@ -1325,6 +1344,18 @@ KINDS.section = { build: buildSectionRow, apply: applySectionRow };
 // an update (law #5). The old panel was re-created from a template string
 // every second, which is why it scrolled itself back to the top while you
 // were reading it.
+//
+// ONE panel, two sources. History used to have a panel of its own — a bare
+// meta string over an unstyled table — and the result was that the same job
+// looked like two different things depending on which tab you found it in,
+// and the history one looked like the lesser of the two. It is the same
+// job. The queue reads it off the live snapshot; history reads it off the
+// JobRecord captured as the job left. The renderer cannot tell, and that is
+// the point: nothing that is true in the queue has to be re-learned in
+// history (field report 2026-07-31).
+//
+// The one deliberate difference is the file list, and it is a default, not
+// a structure: open in the queue, folded in history (see `filesOpen`).
 let openJob = null;
 
 function buildDetailRow(d) {
@@ -1354,7 +1385,20 @@ function buildDetailRow(d) {
   // answers a narrower question and can wait its turn.
   c.pipe = d.append(wrap, d.create("div", "jd-pipe"));
 
-  c.filesTable = d.append(wrap, d.create("table", "subtable"));
+  // Where it came from and who asked for it. The queue snapshot carries
+  // only the job's public params; history carries the whole provenance.
+  c.meta = d.append(wrap, d.create("div", "jd-meta"));
+
+  // The file list folds. `open` is set from the model on the first apply
+  // and then left alone — a later tick writes it only if the DEFAULT
+  // changed, so folding it yourself sticks for as long as the panel is up
+  // (law #5: an update never undoes something you just did).
+  c.filesBox = d.append(wrap, d.create("details", "jd-files"));
+  c.filesSummary = d.append(c.filesBox, d.create("summary"));
+  c.filesLabel = d.append(c.filesSummary, d.create("span"));
+  d.text(c.filesLabel, "Files");
+  c.filesCount = d.append(c.filesSummary, d.create("span", "jd-fcount"));
+  c.filesTable = d.append(c.filesBox, d.create("table", "subtable"));
   const thead = d.append(c.filesTable, d.create("thead"));
   const htr = d.append(thead, d.create("tr"));
   for (const [label, cls] of [["File", ""], ["Size", "num"], ["Segments", "num"], ["", ""]]) {
@@ -1411,8 +1455,14 @@ function detailModel(j, nowMs) {
   const cls = typeof j.status !== "string" ? "warn" : (STATUS_CLASS[st] || "dim");
   const files = store.jobFiles && store.jobFiles.job === j.id ? store.jobFiles.files : null;
   const logs = store.jobLogs && store.jobLogs.job === j.id ? store.jobLogs.entries : null;
+  // A job's own params — a consumer's transfer id among them — are the
+  // only provenance the live snapshot carries; `*`-internal ones never
+  // leave the daemon. History has the rest, and shows it in the same line.
+  const bits = (j.params || [])
+    .filter(([k]) => k && k[0] !== "*")
+    .map(([k, v]) => k + " = " + v);
   return {
-    key: "__detail", kind: "detail", id: j.id,
+    key: "__detail", kind: "detail", id: j.id, scope: "queue",
     pipe: pipelineModels(j, nowMs),
     st: statusLabel(j.status).toUpperCase(), stCls: "st " + cls,
     articles: "articles " + j.done_articles + "/" + j.total_articles +
@@ -1421,7 +1471,12 @@ function detailModel(j, nowMs) {
     health: "health " + (j.health / 10).toFixed(1) + "%",
     dupe: j.dupe_key ? "dupe: " + j.dupe_key : "",
     nzbHref: "/api/v1/jobs/" + j.id + "/nzb",
-    files: files,
+    nzbHidden: false,
+    meta: bits.join("  ·  "),
+    // Open: you opened a live job to watch its files fill in.
+    filesOpen: true,
+    files: files ? files.map(fileModel) : null,
+    filesEmptyText: "no files yet",
     logs: logs,
   };
 }
@@ -1483,13 +1538,21 @@ function applyDetail(tr, m, d) {
   w("id", m.id, v => {
     d.text(c.id, "#" + v);
     d.data(c.close, "job", String(v));
+    d.data(tr, "jobId", String(v));
   });
+  // Which tab this panel is in. The close button is the same button in
+  // both, so the row says which toggle the delegated listener should call.
+  w("scope", m.scope || "queue", v => d.data(tr, "scope", v));
   w("st", m.st, v => d.text(c.st, v));
   w("stCls", m.stCls, v => d.cls(c.st, v));
   w("articles", m.articles, v => d.text(c.articles, v));
   w("health", m.health, v => d.text(c.health, v));
   w("dupe", m.dupe, v => d.text(c.dupe, v));
-  w("nzbHref", m.nzbHref, v => d.attr(c.nzb, "href", v));
+  w("nzbHref", m.nzbHref || "", v => d.attr(c.nzb, "href", v));
+  // History has no NZB endpoint of its own — a parked NZB is reachable
+  // only through requeue — so the button is absent rather than broken.
+  w("nzbHidden", !!m.nzbHidden, v => d.prop(c.nzb, "hidden", v));
+  w("meta", m.meta || "", v => d.text(c.meta, v));
   // Pipeline: keyed by position + stage, so a job that enters the same
   // stage twice (a repair that runs, fetches more par blocks, and runs
   // again) gets two rows rather than one that overwrites itself.
@@ -1498,10 +1561,15 @@ function applyDetail(tr, m, d) {
   // node — and the table does not jump under the pointer.
   const fileModels = m.files
     ? (m.files.length
-        ? m.files.map(fileModel)
-        : [{ key: "__nofiles", kind: "empty", span: 4, text: "no files yet" }])
+        ? m.files
+        : [{ key: "__nofiles", kind: "empty", span: 4,
+             text: m.filesEmptyText || "no files yet" }])
     : [{ key: "__loading", kind: "empty", span: 4, text: "loading files…" }];
   reconcileRows(c.files, fileModels, d);
+  w("filesCount", m.files ? String(m.files.length) : "", v => d.text(c.filesCount, v));
+  // Written only when the default itself changes, which is never inside
+  // one open panel — so your own fold survives every tick.
+  w("filesOpen", m.filesOpen !== false, v => d.prop(c.filesBox, "open", v));
   // Activity tail: appended incrementally, keyed by the log record's own
   // monotonic id. Scroll position survives because nothing is re-created.
   const logModels = m.logs
@@ -1988,39 +2056,31 @@ function histModel(e) {
 }
 
 // ---- history detail: the job as it was ----------------------------------
-// The queue's detail panel answers "what is this doing"; this one answers
-// "what WAS this" — which file was short, which indexer it came from, who
-// asked for it, how long it took. Those questions get asked afterwards, so
-// the answers have to survive the trip out of the queue (see JobRecord).
+// The same panel the queue uses (KINDS.detail), fed from the JobRecord
+// captured as the job left the queue instead of from the live snapshot.
+// The queue's panel answers "what is this doing"; this one answers "what
+// WAS this" — which file was short, which indexer it came from, who asked
+// for it, how long it took. Same questions, same shape, same widget: the
+// only thing history has to do differently is fold the file list, because
+// the job is over and "which part 47" is no longer the question.
 let openHist = null;
 
-function buildHistDetail(d) {
-  const tr = d.create("tr", "detail");
-  const td = d.append(tr, d.create("td"));
-  d.prop(td, "colSpan", 6);
-  const c = {};
-  c.meta = d.append(td, d.create("div", "jd-meta"));
-  c.files = d.append(td, d.create("table", "jd-files"));
-  tr.__c = c;
-  return tr;
+/// A recorded file, rendered as the queue's file row — same four columns,
+/// so a short part looks the same on both tabs.
+function histFileModel(f, i) {
+  const short = f.segments_failed > 0;
+  return {
+    key: "hf" + i + ":" + f.name, kind: "file",
+    name: f.name,
+    size: fmtBytes(f.size),
+    seg: f.segments_done + "/" + f.segments_total,
+    failed: short ? " · " + f.segments_failed + " failed" : "",
+    state: short ? "SHORT" : f.par2 ? "PAR2" : "DONE",
+    stateCls: "st " + (short ? "warn" : f.par2 ? "dim" : "ok"),
+  };
 }
-function applyHistDetail(node, m, d) {
-  d = d || dom;
-  const c = node.__c;
-  const w = differ(node);
-  w("meta", m.meta, v => d.text(c.meta, v));
-  const fileModels = m.files.length
-    ? m.files.map(f => ({
-        key: "hf" + f.name, kind: "note",
-        text: f.name + "  ·  " + f.size + "  ·  " + f.segs + (f.par2 ? "  ·  par2" : ""),
-        cls: f.short ? "jd-file short" : "jd-file",
-      }))
-    : [{ key: "hf__none", kind: "note", text: "no file list recorded for this entry" }];
-  reconcileRows(c.files, fileModels, d);
-}
-KINDS.histdetail = { build: buildHistDetail, apply: applyHistDetail };
 
-/// What the stored record can say, in one line, plus the file table.
+/// What the stored record can say, in the queue's own panel.
 function histDetailModel(e) {
   const r = e.record || {};
   const bits = [];
@@ -2028,26 +2088,43 @@ function histDetailModel(e) {
   if (r.url) bits.push("from " + r.url);
   if (r.original_name && r.original_name !== e.name)
     bits.push("added as “" + r.original_name + "”");
-  if (r.total_articles)
-    bits.push(r.success_articles + "/" + r.total_articles + " articles" +
-      (r.failed_articles ? " · " + r.failed_articles + " failed" : ""));
   if (r.par_size) bits.push(fmtBytes(r.par_size) + " par2");
   if (r.queued_at_unix && e.completed_at_unix > r.queued_at_unix)
     bits.push("took " + fmtDur((e.completed_at_unix - r.queued_at_unix) * 1000));
   if (e.final_dir) bits.push("in " + e.final_dir);
-  if (!bits.length)
+  if (!e.record)
     bits.push("this entry predates the stored job record — nothing was kept but the summary");
+  const files = r.files || null;
   return {
-    key: "hd" + e.job, kind: "histdetail",
+    key: "hd" + e.job, kind: "detail", id: e.job, scope: "history",
+    // Stages were copied off the job as it finished, so the pipeline is
+    // the same widget reading the same list. "Now" for a finished job is
+    // the moment it finished, so a stage that never closed (the daemon
+    // died inside it) reads as time spent, not time still ticking.
+    pipe: pipelineModels({ stages: e.stages || [] },
+                         (e.completed_at_unix || 0) * 1000),
+    st: String(e.status || "").toUpperCase(), stCls: "st " + histClass(e.status || ""),
+    articles: r.total_articles
+      ? "articles " + r.success_articles + "/" + r.total_articles +
+        (r.failed_articles ? " · " + r.failed_articles + " failed" : "") +
+        (r.retried_articles ? " · " + r.retried_articles + " retried" : "")
+      : "",
+    health: e.health != null ? "health " + (e.health / 10).toFixed(1) + "%" : "",
+    dupe: e.dupe_key ? "dupe: " + e.dupe_key : "",
+    // No history NZB endpoint: the parked NZB is reachable through
+    // requeue, and a link that 404s is worse than no link.
+    nzbHref: "", nzbHidden: true,
     meta: bits.join("  ·  "),
-    files: (r.files || []).map(f => ({
-      name: f.name,
-      size: fmtBytes(f.size),
-      segs: f.segments_done + "/" + f.segments_total + " segments" +
-            (f.segments_failed ? " · " + f.segments_failed + " failed" : ""),
-      par2: f.par2,
-      short: f.segments_failed > 0,
-    })),
+    // Folded: the job is finished, so the file list is reference material
+    // rather than the thing you came to watch.
+    filesOpen: false,
+    files: files ? files.map(histFileModel) : [],
+    filesEmptyText: "no file list recorded for this entry",
+    // Activity is the daemon's live log ring, not part of the record —
+    // asking for it would make history depend on a buffer that has
+    // already rolled over. The panel omits the section rather than show
+    // an empty box that reads as "nothing happened".
+    logs: null,
   };
 }
 
@@ -2682,8 +2759,10 @@ document.addEventListener("click", (ev) => {
   // else is as clear a "no" as waiting it out.
   if (action !== "h-delete-files" && armed.key) { disarmButton(); renderHistory(); }
   if (PAGE_MOVES[action]) { PAGE_MOVES[action](); return; }
+  // One panel serves both tabs, so its close button is the same button in
+  // both — the row it sits in says which list is holding it open.
   if (action === "detail" || action === "detail-close") {
-    toggleJob(id);
+    if (scope === "history") toggleHist(id); else toggleJob(id);
     return;
   }
   const name = row && row.__prev ? row.__prev.name : "this job";
@@ -3681,7 +3760,7 @@ if (typeof __nzbd_test_enable !== "undefined") {
     pushRate, pushRateSampled, rateSeries, spark, SPARK_N, titleFor,
     appendLogs, logMatches, renderLogs, serverChipModels, LOG_RING_MAX,
     trimLogRing, logClass, logLineText, scheduleLogRender, refreshLogs,
-    histDetailModel, toggleHist, getOpenHist: () => openHist,
+    histDetailModel, histFileModel, toggleHist, getOpenHist: () => openHist,
     refreshHistory, renderHistoryPager, setHistoryPage, setHistoryPageSize, historyPages,
     HISTORY_PAGE_SIZES, HISTORY_PAGE_SIZE_DEFAULT,
     getHistoryPaging: () => ({ page: historyPage, size: historyPageSize, total: historyTotal }),

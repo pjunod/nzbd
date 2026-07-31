@@ -360,13 +360,24 @@ const models = (jobs) => jobs.map((j, i) => T.rowModel(j, { idx: i, count: jobs.
   T.reconcileRows(tbody, withDetail(), fake);
   eq(tbody.children.length, 2, "detail row sits under its job row");
   const detail = tbody.children[1];
-  // wrap children: head, pipeline, files table, activity
-  const filesBody = detail.children[0].children[0].children[2].children[1];
+  // wrap children: head, pipeline, meta, files <details>, activity
+  const wrap = detail.children[0].children[0];
+  const filesBox = wrap.children[3];
+  eq(filesBox.tag, "details", "the file list is foldable");
+  eq(filesBox.open, true, "…and open by default in the queue");
+  const filesBody = filesBox.children[1].children[1];
   eq(filesBody.children.length, 2, "one row per file");
   const fileRow = filesBody.children[0];
-  const logsBox = detail.children[0].children[0].children[3];
+  const logsBox = wrap.children[4];
   eq(logsBox.children.length, 1, "one activity line");
   const logLine = logsBox.children[0];
+
+  // Folding it yourself must survive the next tick: the model writes
+  // `open` only when the DEFAULT changes, and it never does mid-panel.
+  filesBox.open = false;
+  resetCounts();
+  T.reconcileRows(tbody, withDetail(), fake);
+  eq(filesBox.open, false, "a tick does not re-open a list you folded");
 
   // A tick with more segments done must not rebuild the panel.
   T.store.jobFiles.files[0].done_segments = 2;
@@ -432,15 +443,26 @@ const models = (jobs) => jobs.map((j, i) => T.rowModel(j, { idx: i, count: jobs.
     },
   };
   const d = T.histDetailModel(withRecord);
+  // Field report 2026-07-31: "why can't the job in history just be exactly
+  // like it was in the queue?" It is — same kind, same panel, same widget.
+  eq(d.kind, "detail", "history reuses the queue's own detail panel");
+  eq(d.scope, "history", "…and says which tab is holding it open");
   ok(d.meta.includes("added by monarr"), `who asked (got ${d.meta})`);
   ok(d.meta.includes("drunkenslug"), "where it came from");
   ok(d.meta.includes("cc310b99017"), "the name the *arr added it under stays findable");
-  ok(d.meta.includes("6448/6449 articles"), "article counts survive the trip");
-  ok(d.meta.includes("1 failed"), "…including what did not arrive");
+  ok(d.articles.includes("6448/6449"), `article counts survive the trip (got ${d.articles})`);
+  ok(d.articles.includes("1 failed"), "…including what did not arrive");
   ok(d.meta.includes("took "), "queued-to-finished duration is recoverable");
+  eq(d.health, "health 100.0%", "health reads the same as it did in the queue");
+  eq(d.nzbHidden, true, "no NZB link: history has no endpoint behind it");
   eq(d.files.length, 3, "the file table survives");
-  eq(d.files[1].short, true, "a file that lost segments is marked");
-  eq(d.files[2].par2, true, "par2 files are distinguishable");
+  eq(d.files[0].kind, "file", "recorded files render as the queue's file rows");
+  eq(d.files[1].state, "SHORT", "a file that lost segments is marked");
+  eq(d.files[2].state, "PAR2", "par2 files are distinguishable");
+
+  // The one deliberate difference between the two tabs.
+  eq(d.filesOpen, false, "history folds the file list…");
+  eq(T.detailModel(job(1)).filesOpen, true, "…and the queue does not");
 
   // An entry from before records existed says so, rather than rendering an
   // empty panel that looks like a bug.
