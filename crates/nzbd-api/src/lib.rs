@@ -415,6 +415,13 @@ pub struct StatusDto {
     pub download_paused: bool,
     /// Queue-hold reasons (why nothing is downloading right now).
     pub disk_low: bool,
+    /// Out-of-space errors observed on real writes since start. When this
+    /// is nonzero and `disk_low` is set, the guard was flipped by a failed
+    /// write rather than by the free-space probe — say so in the banner,
+    /// because the probe disagreeing with reality is exactly the case.
+    pub enospc_observed: u64,
+    /// Operation and path of the last one.
+    pub enospc_where: Option<String>,
     pub quota_reached: bool,
     pub blocked_servers: Vec<u32>,
     /// Critical-health abort armed (`[post] health_action` park/delete)?
@@ -462,6 +469,8 @@ pub fn status_dto(snap: &QueueSnapshot) -> StatusDto {
         session_downloaded_bytes: snap.session_downloaded_bytes,
         download_paused: snap.download_paused,
         disk_low: snap.disk_low,
+        enospc_observed: snap.enospc_observed,
+        enospc_where: snap.enospc_where.clone(),
         quota_reached: snap.quota_reached,
         blocked_servers: snap.blocked_servers.clone(),
         health_abort: snap.health_abort,

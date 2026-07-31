@@ -481,7 +481,16 @@ fn spawn_job(
                     let _ = engine.remove_job_silent(job).await;
                 }
             }
-            Err(e) => tracing::error!(job = job.0, error = %e, "post-processing crashed"),
+            Err(e) => {
+                // PP writes as much as the downloader does — unpack,
+                // move, script output. An ENOSPC here is the same ground
+                // truth about the volume and must stop intake too, not
+                // just fail this job.
+                if nzbd_engine::is_out_of_space(&e.to_string()) {
+                    engine.report_out_of_space(format!("post-processing job {}: {e}", job.0));
+                }
+                tracing::error!(job = job.0, error = %e, "post-processing crashed");
+            }
         }
     });
 }
@@ -886,6 +895,12 @@ pub async fn process_job_ctx(
                         error = %e,
                         "category move failed; leaving the files in the global destination"
                     );
+                    if nzbd_engine::is_out_of_space(&e.to_string()) {
+                        engine.report_out_of_space(format!(
+                            "category move to {}: {e}",
+                            target.display()
+                        ));
+                    }
                 }
             }
         }

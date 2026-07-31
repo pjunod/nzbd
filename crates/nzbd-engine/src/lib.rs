@@ -39,6 +39,23 @@ use tokio::time::Duration;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
+/// Does this error message name an out-of-space condition?
+///
+/// Matched on the message because that is what survives every layer this
+/// has to cross — `std::io::Error` stringified by a writer task, the fsx
+/// wrappers' `op path: source`, a subprocess's stderr. ENOSPC and the
+/// quota variant both count: a gluster or NFS mount answers `EDQUOT` for
+/// exactly the same condition, and the whole point of this signal is that
+/// it does not depend on which lie statvfs is telling.
+pub fn is_out_of_space(msg: &str) -> bool {
+    let lower = msg.to_ascii_lowercase();
+    lower.contains("no space left on device")
+        || lower.contains("os error 28")
+        || lower.contains("disk quota exceeded")
+        || lower.contains("os error 122")
+        || lower.contains("no storage space")
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {
     #[error("invalid NZB: {0}")]
@@ -772,6 +789,16 @@ impl EngineHandle {
     /// the same stream as everything else — a second bus would mean two
     /// orderings, two subscribe calls, and an SSE stream that is only
     /// half the story. Fire-and-forget: no subscribers is not an error.
+    /// Report an out-of-space failure observed on a real write (the post
+    /// paths use this; the writer reports its own inline). Never blocks:
+    /// a full disk is exactly when the engine's mailbox is busiest, and a
+    /// dropped duplicate report costs nothing — the latch is already set.
+    pub fn report_out_of_space(&self, whence: impl Into<String>) {
+        let _ = self.cmd_tx.try_send(EngineMsg::OutOfSpace {
+            whence: whence.into(),
+        });
+    }
+
     pub fn emit(&self, event: Event) {
         let _ = self.events.send(event);
     }
@@ -806,5 +833,25 @@ impl EngineHandle {
         let (tx, rx) = oneshot::channel();
         self.send(make(tx)).await?;
         rx.await.map_err(|_| EngineError::Closed)
+    }
+}
+
+#[cfg(test)]
+mod out_of_space_tests {
+    use super::is_out_of_space;
+
+    /// Every shape this string arrives in — the writer's stringified
+    /// `io::Error`, the fsx wrapper's `op path: source`, the quota variant
+    /// a gluster/NFS mount answers instead of ENOSPC.
+    #[test]
+    fn recognises_the_shapes_a_full_volume_arrives_in() {
+        assert!(is_out_of_space("No space left on device (os error 28)"));
+        assert!(is_out_of_space(
+            "write /working/monarr/completed/x.part05.rar.part: no storage space"
+        ));
+        assert!(is_out_of_space("io: No space left on device"));
+        assert!(is_out_of_space("Disk quota exceeded (os error 122)"));
+        assert!(!is_out_of_space("Permission denied (os error 13)"));
+        assert!(!is_out_of_space("connection reset by peer"));
     }
 }

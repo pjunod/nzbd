@@ -127,6 +127,15 @@ async fn writer_task(
                     },
                     Err(e) => {
                         tracing::warn!(job = job.0, file = file_id.0, error = %e, "finalize failed");
+                        // Ground truth about the volume, from the one
+                        // place that actually tried to use it.
+                        if crate::is_out_of_space(&e.to_string()) {
+                            let _ = engine_tx
+                                .send(EngineMsg::OutOfSpace {
+                                    whence: format!("finalize {}: {e}", final_path.display()),
+                                })
+                                .await;
+                        }
                         EngineMsg::WriterFinalized {
                             job,
                             file: file_id,

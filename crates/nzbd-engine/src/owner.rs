@@ -342,6 +342,12 @@ pub(crate) enum EngineMsg {
         file: FileId,
         error: String,
     },
+    /// A real write ran out of space (ENOSPC/EDQUOT). Reported from
+    /// wherever it happened — writer, finalize, post-processing — and
+    /// latches the disk guard immediately.
+    OutOfSpace {
+        whence: String,
+    },
     /// A completed par2 file told us what this job really is. Cosmetic and
     /// best-effort: dropped freely under load, and ignored if the job has
     /// meanwhile acquired a real name by any other route.
@@ -450,6 +456,11 @@ pub(crate) struct Owner {
     volumes: crate::volumes::VolumeBook,
     quota_reached: bool,
     disk_low: bool,
+    /// Latched by an out-of-space error observed on a real write. statvfs
+    /// is the forecast; this is the ground truth, and it wins.
+    enospc_latched: bool,
+    enospc_observed: u64,
+    enospc_where: Option<String>,
     guard_tick: u32,
     /// Round-robin cursor over the active set, advanced per granted
     /// lease. See `SelectionCtx::rotate`.
@@ -596,6 +607,9 @@ impl Owner {
             volumes: crate::volumes::VolumeBook::load(state_dir, journal_suffix),
             quota_reached: false,
             disk_low: false,
+            enospc_latched: false,
+            enospc_observed: 0,
+            enospc_where: None,
             rotate: 0,
             guard_tick: 0,
         })
@@ -759,8 +773,12 @@ impl Owner {
                 combined_crc,
             } => self.on_writer_finalized(job, file, ok, final_path, combined_crc),
             EngineMsg::LearnedJobName { job, name } => self.adopt_learned_name(job, name),
+            EngineMsg::OutOfSpace { whence } => self.observe_out_of_space(&whence),
             EngineMsg::WriterError { job, file, error } => {
                 tracing::warn!(job = job.0, file = file.0, %error, "writer error; failing file");
+                if crate::is_out_of_space(&error) {
+                    self.observe_out_of_space(&error);
+                }
                 self.fail_whole_file(job, file);
             }
         }
@@ -1055,6 +1073,9 @@ impl Owner {
                     "queue resume requested"
                 );
                 self.state.download_paused = false;
+                // An operator resuming the queue is the operator override
+                // for the out-of-space latch: they have seen the banner.
+                self.clear_enospc_latch();
                 self.dirty = true;
                 self.emit(Event::QueuePauseChanged {
                     paused: false,
@@ -2218,23 +2239,84 @@ impl Owner {
         self.disk_free.clone()
     }
 
+    /// A write path hit ENOSPC/EDQUOT. Hold intake NOW.
+    ///
+    /// The statvfs prober is a forecast, and on a quota-backed mount it
+    /// can be wrong for hours: nuc3 answered `disk_low: false` and kept
+    /// downloading at wire speed while writers, finalize and PP were all
+    /// being told there was no space — 725 GB burned in a day. A failed
+    /// write is not a forecast, so it does not go through the threshold:
+    /// it latches the guard directly and only a statvfs reading of twice
+    /// the floor (or an operator resume) clears it.
+    pub(crate) fn observe_out_of_space(&mut self, whence: &str) {
+        self.enospc_observed += 1;
+        self.enospc_where = Some(whence.to_string());
+        if !self.enospc_latched {
+            self.enospc_latched = true;
+            tracing::error!(
+                whence,
+                observed = self.enospc_observed,
+                "out of space on the destination volume — holding all downloads (observed from a \
+                 write, not from the free-space probe)"
+            );
+        }
+        if !self.disk_low {
+            self.disk_low = true;
+            self.publish_now();
+        }
+    }
+
+    /// Operator resume clears the latch: they have been told what
+    /// happened, and only they can know the volume is usable again when
+    /// statvfs is the thing that is lying.
+    pub(crate) fn clear_enospc_latch(&mut self) {
+        if self.enospc_latched {
+            self.enospc_latched = false;
+            tracing::info!(
+                observed = self.enospc_observed,
+                "out-of-space latch cleared by the operator"
+            );
+            self.update_guards();
+            self.publish_now();
+        }
+    }
+
     fn update_guards(&mut self) {
-        if self.tuning.min_free_disk_bytes > 0 {
+        // Hysteresis: a mount that lied once has to prove itself with room
+        // to spare before intake resumes, so a volume hovering at the
+        // floor cannot flap the whole fleet. With no floor configured the
+        // latch is the operator's to clear.
+        if self.enospc_latched {
             let free = self.disk_free.load(Ordering::Relaxed);
-            let was = self.disk_low;
-            self.disk_low = free < self.tuning.min_free_disk_bytes;
-            if self.disk_low != was {
-                if self.disk_low {
-                    tracing::warn!(
-                        free,
-                        floor = self.tuning.min_free_disk_bytes,
-                        "destination volume low on space — downloads held"
-                    );
-                } else {
-                    tracing::info!(free, "disk space recovered — downloads resume");
-                }
-                self.publish_now();
+            let clear_at = self.tuning.min_free_disk_bytes.saturating_mul(2);
+            if clear_at > 0 && free >= clear_at {
+                self.enospc_latched = false;
+                tracing::info!(
+                    free,
+                    clear_at,
+                    "out-of-space latch cleared — the volume reports twice the floor free"
+                );
             }
+        }
+        let below_floor = self.tuning.min_free_disk_bytes > 0
+            && self.disk_free.load(Ordering::Relaxed) < self.tuning.min_free_disk_bytes;
+        let was = self.disk_low;
+        self.disk_low = self.enospc_latched || below_floor;
+        if self.disk_low != was {
+            if self.disk_low {
+                tracing::warn!(
+                    free = self.disk_free.load(Ordering::Relaxed),
+                    floor = self.tuning.min_free_disk_bytes,
+                    observed_enospc = self.enospc_observed,
+                    "destination volume low on space — downloads held"
+                );
+            } else {
+                tracing::info!(
+                    free = self.disk_free.load(Ordering::Relaxed),
+                    "disk space recovered — downloads resume"
+                );
+            }
+            self.publish_now();
         }
         if self.tuning.daily_quota_bytes > 0 || self.tuning.monthly_quota_bytes > 0 {
             let (day, month) = self
@@ -2504,6 +2586,8 @@ impl Owner {
             download_paused: self.state.download_paused,
             quota_reached: self.quota_reached,
             disk_low: self.disk_low,
+            enospc_observed: self.enospc_observed,
+            enospc_where: self.enospc_where.clone(),
             blocked_servers,
             health_abort: self.tuning.health_abort,
             server_volumes: {

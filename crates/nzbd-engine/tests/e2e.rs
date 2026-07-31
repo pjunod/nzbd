@@ -781,6 +781,72 @@ async fn disk_low_guard_flips_from_the_cached_probe() {
     engine.shutdown().await;
 }
 
+/// An observed ENOSPC is ground truth and the statvfs forecast is not.
+///
+/// Field report 2026-07-31: writers, finalize and post-processing all took
+/// `No space left on device` for hours while `/api/v1/status` reported
+/// `disk_low: false` and intake ran at wire speed — 725 GB downloaded in a
+/// day, all of it onto a full volume. The probe's own slow-probe warning
+/// fired 42 times. So the write path reports, the guard latches
+/// immediately, and only an operator resume (or, elsewhere, twice the
+/// floor free) lets go.
+#[tokio::test]
+async fn an_observed_enospc_latches_the_disk_guard() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join("dest")).unwrap();
+    // No statvfs floor at all: the latch must hold intake on its own, or
+    // a mount whose free-space answer is a lie stops nothing.
+    let engine = Engine::spawn(EngineConfig::single_node(
+        vec![],
+        tmp.path().join("state"),
+        tmp.path().join("dest"),
+        test_tuning(),
+        None,
+    ))
+    .await
+    .expect("engine spawn");
+    assert!(!engine.snapshot().disk_low);
+
+    engine.report_out_of_space("write /working/x.part: No space left on device (os error 28)");
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let snap = engine.snapshot();
+        if snap.disk_low {
+            assert_eq!(snap.enospc_observed, 1);
+            assert!(
+                snap.enospc_where
+                    .as_deref()
+                    .is_some_and(|w| w.contains("x.part")),
+                "the banner has to name what failed: {:?}",
+                snap.enospc_where
+            );
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "an observed ENOSPC never flipped the guard"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // The operator has seen it; resuming the queue is the override.
+    engine.resume_all("test").await.unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if !engine.snapshot().disk_low {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "resume never cleared the out-of-space latch"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    // The count is a record, not a state: it survives the clear.
+    assert_eq!(engine.snapshot().enospc_observed, 1);
+    engine.shutdown().await;
+}
+
 // ---------------------------------------------------------------------------
 // Naming an obfuscated post from its own metadata
 // ---------------------------------------------------------------------------

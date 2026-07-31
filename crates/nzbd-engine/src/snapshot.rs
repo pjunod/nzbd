@@ -80,6 +80,16 @@ pub struct QueueSnapshot {
     /// Free space on the destination volume is below the floor — all
     /// downloading is held.
     pub disk_low: bool,
+    /// How many out-of-space errors (ENOSPC/EDQUOT) the write paths have
+    /// reported since start. Nonzero with `disk_low` set means the guard
+    /// was flipped by an observed failed write, not by the statvfs
+    /// forecast — which is the case the forecast got wrong for hours.
+    #[serde(default)]
+    pub enospc_observed: u64,
+    /// What the write path was doing when it last ran out of space
+    /// (operation and path, as the fsx layer stamped it).
+    #[serde(default)]
+    pub enospc_where: Option<String>,
     /// Per-server session/day/month volume counters (this node).
     pub server_volumes: Vec<ServerVolume>,
     /// Servers currently blocked after connect failures (retrying on a

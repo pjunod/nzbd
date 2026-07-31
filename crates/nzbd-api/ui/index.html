@@ -1858,7 +1858,13 @@ function renderStatus() {
   reconcileRows($("badges"), statusModels(s), dom);
   // Why is nothing downloading? Say so instead of sitting silently.
   const holds = [];
-  if (s.disk_low) holds.push("low disk space on the destination volume — downloads held until space is freed");
+  if (s.disk_low) {
+    // Say WHICH signal stopped it. A statvfs forecast that reads fine
+    // while every write fails is the whole reason this distinction exists.
+    holds.push(s.enospc_observed
+      ? `out of space on the destination volume — downloads held (observed from a write${s.enospc_where ? ": " + s.enospc_where : ""}); resume the queue once space is free`
+      : "low disk space on the destination volume — downloads held until space is freed");
+  }
   if (s.quota_reached) holds.push("download quota reached — normal jobs held (force-priority still runs)");
   if (s.blocked_servers && s.blocked_servers.length)
     holds.push("news server " + s.blocked_servers.map(x => "#" + x).join(", ") +
