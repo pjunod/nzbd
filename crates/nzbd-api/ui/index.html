@@ -218,6 +218,13 @@
      the labels are different widths. */
   .jd-pipe { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 9px; }
   .jd-pipe:empty { display: none; }
+  .jd-recovery { display: flex; align-items: center; flex-wrap: wrap; gap: 6px;
+    margin-top: 9px; padding-top: 8px; border-top: 1px solid var(--line); }
+  .jd-recovery[hidden] { display: none; }
+  .jd-recovery .jd-recovery-label { color: var(--muted); font-size: 11.5px;
+    margin-right: 2px; }
+  .jd-recovery button { font-size: 11.5px; padding: 3px 8px; }
+  .jd-recovery button:disabled { opacity: .38; cursor: not-allowed; }
   .pipe-stage { display: inline-flex; align-items: baseline; gap: 6px;
     border: 1px solid var(--line); border-radius: 7px; padding: 3px 9px;
     font-size: 11.5px; color: var(--ink2); background: var(--panel);
@@ -1385,6 +1392,28 @@ function buildDetailRow(d) {
   // answers a narrower question and can wait its turn.
   c.pipe = d.append(wrap, d.create("div", "jd-pipe"));
 
+  // Recovery is intentionally in the live detail panel, beside the stage
+  // timeline it acts on. Each boundary restarts that phase and everything
+  // after it; the manager first cancels and reaps the current subprocess.
+  c.recovery = d.append(wrap, d.create("div", "jd-recovery"));
+  c.recoveryButtons = {};
+  const recoveryLabel = d.append(c.recovery, d.create("span", "jd-recovery-label"));
+  d.text(recoveryLabel, "Restart post-processing from:");
+  for (const [action, label, tip] of [
+    ["post-restart-all", "all stages", "Cancel the active attempt and restart verification, extraction, cleanup, move and scripts."],
+    ["post-restart-verify", "verify / repair", "Re-check par2 integrity, repair if needed, then continue through the remaining stages."],
+    ["post-restart-unpack", "extract", "Kill the current extractor, discard its staging output, and start extraction again."],
+    ["post-restart-cleanup", "cleanup", "Restart cleanup and the remaining stages without extracting again."],
+    ["post-restart-move", "move", "Restart the destination move and scripts."],
+    ["post-restart-scripts", "scripts", "Restart extension scripts only."],
+  ]) {
+    const b = d.append(c.recovery, d.create("button", "small"));
+    d.data(b, "action", action);
+    d.text(b, label);
+    d.prop(b, "title", tip);
+    c.recoveryButtons[action] = b;
+  }
+
   // Where it came from and who asked for it. The queue snapshot carries
   // only the job's public params; history carries the whole provenance.
   c.meta = d.append(wrap, d.create("div", "jd-meta"));
@@ -1450,6 +1479,24 @@ function pipelineModels(j, nowMs) {
   });
 }
 
+// Furthest safe recovery boundary for the stage currently on screen. A
+// later phase is disabled: entering cleanup while extraction is hung would
+// skip the very work being recovered and could delete its source archives.
+function recoveryMax(j) {
+  if (j.pp_done) return "";
+  if (j.status === "completed") return "all";
+  if (j.status === "post_queued") return "all";
+  const stage = j.status && typeof j.status === "object" && j.status.post
+    ? j.status.post.stage : "";
+  if (["par_rename", "rar_rename"].includes(stage)) return "all";
+  if (["par_verify", "par_repair"].includes(stage)) return "verify";
+  if (stage === "unpack") return "unpack";
+  if (["cleanup", "post_unpack_rename"].includes(stage)) return "cleanup";
+  if (stage === "move") return "move";
+  if (stage === "script") return "scripts";
+  return "";
+}
+
 function detailModel(j, nowMs) {
   const st = statusName(j.status);
   const cls = typeof j.status !== "string" ? "warn" : (STATUS_CLASS[st] || "dim");
@@ -1461,8 +1508,9 @@ function detailModel(j, nowMs) {
   const bits = (j.params || [])
     .filter(([k]) => k && k[0] !== "*")
     .map(([k, v]) => k + " = " + v);
+  const recoverMax = recoveryMax(j);
   return {
-    key: "__detail", kind: "detail", id: j.id, scope: "queue",
+    key: "__detail", kind: "detail", id: j.id, name: j.name, scope: "queue",
     pipe: pipelineModels(j, nowMs),
     st: statusLabel(j.status).toUpperCase(), stCls: "st " + cls,
     articles: "articles " + j.done_articles + "/" + j.total_articles +
@@ -1472,6 +1520,8 @@ function detailModel(j, nowMs) {
     dupe: j.dupe_key ? "dupe: " + j.dupe_key : "",
     nzbHref: "/api/v1/jobs/" + j.id + "/nzb",
     nzbHidden: false,
+    recoverHidden: !recoverMax,
+    recoverMax,
     meta: bits.join("  ·  "),
     // Open: you opened a live job to watch its files fill in.
     filesOpen: true,
@@ -1552,6 +1602,15 @@ function applyDetail(tr, m, d) {
   // History has no NZB endpoint of its own — a parked NZB is reachable
   // only through requeue — so the button is absent rather than broken.
   w("nzbHidden", !!m.nzbHidden, v => d.prop(c.nzb, "hidden", v));
+  w("recoverHidden", m.recoverHidden !== false, v => d.prop(c.recovery, "hidden", v));
+  w("recoverMax", m.recoverMax || "", v => {
+    const order = ["all", "verify", "unpack", "cleanup", "move", "scripts"];
+    const max = order.indexOf(v);
+    for (const [action, button] of Object.entries(c.recoveryButtons)) {
+      const point = action.slice("post-restart-".length);
+      d.prop(button, "disabled", max < 0 || order.indexOf(point) > max);
+    }
+  });
   w("meta", m.meta || "", v => d.text(c.meta, v));
   // Pipeline: keyed by position + stage, so a job that enters the same
   // stage twice (a repair that runs, fetches more par blocks, and runs
@@ -2096,7 +2155,7 @@ function histDetailModel(e) {
     bits.push("this entry predates the stored job record — nothing was kept but the summary");
   const files = r.files || null;
   return {
-    key: "hd" + e.job, kind: "detail", id: e.job, scope: "history",
+    key: "hd" + e.job, kind: "detail", id: e.job, name: e.name, scope: "history",
     // Stages were copied off the job as it finished, so the pipeline is
     // the same widget reading the same list. "Now" for a finished job is
     // the moment it finished, so a stage that never closed (the daemon
@@ -2113,7 +2172,7 @@ function histDetailModel(e) {
     dupe: e.dupe_key ? "dupe: " + e.dupe_key : "",
     // No history NZB endpoint: the parked NZB is reachable through
     // requeue, and a link that 404s is worse than no link.
-    nzbHref: "", nzbHidden: true,
+    nzbHref: "", nzbHidden: true, recoverHidden: true, recoverMax: "",
     meta: bits.join("  ·  "),
     // Folded: the job is finished, so the file list is reference material
     // rather than the thing you came to watch.
@@ -2796,6 +2855,20 @@ document.addEventListener("click", (ev) => {
     jobAction(id, action, {
       key: pending.key(id, action), kind: action, jobId: id,
       label: (action === "pause" ? "Pausing " : "Resuming ") + name,
+    });
+    return;
+  }
+  if (action.startsWith("post-restart-")) {
+    const labels = {
+      "post-restart-all": "all stages",
+      "post-restart-verify": "verification / repair",
+      "post-restart-unpack": "extraction",
+      "post-restart-cleanup": "cleanup",
+      "post-restart-move": "move",
+      "post-restart-scripts": "scripts",
+    };
+    jobAction(id, action).then(r => {
+      if (r) toast({ text: "Restarting " + (labels[action] || "post-processing") + " for “" + name + "”" });
     });
     return;
   }

@@ -360,15 +360,17 @@ const models = (jobs) => jobs.map((j, i) => T.rowModel(j, { idx: i, count: jobs.
   T.reconcileRows(tbody, withDetail(), fake);
   eq(tbody.children.length, 2, "detail row sits under its job row");
   const detail = tbody.children[1];
-  // wrap children: head, pipeline, meta, files <details>, activity
+  // wrap children: head, pipeline, recovery, meta, files <details>, activity
   const wrap = detail.children[0].children[0];
-  const filesBox = wrap.children[3];
+  const recovery = wrap.children[2];
+  eq(recovery.hidden, true, "recovery controls stay out of ordinary downloads");
+  const filesBox = wrap.children[4];
   eq(filesBox.tag, "details", "the file list is foldable");
   eq(filesBox.open, true, "…and open by default in the queue");
   const filesBody = filesBox.children[1].children[1];
   eq(filesBody.children.length, 2, "one row per file");
   const fileRow = filesBody.children[0];
-  const logsBox = wrap.children[4];
+  const logsBox = wrap.children[5];
   eq(logsBox.children.length, 1, "one activity line");
   const logLine = logsBox.children[0];
 
@@ -1397,6 +1399,18 @@ const models = (jobs) => jobs.map((j, i) => T.rowModel(j, { idx: i, count: jobs.
     eq(pipe[2].dur, "30s", "…and its figure is live, not banked");
     ok(pipe[1].cls.includes("slow"), "the longest closed stage is called out");
     ok(!pipe[0].cls.includes("slow"), "…and only that one");
+    const dm = T.detailModel(j, 3_442_000);
+    eq(dm.recoverHidden, false, "a live post-processing job exposes recovery controls");
+    const tbody = node("tbody");
+    T.reconcileRows(tbody, [dm], fake);
+    const recovery = tbody.children[0].children[0].children[0].children[2];
+    eq(recovery.hidden, false, "the recovery row is visible while post-processing");
+    eq(recovery.children.length, 7, "label plus six safe restart boundaries");
+    eq(recovery.children[3].dataset.action, "post-restart-unpack",
+      "the extraction button targets the unpack recovery action");
+    eq(recovery.children[3].disabled, false, "the current extraction phase can be restarted");
+    eq(recovery.children[4].disabled, true,
+      "cleanup cannot skip past an extraction that has not completed");
     // Distinct keys, so two visits to the same stage are two rows.
     const twice = T.pipelineModels(job(1, { stages: [
       { stage: "par_repair", started_at_unix: 1, ms: 10 },
