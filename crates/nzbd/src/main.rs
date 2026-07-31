@@ -617,6 +617,7 @@ fn run(
         // Shared with the API so `/metrics` can report stage durations
         // measured where they actually happen.
         let mut pp_stats = None;
+        let mut pp_manager = None;
         if cfg.post.enabled {
             let state_dir = cfg.state_dir();
             let db = open_history(
@@ -629,7 +630,7 @@ fn run(
             let slots = nzbd_post::manager::strategy_slots(&cfg.post.strategy);
             let stats = Arc::new(nzbd_types::metrics::PpStageStats::new());
             pp_stats = Some(stats.clone());
-            nzbd_post::manager::spawn_post_manager(
+            pp_manager = Some(nzbd_post::manager::spawn_post_manager(
                 engine.clone(),
                 post_config(&cfg, slots, Some(stats)),
                 db,
@@ -637,7 +638,7 @@ fn run(
                 None, // single node: always the authority
                 pp_cancel.clone(),
                 &pp_tracker,
-            );
+            ));
         }
         pp_tracker.close();
 
@@ -686,6 +687,7 @@ fn run(
                 clients: Some(clients_registry.clone()),
                 shutdown: Some(sse_shutdown_rx),
                 pp_stats,
+                pp_manager,
                 events: None, // router_with starts the hub
             })
             .merge(nzbd_compat::router(compat_state)),

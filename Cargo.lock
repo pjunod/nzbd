@@ -871,6 +871,7 @@ dependencies = [
  "nzbd-nntp",
  "nzbd-nserv",
  "nzbd-nzb",
+ "nzbd-post",
  "nzbd-state",
  "nzbd-types",
  "serde",

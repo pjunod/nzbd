@@ -44,6 +44,9 @@ pub struct ApiState {
     /// Post-processing stage timings, shared with the PP manager. `None`
     /// when the daemon runs without post-processing.
     pub pp_stats: Option<Arc<PpStageStats>>,
+    /// Reliable recovery controls for live post-processing attempts. `None`
+    /// when post-processing is disabled (or this node does not run it).
+    pub pp_manager: Option<nzbd_post::manager::PostManagerHandle>,
     /// Seq-stamped event stream + replay ring. Filled in by `router_with`
     /// when the caller leaves it `None`, so there is exactly one hub per
     /// router and no code path where events are unnumbered.
@@ -886,6 +889,39 @@ async fn job_action(
 ) -> Response {
     let engine = &st.engine;
     let job = JobId(id);
+    if let Some(raw) = action.strip_prefix("post-restart-") {
+        use nzbd_post::manager::{RestartPoint as P, RestartPostError as E};
+        let from = match raw {
+            "all" => P::Beginning,
+            "verify" => P::Verify,
+            "unpack" => P::Unpack,
+            "cleanup" => P::Cleanup,
+            "move" => P::Move,
+            "scripts" => P::Scripts,
+            _ => return error(
+                StatusCode::BAD_REQUEST,
+                "unknown post-processing restart point (all|verify|unpack|cleanup|move|scripts)",
+            ),
+        };
+        let Some(manager) = st.pp_manager.as_ref() else {
+            return error(
+                StatusCode::NOT_IMPLEMENTED,
+                "post-processing recovery is not available on this node",
+            );
+        };
+        return match manager.restart(job, from).await {
+            Ok(()) => Json(json!({
+                "ok": true,
+                "restarting": from.as_str(),
+            }))
+            .into_response(),
+            Err(E::NotFound) => not_found(),
+            Err(e @ (E::AlreadyFinished | E::NotReady | E::UnsafePoint | E::NotOwned)) => {
+                error(StatusCode::CONFLICT, &e.to_string())
+            }
+            Err(E::Closed) => error(StatusCode::SERVICE_UNAVAILABLE, &E::Closed.to_string()),
+        };
+    }
     // Delete parks. The job's regenerated NZB (or its source URL) is
     // captured first, the engine deletes exactly as it always did, and only
     // a CONFIRMED delete writes the `DELETED` history entry the UI offers
@@ -1672,7 +1708,7 @@ async fn openapi() -> Response {
                           ] }
             },
             "/api/v1/jobs/{id}": { "get": { "summary": "Job detail" } },
-            "/api/v1/jobs/{id}/actions/{action}": { "post": { "summary": "pause|resume|delete|delete-files|move-*; delete answers {ok, parked}" } },
+            "/api/v1/jobs/{id}/actions/{action}": { "post": { "summary": "pause|resume|delete|delete-files|move-*|post-restart-*; delete answers {ok, parked}" } },
             "/api/v1/queue/actions/{action}": { "post": { "summary": "pause|resume" } },
             "/api/v1/queue/speed-limit": { "put": { "summary": "Set speed limit (bytes_per_sec)" } },
             "/api/v1/servers/test": { "post": { "summary": "Live news-server connectivity probe (connect + greeting + AUTHINFO)" } },
@@ -1713,6 +1749,7 @@ pub fn router(engine: EngineHandle) -> Router {
         clients: None,
         shutdown: None,
         pp_stats: None,
+        pp_manager: None,
         events: None,
     })
 }
@@ -3016,6 +3053,7 @@ mod tests {
             clients: None,
             shutdown: None,
             pp_stats: None,
+            pp_manager: None,
             events: None,
         });
         let page = |offset: usize, limit: usize| {
@@ -3098,6 +3136,7 @@ mod tests {
             clients: None,
             shutdown: None,
             pp_stats: None,
+            pp_manager: None,
             events: None,
         });
         // Pre-existing lines must NOT be replayed: a fresh connection tails
@@ -3307,6 +3346,7 @@ mod tests {
             clients: None,
             shutdown: None,
             pp_stats: None,
+            pp_manager: None,
             events: None,
         });
 

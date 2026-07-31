@@ -75,6 +75,7 @@ pub struct ClusterRuntime {
     leader_shared: Arc<LeaderShared>,
     client: ClusterClient,
     pp: Option<PpSetup>,
+    pp_manager: Option<nzbd_post::manager::PostManagerHandle>,
     cancel: CancellationToken,
     tracker: TaskTracker,
 }
@@ -169,6 +170,7 @@ impl ClusterRuntime {
         // Leader-local PP manager (C2): processes only jobs the scheduler
         // assigned to THIS node, and only while it holds authority. Health-
         // failed jobs (no PP) are history-recorded by the leader.
+        let mut pp_manager = None;
         if let Some(setup) = &pp {
             if cfg.post_process && cfg.pp_slots > 0 {
                 let gate: nzbd_post::manager::PpGate = Some(std::sync::Arc::new({
@@ -189,7 +191,7 @@ impl ClusterRuntime {
                 }));
                 let mut post = setup.post.clone();
                 post.slots = cfg.pp_slots.max(1) as usize;
-                nzbd_post::manager::spawn_post_manager(
+                pp_manager = Some(nzbd_post::manager::spawn_post_manager(
                     engine.clone(),
                     post,
                     setup.history.clone(),
@@ -197,7 +199,7 @@ impl ClusterRuntime {
                     gate,
                     cancel.clone(),
                     &tracker,
-                );
+                ));
             }
         }
 
@@ -237,6 +239,7 @@ impl ClusterRuntime {
             leader_shared,
             client,
             pp,
+            pp_manager,
             cancel,
             tracker,
         })
@@ -316,6 +319,7 @@ impl ClusterRuntime {
                 clients: Some(shared_clients.clone()),
                 shutdown: None,
                 pp_stats: None,
+                pp_manager: self.pp_manager.clone(),
                 events: None, // router_with starts the hub
             })
             .merge(nzbd_compat::router(compat_state)),
