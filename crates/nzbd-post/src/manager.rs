@@ -15,7 +15,7 @@ use nzbd_state::history::HistoryDb;
 use nzbd_state::HistoryEntry;
 use nzbd_types::metrics::PpStageStats;
 use nzbd_types::{Health, Job, JobId, JobStatus, PostStage};
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -204,6 +204,116 @@ impl Default for PpCtx {
 /// on a prior run — the `*PP:done` stamp keeps it idempotent).
 const RESCAN_INTERVAL: Duration = Duration::from_secs(30);
 
+/// A safe point to resume a post-processing pipeline from.
+///
+/// These are deliberately coarser than [`PostStage`]. Verification owns
+/// repair, extraction owns its repair-and-retry loop, and cleanup owns the
+/// final rename pass; starting in the middle of one of those coupled pieces
+/// would manufacture state the rest of the pipeline cannot prove.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestartPoint {
+    Beginning,
+    Verify,
+    Unpack,
+    Cleanup,
+    Move,
+    Scripts,
+}
+
+impl RestartPoint {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RestartPoint::Beginning => "beginning",
+            RestartPoint::Verify => "verify",
+            RestartPoint::Unpack => "unpack",
+            RestartPoint::Cleanup => "cleanup",
+            RestartPoint::Move => "move",
+            RestartPoint::Scripts => "scripts",
+        }
+    }
+
+    fn includes(self, point: RestartPoint) -> bool {
+        let order = |p| match p {
+            RestartPoint::Beginning => 0,
+            RestartPoint::Verify => 1,
+            RestartPoint::Unpack => 2,
+            RestartPoint::Cleanup => 3,
+            RestartPoint::Move => 4,
+            RestartPoint::Scripts => 5,
+        };
+        order(self) <= order(point)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum RestartPostError {
+    #[error("no such job")]
+    NotFound,
+    #[error("post-processing already finished for this job")]
+    AlreadyFinished,
+    #[error("the job is not ready for post-processing")]
+    NotReady,
+    #[error("cannot skip past the job's current post-processing stage")]
+    UnsafePoint,
+    #[error("post-processing for this job is owned by another node")]
+    NotOwned,
+    #[error("the post-processing manager is shutting down")]
+    Closed,
+}
+
+enum ManagerCommand {
+    Restart {
+        job: JobId,
+        from: RestartPoint,
+        reply: tokio::sync::oneshot::Sender<Result<(), RestartPostError>>,
+    },
+}
+
+/// Reliable control path from the API to the post manager.
+///
+/// Engine events remain the observation stream; recovery commands use a
+/// bounded mailbox and a reply so a button click cannot be silently lost to
+/// broadcast lag.
+#[derive(Clone)]
+pub struct PostManagerHandle {
+    tx: tokio::sync::mpsc::Sender<ManagerCommand>,
+}
+
+impl PostManagerHandle {
+    pub async fn restart(&self, job: JobId, from: RestartPoint) -> Result<(), RestartPostError> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.tx
+            .send(ManagerCommand::Restart {
+                job,
+                from,
+                reply: tx,
+            })
+            .await
+            .map_err(|_| RestartPostError::Closed)?;
+        rx.await.map_err(|_| RestartPostError::Closed)?
+    }
+}
+
+struct ActiveAttempt {
+    cancel: CancellationToken,
+}
+
+fn restart_limit(status: JobStatus) -> Option<RestartPoint> {
+    match status {
+        JobStatus::Completed => Some(RestartPoint::Beginning),
+        JobStatus::PostQueued => Some(RestartPoint::Beginning),
+        JobStatus::Post { stage } => Some(match stage {
+            PostStage::ParRename | PostStage::RarRename => RestartPoint::Beginning,
+            PostStage::ParVerify | PostStage::ParRepair => RestartPoint::Verify,
+            PostStage::Unpack => RestartPoint::Unpack,
+            PostStage::Cleanup | PostStage::PostUnpackRename => RestartPoint::Cleanup,
+            PostStage::Move => RestartPoint::Move,
+            PostStage::Script => RestartPoint::Scripts,
+        }),
+        _ => None,
+    }
+}
+
 pub fn spawn_post_manager(
     engine: EngineHandle,
     cfg: PostConfig,
@@ -212,13 +322,16 @@ pub fn spawn_post_manager(
     gate: PpGate,
     cancel: CancellationToken,
     tracker: &TaskTracker,
-) {
+) -> PostManagerHandle {
+    let (control_tx, control_rx) = tokio::sync::mpsc::channel(32);
     let t2 = tracker.clone();
     tracker.spawn(manager_task(
-        engine, cfg, history, dest_dir, gate, cancel, t2,
+        engine, cfg, history, dest_dir, gate, cancel, t2, control_rx,
     ));
+    PostManagerHandle { tx: control_tx }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn manager_task(
     engine: EngineHandle,
     cfg: PostConfig,
@@ -227,9 +340,12 @@ async fn manager_task(
     gate: PpGate,
     cancel: CancellationToken,
     tracker: TaskTracker,
+    mut control: tokio::sync::mpsc::Receiver<ManagerCommand>,
 ) {
     let mut rx = engine.subscribe();
-    let mut queued: HashSet<JobId> = HashSet::new();
+    let mut active: HashMap<JobId, ActiveAttempt> = HashMap::new();
+    let mut pending_restarts: HashMap<JobId, RestartPoint> = HashMap::new();
+    let (finished_tx, mut finished_rx) = tokio::sync::mpsc::unbounded_channel();
     let sem = Arc::new(tokio::sync::Semaphore::new(cfg.slots.max(1)));
     let claim = |g: &PpGate, job: JobId| g.as_ref().map(|f| f(job)).unwrap_or(true);
 
@@ -243,14 +359,17 @@ async fn manager_task(
         tokio::select! {
             _ = cancel.cancelled() => break,
             _ = rescan.tick() => {
-                scan_queue(&tracker, &engine, &cfg, &history, &dest_dir, &gate, &sem, &cancel, &mut queued).await;
+                scan_queue(
+                    &tracker, &engine, &cfg, &history, &dest_dir, &gate, &sem,
+                    &cancel, &finished_tx, &mut active,
+                ).await;
             }
             ev = rx.recv() => match ev {
                 Ok(Event::JobFinished { job, status, name, health }) => match status {
                     JobStatus::Completed if claim(&gate, job) => {
                         if let Ok(Some(exported)) = engine.export_job(job).await {
-                            if !pp_done(&exported) && queued.insert(job) {
-                                spawn_job(
+                            if !pp_done(&exported) && !active.contains_key(&job) {
+                                let attempt = spawn_job(
                                     &tracker,
                                     &engine,
                                     &cfg,
@@ -258,9 +377,12 @@ async fn manager_task(
                                     &dest_dir,
                                     &sem,
                                     &cancel,
+                                    &finished_tx,
                                     job,
                                     gate.is_none(),
+                                    RestartPoint::Beginning,
                                 );
+                                active.insert(job, attempt);
                             }
                         }
                     }
@@ -369,11 +491,84 @@ async fn manager_task(
                     }
                     _ => {}
                 },
+                Ok(Event::JobDeleted { job }) => {
+                    pending_restarts.remove(&job);
+                    if let Some(attempt) = active.get(&job) {
+                        attempt.cancel.cancel();
+                    }
+                }
                 Ok(_) => {}
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
                 Err(_) => break,
             },
+            Some(job) = finished_rx.recv() => {
+                // Releasing this claim is the automatic-recovery fix: a
+                // crashed tool attempt remains eligible for the next rescan
+                // instead of being remembered as active forever.
+                active.remove(&job);
+                if let Some(from) = pending_restarts.remove(&job) {
+                    let restartable = engine.snapshot().jobs.iter().any(|j| {
+                        j.id == job
+                            && !j.pp_done
+                            && matches!(
+                                j.status,
+                                JobStatus::Completed | JobStatus::PostQueued | JobStatus::Post { .. }
+                            )
+                    });
+                    if restartable && claim(&gate, job) {
+                        let attempt = spawn_job(
+                            &tracker, &engine, &cfg, &history, &dest_dir, &sem,
+                            &cancel, &finished_tx, job, gate.is_none(), from,
+                        );
+                        active.insert(job, attempt);
+                    }
+                }
+            }
+            Some(cmd) = control.recv() => match cmd {
+                ManagerCommand::Restart { job, from, reply } => {
+                    let result = match engine.snapshot().jobs.iter().find(|j| j.id == job) {
+                        None => Err(RestartPostError::NotFound),
+                        Some(j) if j.pp_done => Err(RestartPostError::AlreadyFinished),
+                        Some(j) if !matches!(
+                            j.status,
+                            JobStatus::Completed | JobStatus::PostQueued | JobStatus::Post { .. }
+                        ) => Err(RestartPostError::NotReady),
+                        Some(_) if !claim(&gate, job) => Err(RestartPostError::NotOwned),
+                        Some(j) if !from.includes(restart_limit(j.status).unwrap()) => {
+                            Err(RestartPostError::UnsafePoint)
+                        }
+                        Some(_) => {
+                            tracing::warn!(
+                                job = job.0,
+                                from = from.as_str(),
+                                "operator requested a post-processing restart"
+                            );
+                            if let Some(attempt) = active.get(&job) {
+                                // Latest click wins while the old subprocess
+                                // is being killed and its stage span closes.
+                                pending_restarts.insert(job, from);
+                                attempt.cancel.cancel();
+                            } else {
+                                let attempt = spawn_job(
+                                    &tracker, &engine, &cfg, &history, &dest_dir, &sem,
+                                    &cancel, &finished_tx, job, gate.is_none(), from,
+                                );
+                                active.insert(job, attempt);
+                            }
+                            Ok(())
+                        }
+                    };
+                    let _ = reply.send(result);
+                }
+            },
         }
+    }
+
+    // Per-job tokens stop attempts before the tracker is awaited. The global
+    // token normally does this too; being explicit keeps shutdown behavior
+    // correct if the manager's own select loop is the first task to observe it.
+    for attempt in active.values() {
+        attempt.cancel.cancel();
     }
 }
 
@@ -387,7 +582,8 @@ async fn scan_queue(
     gate: &PpGate,
     sem: &Arc<tokio::sync::Semaphore>,
     cancel: &CancellationToken,
-    queued: &mut HashSet<JobId>,
+    finished: &tokio::sync::mpsc::UnboundedSender<JobId>,
+    active: &mut HashMap<JobId, ActiveAttempt>,
 ) {
     let claim = |job: JobId| gate.as_ref().map(|f| f(job)).unwrap_or(true);
     for j in engine.snapshot().jobs.iter() {
@@ -399,7 +595,9 @@ async fn scan_queue(
             && matches!(j.status, JobStatus::Completed | JobStatus::Failed)
         {
             let _ = engine.remove_job_silent(j.id).await;
-            queued.remove(&j.id);
+            if let Some(attempt) = active.remove(&j.id) {
+                attempt.cancel.cancel();
+            }
             continue;
         }
         let needs_pp = !j.pp_done
@@ -407,8 +605,8 @@ async fn scan_queue(
                 j.status,
                 JobStatus::Completed | JobStatus::PostQueued | JobStatus::Post { .. }
             );
-        if needs_pp && claim(j.id) && queued.insert(j.id) {
-            spawn_job(
+        if needs_pp && claim(j.id) && !active.contains_key(&j.id) {
+            let attempt = spawn_job(
                 tracker,
                 engine,
                 cfg,
@@ -416,9 +614,12 @@ async fn scan_queue(
                 dest_dir,
                 sem,
                 cancel,
+                finished,
                 j.id,
                 gate.is_none(),
+                RestartPoint::Beginning,
             );
+            active.insert(j.id, attempt);
         }
     }
 }
@@ -431,16 +632,21 @@ fn spawn_job(
     history: &Arc<HistoryDb>,
     dest_dir: &Path,
     sem: &Arc<tokio::sync::Semaphore>,
-    cancel: &CancellationToken,
+    global_cancel: &CancellationToken,
+    finished: &tokio::sync::mpsc::UnboundedSender<JobId>,
     job: JobId,
     retire_local: bool,
-) {
+    from: RestartPoint,
+) -> ActiveAttempt {
     let engine = engine.clone();
     let cfg = cfg.clone();
     let history = history.clone();
     let dest = dest_dir.to_path_buf();
     let sem = sem.clone();
-    let cancel = cancel.clone();
+    let global_cancel = global_cancel.clone();
+    let attempt_cancel = CancellationToken::new();
+    let task_cancel = attempt_cancel.clone();
+    let finished = finished.clone();
     tracker.spawn(async move {
         // Cancel-aware at both await points. Without this, one PP job —
         // a par2 repair, an unpack, an extension script — kept the PP
@@ -451,48 +657,53 @@ fn spawn_job(
         // been written, subprocesses are kill-on-drop, and the next pass's
         // rescan re-runs the job from scratch.
         let permit = tokio::select! {
-            _ = cancel.cancelled() => return, // never START work mid-shutdown
-            p = sem.acquire() => match p {
-                Ok(p) => p,
-                Err(_) => return,
-            },
+            _ = global_cancel.cancelled() => None,
+            _ = task_cancel.cancelled() => None,
+            p = sem.acquire() => p.ok(),
         };
-        let _permit = permit;
-        let outcome = tokio::select! {
-            _ = cancel.cancelled() => {
-                tracing::info!(
-                    job = job.0,
-                    "post-processing aborted by shutdown/restart; it will re-run on the next pass"
-                );
-                return;
-            }
-            r = process_job(&engine, &cfg, &history, &dest, job) => r,
-        };
-        match outcome {
-            Ok(outcome) => {
-                tracing::info!(
-                    job = job.0,
-                    outcome = outcome.as_str(),
-                    "post-processing finished"
-                );
-                if retire_local {
-                    // NZBGet parity: the finished job's record IS the
-                    // history entry — move it out of the queue now.
-                    let _ = engine.remove_job_silent(job).await;
+        if let Some(permit) = permit {
+            let _permit = permit;
+            let outcome = tokio::select! {
+                _ = global_cancel.cancelled() => None,
+                _ = task_cancel.cancelled() => None,
+                r = process_job_from(&engine, &cfg, &history, &dest, job, from) => Some(r),
+            };
+            match outcome {
+                None => {
+                    tracing::info!(
+                        job = job.0,
+                        "post-processing attempt cancelled; a requested replacement may now start"
+                    );
                 }
-            }
-            Err(e) => {
-                // PP writes as much as the downloader does — unpack,
-                // move, script output. An ENOSPC here is the same ground
-                // truth about the volume and must stop intake too, not
-                // just fail this job.
-                if nzbd_engine::is_out_of_space(&e.to_string()) {
-                    engine.report_out_of_space(format!("post-processing job {}: {e}", job.0));
+                Some(Ok(outcome)) => {
+                    tracing::info!(
+                        job = job.0,
+                        outcome = outcome.as_str(),
+                        "post-processing finished"
+                    );
+                    if retire_local {
+                        // NZBGet parity: the finished job's record IS the
+                        // history entry — move it out of the queue now.
+                        let _ = engine.remove_job_silent(job).await;
+                    }
                 }
-                tracing::error!(job = job.0, error = %e, "post-processing crashed");
+                Some(Err(e)) => {
+                    // PP writes as much as the downloader does — unpack,
+                    // move, script output. An ENOSPC here is the same ground
+                    // truth about the volume and must stop intake too, not
+                    // just fail this job.
+                    if nzbd_engine::is_out_of_space(&e.to_string()) {
+                        engine.report_out_of_space(format!("post-processing job {}: {e}", job.0));
+                    }
+                    tracing::error!(job = job.0, error = %e, "post-processing crashed");
+                }
             }
         }
+        let _ = finished.send(job);
     });
+    ActiveAttempt {
+        cancel: attempt_cancel,
+    }
 }
 
 fn pp_done(job: &Job) -> bool {
@@ -620,14 +831,13 @@ impl Drop for Stages<'_> {
     /// — and now that the span is on the job too, an abandoned job's last
     /// stage does not sit in history looking like it never ended.
     ///
-    /// Drop cannot await, so the engine half is spawned. It is ordered
-    /// behind nothing: the span is already closed in the histogram, and
-    /// `close_span` on the owner side is idempotent, so a late arrival
-    /// cannot overwrite a good measurement.
+    /// Drop cannot await. The engine offers an ordered non-blocking enqueue
+    /// specifically for this path: spawning a detached sender here lets an
+    /// old cancelled attempt's close arrive after its replacement entered a
+    /// stage, incorrectly closing the replacement span.
     fn drop(&mut self) {
         let ms = self.close();
-        let (engine, job) = (self.engine.clone(), self.job);
-        tokio::spawn(async move { engine.close_post_stage(job, now(), ms).await });
+        self.engine.close_post_stage_now(self.job, now(), ms);
     }
 }
 
@@ -642,7 +852,36 @@ pub async fn process_job(
     dest_dir: &Path,
     job_id: JobId,
 ) -> Result<PpFinal, PostError> {
-    process_job_ctx(engine, cfg, history, dest_dir, job_id, &PpCtx::default()).await
+    process_job_from(
+        engine,
+        cfg,
+        history,
+        dest_dir,
+        job_id,
+        RestartPoint::Beginning,
+    )
+    .await
+}
+
+/// Run a local pipeline from one of the operator-safe recovery boundaries.
+pub async fn process_job_from(
+    engine: &EngineHandle,
+    cfg: &PostConfig,
+    history: &Arc<HistoryDb>,
+    dest_dir: &Path,
+    job_id: JobId,
+    from: RestartPoint,
+) -> Result<PpFinal, PostError> {
+    process_job_ctx_from(
+        engine,
+        cfg,
+        history,
+        dest_dir,
+        job_id,
+        &PpCtx::default(),
+        from,
+    )
+    .await
 }
 
 /// The stage pipeline with explicit fencing (cluster PP leases pass their
@@ -654,6 +893,27 @@ pub async fn process_job_ctx(
     dest_dir: &Path,
     job_id: JobId,
     ctx: &PpCtx,
+) -> Result<PpFinal, PostError> {
+    process_job_ctx_from(
+        engine,
+        cfg,
+        history,
+        dest_dir,
+        job_id,
+        ctx,
+        RestartPoint::Beginning,
+    )
+    .await
+}
+
+async fn process_job_ctx_from(
+    engine: &EngineHandle,
+    cfg: &PostConfig,
+    history: &Arc<HistoryDb>,
+    dest_dir: &Path,
+    job_id: JobId,
+    ctx: &PpCtx,
+    from: RestartPoint,
 ) -> Result<PpFinal, PostError> {
     let _ = engine.set_job_status(job_id, JobStatus::PostQueued).await;
     let Some(job) = engine
@@ -704,11 +964,14 @@ pub async fn process_job_ctx(
     // Obfuscated posts get their real names back before anything verifies
     // or unpacks. Whole-file CRCs are content-addressed, so download
     // evidence just needs its paths remapped.
-    stages.enter(PostStage::ParRename).await;
-    let mut renames = par_rename(&dir);
-    if unpack_enabled {
-        stages.enter(PostStage::RarRename).await;
-        renames.extend(rar_rename(&dir));
+    let mut renames = Vec::new();
+    if from == RestartPoint::Beginning {
+        stages.enter(PostStage::ParRename).await;
+        renames = par_rename(&dir);
+        if unpack_enabled {
+            stages.enter(PostStage::RarRename).await;
+            renames.extend(rar_rename(&dir));
+        }
     }
     let rename_map: std::collections::HashMap<PathBuf, PathBuf> = renames.into_iter().collect();
 
@@ -718,28 +981,35 @@ pub async fn process_job_ctx(
         timeout: cfg.tool_timeout,
     };
     let mut par_ok = true;
-    let mut par_did_repair = false;
+    let mut par_did_repair = !from.includes(RestartPoint::Verify)
+        && job.stages.iter().any(|s| s.stage == PostStage::ParRepair);
     // Names the par2 set vouches for: proven correct, off-limits to the
     // heuristic deobfuscation pass at the end.
     let mut par2_names: std::collections::HashSet<String> = Default::default();
-    if let Some(set) = par2::load_dir(&dir)? {
-        par2_names = set.files.iter().map(|f| f.name.clone()).collect();
-        stages.enter(PostStage::ParVerify).await;
-        let quick = par2::quick_verify(&set, &evidence_of(&job, &dir, &rename_map));
-        if quick == VerifyResult::Intact {
-            tracing::info!(job = job_id.0, "par quick-verify: intact (no data re-read)");
-        } else if let Some(main) = set.main_path.clone() {
-            par_ok = repair_loop(engine, cfg, &par_tool, &mut stages, job_id, &main).await?;
-            par_did_repair = par_ok;
-        } else {
-            par_ok = false;
+    if from.includes(RestartPoint::Cleanup) {
+        if let Some(set) = par2::load_dir(&dir)? {
+            par2_names = set.files.iter().map(|f| f.name.clone()).collect();
+            if from.includes(RestartPoint::Verify) {
+                stages.enter(PostStage::ParVerify).await;
+                let quick = par2::quick_verify(&set, &evidence_of(&job, &dir, &rename_map));
+                if quick == VerifyResult::Intact {
+                    tracing::info!(job = job_id.0, "par quick-verify: intact (no data re-read)");
+                } else if let Some(main) = set.main_path.clone() {
+                    par_ok =
+                        repair_loop(engine, cfg, &par_tool, &mut stages, job_id, &main).await?;
+                    par_did_repair = par_ok;
+                } else {
+                    par_ok = false;
+                }
+            }
         }
     }
 
     // ---- UNPACK stage ------------------------------------------------------
     let mut unpack_ok = true;
-    let mut unpacked_any = false;
-    if unpack_enabled {
+    let mut unpacked_any = !from.includes(RestartPoint::Unpack)
+        && job.stages.iter().any(|s| s.stage == PostStage::Unpack);
+    if unpack_enabled && from.includes(RestartPoint::Unpack) {
         let archives = detect_archives(&dir);
         if !archives.is_empty() {
             stages.enter(PostStage::Unpack).await;
@@ -819,7 +1089,7 @@ pub async fn process_job_ctx(
     }
 
     // ---- CLEANUP stage -----------------------------------------------------
-    if cfg.cleanup && par_ok && unpack_ok && unpacked_any {
+    if from.includes(RestartPoint::Cleanup) && cfg.cleanup && par_ok && unpack_ok && unpacked_any {
         stages.enter(PostStage::Cleanup).await;
         cleanup_dir(&dir);
     }
@@ -833,7 +1103,7 @@ pub async fn process_job_ctx(
     // the applied renames are recorded on the job as `Deobfuscate:*`
     // parameters, which persist into history.
     let mut deobfuscated: Vec<(PathBuf, PathBuf)> = Vec::new();
-    if cfg.deobfuscate_final && par_ok && unpack_ok {
+    if from.includes(RestartPoint::Cleanup) && cfg.deobfuscate_final && par_ok && unpack_ok {
         stages.enter(PostStage::PostUnpackRename).await;
         deobfuscated = crate::deobfuscate::deobfuscate_dir(&dir, &sanitized, &par2_names);
         for (from, to) in &deobfuscated {
@@ -861,45 +1131,47 @@ pub async fn process_job_ctx(
     // path in the event, in history, and in compat `FinalDir` is the path
     // the files are actually at. Moving earlier would fight the unpack
     // staging; moving later would report a path that is about to change.
-    if let Some(target_root) = rule.as_ref().and_then(|r| r.dest_dir.as_ref()) {
-        let target = target_root.join(&sanitized);
-        if target != dir && dir.exists() {
-            let _ = std::fs::remove_dir_all(&staging); // never move the lease's scratch
-            stages.enter(PostStage::Move).await;
-            if !(ctx.commit_ok)() {
-                return Err(PostError::Subprocess("pp lease lost before move".into()));
-            }
-            let from = dir.clone();
-            let to = target.clone();
-            let tag = ctx.tag.clone();
-            let moved = tokio::task::spawn_blocking(move || move_dir(&from, &to, &tag))
-                .await
-                .unwrap_or_else(|e| Err(std::io::Error::other(e.to_string())));
-            match moved {
-                Ok(()) => {
-                    tracing::info!(
-                        job = job_id.0,
-                        category = job.category.as_deref().unwrap_or(""),
-                        to = %target.display(),
-                        "moved to the category destination"
-                    );
-                    dir = target;
+    if from.includes(RestartPoint::Move) {
+        if let Some(target_root) = rule.as_ref().and_then(|r| r.dest_dir.as_ref()) {
+            let target = target_root.join(&sanitized);
+            if target != dir && dir.exists() {
+                let _ = std::fs::remove_dir_all(&staging); // never move the lease's scratch
+                stages.enter(PostStage::Move).await;
+                if !(ctx.commit_ok)() {
+                    return Err(PostError::Subprocess("pp lease lost before move".into()));
                 }
-                Err(e) => {
-                    // Report where the files ARE, not where they were
-                    // meant to go. A wrong path here is the silent import
-                    // failure this whole change exists to remove.
-                    tracing::error!(
-                        job = job_id.0,
-                        to = %target.display(),
-                        error = %e,
-                        "category move failed; leaving the files in the global destination"
-                    );
-                    if nzbd_engine::is_out_of_space(&e.to_string()) {
-                        engine.report_out_of_space(format!(
-                            "category move to {}: {e}",
-                            target.display()
-                        ));
+                let from = dir.clone();
+                let to = target.clone();
+                let tag = ctx.tag.clone();
+                let moved = tokio::task::spawn_blocking(move || move_dir(&from, &to, &tag))
+                    .await
+                    .unwrap_or_else(|e| Err(std::io::Error::other(e.to_string())));
+                match moved {
+                    Ok(()) => {
+                        tracing::info!(
+                            job = job_id.0,
+                            category = job.category.as_deref().unwrap_or(""),
+                            to = %target.display(),
+                            "moved to the category destination"
+                        );
+                        dir = target;
+                    }
+                    Err(e) => {
+                        // Report where the files ARE, not where they were
+                        // meant to go. A wrong path here is the silent import
+                        // failure this whole change exists to remove.
+                        tracing::error!(
+                            job = job_id.0,
+                            to = %target.display(),
+                            error = %e,
+                            "category move failed; leaving the files in the global destination"
+                        );
+                        if nzbd_engine::is_out_of_space(&e.to_string()) {
+                            engine.report_out_of_space(format!(
+                                "category move to {}: {e}",
+                                target.display()
+                            ));
+                        }
                     }
                 }
             }

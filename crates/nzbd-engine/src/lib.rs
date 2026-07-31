@@ -648,6 +648,23 @@ impl EngineHandle {
             .await;
     }
 
+    /// Queue a stage close without spawning another task.
+    ///
+    /// This is the cancellation/drop path used by post-processing. Keeping
+    /// the send synchronous preserves mailbox order: a replacement attempt
+    /// may enter its first stage immediately after the old future is dropped,
+    /// and a detached async close from the old attempt could otherwise arrive
+    /// late and close the replacement's brand-new span.
+    pub fn close_post_stage_now(&self, job: JobId, at_unix: i64, ms: Option<u64>) {
+        let _ = self
+            .cmd_tx
+            .try_send(EngineMsg::Command(QueueCommand::ClosePostStage {
+                job,
+                at_unix,
+                ms,
+            }));
+    }
+
     pub async fn remove_job_silent(&self, job: JobId) -> Result<bool, EngineError> {
         self.roundtrip_bool(|reply| QueueCommand::RemoveJobSilent { job, reply })
             .await

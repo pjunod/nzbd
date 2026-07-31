@@ -4,7 +4,9 @@
 //! classification, and the event-driven manager.
 
 use nzbd_engine::{Engine, EngineConfig, EngineHandle, Tuning};
-use nzbd_post::manager::{process_job, spawn_post_manager, PostConfig, PpFinal, PP_DONE_PARAM};
+use nzbd_post::manager::{
+    process_job, spawn_post_manager, PostConfig, PpFinal, RestartPoint, PP_DONE_PARAM,
+};
 use nzbd_state::history::HistoryDb;
 use nzbd_types::{DupeInfo, FileEntry, FileId, Job, JobId, JobKind, JobStatus, JobTotals};
 use std::path::{Path, PathBuf};
@@ -551,6 +553,119 @@ async fn manager_event_driven_and_restart_safe() {
     cancel2.cancel();
     tracker2.close();
     tracker2.wait().await;
+    engine.shutdown().await;
+}
+
+/// A recovery click must kill the active subprocess before the replacement
+/// starts, then resume at the selected boundary. This is the field shape that
+/// prompted the control: a job can remain in `Post::Unpack`/`Post::Script`
+/// forever unless an operator can reclaim that one attempt without
+/// re-downloading the NZB.
+#[tokio::test]
+async fn manager_restarts_a_hung_stage_in_place() {
+    let tmp = tempfile::tempdir().unwrap();
+    let engine = spawn_engine(tmp.path()).await;
+    let dir = tmp.path().join("dest/recover-me");
+    std::fs::create_dir_all(&dir).unwrap();
+    let data = b"already downloaded".to_vec();
+    std::fs::write(dir.join("payload.bin"), &data).unwrap();
+
+    let scripts = tmp.path().join("scripts");
+    std::fs::create_dir_all(&scripts).unwrap();
+    let script = scripts.join("hang-once.sh");
+    std::fs::write(
+        &script,
+        "#!/bin/sh\n### NZBGET POST-PROCESSING SCRIPT ###\n\
+         first=\"$NZBPP_DIRECTORY/.first-script-run\"\n\
+         if [ ! -e \"$first\" ]; then\n\
+           : > \"$first\"\n\
+           exec sleep 60\n\
+         fi\n\
+         : > \"$NZBPP_DIRECTORY/.second-script-run\"\n\
+         exit 93\n",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    let hist = history(tmp.path());
+    let cancel = CancellationToken::new();
+    let tracker = TaskTracker::new();
+    let manager = spawn_post_manager(
+        engine.clone(),
+        PostConfig {
+            scripts_dir: Some(scripts),
+            deobfuscate_final: false,
+            ..PostConfig::default()
+        },
+        hist.clone(),
+        tmp.path().join("dest"),
+        None,
+        cancel.clone(),
+        &tracker,
+    );
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    engine
+        .import_job(
+            completed_job(
+                60,
+                "recover-me",
+                vec![file_entry(1, "payload.bin", Some(crc(&data)), false)],
+            ),
+            false,
+            true,
+        )
+        .await
+        .unwrap();
+
+    let first = dir.join(".first-script-run");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !first.exists() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the first script attempt never started"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    manager
+        .restart(JobId(60), RestartPoint::Scripts)
+        .await
+        .expect("operator restart accepted");
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let entries = hist.list(10).unwrap();
+        if engine.export_job(JobId(60)).await.unwrap().is_none() && entries.len() == 1 {
+            let scripts_run = entries[0]
+                .stages
+                .iter()
+                .filter(|s| s.stage == nzbd_types::PostStage::Script)
+                .count();
+            assert_eq!(
+                scripts_run, 2,
+                "cancelled attempt + replacement are recorded"
+            );
+            assert!(
+                entries[0].stages.iter().all(|s| s.ms.is_some()),
+                "the cancelled span must close before its replacement starts"
+            );
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the restarted script never finished and retired the job"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(dir.join(".second-script-run").exists());
+
+    cancel.cancel();
+    tracker.close();
+    tracker.wait().await;
     engine.shutdown().await;
 }
 
