@@ -292,8 +292,88 @@ async fn unrepairable_is_par_failure() {
 
     let job = engine.export_job(JobId(3)).await.unwrap().unwrap();
     assert_eq!(job.status, JobStatus::Failed);
-    assert_eq!(hist.list(10).unwrap()[0].status, "PAR_FAILURE");
+    let row = hist.list(10).unwrap()[0].clone();
+    assert_eq!(row.status, "PAR_FAILURE");
+    // D2: the default disposes of the corpse, and the row says so. Five
+    // failed grabs of one movie used to leave 336 GB behind them.
+    assert!(!dir.exists(), "a failed job's files must not survive it");
+    assert_eq!(row.final_dir, None, "deleted files have no final dir");
+    assert!(
+        row.params
+            .iter()
+            .any(|(k, v)| k == "Failure:Files" && v == "deleted"),
+        "the history row must say where the files went: {:?}",
+        row.params
+    );
     engine.shutdown().await;
+}
+
+/// `failure_action = park` moves the corpse off the tree the importer
+/// watches, intact, and the row points at where it went. `= none` is the
+/// old behaviour and stays available for an operator who wants the
+/// forensics.
+#[tokio::test]
+async fn par_failure_parks_or_keeps_per_config() {
+    if !require_tool("par2") {
+        return;
+    }
+    for (action, job_id) in [
+        (nzbd_post::manager::FailureAction::Park, 41u32),
+        (nzbd_post::manager::FailureAction::None, 42),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = spawn_engine(tmp.path()).await;
+        let dir = tmp.path().join("dest/hopeless");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let data: Vec<u8> = (0..60_000u32).map(|i| ((i * 13) % 249) as u8).collect();
+        std::fs::write(dir.join("payload.bin"), &data).unwrap();
+        par2_create(&dir, 1, &["payload.bin"]);
+        let mut bad = data.clone();
+        for b in &mut bad[8_192..49_152] {
+            *b = 0;
+        }
+        std::fs::write(dir.join("payload.bin"), &bad).unwrap();
+
+        let mut files = vec![file_entry(1, "payload.bin", Some(crc(&bad)), false)];
+        files.extend(par2_entries(&dir, 2));
+        engine
+            .import_job(completed_job(job_id, "hopeless", files), false, false)
+            .await
+            .unwrap();
+
+        let parked_root = tmp.path().join("failed");
+        let hist = history(tmp.path());
+        let out = process_job(
+            &engine,
+            &PostConfig {
+                failure_action: action,
+                failed_dir: Some(parked_root.clone()),
+                ..PostConfig::default()
+            },
+            &hist,
+            &tmp.path().join("dest"),
+            JobId(job_id),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out, PpFinal::ParFailure);
+        let row = hist.list(10).unwrap()[0].clone();
+
+        match action {
+            nzbd_post::manager::FailureAction::Park => {
+                assert!(!dir.exists(), "parked means moved, not copied");
+                let moved = parked_root.join("hopeless");
+                assert!(moved.join("payload.bin").is_file(), "the tree moves intact");
+                assert_eq!(row.final_dir.as_deref(), moved.to_str());
+            }
+            _ => {
+                assert!(dir.join("payload.bin").is_file(), "`none` keeps the files");
+                assert_eq!(row.final_dir.as_deref(), dir.to_str());
+            }
+        }
+        engine.shutdown().await;
+    }
 }
 
 /// Archive job: unpack extracts, cleanup removes the archive husks.
@@ -673,10 +753,11 @@ async fn per_job_password_unlocks_archive() {
     engine.shutdown().await;
 }
 
-/// HealthAction::Delete removes the failed download's files from disk.
+/// `failure_action = delete` removes the failed download's files from
+/// disk — the health gate is one of the terminal failures it covers.
 #[tokio::test]
 async fn health_action_delete_removes_files() {
-    use nzbd_post::manager::HealthAction;
+    use nzbd_post::manager::FailureAction;
     let tmp = tempfile::tempdir().unwrap();
     let engine = spawn_engine(tmp.path()).await;
     let dir = tmp.path().join("dest/sick");
@@ -689,7 +770,7 @@ async fn health_action_delete_removes_files() {
     spawn_post_manager(
         engine.clone(),
         PostConfig {
-            health_action: HealthAction::Delete,
+            failure_action: FailureAction::Delete,
             ..PostConfig::default()
         },
         hist.clone(),

@@ -183,12 +183,24 @@ deobfuscate_final = true    # rename still-obfuscated files to the job name
                             # names are never touched
 strategy = "balanced"       # sequential | balanced | aggressive | rocket
                             # (1 / 2 / 3 / 6 concurrent PP jobs)
-health_action = "none"      # none | park | delete — what to do with
-                            # unrepairable downloads. Anything but "none"
-                            # also aborts a download the moment its health
-                            # drops below critical health (the point where
-                            # even all par2 blocks can't repair it), instead
-                            # of finishing a doomed download
+failure_action = "delete"   # none | park | delete — what happens to the
+                            # FILES of a job that ended in a terminal
+                            # failure: par failure, unpack failure, script
+                            # failure, health abort, post crash. Deleting
+                            # loses nothing: the job's NZB is parked with
+                            # its history row, so requeue re-downloads it.
+                            # "none" leaves ~90 GB per failed grab in the
+                            # tree your importer watches — that is how a
+                            # terabyte of duplicates happened. Anything but
+                            # "none" also aborts a download the moment its
+                            # health drops below critical health (the point
+                            # where even all par2 blocks can't repair it),
+                            # instead of finishing a doomed download.
+                            # Accepts the old name `health_action`, which
+                            # only ever governed the health gate
+failed_dir = "/data/usenet/failed"   # where "park" puts them; defaults to
+                            # <main_dir>/failed — deliberately off the
+                            # category tree
 tool_timeout_secs = 3600
 script_timeout_secs = 3600
 par_fetch_timeout_secs = 600   # wait for delayed par files during repair

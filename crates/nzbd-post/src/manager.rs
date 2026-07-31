@@ -26,23 +26,33 @@ use tokio_util::task::TaskTracker;
 /// `nzbd-types` so the engine snapshot and cluster scheduler see it too).
 pub use nzbd_types::PP_DONE_PARAM;
 
-/// What to do with a job that failed its health gate (NZBGet
-/// `HealthCheck`): keep the partial files (`None`/`Park` — the history
-/// entry records the failure either way) or delete them from disk.
+/// What to do with the FILES of a job that ended in a terminal failure —
+/// par failure, unpack failure, script failure, health abort, post crash.
+///
+/// Was `HealthAction` and governed the health gate alone, which left
+/// every *other* terminal failure's directory sitting in the category
+/// tree an importer watches, forever. Nothing ever removed them: ~523 GB
+/// of known-bad downloads in one field report
+/// (docs/REGRAB_LOOP_PLAN.md D2).
+///
+/// `Delete` is the default. The bytes are known-bad by definition, and
+/// the job's NZB is parked with its history entry, so `requeue` fetches
+/// them again — deleting loses nothing but the disk space.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum HealthAction {
-    #[default]
+pub enum FailureAction {
+    /// Leave the files where they are. What produced the terabyte.
     None,
     Park,
+    #[default]
     Delete,
 }
 
-impl HealthAction {
-    pub fn parse(s: &str) -> HealthAction {
+impl FailureAction {
+    pub fn parse(s: &str) -> FailureAction {
         match s.to_ascii_lowercase().as_str() {
-            "delete" => HealthAction::Delete,
-            "park" | "pause" => HealthAction::Park,
-            _ => HealthAction::None,
+            "none" | "keep" | "" => FailureAction::None,
+            "park" | "pause" => FailureAction::Park,
+            _ => FailureAction::Delete,
         }
     }
 }
@@ -79,8 +89,13 @@ pub struct PostConfig {
     /// Rename still-obfuscated files to the job name after unpack
     /// (SABnzbd-style; fully obfuscated season packs get `<job> - NN`).
     pub deobfuscate_final: bool,
-    /// Action for health-gated failures (files on disk).
-    pub health_action: HealthAction,
+    /// What happens to the files of a job that ends in a terminal
+    /// failure (par, unpack, script, health abort, crash).
+    pub failure_action: FailureAction,
+    /// Where `FailureAction::Park` moves a failed job's directory.
+    /// `None` falls back to a `.failed` dir beside the downloads, which
+    /// is at least out of an importer's way (dot-prefixed).
+    pub failed_dir: Option<PathBuf>,
     /// Concurrent PP jobs (PostStrategy: sequential=1, balanced=2,
     /// aggressive=3, rocket=6).
     pub slots: usize,
@@ -104,7 +119,8 @@ impl Default for PostConfig {
             unpack: true,
             cleanup: true,
             deobfuscate_final: true,
-            health_action: HealthAction::None,
+            failure_action: FailureAction::default(),
+            failed_dir: None,
             slots: 1,
             tool_timeout: Duration::from_secs(3600),
             script_timeout: Duration::from_secs(3600),
@@ -264,15 +280,40 @@ async fn manager_task(
                         } else {
                             "FAILURE/HEALTH"
                         };
+                        // Same disposition as every other terminal
+                        // failure: the health gate is not a special case,
+                        // it is just the earliest one.
+                        let disposition = match exported.as_ref() {
+                            Some(j) if !j.files.is_empty() => {
+                                let dir_name = nzbd_engine::queue::job_dir_name(j);
+                                Some(dispose_failed(
+                                    &cfg,
+                                    job,
+                                    &dest_dir.join(&dir_name),
+                                    &dest_dir,
+                                    &dir_name,
+                                    "local",
+                                ).await)
+                            }
+                            _ => None,
+                        };
+                        let mut fail_params =
+                            exported.as_ref().map(user_params).unwrap_or_default();
+                        if let Some(d) = disposition.as_ref() {
+                            fail_params.push(("Failure:Files".into(), d.note.clone()));
+                        }
                         let entry = HistoryEntry {
                             job,
                             name: name.clone(),
                             category: exported.as_ref().and_then(|j| j.category.clone()),
-                            final_dir: None,
+                            final_dir: disposition
+                                .as_ref()
+                                .and_then(|d| d.files_at.as_ref())
+                                .map(|p| p.to_string_lossy().into_owned()),
                             status: fail_status.into(),
                             size: exported.as_ref().map(|j| j.totals.size).unwrap_or(0),
                             health,
-                            params: exported.as_ref().map(user_params).unwrap_or_default(),
+                            params: fail_params.clone(),
                             dupe_key: exported
                                 .as_ref()
                                 .map(|j| j.dupe.key.clone())
@@ -319,15 +360,8 @@ async fn manager_task(
                             history_seq,
                         });
                         if let Some(mut fin) = exported {
-                            if cfg.health_action == HealthAction::Delete {
-                                let dir = dest_dir
-                                    .join(nzbd_engine::queue::sanitize_name(&fin.name));
-                                tracing::warn!(job = job.0, dir = %dir.display(),
-                                    "health check action: deleting failed download");
-                                let _ = tokio::task::spawn_blocking(move || {
-                                    std::fs::remove_dir_all(&dir)
-                                })
-                                .await;
+                            if let Some(d) = disposition.as_ref() {
+                                fin.params.push(("Failure:Files".into(), d.note.clone()));
                             }
                             fin.params.push((PP_DONE_PARAM.into(), fail_status.into()));
                             let _ = engine.import_job(fin, false, false).await;
@@ -926,6 +960,18 @@ pub async fn process_job_ctx(
             "pp lease lost before finalize".into(),
         ));
     }
+    // ---- disposition of a terminal failure ---------------------------------
+    // A failed job's bytes are known-bad, and until this existed nothing
+    // ever removed them: the directory stayed in the very tree the
+    // importer watches, one ~90 GB corpse per failed grab, until the
+    // volume filled (docs/REGRAB_LOOP_PLAN.md D2). Before the history row
+    // is written, so the row can say where the files went.
+    let disposition = if outcome == PpFinal::Success {
+        None
+    } else {
+        Some(dispose_failed(cfg, job_id, &dir, dest_dir, &sanitized, &ctx.tag).await)
+    };
+
     // Close the last stage span BEFORE the export below reads the job:
     // the timeline that lands in history has to be complete, and the
     // final stage is the one an operator looks at first.
@@ -960,12 +1006,27 @@ pub async fn process_job_ctx(
         } else {
             JobStatus::Failed
         };
+        // Plain param: it survives into history and the compat
+        // `Parameters` array, so the row itself answers "where did the
+        // files go" — the question every one of these corpses raised.
+        if let Some(d) = disposition.as_ref() {
+            fin.params.push(("Failure:Files".into(), d.note.clone()));
+        }
         let health = Health::calc(&fin.totals).0;
+        // A row must not point at a directory that is no longer there:
+        // deleted means no final dir, parked means the parked one.
+        let final_dir = match disposition.as_ref() {
+            None => Some(final_dir),
+            Some(d) => d
+                .files_at
+                .as_ref()
+                .map(|p| p.to_string_lossy().into_owned()),
+        };
         let entry = HistoryEntry {
             job: job_id,
             name: fin.name.clone(),
             category: fin.category.clone(),
-            final_dir: Some(final_dir.clone()),
+            final_dir: final_dir.clone(),
             status: outcome.as_str().into(),
             size: fin.totals.size,
             health,
@@ -1030,7 +1091,7 @@ pub async fn process_job_ctx(
             name: fin.name.clone(),
             category: fin.category.clone(),
             pp_status: outcome.as_str().into(),
-            final_dir: Some(final_dir),
+            final_dir,
             size_bytes: fin.totals.size,
             health,
             params: user_params(&fin),
@@ -1179,6 +1240,100 @@ async fn repair_loop(
         }
     }
     Ok(false)
+}
+
+/// What became of a failed job's files: what to tell the history row, and
+/// where the bytes are now (`None` = gone).
+#[derive(Debug, Clone)]
+pub struct Disposition {
+    pub note: String,
+    pub files_at: Option<PathBuf>,
+}
+
+/// Dispose of the files of a job that ended in a terminal failure, per
+/// `[post] failure_action`, and describe what happened for the history row.
+///
+/// The one-dir-one-job invariant is what makes this safe to do wholesale:
+/// a job's directory contains that job's files and nothing else, so
+/// removing or moving the tree cannot take a neighbour's download with it.
+///
+/// Deleting is not destructive in the way it looks: the job's NZB is
+/// spooled beside its history entry, so `requeue` re-downloads exactly
+/// what was thrown away. Keeping it is what filled a terabyte.
+pub async fn dispose_failed(
+    cfg: &PostConfig,
+    job_id: JobId,
+    dir: &Path,
+    dest_dir: &Path,
+    dir_name: &str,
+    tag: &str,
+) -> Disposition {
+    let kept = |note: &str| Disposition {
+        note: note.into(),
+        files_at: Some(dir.to_path_buf()),
+    };
+    if !dir.exists() {
+        return Disposition {
+            note: "already gone".into(),
+            files_at: None,
+        };
+    }
+    match cfg.failure_action {
+        FailureAction::None => kept("kept"),
+        FailureAction::Delete => {
+            let d = dir.to_path_buf();
+            let res = tokio::task::spawn_blocking(move || std::fs::remove_dir_all(&d)).await;
+            match res {
+                Ok(Ok(())) => {
+                    tracing::warn!(job = job_id.0, dir = %dir.display(),
+                        "failed job: deleting its files (requeue re-downloads them)");
+                    Disposition {
+                        note: "deleted".into(),
+                        files_at: None,
+                    }
+                }
+                Ok(Err(e)) => {
+                    tracing::error!(job = job_id.0, dir = %dir.display(), error = %e,
+                        "failed job: could not delete its files — they stay on the volume");
+                    kept(&format!("delete failed: {e}"))
+                }
+                Err(e) => kept(&format!("delete failed: {e}")),
+            }
+        }
+        FailureAction::Park => {
+            let root = cfg
+                .failed_dir
+                .clone()
+                .unwrap_or_else(|| dest_dir.join(".failed"));
+            let target = root.join(dir_name);
+            let from = dir.to_path_buf();
+            let to = target.clone();
+            let tag = tag.to_string();
+            let res = tokio::task::spawn_blocking(move || {
+                if let Some(parent) = to.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                move_dir(&from, &to, &tag)
+            })
+            .await;
+            match res {
+                Ok(Ok(())) => {
+                    tracing::warn!(job = job_id.0, to = %target.display(),
+                        "failed job: parking its files off the destination tree");
+                    Disposition {
+                        note: format!("parked at {}", target.display()),
+                        files_at: Some(target),
+                    }
+                }
+                Ok(Err(e)) => {
+                    tracing::error!(job = job_id.0, to = %target.display(), error = %e,
+                        "failed job: could not park its files — they stay where they are");
+                    kept(&format!("park failed: {e}"))
+                }
+                Err(e) => kept(&format!("park failed: {e}")),
+            }
+        }
+    }
 }
 
 /// The recovery-set slice size from the job's main par2 index, if it can

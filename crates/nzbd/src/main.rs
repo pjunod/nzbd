@@ -148,7 +148,14 @@ fn post_config(
         unpack: cfg.post.unpack,
         cleanup: cfg.post.cleanup,
         deobfuscate_final: cfg.post.deobfuscate_final,
-        health_action: nzbd_post::manager::HealthAction::parse(&cfg.post.health_action),
+        failure_action: nzbd_post::manager::FailureAction::parse(&cfg.post.failure_action),
+        failed_dir: Some(
+            cfg.post
+                .failed_dir
+                .clone()
+                .map(|p| nzbd_config::expand_home(&p))
+                .unwrap_or_else(|| nzbd_config::expand_home(&cfg.paths.main_dir).join("failed")),
+        ),
         slots,
         tool_timeout: Duration::from_secs(cfg.post.tool_timeout_secs.max(1)),
         script_timeout: Duration::from_secs(cfg.post.script_timeout_secs.max(1)),
@@ -567,8 +574,8 @@ fn run(
         daily_quota_bytes: cfg.queue.daily_quota_mb * 1024 * 1024,
         monthly_quota_bytes: cfg.queue.monthly_quota_mb * 1024 * 1024,
         quota_start_day: cfg.queue.quota_start_day.clamp(1, 28),
-        health_abort: nzbd_post::manager::HealthAction::parse(&cfg.post.health_action)
-            != nzbd_post::manager::HealthAction::None,
+        health_abort: nzbd_post::manager::FailureAction::parse(&cfg.post.failure_action)
+            != nzbd_post::manager::FailureAction::None,
         ..Tuning::default()
     };
 
@@ -1112,7 +1119,11 @@ mod tests {
             "[post]\nhealth_action = \"park\"\ntool_timeout_secs = 0\nscripts_dir = \"~/scripts\"\n",
         );
         let pc = post_config(&cfg, 3, None);
-        assert_eq!(pc.health_action, nzbd_post::manager::HealthAction::Park);
+        assert_eq!(
+            pc.failure_action,
+            nzbd_post::manager::FailureAction::Park,
+            "the old `health_action` key still parses"
+        );
         assert_eq!(pc.slots, 3);
         // Zero timeout is clamped to something sane rather than "instant".
         assert!(pc.tool_timeout >= Duration::from_secs(1));

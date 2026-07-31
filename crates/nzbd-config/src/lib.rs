@@ -94,9 +94,23 @@ pub struct PostSection {
     pub deobfuscate_final: bool,
     /// NZBGet `PostStrategy`: sequential | balanced | aggressive | rocket.
     pub strategy: String,
-    /// What to do with health-gated failures: none | park | delete
-    /// (NZBGet `HealthCheck`).
-    pub health_action: String,
+    /// What to do with the FILES of a job that ended in a terminal
+    /// failure — par failure, unpack failure, health abort, post crash:
+    /// none | park | delete.
+    ///
+    /// Was `health_action` (NZBGet `HealthCheck`) and still parses under
+    /// that name. It only ever governed the health gate, so a par failure
+    /// left its whole directory in the category tree forever — which is
+    /// how ~523 GB of known-bad downloads accumulated under an importer's
+    /// watch folder (docs/REGRAB_LOOP_PLAN.md D2). The default is
+    /// `delete`: the bytes are known-bad and the job's NZB is parked with
+    /// its history entry, so `requeue` gets them back.
+    #[serde(alias = "health_action")]
+    pub failure_action: String,
+    /// Where `failure_action = "park"` puts a failed job's directory.
+    /// Defaults to `<main_dir>/failed` — deliberately off the category
+    /// tree an importer watches.
+    pub failed_dir: Option<PathBuf>,
     pub tool_timeout_secs: u64,
     pub script_timeout_secs: u64,
     /// How long to wait for delayed par-block downloads during repair.
@@ -115,7 +129,8 @@ impl Default for PostSection {
             cleanup: true,
             deobfuscate_final: true,
             strategy: "balanced".into(),
-            health_action: "none".into(),
+            failure_action: "delete".into(),
+            failed_dir: None,
             tool_timeout_secs: 3600,
             script_timeout_secs: 3600,
             par_fetch_timeout_secs: 600,
@@ -944,8 +959,8 @@ pub fn import_nzbget_conf(content: &str) -> Result<(Config, ImportReport), Confi
                 Some("post.unpack".into())
             }
             "healthcheck" => {
-                cfg.post.health_action = v.to_lowercase();
-                Some("post.health_action".into())
+                cfg.post.failure_action = v.to_lowercase();
+                Some("post.failure_action".into())
             }
             "unpackcleanupdisk" => {
                 cfg.post.cleanup = yes(&v);
