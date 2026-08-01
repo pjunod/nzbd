@@ -1,0 +1,60 @@
+{
+  "expo": {
+    "name": "nzbd",
+    "slug": "nzbd-mobile",
+    "description": "Watch and control an nzbd queue from iPhone, iPad, and Android.",
+    "version": "1.0.0",
+    "platforms": ["ios", "android"],
+    "orientation": "default",
+    "icon": "./assets/nzbd-icon.png",
+    "userInterfaceStyle": "automatic",
+    "backgroundColor": "#0B1219",
+    "scheme": "nzbd",
+    "ios": {
+      "bundleIdentifier": "com.pjunod.nzbd",
+      "buildNumber": "1",
+      "supportsTablet": true,
+      "requireFullScreen": false,
+      "config": {
+        "usesNonExemptEncryption": false
+      },
+      "infoPlist": {
+        "NSBonjourServices": ["_nzbd._tcp"],
+        "NSLocalNetworkUsageDescription": "nzbd scans for and connects to download servers on your local network.",
+        "NSAppTransportSecurity": {
+          "NSAllowsArbitraryLoads": true,
+          "NSAllowsLocalNetworking": true
+        }
+      }
+    },
+    "android": {
+      "package": "com.pjunod.nzbd",
+      "versionCode": 1,
+      "adaptiveIcon": {
+        "backgroundColor": "#101010",
+        "foregroundImage": "./assets/nzbd-icon.png"
+      },
+      "predictiveBackGestureEnabled": false
+    },
+    "plugins": [
+      "expo-document-picker",
+      [
+        "expo-secure-store",
+        {
+          "configureAndroidBackup": true
+        }
+      ],
+      [
+        "expo-build-properties",
+        {
+          "android": {
+            "usesCleartextTraffic": true
+          }
+        }
+      ]
+    ],
+    "web": {
+      "favicon": "./assets/favicon.png"
+    }
+  }
+}
