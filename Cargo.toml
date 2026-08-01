@@ -78,6 +78,7 @@ arc-swap = "1"
 clap = { version = "4", features = ["derive"] }
 toml = "1"
 bytes = "1"
+mdns-sd = "0.20.3"
 
 [profile.release]
 lto = "thin"

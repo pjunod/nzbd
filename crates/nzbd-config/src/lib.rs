@@ -372,6 +372,10 @@ impl Default for QueueConfig {
 #[serde(deny_unknown_fields, default)]
 pub struct ApiConfig {
     pub bind: String,
+    /// Advertise this API on the local network using DNS-SD/mDNS.
+    /// Loopback-only listeners are never advertised because other devices
+    /// cannot reach them.
+    pub discovery: bool,
     /// Serve HTTPS instead of HTTP. With no cert configured, a
     /// self-signed certificate is generated on first boot (under the
     /// state dir) and reused after that — trust it on your devices for
@@ -400,6 +404,7 @@ impl Default for ApiConfig {
     fn default() -> Self {
         ApiConfig {
             bind: "127.0.0.1:6789".into(),
+            discovery: true,
             tls: false,
             tls_cert: None,
             tls_key: None,
@@ -1158,6 +1163,7 @@ bind = "0.0.0.0:6789"
         assert_eq!(defs[1].tier, 1);
         assert!(defs[1].fill);
         assert_eq!(cfg.api.compat_version, "26.2");
+        assert!(cfg.api.discovery); // omitted field keeps LAN discovery on
     }
 
     #[test]

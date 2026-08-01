@@ -4,6 +4,7 @@
 
 use clap::{Parser, Subcommand};
 
+mod discovery;
 mod tls;
 use nzbd_engine::{Engine, EngineConfig, Tuning};
 use nzbd_types::CertLevel;
@@ -53,6 +54,24 @@ enum Command {
         #[arg(long, default_value = "127.0.0.1:6789")]
         url: String,
     },
+    /// Advertise a host-published nzbd API over DNS-SD/mDNS.
+    ///
+    /// Run this companion on the host network when the daemon itself is in
+    /// a bridged container whose multicast traffic cannot reach the LAN.
+    Advertise {
+        /// API port published on the host.
+        #[arg(long, default_value_t = 6789)]
+        port: u16,
+        /// LAN-visible node name, e.g. nuc3.
+        #[arg(long)]
+        name: Option<String>,
+        /// Advertise an HTTPS endpoint instead of HTTP.
+        #[arg(long)]
+        tls: bool,
+        /// Authentication metadata only; no credential is advertised.
+        #[arg(long, default_value = "unknown")]
+        auth: String,
+    },
     /// Import an nzbget.conf into nzbd.toml with a mapping report.
     ImportConfig {
         /// Path to the nzbget.conf to import.
@@ -95,6 +114,12 @@ fn main() -> anyhow_lite::Result<()> {
             priority,
         } => client_add(file, url, name, category, priority),
         Command::Status { url } => client_status(url),
+        Command::Advertise {
+            port,
+            name,
+            tls,
+            auth,
+        } => advertise(port, name, tls, auth),
         Command::ImportConfig { path, out } => {
             let content = std::fs::read_to_string(&path)?;
             match nzbd_config::import_nzbget_conf(&content) {
@@ -124,6 +149,18 @@ fn main() -> anyhow_lite::Result<()> {
             }
         }
     }
+}
+
+fn advertise(port: u16, name: Option<String>, tls: bool, auth: String) -> anyhow_lite::Result<()> {
+    let advertiser =
+        discovery::Advertiser::start_standalone(port, name.as_deref(), tls, auth.trim())
+            .ok_or_else(|| anyhow_lite::Error::msg("could not start local API advertisement"))?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(shutdown_signal());
+    drop(advertiser);
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -732,9 +769,12 @@ fn run(
 
         let tls_setup = tls::server_config(&cfg, &cfg.state_dir())
             .map_err(|e| anyhow_lite::Error::msg(e.to_string()))?;
+        let listener = tokio::net::TcpListener::bind(&bind).await?;
+        let listener_address = listener.local_addr()?;
+        let _advertiser =
+            discovery::Advertiser::start(&cfg.api, listener_address, None, tls_setup.is_some());
         match tls_setup {
             None => {
-                let listener = tokio::net::TcpListener::bind(&bind).await?;
                 tracing::info!(%bind, "nzbd listening");
                 let serve = std::future::IntoFuture::into_future(
                     axum::serve(listener, app).with_graceful_shutdown(shutdown),
@@ -749,7 +789,7 @@ fn run(
             }
             Some(t) => {
                 tracing::info!(%bind, %t.note, "nzbd listening (https)");
-                serve_tls(&bind, t.config, app, shutdown).await?;
+                serve_tls(listener, t.config, app, shutdown).await?;
             }
         }
 
@@ -792,12 +832,11 @@ fn run(
 /// rustls stack. Per-connection tasks die with the runtime when a run
 /// pass ends (shutdown or setup reload).
 async fn serve_tls(
-    bind: &str,
+    listener: tokio::net::TcpListener,
     config: std::sync::Arc<rustls::ServerConfig>,
     app: axum::Router,
     shutdown: impl std::future::Future<Output = ()>,
 ) -> anyhow_lite::Result<()> {
-    let listener = tokio::net::TcpListener::bind(bind).await?;
     let acceptor = tokio_rustls::TlsAcceptor::from(config);
     let mut shutdown = std::pin::pin!(shutdown);
     loop {
@@ -942,6 +981,13 @@ async fn run_cluster(
         feeds_handle,
     );
     let listener = tokio::net::TcpListener::bind(&bind).await?;
+    let listener_address = listener.local_addr()?;
+    let _advertiser = discovery::Advertiser::start(
+        &cfg.api,
+        listener_address,
+        Some(&cfg.cluster.node_name),
+        false,
+    );
     tracing::info!(
         %bind,
         node = %cfg.cluster.node_name,

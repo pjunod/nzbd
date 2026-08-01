@@ -50,6 +50,20 @@ services:
       retries: 3
       start_period: 10s
 
+  # mDNS does not cross a normal Docker bridge. This companion uses the
+  # same image but runs only the DNS-SD advertiser on the Linux host network,
+  # where phones and tablets can see it. The API remains published by nzbd
+  # on host port 6789; no credentials or queue state leave the container.
+  nzbd-discovery:
+    image: ghcr.io/pjunod/nzbd:latest
+    container_name: nzbd-discovery
+    restart: unless-stopped
+    network_mode: host
+    command: ["advertise", "--name", "${NZBD_DISCOVERY_NAME:-nzbd}", "--port", "6789"]
+    depends_on:
+      nzbd:
+        condition: service_healthy
+
   # Typical companion — uncomment to run Sonarr alongside and add nzbd as
   # its NZBGet download client at host "nzbd", port 6789.
   #
@@ -66,4 +80,3 @@ services:
   #     - PUID=1000
   #     - PGID=1000
   #     - TZ=Etc/UTC
-

@@ -60,3 +60,12 @@ services:
           path: ../Cargo.lock
         - action: rebuild
           path: ../Dockerfile
+
+  nzbd-discovery:
+    image: nzbd:dev
+    container_name: nzbd-discovery-dev
+    network_mode: host
+    command: ["advertise", "--name", "${NZBD_DISCOVERY_NAME:-nzbd-dev}", "--port", "6789"]
+    depends_on:
+      nzbd:
+        condition: service_healthy
