@@ -72,6 +72,14 @@ export class NzbdClient {
     return this.json(`/api/v1/jobs/${id}/actions/${action}`, { method: 'POST' });
   }
 
+  async setJobPriority(id: number, priority: number): Promise<void> {
+    await this.json(`/api/v1/jobs/${id}/priority`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ priority }),
+    });
+  }
+
   async addNzb(file: File, options: AddNzbOptions): Promise<AddNzbResult> {
     const query = new URLSearchParams({
       name: options.name,

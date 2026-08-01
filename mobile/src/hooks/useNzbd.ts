@@ -31,6 +31,7 @@ interface HookResult {
       | 'move-down'
       | 'move-bottom',
   ) => Promise<{ ok: boolean; parked?: boolean }>;
+  setJobPriority: (id: number, priority: number) => Promise<void>;
   addNzb: (file: File, options: AddNzbOptions) => Promise<AddNzbResult>;
 }
 
@@ -167,6 +168,8 @@ export function useNzbd(config: ConnectionConfig): HookResult {
     queueAction: (action) => mutate(`queue:${action}`, () => client.queueAction(action)),
     jobAction: (id, action) =>
       mutate(`job:${id}:${action}`, () => client.jobAction(id, action)),
+    setJobPriority: (id, priority) =>
+      mutate(`job:${id}:priority`, () => client.setJobPriority(id, priority)),
     addNzb: (file, options) => mutate('add', () => client.addNzb(file, options)),
   };
 }

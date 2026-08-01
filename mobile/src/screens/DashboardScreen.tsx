@@ -39,6 +39,7 @@ import { ActionButton } from '../components/ActionButton';
 import { ThemeSwitcher } from '../components/ThemeSwitcher';
 import { useNzbd } from '../hooks/useNzbd';
 import { QueueSectionKey, sectionQueueJobs } from '../queueSections';
+import { DOWNLOAD_PRIORITIES, downloadPriorityLabel } from '../priority';
 import { Theme, useTheme } from '../theme';
 import { HistoryView } from './HistoryView';
 import { LogsView } from './LogsView';
@@ -68,6 +69,7 @@ export function DashboardScreen({ config, onEditConnection }: Props) {
     refresh,
     queueAction,
     jobAction,
+    setJobPriority,
     addNzb,
   } = useNzbd(config);
 
@@ -105,6 +107,16 @@ export function DashboardScreen({ config, onEditConnection }: Props) {
         { text: 'Remove', style: 'destructive', onPress: () => void mutateJob(job, 'delete') },
       ],
     );
+  };
+
+  const mutatePriority = async (job: JobSummary, priority: number) => {
+    if (priority === job.priority) return;
+    try {
+      await setJobPriority(job.id, priority);
+      setNotice(`${job.name} is now ${downloadPriorityLabel(priority).toLowerCase()} priority.`);
+    } catch {
+      // The hook owns the visible error banner.
+    }
   };
 
   const toggleQueue = async () => {
@@ -272,6 +284,7 @@ export function DashboardScreen({ config, onEditConnection }: Props) {
                               movable={definition.ordered}
                               onAction={(action) => void mutateJob(job, action)}
                               onDelete={() => confirmDelete(job)}
+                              onPriorityChange={(priority) => void mutatePriority(job, priority)}
                               onToggle={() => setExpanded(expanded === job.id ? null : job.id)}
                               sectionKey={definition.key}
                               sectionLabel={definition.label}
@@ -485,6 +498,7 @@ function JobCard({
   onToggle,
   onAction,
   onDelete,
+  onPriorityChange,
   movable,
   sectionKey,
   sectionLabel,
@@ -501,6 +515,7 @@ function JobCard({
     action: 'pause' | 'resume' | 'move-top' | 'move-up' | 'move-down' | 'move-bottom',
   ) => void;
   onDelete: () => void;
+  onPriorityChange: (priority: number) => void;
   movable: boolean;
   sectionKey: QueueSectionKey;
   sectionLabel: string;
@@ -568,8 +583,26 @@ function JobCard({
           <View style={styles.jobFacts}>
             <Fact label="Health" styles={styles} value={`${(job.health / 10).toFixed(1)}%`} />
             <Fact label="Files" styles={styles} value={`${job.files_done}/${job.files_total}`} />
-            <Fact label="Priority" styles={styles} value={String(job.priority)} />
+            <Fact label="Priority" styles={styles} value={downloadPriorityLabel(job.priority)} />
             <Fact label="Category" styles={styles} value={job.category || '—'} />
+          </View>
+          <View style={styles.jobPriorityEditor}>
+            <Text style={styles.inputLabel}>Download priority</Text>
+            <View style={styles.priorityRow}>
+              {DOWNLOAD_PRIORITIES.map(({ value, label }) => (
+                <PriorityChip
+                  busy={busy}
+                  key={value}
+                  label={label}
+                  onPress={() => onPriorityChange(value)}
+                  selected={job.priority === value}
+                  styles={styles}
+                />
+              ))}
+            </View>
+            {job.priority >= 900 ? (
+              <Text style={styles.priorityHint}>Force can download through queue pauses and quota holds.</Text>
+            ) : null}
           </View>
           <View style={styles.actionRow}>
             {canPause ? (
@@ -844,31 +877,20 @@ function AddNzbModal({
 
           <Text style={styles.inputLabel}>Priority</Text>
           <View style={styles.priorityRow}>
-            {[
-              [-100, 'Low'],
-              [0, 'Normal'],
-              [100, 'High'],
-              [900, 'Force'],
-            ].map(([value, label]) => (
-              <Pressable
-                accessibilityRole="button"
-                accessibilityState={{ selected: priority === value }}
-                disabled={busy}
+            {DOWNLOAD_PRIORITIES.map(({ value, label }) => (
+              <PriorityChip
+                busy={busy}
                 key={value}
-                onPress={() => setPriority(value as number)}
-                style={[styles.priorityChip, priority === value && styles.priorityChipSelected]}
-              >
-                <Text
-                  style={[
-                    styles.priorityChipText,
-                    priority === value && styles.priorityChipTextSelected,
-                  ]}
-                >
-                  {label}
-                </Text>
-              </Pressable>
+                label={label}
+                onPress={() => setPriority(value)}
+                selected={priority === value}
+                styles={styles}
+              />
             ))}
           </View>
+          {priority >= 900 ? (
+            <Text style={styles.priorityHint}>Force can download through queue pauses and quota holds.</Text>
+          ) : null}
 
           <View style={styles.switchRow}>
             <View style={styles.switchText}>
@@ -900,6 +922,34 @@ function AddNzbModal({
         </SafeAreaView>
       </View>
     </Modal>
+  );
+}
+
+function PriorityChip({
+  busy,
+  label,
+  onPress,
+  selected,
+  styles,
+}: {
+  busy: boolean;
+  label: string;
+  onPress: () => void;
+  selected: boolean;
+  styles: ReturnType<typeof makeStyles>;
+}) {
+  return (
+    <Pressable
+      accessibilityRole="button"
+      accessibilityState={{ selected }}
+      disabled={busy}
+      onPress={onPress}
+      style={[styles.priorityChip, selected && styles.priorityChipSelected]}
+    >
+      <Text style={[styles.priorityChipText, selected && styles.priorityChipTextSelected]}>
+        {label}
+      </Text>
+    </Pressable>
   );
 }
 
@@ -1277,9 +1327,11 @@ const makeStyles = (theme: Theme) =>
       color: theme.text,
       fontSize: 15,
     },
-    priorityRow: { flexDirection: 'row', gap: 6 },
+    jobPriorityEditor: { gap: 8 },
+    priorityRow: { flexDirection: 'row', flexWrap: 'wrap', gap: 6 },
     priorityChip: {
-      flex: 1,
+      flexGrow: 1,
+      flexBasis: '30%',
       minHeight: 39,
       paddingHorizontal: 6,
       borderRadius: 9,
@@ -1291,6 +1343,7 @@ const makeStyles = (theme: Theme) =>
     priorityChipSelected: { backgroundColor: theme.accent, borderColor: theme.accent },
     priorityChipText: { color: theme.text, fontSize: 11, fontWeight: '700' },
     priorityChipTextSelected: { color: '#FFFFFF' },
+    priorityHint: { color: theme.textMuted, fontSize: 11, lineHeight: 16 },
     switchRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: 14 },
     switchText: { flex: 1 },
     switchTitle: { color: theme.text, fontSize: 14, fontWeight: '700' },
