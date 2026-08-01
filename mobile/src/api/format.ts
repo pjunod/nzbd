@@ -27,6 +27,7 @@ export function formatDuration(seconds: number): string {
 export interface StorageUsage {
   availableBytes: number;
   totalBytes: number;
+  usedBytes: number;
   usedPercent: number;
 }
 
@@ -42,10 +43,12 @@ export function storageUsage(storage: StoragePath): StorageUsage | null {
   }
   const totalBytes = storage.total_bytes;
   const availableBytes = Math.max(0, Math.min(totalBytes, storage.available_bytes));
+  const usedBytes = totalBytes - availableBytes;
   return {
     availableBytes,
     totalBytes,
-    usedPercent: ((totalBytes - availableBytes) * 100) / totalBytes,
+    usedBytes,
+    usedPercent: (usedBytes * 100) / totalBytes,
   };
 }
 

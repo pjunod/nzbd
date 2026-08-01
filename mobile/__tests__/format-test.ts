@@ -102,6 +102,7 @@ describe('API presentation helpers', () => {
     expect(critical && storageUsage(critical)).toEqual({
       availableBytes: 5,
       totalBytes: 100,
+      usedBytes: 95,
       usedPercent: 95,
     });
   });

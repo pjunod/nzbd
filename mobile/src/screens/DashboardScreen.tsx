@@ -32,6 +32,7 @@ import {
   ConnectionConfig,
   ConnectionState,
   JobSummary,
+  StoragePath,
   StatusDto,
 } from '../api/types';
 import { ActionButton } from '../components/ActionButton';
@@ -205,7 +206,7 @@ export function DashboardScreen({ config, onEditConnection }: Props) {
 
       {activeSection === 'queue' && status ? (
         <View style={styles.overviewDock}>
-          <Overview status={status} styles={styles} />
+          <Overview status={status} styles={styles} wide={wide} />
         </View>
       ) : null}
 
@@ -294,90 +295,156 @@ export function DashboardScreen({ config, onEditConnection }: Props) {
 function Overview({
   status,
   styles,
+  wide,
 }: {
   status: StatusDto;
   styles: ReturnType<typeof makeStyles>;
+  wide: boolean;
 }) {
   const eta = status.download_paused
     ? 'paused'
     : status.download_rate_bps > 0
       ? formatDuration(status.remaining_bytes / status.download_rate_bps)
       : '—';
-  const storage = criticalStorage(status.storage ?? []);
-  const usage = storage ? storageUsage(storage) : null;
-  const storageTone = usage
+  const volumes = status.storage ?? [];
+  const critical = criticalStorage(volumes);
+  const criticalUsage = critical ? storageUsage(critical) : null;
+  return (
+    <View style={styles.overviewBlocks}>
+      <View style={styles.queueSummaryBlock}>
+        <Text style={styles.overviewBlockTitle}>Queue</Text>
+        <View style={[styles.queueSummaryGrid, wide && styles.queueSummaryGridWide]}>
+          <SummaryMetric
+            label="Speed"
+            styles={styles}
+            value={formatBytes(status.download_rate_bps, '/s')}
+            wide={wide}
+          />
+          <SummaryMetric
+            label="Remaining"
+            styles={styles}
+            value={formatBytes(status.remaining_bytes)}
+            wide={wide}
+          />
+          <SummaryMetric label="Time left" styles={styles} value={eta} wide={wide} />
+          <SummaryMetric
+            label="Active / queued"
+            styles={styles}
+            value={`${status.jobs_downloading} / ${status.jobs_queued}`}
+            wide={wide}
+          />
+        </View>
+      </View>
+
+      <View style={styles.storageBlock}>
+        <View style={styles.storageBlockHeading}>
+          <Text style={styles.overviewBlockTitle}>Storage volumes</Text>
+          <Text numberOfLines={1} style={styles.storageCritical}>
+            {criticalUsage && critical ? `critical: ${critical.label}` : 'measuring volumes…'}
+          </Text>
+        </View>
+        {volumes.length > 0 ? (
+          <View style={styles.storageList}>
+            {volumes.map((volume, index) => (
+              <StorageVolume
+                critical={criticalUsage !== null && volume === critical}
+                key={`${volume.path}:${index}`}
+                storage={volume}
+                styles={styles}
+              />
+            ))}
+          </View>
+        ) : (
+          <Text style={styles.storageEmpty}>Waiting for filesystem capacity readings.</Text>
+        )}
+      </View>
+    </View>
+  );
+}
+
+function SummaryMetric({
+  label,
+  value,
+  styles,
+  wide,
+}: {
+  label: string;
+  value: string;
+  styles: ReturnType<typeof makeStyles>;
+  wide: boolean;
+}) {
+  return (
+    <View style={[styles.summaryMetric, wide && styles.summaryMetricWide]}>
+      <Text style={styles.summaryMetricLabel}>{label}</Text>
+      <Text adjustsFontSizeToFit numberOfLines={1} style={styles.summaryMetricValue}>
+        {value}
+      </Text>
+    </View>
+  );
+}
+
+function StorageVolume({
+  storage,
+  critical,
+  styles,
+}: {
+  storage: StoragePath;
+  critical: boolean;
+  styles: ReturnType<typeof makeStyles>;
+}) {
+  const usage = storageUsage(storage);
+  const tone = usage
     ? usage.usedPercent >= 95
       ? 'danger'
       : usage.usedPercent >= 85
         ? 'warning'
         : undefined
     : undefined;
-  return (
-    <View style={styles.metrics}>
-      <Metric
-        label="Speed"
-        styles={styles}
-        value={formatBytes(status.download_rate_bps, '/s')}
-      />
-      <Metric label="Remaining" styles={styles} value={formatBytes(status.remaining_bytes)} />
-      <Metric label="Time left" styles={styles} value={eta} />
-      <Metric
-        label="Active / queued"
-        styles={styles}
-        value={`${status.jobs_downloading} / ${status.jobs_queued}`}
-      />
-      <Metric
-        detail={
-          storage
-            ? usage
-              ? `${Math.round(usage.usedPercent)}% used · ${storage.label}`
-              : `${storage.label} · measuring capacity`
-            : 'measuring critical path'
-        }
-        label="Storage"
-        storage
-        styles={styles}
-        tone={storageTone}
-        value={usage ? `${formatBytes(usage.availableBytes)} free` : 'measuring…'}
-      />
-    </View>
-  );
-}
+  const percent = usage ? Math.round(usage.usedPercent) : null;
+  const fillWidth = `${usage?.usedPercent ?? 0}%` as `${number}%`;
+  const capacity = usage
+    ? `${formatBytes(usage.usedBytes)} used / ${formatBytes(usage.totalBytes)} total`
+    : 'capacity unavailable';
 
-function Metric({
-  label,
-  value,
-  detail,
-  storage = false,
-  tone,
-  styles,
-}: {
-  label: string;
-  value: string;
-  detail?: string;
-  storage?: boolean;
-  tone?: 'warning' | 'danger';
-  styles: ReturnType<typeof makeStyles>;
-}) {
   return (
-    <View style={[styles.metric, storage && styles.storageMetric]}>
-      <Text style={styles.metricLabel}>{label}</Text>
-      <Text
-        adjustsFontSizeToFit
-        numberOfLines={1}
-        style={[
-          styles.metricValue,
-          tone === 'warning' && styles.metricValueWarning,
-          tone === 'danger' && styles.metricValueDanger,
-        ]}
-      >
-        {value}
-      </Text>
-      {detail ? (
-        <Text numberOfLines={1} style={styles.metricDetail}>
-          {detail}
+    <View
+      accessibilityLabel={`${storage.label}, ${storage.path}, ${percent === null ? 'capacity unavailable' : `${percent} percent used, ${capacity}`}`}
+      style={[styles.storageRow, critical && styles.storageRowCritical]}
+    >
+      <View style={styles.storageTop}>
+        <Text numberOfLines={1} style={styles.storageLabel}>
+          {storage.label || 'volume'}
         </Text>
-      ) : null}
+        <Text
+          style={[
+            styles.storagePercent,
+            tone === 'warning' && styles.storageTextWarning,
+            tone === 'danger' && styles.storageTextDanger,
+          ]}
+        >
+          {percent === null ? 'measuring…' : `${percent}%`}
+        </Text>
+      </View>
+      <Text numberOfLines={1} style={styles.storagePath}>
+        {storage.path || '—'}
+      </Text>
+      <View
+        accessibilityRole="progressbar"
+        accessibilityValue={percent === null ? undefined : { min: 0, max: 100, now: percent }}
+        style={styles.storageTrack}
+      >
+        <View
+          style={[
+            styles.storageFill,
+            { width: fillWidth },
+            tone === 'warning' && styles.storageFillWarning,
+            tone === 'danger' && styles.storageFillDanger,
+          ]}
+        />
+      </View>
+      <Text numberOfLines={1} style={styles.storageCapacity}>
+        {capacity}
+      </Text>
     </View>
   );
 }
@@ -833,45 +900,131 @@ const makeStyles = (theme: Theme) =>
     dashboardWide: { flexDirection: 'row', alignItems: 'flex-start', gap: 20 },
     queueColumn: { flex: 1, minWidth: 0 },
     sidebar: { width: 278, gap: 14 },
-    metrics: {
+    overviewBlocks: {
       width: '100%',
       maxWidth: 1300,
       alignSelf: 'center',
       flexDirection: 'row',
-      flexWrap: 'wrap',
-      gap: 5,
+      alignItems: 'stretch',
+      gap: 6,
     },
-    metric: {
-      minWidth: 54,
+    queueSummaryBlock: {
+      minWidth: 112,
+      flex: 0.72,
+      padding: 6,
+      borderRadius: 10,
+      borderWidth: 1,
+      borderColor: theme.border,
+      backgroundColor: theme.panel,
+    },
+    overviewBlockTitle: {
+      color: theme.text,
+      fontSize: 9,
+      fontWeight: '900',
+      letterSpacing: 0.7,
+      textTransform: 'uppercase',
+    },
+    queueSummaryGrid: {
+      flex: 1,
+      marginTop: 4,
+      flexDirection: 'row',
+      flexWrap: 'wrap',
+      alignContent: 'stretch',
+      gap: 4,
+    },
+    queueSummaryGridWide: { flex: 0, alignContent: 'flex-start' },
+    summaryMetric: {
+      minWidth: 46,
+      flexBasis: '45%',
       flexGrow: 1,
-      flexBasis: 54,
-      minHeight: 51,
-      paddingHorizontal: 8,
+      paddingHorizontal: 5,
+      paddingVertical: 4,
+      borderRadius: 6,
+      backgroundColor: theme.panelAlt,
+      justifyContent: 'center',
+    },
+    summaryMetricWide: { flexBasis: 46 },
+    summaryMetricLabel: {
+      color: theme.textMuted,
+      fontSize: 7,
+      fontWeight: '800',
+      letterSpacing: 0.35,
+      textTransform: 'uppercase',
+    },
+    summaryMetricValue: {
+      color: theme.text,
+      marginTop: 1,
+      fontSize: 13,
+      fontWeight: '800',
+      letterSpacing: -0.2,
+      fontVariant: ['tabular-nums'],
+    },
+    storageBlock: {
+      minWidth: 0,
+      flex: 1.28,
+      paddingHorizontal: 7,
       paddingVertical: 6,
       borderRadius: 10,
       borderWidth: 1,
       borderColor: theme.border,
       backgroundColor: theme.panel,
-      justifyContent: 'space-between',
     },
-    storageMetric: { minWidth: 90, flexBasis: 90 },
-    metricLabel: {
-      color: theme.textMuted,
+    storageBlockHeading: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      justifyContent: 'space-between',
+      gap: 6,
+      marginBottom: 4,
+    },
+    storageCritical: { color: theme.textMuted, fontSize: 7, flexShrink: 1 },
+    storageList: { flexDirection: 'row', flexWrap: 'wrap', gap: 5 },
+    storageRow: {
+      minWidth: 150,
+      flexBasis: 170,
+      flexGrow: 1,
+      paddingHorizontal: 6,
+      paddingVertical: 4,
+      borderRadius: 7,
+      borderWidth: 1,
+      borderColor: 'transparent',
+      backgroundColor: theme.panelAlt,
+    },
+    storageRowCritical: { borderColor: theme.accent },
+    storageTop: { flexDirection: 'row', alignItems: 'center', gap: 5 },
+    storageLabel: {
+      color: theme.text,
       fontSize: 8,
       fontWeight: '800',
-      letterSpacing: 0.5,
       textTransform: 'uppercase',
+      flex: 1,
     },
-    metricValue: {
-      color: theme.text,
-      fontSize: 16,
-      fontWeight: '800',
-      letterSpacing: -0.3,
+    storagePercent: {
+      color: theme.accent,
+      fontSize: 9,
+      fontWeight: '900',
       fontVariant: ['tabular-nums'],
     },
-    metricValueWarning: { color: theme.warning },
-    metricValueDanger: { color: theme.danger },
-    metricDetail: { color: theme.textMuted, fontSize: 8, lineHeight: 10 },
+    storageTextWarning: { color: theme.warning },
+    storageTextDanger: { color: theme.danger },
+    storagePath: { color: theme.textMuted, fontSize: 7, marginTop: 1 },
+    storageTrack: {
+      height: 4,
+      marginTop: 3,
+      overflow: 'hidden',
+      borderRadius: 99,
+      backgroundColor: theme.border,
+    },
+    storageFill: { height: '100%', borderRadius: 99, backgroundColor: theme.accent },
+    storageFillWarning: { backgroundColor: theme.warning },
+    storageFillDanger: { backgroundColor: theme.danger },
+    storageCapacity: {
+      color: theme.textMuted,
+      fontSize: 8,
+      lineHeight: 10,
+      marginTop: 2,
+      fontVariant: ['tabular-nums'],
+    },
+    storageEmpty: { color: theme.textMuted, fontSize: 9, lineHeight: 12 },
     sectionHeading: {
       flexDirection: 'row',
       alignItems: 'flex-end',
