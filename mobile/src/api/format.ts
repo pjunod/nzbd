@@ -1,0 +1,91 @@
+import { JobStatus, JobSummary } from './types';
+
+const UNITS = ['B', 'KiB', 'MiB', 'GiB', 'TiB'];
+export const DEFAULT_NZBD_PORT = 6789;
+
+export function formatBytes(value: number, suffix = ''): string {
+  if (!Number.isFinite(value) || value <= 0) return `0 B${suffix}`;
+  let amount = value;
+  let unit = 0;
+  while (amount >= 1024 && unit < UNITS.length - 1) {
+    amount /= 1024;
+    unit += 1;
+  }
+  const digits = amount >= 100 || unit === 0 ? 0 : amount >= 10 ? 1 : 2;
+  return `${amount.toFixed(digits)} ${UNITS[unit]}${suffix}`;
+}
+
+export function formatDuration(seconds: number): string {
+  if (!Number.isFinite(seconds) || seconds < 0) return '—';
+  if (seconds < 60) return `${Math.ceil(seconds)}s`;
+  if (seconds < 3600) return `${Math.ceil(seconds / 60)}m`;
+  const hours = Math.floor(seconds / 3600);
+  const minutes = Math.ceil((seconds % 3600) / 60);
+  return minutes > 0 ? `${hours}h ${minutes}m` : `${hours}h`;
+}
+
+export function jobProgress(job: JobSummary): number {
+  if (job.size_bytes > 0) {
+    return Math.max(0, Math.min(1, job.downloaded_bytes / job.size_bytes));
+  }
+  if (job.total_articles > 0) {
+    return Math.max(0, Math.min(1, job.done_articles / job.total_articles));
+  }
+  return 0;
+}
+
+export function jobStatusKey(status: JobStatus): string {
+  if (typeof status === 'string') return status;
+  return status.post?.stage ? `post:${status.post.stage}` : 'post';
+}
+
+export function jobStatusLabel(status: JobStatus): string {
+  const key = jobStatusKey(status);
+  if (key.startsWith('post:')) {
+    return key.slice(5).replaceAll('_', ' ');
+  }
+  return key.replaceAll('_', ' ');
+}
+
+export function isJobPaused(status: JobStatus): boolean {
+  return jobStatusKey(status) === 'paused';
+}
+
+export function normalizeServerUrl(input: string): string {
+  const trimmed = input.trim();
+  if (!trimmed) throw new Error('Enter the address of your nzbd server.');
+  const withScheme = /^https?:\/\//i.test(trimmed) ? trimmed : `http://${trimmed}`;
+  let parsed: URL;
+  try {
+    parsed = new URL(withScheme);
+  } catch {
+    throw new Error('Use an address like http://192.168.1.20:6789.');
+  }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    throw new Error('The server address must use http:// or https://.');
+  }
+  if (parsed.username || parsed.password) {
+    throw new Error('Put credentials in the fields below, not in the URL.');
+  }
+  if (parsed.pathname !== '/' || parsed.search || parsed.hash) {
+    throw new Error('Use the nzbd server origin without a path or query.');
+  }
+  if (!hasExplicitPort(withScheme)) {
+    parsed.port = String(DEFAULT_NZBD_PORT);
+  }
+  return parsed.origin;
+}
+
+function hasExplicitPort(url: string): boolean {
+  const authority = url.replace(/^https?:\/\//i, '').split(/[/?#]/, 1)[0];
+  if (authority.startsWith('[')) {
+    return /^\[[^\]]+\]:\d+$/.test(authority);
+  }
+  return /:\d+$/.test(authority);
+}
+
+export function jobEta(job: JobSummary): string {
+  if (isJobPaused(job.status)) return 'paused';
+  if (job.rate_bps <= 0 || job.remaining_bytes <= 0) return '—';
+  return formatDuration(job.remaining_bytes / job.rate_bps);
+}
