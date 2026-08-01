@@ -348,12 +348,12 @@ pub(crate) enum EngineMsg {
     OutOfSpace {
         whence: String,
     },
-    /// A completed par2 file told us what this job really is. Cosmetic and
-    /// best-effort: dropped freely under load, and ignored if the job has
-    /// meanwhile acquired a real name by any other route.
-    LearnedJobName {
+    /// A completed file has finished its background par2-name inspection.
+    /// `None` matters: terminal completion waits for every inspection that
+    /// was already started, so it needs an explicit negative result too.
+    JobNameInspected {
         job: JobId,
-        name: String,
+        name: Option<String>,
     },
 }
 
@@ -368,6 +368,11 @@ pub(crate) struct Owner {
     writers: HashMap<FileId, WriterHandle>,
     finalize_sent: HashSet<FileId>,
     pending_finalize: Vec<(JobId, FileId)>,
+    /// Background par2-name inspections already started for each job.
+    /// A terminal event must not overtake them: history and post-processing
+    /// consume that event immediately and would otherwise preserve the
+    /// requestor placeholder even when the par2 answer was milliseconds away.
+    pending_name_inspections: HashMap<JobId, u32>,
     file_sizes: HashMap<FileId, u64>,
     /// Jobs whose bytes did not survive the trip to disk, and why.
     ///
@@ -571,6 +576,7 @@ impl Owner {
             writers: HashMap::new(),
             finalize_sent: HashSet::new(),
             pending_finalize: Vec::new(),
+            pending_name_inspections: HashMap::new(),
             file_sizes,
             write_failures: HashMap::new(),
             delegated: HashMap::new(),
@@ -772,7 +778,7 @@ impl Owner {
                 final_path,
                 combined_crc,
             } => self.on_writer_finalized(job, file, ok, final_path, combined_crc),
-            EngineMsg::LearnedJobName { job, name } => self.adopt_learned_name(job, name),
+            EngineMsg::JobNameInspected { job, name } => self.on_job_name_inspected(job, name),
             EngineMsg::OutOfSpace { whence } => self.observe_out_of_space(&whence),
             EngineMsg::WriterError { job, file, error } => {
                 tracing::warn!(job = job.0, file = file.0, %error, "writer error; failing file");
@@ -1881,15 +1887,32 @@ impl Owner {
         if !crate::queue::name_is_open(j) {
             return; // already named by something real
         }
+        *self.pending_name_inspections.entry(job).or_default() += 1;
         let tx = self.engine_tx.clone();
         self.tracker.spawn_blocking(move || {
-            let Some(name) = read_par2_name(&path) else {
-                return;
-            };
-            // Best effort: a full channel means the owner is busy, and a
-            // cosmetic rename is not worth blocking a writer thread for.
-            let _ = tx.try_send(EngineMsg::LearnedJobName { job, name });
+            let name = read_par2_name(&path);
+            // This runs on the blocking pool, so waiting for channel room
+            // cannot stall the queue owner. Every inspection must answer,
+            // including a negative one, or completion could wait forever.
+            let _ = tx.blocking_send(EngineMsg::JobNameInspected { job, name });
         });
+    }
+
+    fn on_job_name_inspected(&mut self, job: JobId, name: Option<String>) {
+        match self.pending_name_inspections.get_mut(&job) {
+            Some(pending) if *pending > 1 => *pending -= 1,
+            Some(_) => {
+                self.pending_name_inspections.remove(&job);
+            }
+            None => {}
+        }
+        if let Some(name) = name {
+            self.adopt_learned_name(job, name);
+        }
+        // The last writer may already have finalized while this blocking
+        // read was in flight. Re-evaluate now that it can no longer be
+        // overtaken by the terminal event.
+        self.check_job_complete(job);
     }
 
     /// Fall back to naming a job by who asked for it, when its own
@@ -1946,6 +1969,13 @@ impl Owner {
     fn check_job_complete(&mut self, job_id: JobId) {
         if self.delegated.contains_key(&job_id) {
             return; // completes via the executor's report, not locally
+        }
+        if self
+            .pending_name_inspections
+            .get(&job_id)
+            .is_some_and(|pending| *pending > 0)
+        {
+            return; // a par2 answer already in flight gets the final word
         }
         let Some(job) = self.state.job_mut(job_id) else {
             return;
