@@ -1,4 +1,19 @@
+import {
+  createContext,
+  createElement,
+  useCallback,
+  useContext,
+  useEffect,
+  useMemo,
+  useState,
+} from 'react';
+import type { PropsWithChildren } from 'react';
 import { useColorScheme } from 'react-native';
+import type { ColorSchemeName } from 'react-native';
+
+import { loadThemePreference, saveThemePreference } from './storage/themePreference';
+
+export type ThemePreference = 'system' | 'light' | 'dark';
 
 export interface Theme {
   dark: boolean;
@@ -51,6 +66,60 @@ const dark: Theme = {
   overlay: 'rgba(0, 0, 0, 0.68)',
 };
 
+interface ThemeContextValue {
+  theme: Theme;
+  preference: ThemePreference;
+  setPreference: (preference: ThemePreference) => void;
+}
+
+const ThemeContext = createContext<ThemeContextValue | null>(null);
+
+export function ThemeProvider({ children }: PropsWithChildren) {
+  const systemScheme = useColorScheme();
+  const [preference, setPreferenceState] = useState<ThemePreference>('system');
+
+  useEffect(() => {
+    let active = true;
+    void loadThemePreference().then((stored) => {
+      if (active && stored) setPreferenceState(stored);
+    });
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  const setPreference = useCallback((next: ThemePreference) => {
+    setPreferenceState(next);
+    void saveThemePreference(next).catch(() => undefined);
+  }, []);
+  const value = useMemo(
+    () => ({ theme: resolveTheme(preference, systemScheme), preference, setPreference }),
+    [preference, setPreference, systemScheme],
+  );
+
+  return createElement(ThemeContext.Provider, { value }, children);
+}
+
+export function resolveTheme(
+  preference: ThemePreference,
+  systemScheme: ColorSchemeName | null | undefined,
+): Theme {
+  if (preference === 'light') return light;
+  if (preference === 'dark') return dark;
+  return systemScheme === 'light' ? light : dark;
+}
+
 export function useTheme(): Theme {
-  return useColorScheme() === 'dark' ? dark : light;
+  return useThemeContext().theme;
+}
+
+export function useThemePreference(): Pick<ThemeContextValue, 'preference' | 'setPreference'> {
+  const { preference, setPreference } = useThemeContext();
+  return { preference, setPreference };
+}
+
+function useThemeContext(): ThemeContextValue {
+  const context = useContext(ThemeContext);
+  if (!context) throw new Error('Theme hooks must be used inside ThemeProvider.');
+  return context;
 }

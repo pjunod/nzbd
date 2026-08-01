@@ -18,6 +18,11 @@ export interface DiscoveredNzbd {
   version?: string;
 }
 
+export function isNzbdServiceType(type: string): boolean {
+  const normalized = type.trim().toLowerCase().replace(/\.local\.$/, '.');
+  return normalized === 'nzbd' || normalized === '_nzbd._tcp' || normalized === '_nzbd._tcp.';
+}
+
 export function serviceKey(service: Pick<NetworkService, 'name' | 'type' | 'domain'>): string {
   return `${service.name}|${service.type}|${service.domain}`;
 }

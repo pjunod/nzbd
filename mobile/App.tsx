@@ -11,12 +11,14 @@ import {
   loadConnection,
   saveConnection,
 } from './src/storage/connection';
-import { useTheme } from './src/theme';
+import { ThemeProvider, useTheme } from './src/theme';
 
 export default function App() {
   return (
     <SafeAreaProvider>
-      <AppContent />
+      <ThemeProvider>
+        <AppContent />
+      </ThemeProvider>
     </SafeAreaProvider>
   );
 }

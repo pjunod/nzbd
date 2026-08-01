@@ -17,6 +17,7 @@ import { NzbdClient } from '../api/client';
 import { normalizeServerUrl } from '../api/format';
 import { ConnectionConfig } from '../api/types';
 import { ActionButton } from '../components/ActionButton';
+import { ThemeSwitcher } from '../components/ThemeSwitcher';
 import { DiscoveredNzbd } from '../discovery/nzbdService';
 import { useNzbdDiscovery } from '../discovery/useNzbdDiscovery';
 import { Theme, useTheme } from '../theme';
@@ -36,7 +37,7 @@ export function ConnectionScreen({ initial, onConnect, onCancel, onForget }: Pro
   const [username, setUsername] = useState(initial?.username ?? '');
   const [password, setPassword] = useState(initial?.password ?? '');
   const [token, setToken] = useState(initial?.token ?? '');
-  const [busy, setBusy] = useState(false);
+  const [busy, setBusy] = useState<'test' | 'connect' | null>(null);
   const [showPassword, setShowPassword] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
   const [messageKind, setMessageKind] = useState<'ok' | 'error'>('ok');
@@ -52,16 +53,34 @@ export function ConnectionScreen({ initial, onConnect, onCancel, onForget }: Pro
     );
   };
 
-  const submit = async () => {
-    setBusy(true);
+  const configFromFields = (): ConnectionConfig => ({
+    baseUrl: normalizeServerUrl(baseUrl),
+    username: username.trim(),
+    password,
+    token: token.trim(),
+  });
+
+  const testConnection = async () => {
+    setBusy('test');
     setMessage(null);
     try {
-      const config: ConnectionConfig = {
-        baseUrl: normalizeServerUrl(baseUrl),
-        username: username.trim(),
-        password,
-        token: token.trim(),
-      };
+      const config = configFromFields();
+      const status = await new NzbdClient(config).getStatus();
+      setMessageKind('ok');
+      setMessage(`Connection works — nzbd ${status.version} answered at ${config.baseUrl}.`);
+    } catch (cause) {
+      setMessageKind('error');
+      setMessage(cause instanceof Error ? cause.message : 'Could not connect to nzbd.');
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const submit = async () => {
+    setBusy('connect');
+    setMessage(null);
+    try {
+      const config = configFromFields();
       const status = await new NzbdClient(config).getStatus();
       await onConnect(config);
       setMessageKind('ok');
@@ -70,7 +89,7 @@ export function ConnectionScreen({ initial, onConnect, onCancel, onForget }: Pro
       setMessageKind('error');
       setMessage(cause instanceof Error ? cause.message : 'Could not connect to nzbd.');
     } finally {
-      setBusy(false);
+      setBusy(null);
     }
   };
 
@@ -85,8 +104,11 @@ export function ConnectionScreen({ initial, onConnect, onCancel, onForget }: Pro
           keyboardShouldPersistTaps="handled"
         >
           <View style={[styles.card, width >= 700 && styles.cardWide]}>
-            <View style={styles.brandMark}>
-              <Text style={styles.brandMarkText}>n</Text>
+            <View style={styles.cardTopline}>
+              <View style={styles.brandMark}>
+                <Text style={styles.brandMarkText}>n</Text>
+              </View>
+              <ThemeSwitcher />
             </View>
             <Text style={styles.title}>{initial ? 'Server settings' : 'Connect to nzbd'}</Text>
             <Text style={styles.subtitle}>
@@ -140,7 +162,9 @@ export function ConnectionScreen({ initial, onConnect, onCancel, onForget }: Pro
                   ) : null}
                   <Text style={[styles.discoveryEmptyText, nearby.error && styles.discoveryError]}>
                     {nearby.error ??
-                      'Scanning this Wi-Fi network. You can still enter an address manually.'}
+                      (nearby.noResults
+                        ? 'No server found yet. Check Local Network permission and Wi-Fi. Docker installs need the host-network discovery companion.'
+                        : 'Scanning this Wi-Fi network. You can still enter an address manually.')}
                   </Text>
                 </View>
               ) : null}
@@ -221,12 +245,23 @@ export function ConnectionScreen({ initial, onConnect, onCancel, onForget }: Pro
               </View>
             ) : null}
 
-            <ActionButton
-              label="Connect"
-              loading={busy}
-              onPress={() => void submit()}
-              variant="primary"
-            />
+            <View style={styles.connectActions}>
+              <ActionButton
+                disabled={busy !== null}
+                label="Test connection"
+                loading={busy === 'test'}
+                onPress={() => void testConnection()}
+                style={styles.connectAction}
+              />
+              <ActionButton
+                disabled={busy !== null}
+                label="Connect"
+                loading={busy === 'connect'}
+                onPress={() => void submit()}
+                style={styles.connectAction}
+                variant="primary"
+              />
+            </View>
             {onCancel ? (
               <ActionButton label="Cancel" onPress={onCancel} variant="ghost" />
             ) : null}
@@ -241,7 +276,9 @@ export function ConnectionScreen({ initial, onConnect, onCancel, onForget }: Pro
             {busy ? (
               <View style={styles.testing}>
                 <ActivityIndicator color={theme.accent} size="small" />
-                <Text style={styles.testingText}>Testing the native API…</Text>
+                <Text style={styles.testingText}>
+                  {busy === 'connect' ? 'Testing and saving…' : 'Testing the native API…'}
+                </Text>
               </View>
             ) : null}
             <Text style={styles.securityNote}>
@@ -271,6 +308,12 @@ const makeStyles = (theme: Theme) =>
       gap: 12,
     },
     cardWide: { padding: 30 },
+    cardTopline: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      justifyContent: 'space-between',
+      gap: 12,
+    },
     brandMark: {
       width: 46,
       height: 46,
@@ -356,6 +399,8 @@ const makeStyles = (theme: Theme) =>
     messageError: { backgroundColor: theme.dangerSoft },
     messageText: { color: theme.accent, fontSize: 13, lineHeight: 18 },
     messageErrorText: { color: theme.danger },
+    connectActions: { flexDirection: 'row', gap: 9 },
+    connectAction: { flex: 1 },
     testing: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 8 },
     testingText: { color: theme.textMuted, fontSize: 12 },
     securityNote: { color: theme.textMuted, fontSize: 11, lineHeight: 16, marginTop: 2 },

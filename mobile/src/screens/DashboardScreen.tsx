@@ -33,6 +33,7 @@ import {
   StatusDto,
 } from '../api/types';
 import { ActionButton } from '../components/ActionButton';
+import { ThemeSwitcher } from '../components/ThemeSwitcher';
 import { useNzbd } from '../hooks/useNzbd';
 import { Theme, useTheme } from '../theme';
 import { HistoryView } from './HistoryView';
@@ -141,6 +142,7 @@ export function DashboardScreen({ config, onEditConnection }: Props) {
           </View>
         </View>
         <View style={styles.headerActions}>
+          <ThemeSwitcher compact />
           {activeSection === 'queue' ? (
             <ActionButton
               compact

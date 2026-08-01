@@ -1,13 +1,19 @@
 import * as ServiceDiscovery from '@inthepocket/react-native-service-discovery';
 import { useCallback, useEffect, useState } from 'react';
 
-import { DiscoveredNzbd, serviceKey, toDiscoveredNzbd } from './nzbdService';
+import {
+  DiscoveredNzbd,
+  isNzbdServiceType,
+  serviceKey,
+  toDiscoveredNzbd,
+} from './nzbdService';
 
 const SERVICE_TYPE = 'nzbd';
 
 export interface NzbdDiscoveryState {
   services: DiscoveredNzbd[];
   scanning: boolean;
+  noResults: boolean;
   error: string | null;
   scanAgain: () => Promise<void>;
 }
@@ -15,10 +21,12 @@ export interface NzbdDiscoveryState {
 export function useNzbdDiscovery(): NzbdDiscoveryState {
   const [services, setServices] = useState<DiscoveredNzbd[]>([]);
   const [scanning, setScanning] = useState(false);
+  const [noResults, setNoResults] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   const start = useCallback(async () => {
     setError(null);
+    setNoResults(false);
     try {
       await ServiceDiscovery.startSearch(SERVICE_TYPE);
       setScanning(true);
@@ -42,20 +50,21 @@ export function useNzbdDiscovery(): NzbdDiscoveryState {
   useEffect(() => {
     let active = true;
     const found = ServiceDiscovery.addEventListener('serviceFound', (service) => {
-      if (!active || service.type !== '_nzbd._tcp.') {
+      if (!active || !isNzbdServiceType(service.type)) {
         return;
       }
       const nzbd = toDiscoveredNzbd(service);
       if (!nzbd) {
         return;
       }
+      setNoResults(false);
       setServices((current) => {
         const withoutOldValue = current.filter((item) => item.key !== nzbd.key);
         return [...withoutOldValue, nzbd].sort((a, b) => a.name.localeCompare(b.name));
       });
     });
     const lost = ServiceDiscovery.addEventListener('serviceLost', (service) => {
-      if (active) {
+      if (active && isNzbdServiceType(service.type)) {
         const key = serviceKey(service);
         setServices((current) => current.filter((item) => item.key !== key));
       }
@@ -70,7 +79,13 @@ export function useNzbdDiscovery(): NzbdDiscoveryState {
     };
   }, [start]);
 
-  return { services, scanning, error, scanAgain };
+  useEffect(() => {
+    if (!scanning || services.length > 0 || error) return;
+    const timeout = setTimeout(() => setNoResults(true), 8_000);
+    return () => clearTimeout(timeout);
+  }, [error, scanning, services.length]);
+
+  return { services, scanning, noResults, error, scanAgain };
 }
 
 function discoveryError(cause: unknown): string {

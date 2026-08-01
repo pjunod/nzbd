@@ -1,4 +1,8 @@
-import { serviceKey, toDiscoveredNzbd } from '../src/discovery/nzbdService';
+import {
+  isNzbdServiceType,
+  serviceKey,
+  toDiscoveredNzbd,
+} from '../src/discovery/nzbdService';
 
 const service = {
   name: 'nzbd on studio',
@@ -39,4 +43,11 @@ test('falls back to the advertised hostname and rejects invalid ports', () => {
   );
   expect(toDiscoveredNzbd({ ...service, port: 0 })).toBeNull();
   expect(serviceKey(service)).toBe('nzbd on studio|_nzbd._tcp.|local.');
+});
+
+test('accepts native DNS-SD type variants for nzbd', () => {
+  expect(isNzbdServiceType('_nzbd._tcp.')).toBe(true);
+  expect(isNzbdServiceType('_NZBD._tcp.local.')).toBe(true);
+  expect(isNzbdServiceType('nzbd')).toBe(true);
+  expect(isNzbdServiceType('_http._tcp.')).toBe(false);
 });
