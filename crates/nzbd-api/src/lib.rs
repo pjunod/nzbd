@@ -933,6 +933,26 @@ struct AddJobQuery {
     params: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct SetJobPriorityBody {
+    priority: i32,
+}
+
+/// `PUT /api/v1/jobs/{id}/priority` — change the scheduler priority for a
+/// queued or active job. Higher numeric values are selected first; priority
+/// 900 is the existing force band that can run through soft holds.
+async fn set_job_priority(
+    State(st): State<ApiState>,
+    Path(id): Path<u32>,
+    Json(body): Json<SetJobPriorityBody>,
+) -> Response {
+    match st.engine.set_priority(JobId(id), body.priority).await {
+        Ok(true) => Json(json!({ "ok": true, "priority": body.priority })).into_response(),
+        Ok(false) => not_found(),
+        Err(e) => error(StatusCode::SERVICE_UNAVAILABLE, &e.to_string()),
+    }
+}
+
 /// Parse the `params` query field. `*`-prefixed keys are rejected rather
 /// than accepted-and-ignored: that prefix is nzbd's internal namespace
 /// (`*PP:done`, `*URL`, `*Unpack:Password`), and letting a client write
@@ -1929,6 +1949,7 @@ async fn openapi() -> Response {
                           ] }
             },
             "/api/v1/jobs/{id}": { "get": { "summary": "Job detail" } },
+            "/api/v1/jobs/{id}/priority": { "put": { "summary": "Set scheduler priority; higher values run first and 900 is force" } },
             "/api/v1/jobs/{id}/actions/{action}": { "post": { "summary": "pause|resume|delete|delete-files|move-*|post-restart-*; delete answers {ok, parked}" } },
             "/api/v1/queue/actions/{action}": { "post": { "summary": "pause|resume" } },
             "/api/v1/queue/speed-limit": { "put": { "summary": "Set speed limit (bytes_per_sec)" } },
@@ -2525,6 +2546,7 @@ pub fn router_with(state: ApiState) -> Router {
         .route("/api/v1/status", get(get_status))
         .route("/api/v1/jobs", get(list_jobs).post(add_job))
         .route("/api/v1/jobs/{id}", get(get_job))
+        .route("/api/v1/jobs/{id}/priority", put(set_job_priority))
         .route("/api/v1/jobs/{id}/files", get(get_job_files))
         .route("/api/v1/jobs/{id}/nzb", get(get_job_nzb))
         .route("/api/v1/jobs/{id}/actions/{action}", post(job_action))
@@ -2868,6 +2890,31 @@ mod tests {
         let v = body_json(resp).await;
         assert_eq!(v["jobs"][0]["name"], "myjob");
         assert_eq!(v["jobs"][0]["priority"], 50);
+
+        // Reprioritize an existing job through the native API.
+        let resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::put(format!("/api/v1/jobs/{id}/priority"))
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(r#"{"priority":100}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = body_json(resp).await;
+        assert_eq!(v["ok"], true);
+        assert_eq!(v["priority"], 100);
+        assert_eq!(
+            engine
+                .export_job(JobId(id as u32))
+                .await
+                .unwrap()
+                .unwrap()
+                .priority,
+            100
+        );
 
         // Status.
         let resp = app
