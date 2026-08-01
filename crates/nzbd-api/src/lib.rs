@@ -1542,6 +1542,13 @@ fn client_name(headers: &axum::http::HeaderMap) -> Option<String> {
 /// rather than a browser's `Mozilla/…` masquerade, which is the same rule the
 /// UI uses to decide whether to prettify a chip label.
 fn consumer_name(headers: &axum::http::HeaderMap) -> Option<String> {
+    if headers
+        .get("x-nzbd-role")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.trim().eq_ignore_ascii_case("operator"))
+    {
+        return None;
+    }
     if let Some(explicit) = headers
         .get("x-nzbd-client")
         .and_then(|v| v.to_str().ok())
@@ -3377,6 +3384,17 @@ mod tests {
         let names = ids(&v);
         assert_eq!(names.len(), 3);
         assert_eq!(names[0], "job-0", "cursor walk is oldest-first from seq 0");
+    }
+
+    #[test]
+    fn operator_clients_do_not_count_as_history_consumers() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("x-nzbd-client", "nzbd-mobile/1.0".parse().unwrap());
+        assert_eq!(consumer_name(&headers).as_deref(), Some("nzbd-mobile/1.0"));
+
+        headers.insert("x-nzbd-role", "operator".parse().unwrap());
+        assert_eq!(consumer_name(&headers), None);
+        assert_eq!(client_name(&headers).as_deref(), Some("nzbd-mobile/1.0"));
     }
 
     /// the 1 Hz loop. A `tail -f` that updates once a second is the right
