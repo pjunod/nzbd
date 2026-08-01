@@ -38,6 +38,7 @@ import {
 import { ActionButton } from '../components/ActionButton';
 import { ThemeSwitcher } from '../components/ThemeSwitcher';
 import { useNzbd } from '../hooks/useNzbd';
+import { QueueSectionKey, sectionQueueJobs } from '../queueSections';
 import { Theme, useTheme } from '../theme';
 import { HistoryView } from './HistoryView';
 import { LogsView } from './LogsView';
@@ -72,6 +73,7 @@ export function DashboardScreen({ config, onEditConnection }: Props) {
 
   const status = snapshot?.status;
   const jobs = snapshot?.jobs ?? [];
+  const jobSections = useMemo(() => sectionQueueJobs(jobs), [jobs]);
   const mutateJob = async (
     job: JobSummary,
     action:
@@ -250,20 +252,38 @@ export function DashboardScreen({ config, onEditConnection }: Props) {
                 </View>
               ) : (
                 <View style={styles.jobList}>
-                  {jobs.map((job, index) => (
-                    <JobCard
-                      busy={busyKey !== null}
-                      expanded={expanded === job.id}
-                      index={index}
-                      job={job}
-                      key={job.id}
-                      onAction={(action) => void mutateJob(job, action)}
-                      onDelete={() => confirmDelete(job)}
-                      onToggle={() => setExpanded(expanded === job.id ? null : job.id)}
-                      styles={styles}
-                      total={jobs.length}
-                    />
-                  ))}
+                  {jobSections.map(({ definition, jobs: sectionJobs }) => {
+                    const tone = queueSectionTone(definition.key, theme);
+                    return (
+                      <View key={definition.key} style={styles.queueGroup}>
+                        <View accessibilityRole="header" style={styles.queueGroupHeading}>
+                          <View style={[styles.queueGroupAccent, { backgroundColor: tone.accent }]} />
+                          <Text style={styles.queueGroupTitle}>{definition.label}</Text>
+                          <Text style={styles.queueGroupCount}>{sectionJobs.length}</Text>
+                        </View>
+                        <View style={styles.queueGroupJobs}>
+                          {sectionJobs.map(({ job, index }) => (
+                            <JobCard
+                              busy={busyKey !== null}
+                              expanded={expanded === job.id}
+                              index={index}
+                              job={job}
+                              key={job.id}
+                              movable={definition.ordered}
+                              onAction={(action) => void mutateJob(job, action)}
+                              onDelete={() => confirmDelete(job)}
+                              onToggle={() => setExpanded(expanded === job.id ? null : job.id)}
+                              sectionKey={definition.key}
+                              sectionLabel={definition.label}
+                              styles={styles}
+                              tone={tone}
+                              total={jobs.length}
+                            />
+                          ))}
+                        </View>
+                      </View>
+                    );
+                  })}
                 </View>
               )}
             </View>
@@ -465,7 +485,11 @@ function JobCard({
   onToggle,
   onAction,
   onDelete,
+  movable,
+  sectionKey,
+  sectionLabel,
   styles,
+  tone,
 }: {
   job: JobSummary;
   index: number;
@@ -477,14 +501,27 @@ function JobCard({
     action: 'pause' | 'resume' | 'move-top' | 'move-up' | 'move-down' | 'move-bottom',
   ) => void;
   onDelete: () => void;
+  movable: boolean;
+  sectionKey: QueueSectionKey;
+  sectionLabel: string;
   styles: ReturnType<typeof makeStyles>;
+  tone: QueueSectionTone;
 }) {
   const progress = jobProgress(job);
   const statusKey = jobStatusKey(job.status);
   const canPause = ['queued', 'downloading', 'fetching'].includes(statusKey);
   const canResume = isJobPaused(job.status);
+  const postProcessing = !['downloading', 'fetching', 'waiting'].includes(sectionKey);
+  const showStatus = sectionKey === 'waiting';
   return (
-    <View style={[styles.jobCard, expanded && styles.jobCardExpanded]}>
+    <View
+      style={[
+        styles.jobCard,
+        styles.jobCardStage,
+        { backgroundColor: tone.background, borderLeftColor: tone.accent },
+        expanded && styles.jobCardExpanded,
+      ]}
+    >
       <Pressable
         accessibilityRole="button"
         accessibilityState={{ expanded }}
@@ -495,20 +532,34 @@ function JobCard({
           <Text numberOfLines={2} style={styles.jobName}>
             {job.name}
           </Text>
-          <Text style={styles.jobPercent}>{Math.floor(progress * 100)}%</Text>
+          {!postProcessing ? (
+            <Text style={styles.jobPercent}>{Math.floor(progress * 100)}%</Text>
+          ) : null}
         </View>
-        <View style={styles.progressTrack}>
-          <View style={[styles.progressFill, { width: `${Math.max(progress * 100, 1)}%` }]} />
-        </View>
+        {!postProcessing ? (
+          <View style={styles.progressTrack}>
+            <View style={[styles.progressFill, { width: `${Math.max(progress * 100, 1)}%` }]} />
+          </View>
+        ) : null}
         <View style={styles.jobMeta}>
-          <Text style={[styles.status, statusKey === 'failed' && styles.statusFailed]}>
-            {jobStatusLabel(job.status)}
-          </Text>
+          {showStatus ? (
+            <Text style={[styles.status, statusKey === 'failed' && styles.statusFailed]}>
+              {jobStatusLabel(job.status)}
+            </Text>
+          ) : null}
           <Text style={styles.metaText}>
             {formatBytes(job.downloaded_bytes)} / {formatBytes(job.size_bytes)}
           </Text>
-          <Text style={styles.metaText}>{formatBytes(job.rate_bps, '/s')}</Text>
-          <Text style={styles.metaText}>ETA {jobEta(job)}</Text>
+          {postProcessing ? (
+            <Text style={[styles.metaText, { color: tone.accent }]}>
+              {postProcessingDetail(job, sectionKey, sectionLabel)}
+            </Text>
+          ) : (
+            <>
+              <Text style={styles.metaText}>{formatBytes(job.rate_bps, '/s')}</Text>
+              <Text style={styles.metaText}>ETA {jobEta(job)}</Text>
+            </>
+          )}
         </View>
       </Pressable>
 
@@ -527,36 +578,89 @@ function JobCard({
             {canResume ? (
               <ActionButton compact disabled={busy} label="Resume" onPress={() => onAction('resume')} />
             ) : null}
-            <ActionButton
-              compact
-              disabled={busy || index === 0}
-              label="Top"
-              onPress={() => onAction('move-top')}
-            />
-            <ActionButton
-              compact
-              disabled={busy || index === 0}
-              label="Up"
-              onPress={() => onAction('move-up')}
-            />
-            <ActionButton
-              compact
-              disabled={busy || index === total - 1}
-              label="Down"
-              onPress={() => onAction('move-down')}
-            />
-            <ActionButton
-              compact
-              disabled={busy || index === total - 1}
-              label="Bottom"
-              onPress={() => onAction('move-bottom')}
-            />
+            {movable ? (
+              <>
+                <ActionButton
+                  compact
+                  disabled={busy || index === 0}
+                  label="Top"
+                  onPress={() => onAction('move-top')}
+                />
+                <ActionButton
+                  compact
+                  disabled={busy || index === 0}
+                  label="Up"
+                  onPress={() => onAction('move-up')}
+                />
+                <ActionButton
+                  compact
+                  disabled={busy || index === total - 1}
+                  label="Down"
+                  onPress={() => onAction('move-down')}
+                />
+                <ActionButton
+                  compact
+                  disabled={busy || index === total - 1}
+                  label="Bottom"
+                  onPress={() => onAction('move-bottom')}
+                />
+              </>
+            ) : null}
             <ActionButton compact disabled={busy} label="Remove" onPress={onDelete} variant="danger" />
           </View>
         </View>
       ) : null}
     </View>
   );
+}
+
+interface QueueSectionTone {
+  accent: string;
+  background: string;
+}
+
+const QUEUE_STAGE_ACCENTS: Partial<Record<QueueSectionKey, string>> = {
+  fetching: '#42A5D5',
+  renaming: '#A57BD8',
+  verifying: '#38A9AD',
+  repairing: '#DC7844',
+  extracting: '#C86FA7',
+  cleaning: '#6B9F74',
+  moving: '#5B86D9',
+  scripting: '#8D72D8',
+};
+
+function queueSectionTone(section: QueueSectionKey, theme: Theme): QueueSectionTone {
+  if (section === 'waiting') return { accent: theme.textMuted, background: theme.panel };
+  const accent =
+    section === 'downloading'
+      ? theme.success
+      : section === 'post_queued'
+        ? theme.warning
+        : QUEUE_STAGE_ACCENTS[section] ?? theme.accent;
+  return {
+    accent,
+    background: colorWithAlpha(accent, theme.dark ? 0.1 : 0.055),
+  };
+}
+
+function colorWithAlpha(color: string, alpha: number): string {
+  const match = /^#([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})$/i.exec(color);
+  if (!match) return color;
+  const [, red, green, blue] = match;
+  return `rgba(${Number.parseInt(red, 16)}, ${Number.parseInt(green, 16)}, ${Number.parseInt(blue, 16)}, ${alpha})`;
+}
+
+function postProcessingDetail(
+  job: JobSummary,
+  section: QueueSectionKey,
+  sectionLabel: string,
+): string {
+  if (section === 'post_queued') return 'waiting for a post-processing slot';
+  const currentStage = [...(job.stages ?? [])].reverse().find((stage) => stage.ms == null);
+  if (!currentStage) return sectionLabel.toLowerCase();
+  const elapsedSeconds = Math.max(0, Date.now() / 1000 - currentStage.started_at_unix);
+  return `${formatDuration(elapsedSeconds)} in ${sectionLabel.toLowerCase()}`;
 }
 
 function Fact({
@@ -1063,7 +1167,30 @@ const makeStyles = (theme: Theme) =>
     },
     emptyTitle: { color: theme.text, fontSize: 20, fontWeight: '800' },
     emptyText: { color: theme.textMuted, fontSize: 14, lineHeight: 20, maxWidth: 400, textAlign: 'center' },
-    jobList: { gap: 9 },
+    jobList: { gap: 14 },
+    queueGroup: { gap: 6 },
+    queueGroupHeading: {
+      minHeight: 20,
+      paddingHorizontal: 4,
+      flexDirection: 'row',
+      alignItems: 'center',
+      gap: 6,
+    },
+    queueGroupAccent: { width: 3, height: 13, borderRadius: 2 },
+    queueGroupTitle: {
+      color: theme.textMuted,
+      fontSize: 10,
+      fontWeight: '900',
+      letterSpacing: 1,
+      textTransform: 'uppercase',
+    },
+    queueGroupCount: {
+      color: theme.textMuted,
+      fontSize: 10,
+      fontWeight: '700',
+      fontVariant: ['tabular-nums'],
+    },
+    queueGroupJobs: { gap: 9 },
     jobCard: {
       borderRadius: 16,
       borderWidth: 1,
@@ -1071,6 +1198,7 @@ const makeStyles = (theme: Theme) =>
       backgroundColor: theme.panel,
       overflow: 'hidden',
     },
+    jobCardStage: { borderLeftWidth: 3 },
     jobCardExpanded: { borderColor: theme.accent },
     jobMain: { padding: 14, gap: 10 },
     pressed: { opacity: 0.72 },

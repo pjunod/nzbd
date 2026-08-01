@@ -1,0 +1,55 @@
+import { JobSummary, JobStatus } from '../src/api/types';
+import { queueSectionKey, sectionQueueJobs } from '../src/queueSections';
+
+const statusCases: [JobStatus, string][] = [
+  ['downloading', 'downloading'],
+  ['fetching', 'fetching'],
+  ['post_queued', 'post_queued'],
+  [{ post: { stage: 'par_rename' } }, 'renaming'],
+  [{ post: { stage: 'rar_rename' } }, 'renaming'],
+  [{ post: { stage: 'post_unpack_rename' } }, 'renaming'],
+  [{ post: { stage: 'par_verify' } }, 'verifying'],
+  [{ post: { stage: 'par_repair' } }, 'repairing'],
+  [{ post: { stage: 'unpack' } }, 'extracting'],
+  [{ post: { stage: 'cleanup' } }, 'cleaning'],
+  [{ post: { stage: 'move' } }, 'moving'],
+  [{ post: { stage: 'script' } }, 'scripting'],
+  ['queued', 'waiting'],
+  ['paused', 'waiting'],
+  ['failed', 'waiting'],
+  ['completed', 'waiting'],
+];
+
+test.each(statusCases)('maps %p to the %s queue section', (status, expected) => {
+  expect(queueSectionKey(status)).toBe(expected);
+});
+
+test('groups by activity while preserving queue positions within each section', () => {
+  const jobs = [
+    job(10, { post: { stage: 'unpack' } }),
+    job(11, 'queued'),
+    job(12, 'downloading'),
+    job(13, 'paused'),
+    job(14, { post: { stage: 'par_repair' } }),
+  ];
+
+  const sections = sectionQueueJobs(jobs);
+
+  expect(sections.map((section) => section.definition.key)).toEqual([
+    'downloading',
+    'repairing',
+    'extracting',
+    'waiting',
+  ]);
+  expect(sections.flatMap((section) => section.jobs.map(({ job: item }) => item.id))).toEqual([
+    12, 14, 10, 11, 13,
+  ]);
+  expect(sections.find((section) => section.definition.key === 'waiting')?.jobs).toMatchObject([
+    { index: 1, job: { id: 11 } },
+    { index: 3, job: { id: 13 } },
+  ]);
+});
+
+function job(id: number, status: JobStatus): JobSummary {
+  return { id, status } as JobSummary;
+}
