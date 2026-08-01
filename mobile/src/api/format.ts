@@ -1,4 +1,4 @@
-import { JobStatus, JobSummary } from './types';
+import { JobStatus, JobSummary, StoragePath } from './types';
 
 const UNITS = ['B', 'KiB', 'MiB', 'GiB', 'TiB'];
 export const DEFAULT_NZBD_PORT = 6789;
@@ -22,6 +22,44 @@ export function formatDuration(seconds: number): string {
   const hours = Math.floor(seconds / 3600);
   const minutes = Math.ceil((seconds % 3600) / 60);
   return minutes > 0 ? `${hours}h ${minutes}m` : `${hours}h`;
+}
+
+export interface StorageUsage {
+  availableBytes: number;
+  totalBytes: number;
+  usedPercent: number;
+}
+
+export function storageUsage(storage: StoragePath): StorageUsage | null {
+  if (
+    storage.total_bytes === null ||
+    storage.available_bytes === null ||
+    !Number.isFinite(storage.total_bytes) ||
+    !Number.isFinite(storage.available_bytes) ||
+    storage.total_bytes <= 0
+  ) {
+    return null;
+  }
+  const totalBytes = storage.total_bytes;
+  const availableBytes = Math.max(0, Math.min(totalBytes, storage.available_bytes));
+  return {
+    availableBytes,
+    totalBytes,
+    usedPercent: ((totalBytes - availableBytes) * 100) / totalBytes,
+  };
+}
+
+export function criticalStorage(paths: readonly StoragePath[]): StoragePath | null {
+  let critical: StoragePath | null = null;
+  let highestUsed = -1;
+  for (const path of paths) {
+    const usage = storageUsage(path);
+    if (usage && usage.usedPercent > highestUsed) {
+      critical = path;
+      highestUsed = usage.usedPercent;
+    }
+  }
+  return critical ?? paths[0] ?? null;
 }
 
 export function jobProgress(job: JobSummary): number {

@@ -62,6 +62,13 @@ export interface ServerVolume {
   rate_bps: number;
 }
 
+export interface StoragePath {
+  label: string;
+  path: string;
+  available_bytes: number | null;
+  total_bytes: number | null;
+}
+
 export interface StatusDto {
   version: string;
   built: string;
@@ -83,6 +90,7 @@ export interface StatusDto {
   jobs_post: number;
   jobs_finished: number;
   servers: ServerVolume[];
+  storage: StoragePath[];
 }
 
 export interface QueueSnapshot {

@@ -1,9 +1,11 @@
 import {
+  criticalStorage,
   formatBytes,
   jobProgress,
   jobStatusKey,
   jobStatusLabel,
   normalizeServerUrl,
+  storageUsage,
 } from '../src/api/format';
 import { JobSummary } from '../src/api/types';
 
@@ -71,5 +73,36 @@ describe('API presentation helpers', () => {
     expect(jobProgress(job())).toBe(0.25);
     expect(jobProgress(job({ downloaded_bytes: 250 }))).toBe(1);
     expect(formatBytes(1_048_576)).toBe('1.00 MiB');
+  });
+
+  test('selects the most-full configured filesystem as critical storage', () => {
+    const paths = [
+      {
+        label: 'working',
+        path: '/data',
+        available_bytes: 40,
+        total_bytes: 100,
+      },
+      {
+        label: 'complete',
+        path: '/downloads',
+        available_bytes: 5,
+        total_bytes: 100,
+      },
+      {
+        label: 'measuring',
+        path: '/later',
+        available_bytes: null,
+        total_bytes: null,
+      },
+    ];
+
+    const critical = criticalStorage(paths);
+    expect(critical?.label).toBe('complete');
+    expect(critical && storageUsage(critical)).toEqual({
+      availableBytes: 5,
+      totalBytes: 100,
+      usedPercent: 95,
+    });
   });
 });

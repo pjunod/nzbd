@@ -17,6 +17,7 @@ import {
 import { SafeAreaView } from 'react-native-safe-area-context';
 
 import {
+  criticalStorage,
   formatBytes,
   formatDuration,
   isJobPaused,
@@ -24,6 +25,7 @@ import {
   jobProgress,
   jobStatusKey,
   jobStatusLabel,
+  storageUsage,
 } from '../api/format';
 import {
   AddNzbOptions,
@@ -201,6 +203,12 @@ export function DashboardScreen({ config, onEditConnection }: Props) {
         ))}
       </View>
 
+      {activeSection === 'queue' && status ? (
+        <View style={styles.overviewDock}>
+          <Overview status={status} styles={styles} />
+        </View>
+      ) : null}
+
       {activeSection === 'queue' ? (
         <ScrollView
           contentContainerStyle={[styles.content, wide && styles.contentWide]}
@@ -211,9 +219,8 @@ export function DashboardScreen({ config, onEditConnection }: Props) {
               tintColor={theme.accent}
             />
           }
+          style={styles.queueScroll}
         >
-          {!wide && status ? <Overview status={status} styles={styles} /> : null}
-
           <View style={[styles.dashboard, wide && styles.dashboardWide]}>
             <View style={styles.queueColumn}>
               <View style={styles.sectionHeading}>
@@ -262,7 +269,6 @@ export function DashboardScreen({ config, onEditConnection }: Props) {
 
             {wide && status ? (
               <View style={styles.sidebar}>
-                <Overview status={status} styles={styles} vertical />
                 <ServerList status={status} styles={styles} />
               </View>
             ) : null}
@@ -288,19 +294,26 @@ export function DashboardScreen({ config, onEditConnection }: Props) {
 function Overview({
   status,
   styles,
-  vertical = false,
 }: {
   status: StatusDto;
   styles: ReturnType<typeof makeStyles>;
-  vertical?: boolean;
 }) {
   const eta = status.download_paused
     ? 'paused'
     : status.download_rate_bps > 0
       ? formatDuration(status.remaining_bytes / status.download_rate_bps)
       : '—';
+  const storage = criticalStorage(status.storage ?? []);
+  const usage = storage ? storageUsage(storage) : null;
+  const storageTone = usage
+    ? usage.usedPercent >= 95
+      ? 'danger'
+      : usage.usedPercent >= 85
+        ? 'warning'
+        : undefined
+    : undefined;
   return (
-    <View style={[styles.metrics, vertical && styles.metricsVertical]}>
+    <View style={styles.metrics}>
       <Metric
         label="Speed"
         styles={styles}
@@ -313,6 +326,20 @@ function Overview({
         styles={styles}
         value={`${status.jobs_downloading} / ${status.jobs_queued}`}
       />
+      <Metric
+        detail={
+          storage
+            ? usage
+              ? `${Math.round(usage.usedPercent)}% used · ${storage.label}`
+              : `${storage.label} · measuring capacity`
+            : 'measuring critical path'
+        }
+        label="Storage"
+        storage
+        styles={styles}
+        tone={storageTone}
+        value={usage ? `${formatBytes(usage.availableBytes)} free` : 'measuring…'}
+      />
     </View>
   );
 }
@@ -320,18 +347,37 @@ function Overview({
 function Metric({
   label,
   value,
+  detail,
+  storage = false,
+  tone,
   styles,
 }: {
   label: string;
   value: string;
+  detail?: string;
+  storage?: boolean;
+  tone?: 'warning' | 'danger';
   styles: ReturnType<typeof makeStyles>;
 }) {
   return (
-    <View style={styles.metric}>
+    <View style={[styles.metric, storage && styles.storageMetric]}>
       <Text style={styles.metricLabel}>{label}</Text>
-      <Text adjustsFontSizeToFit numberOfLines={1} style={styles.metricValue}>
+      <Text
+        adjustsFontSizeToFit
+        numberOfLines={1}
+        style={[
+          styles.metricValue,
+          tone === 'warning' && styles.metricValueWarning,
+          tone === 'danger' && styles.metricValueDanger,
+        ]}
+      >
         {value}
       </Text>
+      {detail ? (
+        <Text numberOfLines={1} style={styles.metricDetail}>
+          {detail}
+        </Text>
+      ) : null}
     </View>
   );
 }
@@ -773,27 +819,59 @@ const makeStyles = (theme: Theme) =>
     tabSelected: { backgroundColor: theme.accentSoft },
     tabText: { color: theme.textMuted, fontSize: 12, fontWeight: '800' },
     tabTextSelected: { color: theme.accent },
+    overviewDock: {
+      paddingHorizontal: 8,
+      paddingVertical: 7,
+      borderBottomWidth: StyleSheet.hairlineWidth,
+      borderBottomColor: theme.border,
+      backgroundColor: theme.background,
+    },
+    queueScroll: { flex: 1 },
     content: { padding: 14, paddingBottom: 40, gap: 14 },
     contentWide: { padding: 24, maxWidth: 1300, width: '100%', alignSelf: 'center' },
     dashboard: { gap: 14 },
     dashboardWide: { flexDirection: 'row', alignItems: 'flex-start', gap: 20 },
     queueColumn: { flex: 1, minWidth: 0 },
     sidebar: { width: 278, gap: 14 },
-    metrics: { flexDirection: 'row', flexWrap: 'wrap', gap: 8 },
-    metricsVertical: { flexDirection: 'column' },
+    metrics: {
+      width: '100%',
+      maxWidth: 1300,
+      alignSelf: 'center',
+      flexDirection: 'row',
+      flexWrap: 'wrap',
+      gap: 5,
+    },
     metric: {
-      minWidth: 140,
-      flex: 1,
-      minHeight: 86,
-      padding: 14,
-      borderRadius: 15,
+      minWidth: 54,
+      flexGrow: 1,
+      flexBasis: 54,
+      minHeight: 51,
+      paddingHorizontal: 8,
+      paddingVertical: 6,
+      borderRadius: 10,
       borderWidth: 1,
       borderColor: theme.border,
       backgroundColor: theme.panel,
       justifyContent: 'space-between',
     },
-    metricLabel: { color: theme.textMuted, fontSize: 11, fontWeight: '700', letterSpacing: 0.4 },
-    metricValue: { color: theme.text, fontSize: 24, fontWeight: '800', letterSpacing: -0.5 },
+    storageMetric: { minWidth: 90, flexBasis: 90 },
+    metricLabel: {
+      color: theme.textMuted,
+      fontSize: 8,
+      fontWeight: '800',
+      letterSpacing: 0.5,
+      textTransform: 'uppercase',
+    },
+    metricValue: {
+      color: theme.text,
+      fontSize: 16,
+      fontWeight: '800',
+      letterSpacing: -0.3,
+      fontVariant: ['tabular-nums'],
+    },
+    metricValueWarning: { color: theme.warning },
+    metricValueDanger: { color: theme.danger },
+    metricDetail: { color: theme.textMuted, fontSize: 8, lineHeight: 10 },
     sectionHeading: {
       flexDirection: 'row',
       alignItems: 'flex-end',
