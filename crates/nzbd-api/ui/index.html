@@ -192,11 +192,18 @@
   /* job detail panel (expands under the clicked queue row) */
   #tab-queue td .name { cursor: pointer; }
   #tab-queue td .name:hover { text-decoration: underline; text-decoration-color: var(--muted); }
-  tr.detail-tr > td { background: color-mix(in srgb, var(--accent) 4%, transparent); }
-  .jobdetail { padding: 4px 2px 8px; }
-  .jd-head { display: flex; gap: 8px; align-items: center; font-size: 12.5px;
-             color: var(--ink2); flex-wrap: wrap; }
-  .jd-head b { color: var(--ink); }
+  tr.detail-tr > td { padding: 0; background: color-mix(in srgb, var(--accent) 4%, transparent); }
+  .jobdetail { padding: 14px 16px 16px;
+    border-left: 3px solid color-mix(in srgb, var(--accent) 58%, transparent); }
+  .jd-head { display: flex; gap: 7px; align-items: center; color: var(--ink2);
+    flex-wrap: wrap; padding-bottom: 11px; border-bottom: 1px solid var(--line); }
+  .jd-head .jd-number { color: var(--ink); font-size: 14px; }
+  .jd-head .jd-metric { min-height: 25px; display: inline-flex; align-items: center;
+    padding: 3px 8px; border: 1px solid var(--line); border-radius: 6px;
+    background: color-mix(in srgb, var(--panel) 75%, transparent);
+    color: var(--ink2); font-size: 11.5px; font-variant-numeric: tabular-nums; }
+  .jd-head .jd-dupe { max-width: 32ch; overflow: hidden; text-overflow: ellipsis;
+    white-space: nowrap; }
   .btnlike { border: 1px solid var(--line); border-radius: 7px; padding: 2px 9px;
              color: var(--ink2); text-decoration: none; font-size: 12px; background: var(--panel); }
   .btnlike:hover { border-color: var(--accent); color: var(--ink); }
@@ -216,7 +223,10 @@
   /* The job-detail pipeline: stages left to right, wrapping on narrow
      screens. Tabular figures so the durations stay comparable even when
      the labels are different widths. */
-  .jd-pipe { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 9px; }
+  .jd-pipe-section { margin-top: 11px; }
+  .jd-section-label { color: var(--muted); font-size: 10px; font-weight: 700;
+    letter-spacing: .08em; text-transform: uppercase; }
+  .jd-pipe { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
   .jd-pipe:empty { display: none; }
   .jd-recovery { display: flex; align-items: center; flex-wrap: wrap; gap: 6px;
     margin-top: 9px; padding-top: 8px; border-top: 1px solid var(--line); }
@@ -240,13 +250,28 @@
   .pipe-stage.slow .ps-dur { color: var(--ink); font-weight: 650; }
   /* Provenance: who added it, where it came from, how long it took. Empty
      for a job that has nothing extra to say, and then it takes no room. */
-  .jd-meta { margin-top: 9px; font-size: 12px; color: var(--muted);
-             word-break: break-word; }
+  .jd-meta { margin-top: 11px; padding: 9px 10px; font-size: 12px; color: var(--muted);
+    word-break: break-word; border: 1px solid var(--line); border-radius: 7px;
+    background: color-mix(in srgb, var(--panel) 62%, transparent); }
   .jd-meta:empty { display: none; }
+  /* Finished-job provenance is reference material, not prose. Labeled
+     cells make each answer scannable, while source URLs and output paths
+     get a whole row and ellipsize instead of turning the panel into a wall
+     of grey text. Their full value remains in the native title tooltip. */
+  .jd-facts { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 1px; margin-top: 11px; overflow: hidden; border: 1px solid var(--line);
+    border-radius: 8px; background: var(--line); }
+  .jd-fact { min-width: 0; padding: 8px 10px; background: var(--panel); }
+  .jd-fact.full { grid-column: 1 / -1; }
+  .jd-fact dt { margin: 0 0 2px; color: var(--muted); font-size: 9.5px;
+    font-weight: 700; letter-spacing: .07em; text-transform: uppercase; }
+  .jd-fact dd { margin: 0; overflow: hidden; color: var(--ink2); font-size: 12px;
+    text-overflow: ellipsis; white-space: nowrap; }
+  .jd-fact.mono dd { font: 11px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace; }
   /* The file list folds. Open in the queue (you opened the job to watch
      the files fill in) and closed in history (the job is over; the
      question there is usually "what WAS this", not "which part 47"). */
-  details.jd-files { margin-top: 8px; }
+  details.jd-files { margin-top: 12px; padding-top: 9px; border-top: 1px solid var(--line); }
   details.jd-files > summary { list-style: none; cursor: pointer; width: fit-content;
     font-size: 11.5px; color: var(--ink2); padding: 2px 0;
     display: inline-flex; align-items: baseline; gap: 6px; }
@@ -306,6 +331,12 @@
   .ho.done { color: var(--ok); }
   .ho.na { color: var(--muted); }
   tr.hidden-row td { opacity: .55; }
+  #history-body > tr:not(.detail-tr) .acts { display: grid;
+    grid-template-columns: repeat(2, max-content); gap: 3px; }
+  #history-body > tr:not(.detail-tr) .acts .del { grid-column: 1 / -1; justify-self: end; }
+  #history-body .acts button.details-open { color: var(--accent);
+    border-color: color-mix(in srgb, var(--accent) 55%, transparent);
+    background: color-mix(in srgb, var(--accent) 10%, transparent); }
   #logbox { background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
             margin-top: 12px; padding: 10px 12px; max-height: 480px; overflow-y: auto;
             font: 12px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace; }
@@ -412,6 +443,10 @@
     #setup .row { flex-wrap: wrap; }
     #setup .row label { flex-basis: 100%; }
     #setup .check { padding-top: 0; }
+    .jobdetail { padding: 12px 10px 14px; }
+    .jd-head .spacer { flex-basis: 1px; }
+    .jd-facts { grid-template-columns: minmax(0, 1fr); }
+    .jd-fact.full { grid-column: 1; }
   }
 </style>
 </head>
@@ -1372,11 +1407,11 @@ function buildDetailRow(d) {
   const wrap = d.append(td, d.create("div", "jobdetail"));
   const head = d.append(wrap, d.create("div", "jd-head"));
   const c = {};
-  c.id = d.append(head, d.create("b"));
+  c.id = d.append(head, d.create("b", "jd-number"));
   c.st = d.append(head, d.create("span", "st"));
-  c.articles = d.append(head, d.create("span"));
-  c.health = d.append(head, d.create("span"));
-  c.dupe = d.append(head, d.create("span"));
+  c.articles = d.append(head, d.create("span", "jd-metric"));
+  c.health = d.append(head, d.create("span", "jd-metric"));
+  c.dupe = d.append(head, d.create("span", "jd-metric jd-dupe"));
   const spacer = d.append(head, d.create("span", "spacer"));
   d.style(spacer, "flex", "1");
   c.nzb = d.append(head, d.create("a", "btnlike"));
@@ -1390,7 +1425,10 @@ function buildDetailRow(d) {
   // The pipeline sits above the files: what happened to this job, in
   // order, is the first thing you want when you open it — the file list
   // answers a narrower question and can wait its turn.
-  c.pipe = d.append(wrap, d.create("div", "jd-pipe"));
+  c.pipeSection = d.append(wrap, d.create("section", "jd-pipe-section"));
+  const pipeLabel = d.append(c.pipeSection, d.create("div", "jd-section-label"));
+  d.text(pipeLabel, "Processing timeline");
+  c.pipe = d.append(c.pipeSection, d.create("div", "jd-pipe"));
 
   // Recovery is intentionally in the live detail panel, beside the stage
   // timeline it acts on. Each boundary restarts that phase and everything
@@ -1416,7 +1454,27 @@ function buildDetailRow(d) {
 
   // Where it came from and who asked for it. The queue snapshot carries
   // only the job's public params; history carries the whole provenance.
-  c.meta = d.append(wrap, d.create("div", "jd-meta"));
+  const metaSection = d.append(wrap, d.create("section", "jd-meta-section"));
+  c.meta = d.append(metaSection, d.create("div", "jd-meta"));
+
+  // History has a fixed, labeled fact grid instead of concatenating long
+  // paths and URLs into a paragraph. The same skeleton remains present for
+  // queue details but is hidden there, keeping the shared panel truly one
+  // widget and its subtree stable across updates.
+  c.facts = d.append(metaSection, d.create("dl", "jd-facts"));
+  const fact = (key, label, cls) => {
+    const box = d.append(c.facts, d.create("div", "jd-fact" + (cls ? " " + cls : "")));
+    const dt = d.append(box, d.create("dt"));
+    d.text(dt, label);
+    c[key] = d.append(box, d.create("dd"));
+    c[key + "Box"] = box;
+  };
+  fact("metaClient", "Added by");
+  fact("metaElapsed", "Total time");
+  fact("metaPar", "PAR2 data");
+  fact("metaSource", "Source", "full mono");
+  fact("metaOriginal", "Original name", "full mono");
+  fact("metaDestination", "Destination", "full mono");
 
   // The file list folds. `open` is set from the model on the first apply
   // and then left alone — a later tick writes it only if the DEFAULT
@@ -1520,9 +1578,13 @@ function detailModel(j, nowMs) {
     dupe: j.dupe_key ? "dupe: " + j.dupe_key : "",
     nzbHref: "/api/v1/jobs/" + j.id + "/nzb",
     nzbHidden: false,
+    closeHidden: false,
     recoverHidden: !recoverMax,
     recoverMax,
     meta: bits.join("  ·  "),
+    metaHidden: false,
+    metaClient: "", metaElapsed: "", metaPar: "", metaSource: "",
+    metaOriginal: "", metaDestination: "",
     // Open: you opened a live job to watch its files fill in.
     filesOpen: true,
     files: files ? files.map(fileModel) : null,
@@ -1595,13 +1657,19 @@ function applyDetail(tr, m, d) {
   w("scope", m.scope || "queue", v => d.data(tr, "scope", v));
   w("st", m.st, v => d.text(c.st, v));
   w("stCls", m.stCls, v => d.cls(c.st, v));
-  w("articles", m.articles, v => d.text(c.articles, v));
-  w("health", m.health, v => d.text(c.health, v));
-  w("dupe", m.dupe, v => d.text(c.dupe, v));
+  const metric = (key, value) => w(key, value || "", v => {
+    d.text(c[key], v);
+    d.prop(c[key], "hidden", !v);
+    d.prop(c[key], "title", v);
+  });
+  metric("articles", m.articles);
+  metric("health", m.health);
+  metric("dupe", m.dupe);
   w("nzbHref", m.nzbHref || "", v => d.attr(c.nzb, "href", v));
   // History has no NZB endpoint of its own — a parked NZB is reachable
   // only through requeue — so the button is absent rather than broken.
   w("nzbHidden", !!m.nzbHidden, v => d.prop(c.nzb, "hidden", v));
+  w("closeHidden", !!m.closeHidden, v => d.prop(c.close, "hidden", v));
   w("recoverHidden", m.recoverHidden !== false, v => d.prop(c.recovery, "hidden", v));
   w("recoverMax", m.recoverMax || "", v => {
     const order = ["all", "verify", "unpack", "cleanup", "move", "scripts"];
@@ -1612,10 +1680,23 @@ function applyDetail(tr, m, d) {
     }
   });
   w("meta", m.meta || "", v => d.text(c.meta, v));
+  w("metaHidden", !!m.metaHidden, v => d.prop(c.meta, "hidden", v));
+  const factKeys = ["metaClient", "metaElapsed", "metaPar", "metaSource",
+                    "metaOriginal", "metaDestination"];
+  for (const key of factKeys) {
+    const value = m[key] || "";
+    w(key, value, v => {
+      d.text(c[key], v);
+      d.prop(c[key], "title", v);
+      d.prop(c[key + "Box"], "hidden", !v);
+    });
+  }
+  w("factsHidden", !factKeys.some(key => m[key]), v => d.prop(c.facts, "hidden", v));
   // Pipeline: keyed by position + stage, so a job that enters the same
   // stage twice (a repair that runs, fetches more par blocks, and runs
   // again) gets two rows rather than one that overwrites itself.
   reconcileRows(c.pipe, m.pipe || [], d);
+  w("pipeHidden", !(m.pipe || []).length, v => d.prop(c.pipeSection, "hidden", v));
   // Files: keyed by file id, so a file that only gained segments keeps its
   // node — and the table does not jump under the pointer.
   const fileModels = m.files
@@ -2105,6 +2186,7 @@ function histModel(e) {
     // Undo toast has faded.
     requeueHidden: !e.can_requeue,
     detailsLabel: e.job === openHist ? "close" : "details",
+    detailsCls: e.job === openHist ? "details-open" : "",
     // The only destructive action on the page arms first (§ two-step).
     delLabel: isArmed ? "sure?" : "delete files",
     delCls: isArmed ? "del armed" : "del",
@@ -2172,8 +2254,19 @@ function histDetailModel(e) {
     dupe: e.dupe_key ? "dupe: " + e.dupe_key : "",
     // No history NZB endpoint: the parked NZB is reachable through
     // requeue, and a link that 404s is worse than no link.
-    nzbHref: "", nzbHidden: true, recoverHidden: true, recoverMax: "",
-    meta: bits.join("  ·  "),
+    nzbHref: "", nzbHidden: true, closeHidden: true,
+    recoverHidden: true, recoverMax: "",
+    // Keep the joined string in the model for compatibility/searchability,
+    // but records render through labeled facts below. Only the explanatory
+    // pre-record note still renders as prose.
+    meta: bits.join("  ·  "), metaHidden: !!e.record,
+    metaClient: r.client || "",
+    metaElapsed: r.queued_at_unix && e.completed_at_unix > r.queued_at_unix
+      ? fmtDur((e.completed_at_unix - r.queued_at_unix) * 1000) : "",
+    metaPar: r.par_size ? fmtBytes(r.par_size) : "",
+    metaSource: r.url || "",
+    metaOriginal: r.original_name && r.original_name !== e.name ? r.original_name : "",
+    metaDestination: e.final_dir || "",
     // Folded: the job is finished, so the file list is reference material
     // rather than the thing you came to watch.
     filesOpen: false,
@@ -2245,6 +2338,7 @@ function applyHistRow(tr, m, d) {
   w("visTip", m.visTip, v => d.prop(c.vis, "title", v));
   w("requeueHidden", m.requeueHidden, v => d.prop(c.requeue, "hidden", v));
   w("detailsLabel", m.detailsLabel, v => d.text(c.details, v));
+  w("detailsCls", m.detailsCls || "", v => d.cls(c.details, v));
   w("delLabel", m.delLabel, v => d.text(c.delFiles, v));
   w("delCls", m.delCls, v => d.cls(c.delFiles, v));
   w("delTip", m.delTip, v => d.prop(c.delFiles, "title", v));

@@ -455,6 +455,15 @@ const models = (jobs) => jobs.map((j, i) => T.rowModel(j, { idx: i, count: jobs.
   ok(d.articles.includes("6448/6449"), `article counts survive the trip (got ${d.articles})`);
   ok(d.articles.includes("1 failed"), "…including what did not arrive");
   ok(d.meta.includes("took "), "queued-to-finished duration is recoverable");
+  eq(d.metaHidden, true, "the old prose line is replaced when structured facts exist");
+  eq(d.metaClient, "monarr", "requesting client has its own labeled field");
+  eq(d.metaElapsed, "1h", "total time has its own labeled field");
+  ok(d.metaPar.includes("MiB"), `par2 size has its own labeled field (got ${d.metaPar})`);
+  ok(d.metaSource.includes("drunkenslug"), "source has its own labeled field");
+  eq(d.metaOriginal, withRecord.record.original_name,
+    "the original name is no longer buried in prose");
+  eq(d.metaDestination, withRecord.final_dir,
+    "the output path is no longer buried in prose");
   eq(d.health, "health 100.0%", "health reads the same as it did in the queue");
   eq(d.nzbHidden, true, "no NZB link: history has no endpoint behind it");
   eq(d.files.length, 3, "the file table survives");
@@ -480,6 +489,13 @@ const models = (jobs) => jobs.map((j, i) => T.rowModel(j, { idx: i, count: jobs.
   eq(seen.length, 0, "no request — the record is already in hand");
   const body = sandbox.document.getElementById("history-body");
   eq(body.children.length, 2, "the detail row renders under its own row");
+  const dc = body.children[1].__c;
+  eq(dc.meta.hidden, true, "the concatenated history paragraph is not rendered");
+  eq(dc.facts.hidden, false, "the labeled history fact grid is visible");
+  eq(dc.metaClient.textContent, "monarr", "fact values reach the stable detail subtree");
+  eq(dc.metaSource.title, withRecord.record.url,
+    "an ellipsized source keeps its full value in the tooltip");
+  eq(dc.close.hidden, true, "history has one close control, not two adjacent ones");
   T.toggleHist(182);
   eq(T.getOpenHist(), null, "and closes");
   T.store.history = null;
