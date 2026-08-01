@@ -171,9 +171,19 @@ struct StorageTarget {
     path: std::path::PathBuf,
 }
 
-/// One configured path and the capacity of the filesystem that contains
-/// it. Values are optional while the first probe is running or when no
-/// existing ancestor can be measured.
+struct StorageMember<'a> {
+    target: &'a StorageTarget,
+    measured: &'a std::path::Path,
+}
+
+struct StorageGroup<'a> {
+    device: Option<u64>,
+    members: Vec<StorageMember<'a>>,
+}
+
+/// One filesystem used by one or more configured paths. `label` joins the
+/// roles that depend on it, while `path` is their closest common ancestor.
+/// Values are optional when no existing ancestor can be measured.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct StoragePathDto {
     pub label: String,
@@ -232,18 +242,12 @@ impl StorageProbe {
                 );
             }
         }
-        let latest = targets
-            .iter()
-            .map(|t| StoragePathDto {
-                label: t.label.clone(),
-                path: t.path.to_string_lossy().into_owned(),
-                available_bytes: None,
-                total_bytes: None,
-            })
-            .collect();
         StorageProbe {
             targets,
-            latest: std::sync::RwLock::new(latest),
+            // Volume identity needs filesystem metadata. Leave the panel
+            // hidden for the few milliseconds before the first off-thread
+            // probe instead of briefly flashing duplicate path rows.
+            latest: std::sync::RwLock::new(Vec::new()),
             started: std::sync::atomic::AtomicBool::new(false),
         }
     }
@@ -274,28 +278,84 @@ impl StorageProbe {
 }
 
 fn measure_storage(targets: &[StorageTarget]) -> Vec<StoragePathDto> {
-    targets
-        .iter()
-        .map(|target| {
-            // A category or failed directory may not exist until its first
-            // job. Measure the nearest existing ancestor while continuing
-            // to display the configured destination itself.
-            let mut measured = target.path.as_path();
-            while !measured.exists() {
-                let Some(parent) = measured.parent() else {
-                    break;
-                };
-                measured = parent;
-            }
-            let space = nzbd_engine::volumes::disk_space(measured);
+    use std::os::unix::fs::MetadataExt;
+
+    // `st_dev` identifies the containing filesystem. Three configured
+    // directories on one mounted volume should produce one capacity bar,
+    // not three identical bars that imply independent failure domains.
+    let mut groups = Vec::<StorageGroup<'_>>::new();
+    for target in targets {
+        // A category or failed directory may not exist until its first job.
+        // Its nearest existing ancestor still identifies the volume it will
+        // consume once created.
+        let measured = nearest_existing_ancestor(&target.path);
+        let device = std::fs::metadata(measured).ok().map(|m| m.dev());
+        let existing =
+            device.and_then(|id| groups.iter().position(|group| group.device == Some(id)));
+        let member = StorageMember { target, measured };
+        if let Some(index) = existing {
+            groups[index].members.push(member);
+        } else {
+            // An unmeasurable path remains visible on its own: without a
+            // device id there is no honest basis for merging it with one of
+            // the known volumes.
+            groups.push(StorageGroup {
+                device,
+                members: vec![member],
+            });
+        }
+    }
+
+    groups
+        .into_iter()
+        .map(|group| {
+            let space = group
+                .members
+                .iter()
+                .find_map(|member| nzbd_engine::volumes::disk_space(member.measured));
+            let label = group
+                .members
+                .iter()
+                .map(|member| member.target.label.as_str())
+                .collect::<Vec<_>>()
+                .join(" · ");
+            let path = common_storage_path(&group.members);
             StoragePathDto {
-                label: target.label.clone(),
-                path: target.path.to_string_lossy().into_owned(),
+                label,
+                path: path.to_string_lossy().into_owned(),
                 available_bytes: space.map(|s| s.available),
                 total_bytes: space.map(|s| s.total),
             }
         })
         .collect()
+}
+
+fn nearest_existing_ancestor(path: &std::path::Path) -> &std::path::Path {
+    let mut measured = path;
+    while !measured.exists() {
+        let Some(parent) = measured.parent() else {
+            break;
+        };
+        measured = parent;
+    }
+    measured
+}
+
+fn common_storage_path(members: &[StorageMember<'_>]) -> std::path::PathBuf {
+    let mut common = members[0].target.path.clone();
+    while !members
+        .iter()
+        .all(|member| member.target.path.starts_with(&common))
+    {
+        if !common.pop() {
+            break;
+        }
+    }
+    if common.as_os_str().is_empty() {
+        std::path::PathBuf::from(".")
+    } else {
+        common
+    }
 }
 
 /// Try to create (and remove) a sibling probe file where the config will
@@ -2673,6 +2733,12 @@ mod tests {
             ]
         );
         let measured = measure_storage(&probe.targets);
+        assert_eq!(measured.len(), 1, "paths on one volume share one monitor");
+        assert_eq!(
+            measured[0].label,
+            "state · downloads · working · failed · temporary · category: tv"
+        );
+        assert_eq!(measured[0].path, tmp.path().to_string_lossy());
         assert!(measured.iter().all(|p| p.total_bytes.unwrap_or(0) > 0));
         assert!(measured
             .iter()
