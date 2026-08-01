@@ -351,6 +351,7 @@ function Overview({
                 key={`${volume.path}:${index}`}
                 storage={volume}
                 styles={styles}
+                wide={wide}
               />
             ))}
           </View>
@@ -387,10 +388,12 @@ function StorageVolume({
   storage,
   critical,
   styles,
+  wide,
 }: {
   storage: StoragePath;
   critical: boolean;
   styles: ReturnType<typeof makeStyles>;
+  wide: boolean;
 }) {
   const usage = storageUsage(storage);
   const tone = usage
@@ -409,7 +412,11 @@ function StorageVolume({
   return (
     <View
       accessibilityLabel={`${storage.label}, ${storage.path}, ${percent === null ? 'capacity unavailable' : `${percent} percent used, ${capacity}`}`}
-      style={[styles.storageRow, critical && styles.storageRowCritical]}
+      style={[
+        styles.storageRow,
+        wide ? styles.storageRowWide : styles.storageRowPhone,
+        critical && styles.storageRowCritical,
+      ]}
     >
       <View style={styles.storageTop}>
         <Text numberOfLines={1} style={styles.storageLabel}>
@@ -909,8 +916,10 @@ const makeStyles = (theme: Theme) =>
       gap: 6,
     },
     queueSummaryBlock: {
-      minWidth: 112,
-      flex: 0.72,
+      minWidth: 0,
+      flexBasis: 0,
+      flexGrow: 0.72,
+      flexShrink: 1,
       padding: 6,
       borderRadius: 10,
       borderWidth: 1,
@@ -961,7 +970,9 @@ const makeStyles = (theme: Theme) =>
     },
     storageBlock: {
       minWidth: 0,
-      flex: 1.28,
+      flexBasis: 0,
+      flexGrow: 1.28,
+      flexShrink: 1,
       paddingHorizontal: 7,
       paddingVertical: 6,
       borderRadius: 10,
@@ -979,9 +990,9 @@ const makeStyles = (theme: Theme) =>
     storageCritical: { color: theme.textMuted, fontSize: 7, flexShrink: 1 },
     storageList: { flexDirection: 'row', flexWrap: 'wrap', gap: 5 },
     storageRow: {
-      minWidth: 150,
-      flexBasis: 170,
-      flexGrow: 1,
+      minWidth: 0,
+      maxWidth: '100%',
+      flexShrink: 1,
       paddingHorizontal: 6,
       paddingVertical: 4,
       borderRadius: 7,
@@ -989,6 +1000,8 @@ const makeStyles = (theme: Theme) =>
       borderColor: 'transparent',
       backgroundColor: theme.panelAlt,
     },
+    storageRowPhone: { width: '100%' },
+    storageRowWide: { minWidth: 150, flexBasis: 170, flexGrow: 1 },
     storageRowCritical: { borderColor: theme.accent },
     storageTop: { flexDirection: 'row', alignItems: 'center', gap: 5 },
     storageLabel: {
@@ -997,6 +1010,7 @@ const makeStyles = (theme: Theme) =>
       fontWeight: '800',
       textTransform: 'uppercase',
       flex: 1,
+      minWidth: 0,
     },
     storagePercent: {
       color: theme.accent,
@@ -1006,7 +1020,7 @@ const makeStyles = (theme: Theme) =>
     },
     storageTextWarning: { color: theme.warning },
     storageTextDanger: { color: theme.danger },
-    storagePath: { color: theme.textMuted, fontSize: 7, marginTop: 1 },
+    storagePath: { color: theme.textMuted, fontSize: 7, marginTop: 1, minWidth: 0 },
     storageTrack: {
       height: 4,
       marginTop: 3,
