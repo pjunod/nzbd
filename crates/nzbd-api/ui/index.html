@@ -60,6 +60,36 @@
           padding: 10px 12px; }
   .stat .v { font-size: 19px; font-weight: 650; font-variant-numeric: tabular-nums; }
   .stat .l { color: var(--ink2); font-size: 11.5px; margin-top: 1px; }
+  .transfer-pair { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+  .transfer-pair > div + div { padding-left: 10px; border-left: 1px solid var(--line); }
+  .transfer-pair .v { font-size: 16px; }
+
+  /* Capacity is operational state, not a settings detail. The daemon
+     probes these paths off-thread and the dashboard renders the cached
+     readings, so a saturated network volume cannot stall this page. */
+  .storage-panel { margin: 0 0 14px; padding: 10px 12px 11px; background: var(--panel);
+    border: 1px solid var(--line); border-radius: 8px; }
+  .storage-head { display: flex; align-items: baseline; gap: 8px; margin-bottom: 7px; }
+  .storage-head b { font-size: 11.5px; letter-spacing: .06em; text-transform: uppercase; }
+  .storage-head span { color: var(--muted); font-size: 10.5px; }
+  .storage-list { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+    gap: 7px 16px; }
+  .storage-row { min-width: 0; --storage-color: var(--accent); }
+  .storage-row.warn { --storage-color: var(--warn); }
+  .storage-row.bad { --storage-color: var(--bad); }
+  .storage-top, .storage-bottom { display: flex; align-items: baseline; gap: 8px;
+    min-width: 0; font-variant-numeric: tabular-nums; }
+  .storage-label { flex: 0 0 auto; color: var(--ink2); font-size: 10.5px;
+    font-weight: 650; text-transform: uppercase; }
+  .storage-path { min-width: 0; flex: 1; overflow: hidden; text-overflow: ellipsis;
+    color: var(--muted); font: 10.5px/1.35 ui-monospace, SFMono-Regular, Menlo, monospace;
+    white-space: nowrap; }
+  .storage-pct { flex: 0 0 auto; color: var(--storage-color); font-size: 11px; font-weight: 650; }
+  .storage-track { height: 5px; margin: 4px 0 3px; overflow: hidden;
+    background: var(--track); border-radius: 99px; }
+  .storage-fill { height: 100%; width: 0; background: var(--storage-color);
+    border-radius: inherit; transition: width .5s ease; }
+  .storage-bottom { justify-content: space-between; color: var(--muted); font-size: 10.5px; }
 
   .badges { display: flex; gap: 6px; flex-wrap: wrap; }
   .badge { font-size: 11px; font-weight: 600; border: 1px solid var(--line);
@@ -140,6 +170,24 @@
 
   tbody tr { transition: background .15s ease; }
   tbody tr:hover { background: color-mix(in srgb, var(--accent) 4%, transparent); }
+  /* Active work gets a restrained stage color: enough to scan the queue
+     by activity, never enough to overpower status/health warnings. Waiting
+     rows stay neutral so the working set separates immediately. */
+  #queue-body tr.job-row { --job-accent: var(--muted); }
+  #queue-body tr.job-row > td:first-child { box-shadow: inset 3px 0 0
+    color-mix(in srgb, var(--job-accent) 78%, transparent); }
+  #queue-body tr.active-job { background: color-mix(in srgb, var(--job-accent) 5%, transparent); }
+  #queue-body tr.active-job:hover { background: color-mix(in srgb, var(--job-accent) 9%, transparent); }
+  #queue-body tr.job-downloading { --job-accent: var(--ok); }
+  #queue-body tr.job-fetching { --job-accent: #42a5d5; }
+  #queue-body tr.job-post_queued { --job-accent: var(--warn); }
+  #queue-body tr.job-renaming { --job-accent: #a57bd8; }
+  #queue-body tr.job-verifying { --job-accent: #38a9ad; }
+  #queue-body tr.job-repairing { --job-accent: #dc7844; }
+  #queue-body tr.job-extracting { --job-accent: #c86fa7; }
+  #queue-body tr.job-cleaning { --job-accent: #6b9f74; }
+  #queue-body tr.job-moving { --job-accent: #5b86d9; }
+  #queue-body tr.job-scripting { --job-accent: #8d72d8; }
   td .health { font-weight: 650; }
 
   #hold { display: none; margin: 0 0 12px; padding: 8px 12px; border-radius: 8px;
@@ -429,6 +477,8 @@
     .wrap { padding: 12px 10px 34px; }
     .stats { grid-template-columns: repeat(2, 1fr); }
     .stat .v { font-size: 16px; }
+    .transfer-pair .v { font-size: 14px; }
+    .storage-list { grid-template-columns: minmax(0, 1fr); }
     th.num, td.num { display: none; }        /* size/health columns */
     th:nth-child(2), td:nth-child(2) { display: none; } /* status column */
     .st.st-inline { display: inline-block; margin-top: 3px; }
@@ -532,9 +582,16 @@
       <canvas id="spark" height="26" aria-hidden="true"
         title="The last three minutes of throughput, one point per second."></canvas></div>
     <div class="stat"><div class="v" id="s-eta">—</div><div class="l">time left</div></div>
-    <div class="stat"><div class="v" id="s-remaining">—</div><div class="l">remaining</div></div>
-    <div class="stat"><div class="v" id="s-session">—</div><div class="l">this session</div></div>
+    <div class="stat"><div class="transfer-pair">
+      <div><div class="v" id="s-remaining">—</div><div class="l">remaining</div></div>
+      <div><div class="v" id="s-session">—</div><div class="l">this session</div></div>
+    </div></div>
     <div class="stat"><div class="v" id="s-active">—</div><div class="l">active / queued</div></div>
+  </div>
+
+  <div class="storage-panel" id="storage-panel" hidden>
+    <div class="storage-head"><b>Storage</b><span>configured paths and filesystem capacity</span></div>
+    <div class="storage-list" id="storage-list"></div>
   </div>
 
   <div id="hold"></div>
@@ -1142,6 +1199,8 @@ function rowModel(j, ctx) {
   const pend = ctx.pendingOps || null;
   const over = pend ? pend.status(j.id) : null;  // unconfirmed pause/resume
   const busy = pend ? pend.busy(j.id) : false;   // an action is in flight
+  const section = ctx.section || sectionOf(j);
+  const active = section !== "waiting";
 
   // A URL job has no articles until its NZB arrives — "0 B of 0 B" reads as
   // broken; say what it is actually doing instead.
@@ -1191,7 +1250,8 @@ function rowModel(j, ctx) {
     key: "j" + j.id,
     kind: "job",
     id: j.id,
-    rowCls: busy ? "pending" : "",
+    rowCls: "job-row " + (active ? "active-job " : "waiting-job ") +
+            "job-" + section + (busy ? " pending" : ""),
     name: j.name,
     nameTip: j.name + " — click for details",
     sub: "#" + j.id + (j.category ? " · " + j.category : "") +
@@ -1867,6 +1927,7 @@ function queueModels() {
         // Only the waiting list holds jobs whose statuses differ from one
         // another; every other section's heading IS its rows' status.
         mixedSection: sec.key === "waiting",
+        section: sec.key,
         nowMs,
       }));
       // The detail panel belongs to its row, so it only exists while that
@@ -1909,6 +1970,74 @@ function statusModels(s) {
       text: "limit " + fmtRate(s.speed_limit_bps),
     });
   return out;
+}
+
+// ---- configured storage paths ------------------------------------------
+// Each reading is filesystem capacity, even when the configured leaf does
+// not exist yet (the daemon measures its nearest existing ancestor). That
+// makes a future category destination useful before its first job arrives.
+function storageModels(s) {
+  return (s.storage || []).map((v, i) => {
+    const hasReading = v.total_bytes != null && v.available_bytes != null &&
+      Number.isFinite(Number(v.total_bytes)) && Number(v.total_bytes) > 0 &&
+      Number.isFinite(Number(v.available_bytes));
+    const total = hasReading ? Number(v.total_bytes) : 0;
+    const available = hasReading
+      ? Math.max(0, Math.min(total, Number(v.available_bytes))) : 0;
+    const used = Math.max(0, total - available);
+    const pct = total ? Math.max(0, Math.min(100, used * 100 / total)) : 0;
+    const level = pct >= 95 ? " bad" : pct >= 85 ? " warn" : "";
+    return {
+      key: "storage:" + (v.path || i), kind: "storage",
+      cls: "storage-row" + level,
+      label: v.label || "path",
+      path: v.path || "—",
+      pct: hasReading ? Math.round(pct) + "%" : "measuring…",
+      fill: hasReading ? pct.toFixed(1) + "%" : "0%",
+      used: hasReading ? fmtBytes(used) + " / " + fmtBytes(total) : "capacity unavailable",
+      free: hasReading ? fmtBytes(available) + " free" : "",
+      tip: hasReading
+        ? (v.path || "") + " — " + fmtBytes(used) + " used of " + fmtBytes(total) +
+          " (" + Math.round(pct) + "%)"
+        : (v.path || "") + " — waiting for a capacity reading",
+    };
+  });
+}
+
+function buildStorageRow(d) {
+  const row = d.create("div", "storage-row");
+  const top = d.append(row, d.create("div", "storage-top"));
+  const label = d.append(top, d.create("span", "storage-label"));
+  const path = d.append(top, d.create("span", "storage-path"));
+  const pct = d.append(top, d.create("span", "storage-pct"));
+  const track = d.append(row, d.create("div", "storage-track"));
+  const fill = d.append(track, d.create("div", "storage-fill"));
+  const bottom = d.append(row, d.create("div", "storage-bottom"));
+  const used = d.append(bottom, d.create("span"));
+  const free = d.append(bottom, d.create("span"));
+  row.__c = { label, path, pct, fill, used, free };
+  return row;
+}
+function applyStorageRow(row, m, d) {
+  d = d || dom;
+  const c = row.__c, w = differ(row);
+  w("cls", m.cls, v => d.cls(row, v));
+  w("label", m.label, v => d.text(c.label, v));
+  w("path", m.path, v => d.text(c.path, v));
+  w("pct", m.pct, v => d.text(c.pct, v));
+  w("fill", m.fill, v => d.style(c.fill, "width", v));
+  w("used", m.used, v => d.text(c.used, v));
+  w("free", m.free, v => d.text(c.free, v));
+  w("tip", m.tip, v => d.prop(row, "title", v));
+}
+KINDS.storage = { build: buildStorageRow, apply: applyStorageRow };
+
+function renderStorage(s) {
+  const panel = $("storage-panel"), list = $("storage-list");
+  if (!panel || !list) return;
+  const models = storageModels(s);
+  setProp(panel, "hidden", !models.length);
+  reconcileRows(list, models, dom);
 }
 
 // ---- rate history: three minutes under the number -----------------------
@@ -2063,6 +2192,7 @@ function renderStatus() {
     ? post + " of the " + s.jobs_downloading
       + " active job(s) are in post-processing — repairing, extracting or moving."
     : "Jobs being worked on right now, over jobs waiting their turn.");
+  renderStorage(s);
   reconcileRows($("badges"), statusModels(s), dom);
   // Why is nothing downloading? Say so instead of sitting silently.
   const holds = [];
@@ -3912,7 +4042,7 @@ function pollPass() {
 if (typeof __nzbd_test_enable !== "undefined") {
   window.__nzbd_test = {
     rowModel, reconcileRows, applyRow, differ, KINDS, store,
-    histModel, fileModel, statusModels, queueModels, detailModel,
+    histModel, fileModel, statusModels, storageModels, queueModels, detailModel,
     statusName, statusLabel, healthColor, fmtBytes, fmtRate, fmtEta, fmtDur, ppSummary,
     sectionOf, pipelineModels, stageElapsedMs, SECTIONS, ORDERED,
     pending, satisfied, toast, connState, pollResult,
@@ -3925,7 +4055,7 @@ if (typeof __nzbd_test_enable !== "undefined") {
     armButton, armIsSet, disarmButton, histKey, renderHistory, renderStatus,
     deleteJob, requeueJob, jobAction, histAction, post,
     pushRate, pushRateSampled, rateSeries, spark, SPARK_N, titleFor,
-    appendLogs, logMatches, renderLogs, serverChipModels, LOG_RING_MAX,
+    appendLogs, logMatches, renderLogs, serverChipModels, renderStorage, LOG_RING_MAX,
     trimLogRing, logClass, logLineText, scheduleLogRender, refreshLogs,
     histDetailModel, histFileModel, toggleHist, getOpenHist: () => openHist,
     refreshHistory, renderHistoryPager, setHistoryPage, setHistoryPageSize, historyPages,

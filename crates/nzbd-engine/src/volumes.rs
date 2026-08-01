@@ -166,18 +166,37 @@ impl VolumeBook {
     }
 }
 
-/// Free bytes on the filesystem holding `path` (0 if it can't be measured).
-pub fn free_space(path: &Path) -> u64 {
+/// Capacity visible to the daemon on the filesystem holding a path.
+///
+/// `available` uses `f_bavail`, not `f_bfree`: reserved blocks are not
+/// writable by the unprivileged daemon and therefore are not honest free
+/// space for either the queue guard or the dashboard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DiskSpace {
+    pub available: u64,
+    pub total: u64,
+}
+
+pub fn disk_space(path: &Path) -> Option<DiskSpace> {
     use std::os::unix::ffi::OsStrExt;
     let Ok(cstr) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
-        return u64::MAX;
+        return None;
     };
     let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
     let rc = unsafe { libc::statvfs(cstr.as_ptr(), &mut st) };
     if rc != 0 {
-        return u64::MAX; // can't measure → don't false-trip the guard
+        return None;
     }
-    (st.f_bavail as u64).saturating_mul(st.f_frsize as u64)
+    Some(DiskSpace {
+        available: (st.f_bavail as u64).saturating_mul(st.f_frsize as u64),
+        total: (st.f_blocks as u64).saturating_mul(st.f_frsize as u64),
+    })
+}
+
+/// Free bytes on the filesystem holding `path` (`u64::MAX` when it cannot
+/// be measured, so an unavailable probe never false-trips the disk guard).
+pub fn free_space(path: &Path) -> u64 {
+    disk_space(path).map(|s| s.available).unwrap_or(u64::MAX)
 }
 
 #[cfg(test)]
@@ -253,5 +272,12 @@ mod tests {
     fn free_space_measures_something() {
         let free = free_space(Path::new("/"));
         assert!(free > 0);
+    }
+
+    #[test]
+    fn disk_space_reports_available_within_total() {
+        let space = disk_space(Path::new("/")).expect("root filesystem is measurable");
+        assert!(space.total > 0);
+        assert!(space.available <= space.total);
     }
 }

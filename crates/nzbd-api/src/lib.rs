@@ -84,6 +84,10 @@ pub struct SetupHandle {
     /// mirror on the data volume: the path it came from. The UI turns this
     /// into "your config directory isn't keeping anything — fix the mount".
     pub recovered_from: Option<std::path::PathBuf>,
+    /// Cached capacity readings for every configured storage destination.
+    /// The probe runs off-thread: a saturated network volume must never
+    /// make `/status` or the 1 Hz event stream wait on `statvfs`.
+    storage: Arc<StorageProbe>,
 }
 
 impl SetupHandle {
@@ -100,6 +104,7 @@ impl SetupHandle {
             current: std::sync::Mutex::new(nzbd_config::Config::default()),
             pending_restart: std::sync::Mutex::new(Default::default()),
             recovered_from: None,
+            storage: Arc::new(StorageProbe::empty()),
         }
     }
 
@@ -110,6 +115,7 @@ impl SetupHandle {
         current: nzbd_config::Config,
     ) -> Self {
         let writable = config_path.as_deref().map(probe_writable).unwrap_or(false);
+        let storage = Arc::new(StorageProbe::from_config(&current));
         SetupHandle {
             config_path,
             setup_mode: false,
@@ -120,6 +126,7 @@ impl SetupHandle {
             current: std::sync::Mutex::new(current),
             pending_restart: std::sync::Mutex::new(Default::default()),
             recovered_from: None,
+            storage,
         }
     }
 
@@ -156,6 +163,139 @@ impl SetupHandle {
             }
         }
     }
+}
+
+#[derive(Debug, Clone)]
+struct StorageTarget {
+    label: String,
+    path: std::path::PathBuf,
+}
+
+/// One configured path and the capacity of the filesystem that contains
+/// it. Values are optional while the first probe is running or when no
+/// existing ancestor can be measured.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct StoragePathDto {
+    pub label: String,
+    pub path: String,
+    pub available_bytes: Option<u64>,
+    pub total_bytes: Option<u64>,
+}
+
+struct StorageProbe {
+    targets: Vec<StorageTarget>,
+    latest: std::sync::RwLock<Vec<StoragePathDto>>,
+    started: std::sync::atomic::AtomicBool,
+}
+
+impl StorageProbe {
+    fn empty() -> StorageProbe {
+        StorageProbe {
+            targets: Vec::new(),
+            latest: std::sync::RwLock::new(Vec::new()),
+            started: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    fn from_config(cfg: &nzbd_config::Config) -> StorageProbe {
+        let mut targets = Vec::new();
+        let mut push = |label: String, path: std::path::PathBuf| {
+            if !targets.iter().any(|t: &StorageTarget| t.path == path) {
+                targets.push(StorageTarget { label, path });
+            }
+        };
+        push("state".into(), cfg.state_dir());
+        push("downloads".into(), cfg.dest_dir());
+        push(
+            "working".into(),
+            nzbd_config::expand_home(&cfg.paths.main_dir),
+        );
+        push(
+            "failed".into(),
+            cfg.post
+                .failed_dir
+                .as_ref()
+                .map(|path| nzbd_config::expand_home(path))
+                .unwrap_or_else(|| nzbd_config::expand_home(&cfg.paths.main_dir).join("failed")),
+        );
+        if let Some(path) = &cfg.paths.inter_dir {
+            push("intermediate".into(), nzbd_config::expand_home(path));
+        }
+        if let Some(path) = &cfg.paths.temp_dir {
+            push("temporary".into(), nzbd_config::expand_home(path));
+        }
+        for category in &cfg.categories {
+            if let Some(path) = &category.dest_dir {
+                push(
+                    format!("category: {}", category.name),
+                    nzbd_config::expand_home(path),
+                );
+            }
+        }
+        let latest = targets
+            .iter()
+            .map(|t| StoragePathDto {
+                label: t.label.clone(),
+                path: t.path.to_string_lossy().into_owned(),
+                available_bytes: None,
+                total_bytes: None,
+            })
+            .collect();
+        StorageProbe {
+            targets,
+            latest: std::sync::RwLock::new(latest),
+            started: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    fn start(self: &Arc<Self>) {
+        use std::sync::atomic::Ordering;
+        if self.started.swap(true, Ordering::AcqRel) || self.targets.is_empty() {
+            return;
+        }
+        let probe = self.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(10));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tick.tick().await;
+                let targets = probe.targets.clone();
+                let readings = tokio::task::spawn_blocking(move || measure_storage(&targets)).await;
+                if let Ok(readings) = readings {
+                    *probe.latest.write().unwrap() = readings;
+                }
+            }
+        });
+    }
+
+    fn snapshot(&self) -> Vec<StoragePathDto> {
+        self.latest.read().unwrap().clone()
+    }
+}
+
+fn measure_storage(targets: &[StorageTarget]) -> Vec<StoragePathDto> {
+    targets
+        .iter()
+        .map(|target| {
+            // A category or failed directory may not exist until its first
+            // job. Measure the nearest existing ancestor while continuing
+            // to display the configured destination itself.
+            let mut measured = target.path.as_path();
+            while !measured.exists() {
+                let Some(parent) = measured.parent() else {
+                    break;
+                };
+                measured = parent;
+            }
+            let space = nzbd_engine::volumes::disk_space(measured);
+            StoragePathDto {
+                label: target.label.clone(),
+                path: target.path.to_string_lossy().into_owned(),
+                available_bytes: space.map(|s| s.available),
+                total_bytes: space.map(|s| s.total),
+            }
+        })
+        .collect()
 }
 
 /// Try to create (and remove) a sibling probe file where the config will
@@ -458,9 +598,15 @@ pub struct StatusDto {
     /// header tile — two numbers that claim to be the same thing must be
     /// the same measurement.
     pub servers: Vec<nzbd_engine::ServerVolume>,
+    /// Cached capacity readings for the paths this process relies on.
+    pub storage: Vec<StoragePathDto>,
 }
 
 pub fn status_dto(snap: &QueueSnapshot) -> StatusDto {
+    status_dto_with_storage(snap, Vec::new())
+}
+
+fn status_dto_with_storage(snap: &QueueSnapshot, storage: Vec<StoragePathDto>) -> StatusDto {
     let count =
         |pred: &dyn Fn(&JobSummary) -> bool| snap.jobs.iter().filter(|j| pred(j)).count() as u32;
     StatusDto {
@@ -497,11 +643,17 @@ pub fn status_dto(snap: &QueueSnapshot) -> StatusDto {
             )
         }),
         servers: snap.server_volumes.clone(),
+        storage,
     }
 }
 
 async fn get_status(State(st): State<ApiState>) -> Json<StatusDto> {
-    Json(status_dto(&st.engine.snapshot()))
+    let storage = st
+        .setup
+        .as_ref()
+        .map(|s| s.storage.snapshot())
+        .unwrap_or_default();
+    Json(status_dto_with_storage(&st.engine.snapshot(), storage))
 }
 
 async fn healthz() -> &'static str {
@@ -1159,6 +1311,7 @@ async fn sse_events(State(st): State<ApiState>, headers: axum::http::HeaderMap) 
 
     let engine = st.engine.clone();
     let log = st.log.clone();
+    let storage = st.setup.as_ref().map(|s| s.storage.clone());
     let mut shutdown = st.shutdown.clone();
     // Forward engine events into the SSE body, but stop the instant the
     // daemon starts shutting down — an open `/api/v1/events` connection
@@ -1235,7 +1388,8 @@ async fn sse_events(State(st): State<ApiState>, headers: axum::http::HeaderMap) 
                             last_frame = std::time::Instant::now();
                         }
                     }
-                    let payload = tick_payload(&engine.snapshot());
+                    let storage = storage.as_ref().map(|s| s.snapshot()).unwrap_or_default();
+                    let payload = tick_payload(&engine.snapshot(), storage);
                     if last_tick_payload.as_deref() != Some(payload.as_str()) {
                         let sse = SseEvent::default().event("tick").data(&payload);
                         if tx.send(Ok(sse)).await.is_err() {
@@ -1359,8 +1513,8 @@ fn unix_now() -> i64 {
 }
 
 /// The 1 Hz SSE `tick` body: header status + job rows from one snapshot.
-fn tick_payload(snap: &QueueSnapshot) -> String {
-    json!({ "status": status_dto(snap), "jobs": snap.jobs }).to_string()
+fn tick_payload(snap: &QueueSnapshot, storage: Vec<StoragePathDto>) -> String {
+    json!({ "status": status_dto_with_storage(snap, storage), "jobs": snap.jobs }).to_string()
 }
 
 /// Resolve when the daemon is shutting down; pend forever if no shutdown
@@ -2289,6 +2443,9 @@ async fn history_action(
 /// not from whenever the first SSE client happens to connect. Every caller
 /// already builds its router inside one.
 pub fn router_with(state: ApiState) -> Router {
+    if let Some(setup) = &state.setup {
+        setup.storage.start();
+    }
     let state = ApiState {
         events: state
             .events
@@ -2484,6 +2641,42 @@ mod tests {
         };
         let dto = status_dto(&snap);
         assert_eq!((dto.jobs_downloading, dto.jobs_queued), (1, 0));
+    }
+
+    #[test]
+    fn storage_probe_covers_configured_paths_and_missing_destinations() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cfg = nzbd_config::Config::default();
+        cfg.paths.main_dir = tmp.path().join("working");
+        cfg.paths.queue_dir = Some(tmp.path().join("state"));
+        cfg.paths.dest_dir = tmp.path().join("downloads");
+        cfg.paths.temp_dir = Some(tmp.path().join("scratch"));
+        cfg.post.failed_dir = Some(tmp.path().join("failed"));
+        cfg.categories.push(nzbd_config::CategoryConfig {
+            name: "tv".into(),
+            dest_dir: Some(tmp.path().join("library/tv")),
+            ..Default::default()
+        });
+        std::fs::create_dir_all(tmp.path().join("state")).unwrap();
+
+        let probe = StorageProbe::from_config(&cfg);
+        let labels: Vec<_> = probe.targets.iter().map(|t| t.label.as_str()).collect();
+        assert_eq!(
+            labels,
+            [
+                "state",
+                "downloads",
+                "working",
+                "failed",
+                "temporary",
+                "category: tv"
+            ]
+        );
+        let measured = measure_storage(&probe.targets);
+        assert!(measured.iter().all(|p| p.total_bytes.unwrap_or(0) > 0));
+        assert!(measured
+            .iter()
+            .all(|p| { p.available_bytes.unwrap_or(u64::MAX) <= p.total_bytes.unwrap_or(0) }));
     }
 
     /// The endpoint answers with the value it applied, not the one it was

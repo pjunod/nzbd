@@ -347,6 +347,33 @@ const models = (jobs) => jobs.map((j, i) => T.rowModel(j, { idx: i, count: jobs.
   eq(doomed2.hNote, "unrepairable · will fail at end", "…and so is the un-armed case");
 }
 
+// --- 8b. storage paths: capacity, warning levels, stable rows ------------
+{
+  const GiB = 1024 ** 3;
+  const storage = T.storageModels({ storage: [
+    { label: "working", path: "/data/working", available_bytes: 25 * GiB, total_bytes: 100 * GiB },
+    { label: "downloads", path: "/data/downloads", available_bytes: 10 * GiB, total_bytes: 100 * GiB },
+    { label: "failed", path: "/data/failed", available_bytes: null, total_bytes: null },
+  ] });
+  eq(storage.length, 3, "every configured storage path gets a row");
+  eq(storage[0].pct, "75%", "fullness is used capacity, not free capacity");
+  eq(storage[0].used, "75.0 GiB / 100 GiB", "used and total capacity are both stated");
+  eq(storage[0].free, "25.0 GiB free", "remaining capacity is stated too");
+  ok(storage[1].cls.includes("warn"), "a filesystem at 90% reads as a warning");
+  eq(storage[2].pct, "measuring…", "the initial probe does not pretend zero usage");
+
+  const list = node("div");
+  T.reconcileRows(list, storage, fake);
+  const first = list.children[0];
+  eq(first.children[0].children[0].textContent, "working", "the path role is visible");
+  eq(first.children[0].children[1].textContent, "/data/working", "the actual path is visible");
+  eq(first.children[1].children[0].style.width, "75.0%", "the bar shows the same fullness");
+  resetCounts();
+  T.reconcileRows(list, storage, fake);
+  eq(counts.text + counts.cls + counts.style + counts.prop, 0,
+    "unchanged storage readings do not rewrite their rows");
+}
+
 // --- 9. detail panel is a stable subtree ---------------------------------
 {
   const tbody = node("tbody");
@@ -518,7 +545,7 @@ const models = (jobs) => jobs.map((j, i) => T.rowModel(j, { idx: i, count: jobs.
   eq(assigns, 0, "the live-rows renderer never assigns innerHTML");
   const onclicks = (renderer.match(/onclick\s*=\s*["'`]/g) || []).length;
   eq(onclicks, 0, "no generated onclick= strings in rendered rows");
-  for (const container of ["queue-body", "history-body", "logbox", "badges", "clients-strip"])
+  for (const container of ["queue-body", "history-body", "logbox", "badges", "clients-strip", "storage-list"])
     ok(!new RegExp(`\\$\\("${container}"\\)\\.innerHTML`).test(src),
       `#${container} is never rebuilt with innerHTML`);
 }
@@ -580,7 +607,7 @@ const models = (jobs) => jobs.map((j, i) => T.rowModel(j, { idx: i, count: jobs.
   const m = T.queueModels().find(x => x.kind === "job");
   eq(m.st, "PAUSED", "the chip flips the instant the button is clicked");
   eq(m.pauseLabel, "resume", "…and the button offers the opposite action");
-  eq(m.rowCls, "pending", "the row reads as in-flight");
+  ok(m.rowCls.includes("pending"), "the row reads as in-flight");
   T.pending.reconcile([j]); // server still says downloading
   eq(T.pending.ops.size, 1, "an unconfirmed pause stays applied");
   T.pending.reconcile([job(1, { status: "paused" })]);
@@ -1343,6 +1370,20 @@ const models = (jobs) => jobs.map((j, i) => T.rowModel(j, { idx: i, count: jobs.
     eq(movable.moveHidden, false, "a queued job keeps them");
     eq(T.rowModel(job(1), { idx: 0, count: 1 }).moveHidden, false,
       "a caller that says nothing about movability keeps the old controls");
+
+    // Waiting stays visually neutral; active work carries a stable color
+    // hook specific to what it is doing.
+    const waiting = T.rowModel(job(1, { status: "queued" }), { section: "waiting" });
+    const downloading = T.rowModel(job(2), { section: "downloading" });
+    const repairing = T.rowModel(post("par_repair"), { section: "repairing" });
+    const extracting = T.rowModel(post("unpack"), { section: "extracting" });
+    ok(waiting.rowCls.includes("waiting-job") && waiting.rowCls.includes("job-waiting"),
+      "waiting rows carry the neutral waiting treatment");
+    ok(downloading.rowCls.includes("active-job") && downloading.rowCls.includes("job-downloading"),
+      "a download stands out as active and as a download");
+    ok(repairing.rowCls.includes("job-repairing"), "repairing has its own color hook");
+    ok(extracting.rowCls.includes("job-extracting"), "extracting has a different color hook");
+    ok(repairing.rowCls !== extracting.rowCls, "active job types remain distinguishable");
   }
 
   // --- the stage timer -----------------------------------------------------
