@@ -54,26 +54,30 @@
   footer .ver { color: var(--muted); }
   header .spacer { flex: 1; }
 
-  .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
-           gap: 8px; margin: 14px 0; }
+  .overview { display: grid; grid-template-columns: minmax(300px, .72fr) minmax(0, 1.5fr);
+              align-items: stretch; gap: 8px; margin: 14px 0; }
+  .overview.no-storage { grid-template-columns: minmax(0, 1fr); }
+  .stats { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px; }
+  .overview.no-storage .stats { grid-template-columns: repeat(4, minmax(120px, 1fr)); }
   .stat { background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
-          padding: 10px 12px; }
-  .stat .v { font-size: 19px; font-weight: 650; font-variant-numeric: tabular-nums; }
-  .stat .l { color: var(--ink2); font-size: 11.5px; margin-top: 1px; }
-  .transfer-pair { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
-  .transfer-pair > div + div { padding-left: 10px; border-left: 1px solid var(--line); }
-  .transfer-pair .v { font-size: 16px; }
+          min-width: 0; padding: 7px 9px; }
+  .stat .v { font-size: 15.5px; line-height: 1.25; font-weight: 650;
+             font-variant-numeric: tabular-nums; }
+  .stat .l { color: var(--ink2); font-size: 10.5px; margin-top: 1px; }
+  .transfer-pair { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 7px; }
+  .transfer-pair > div + div { padding-left: 7px; border-left: 1px solid var(--line); }
+  .transfer-pair .v { font-size: 13.5px; }
 
   /* Capacity is operational state, not a settings detail. The daemon
      probes these paths off-thread and the dashboard renders the cached
      readings, so a saturated network volume cannot stall this page. */
-  .storage-panel { margin: 0 0 14px; padding: 10px 12px 11px; background: var(--panel);
+  .storage-panel { min-width: 0; margin: 0; padding: 8px 10px 9px; background: var(--panel);
     border: 1px solid var(--line); border-radius: 8px; }
-  .storage-head { display: flex; align-items: baseline; gap: 8px; margin-bottom: 7px; }
+  .storage-head { display: flex; align-items: baseline; gap: 8px; margin-bottom: 5px; }
   .storage-head b { font-size: 11.5px; letter-spacing: .06em; text-transform: uppercase; }
   .storage-head span { color: var(--muted); font-size: 10.5px; }
-  .storage-list { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
-    gap: 7px 16px; }
+  .storage-list { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+    gap: 5px 14px; }
   .storage-row { min-width: 0; --storage-color: var(--accent); }
   .storage-row.warn { --storage-color: var(--warn); }
   .storage-row.bad { --storage-color: var(--bad); }
@@ -102,7 +106,9 @@
   .badge.srv.live { border-color: color-mix(in srgb, var(--ok) 45%, transparent); }
   /* The rate tile carries three minutes of history under the number. */
   .stat.rate-tile { position: relative; overflow: hidden; }
-  #spark { display: block; width: 100%; height: 26px; margin-top: 2px; }
+  .rate-tile .v, .rate-tile .l { position: relative; z-index: 1; }
+  #spark { position: absolute; right: 7px; bottom: 6px; width: 46%; height: 22px;
+           opacity: .58; }
 
   .controls { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin: 6px 0 14px; }
   button { background: var(--panel); color: var(--ink); border: 1px solid var(--line);
@@ -473,11 +479,14 @@
     background: var(--panel); border: 1px solid var(--line); border-radius: 6px;
     color: var(--ink); white-space: pre; }
   /* phones */
+  @media (max-width: 840px) {
+    .overview { grid-template-columns: minmax(0, 1fr); }
+    .stats, .overview.no-storage .stats { grid-template-columns: repeat(4, minmax(110px, 1fr)); }
+    .storage-list { grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); }
+  }
   @media (max-width: 640px) {
     .wrap { padding: 12px 10px 34px; }
-    .stats { grid-template-columns: repeat(2, 1fr); }
-    .stat .v { font-size: 16px; }
-    .transfer-pair .v { font-size: 14px; }
+    .stats, .overview.no-storage .stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
     .storage-list { grid-template-columns: minmax(0, 1fr); }
     th.num, td.num { display: none; }        /* size/health columns */
     th:nth-child(2), td:nth-child(2) { display: none; } /* status column */
@@ -577,21 +586,23 @@
 
   <div id="offline"></div>
 
-  <div class="stats">
-    <div class="stat rate-tile"><div class="v" id="s-rate">—</div><div class="l">download rate</div>
-      <canvas id="spark" height="26" aria-hidden="true"
-        title="The last three minutes of throughput, one point per second."></canvas></div>
-    <div class="stat"><div class="v" id="s-eta">—</div><div class="l">time left</div></div>
-    <div class="stat"><div class="transfer-pair">
-      <div><div class="v" id="s-remaining">—</div><div class="l">remaining</div></div>
-      <div><div class="v" id="s-session">—</div><div class="l">this session</div></div>
-    </div></div>
-    <div class="stat"><div class="v" id="s-active">—</div><div class="l">active / queued</div></div>
-  </div>
+  <div class="overview no-storage" id="overview">
+    <div class="stats">
+      <div class="stat rate-tile"><div class="v" id="s-rate">—</div><div class="l">download rate</div>
+        <canvas id="spark" height="26" aria-hidden="true"
+          title="The last three minutes of throughput, one point per second."></canvas></div>
+      <div class="stat"><div class="v" id="s-eta">—</div><div class="l">time left</div></div>
+      <div class="stat"><div class="transfer-pair">
+        <div><div class="v" id="s-remaining">—</div><div class="l">remaining</div></div>
+        <div><div class="v" id="s-session">—</div><div class="l">this session</div></div>
+      </div></div>
+      <div class="stat"><div class="v" id="s-active">—</div><div class="l">active / queued</div></div>
+    </div>
 
-  <div class="storage-panel" id="storage-panel" hidden>
-    <div class="storage-head"><b>Storage</b><span>configured paths and filesystem capacity</span></div>
-    <div class="storage-list" id="storage-list"></div>
+    <div class="storage-panel" id="storage-panel" hidden>
+      <div class="storage-head"><b>Storage</b><span>configured paths and filesystem capacity</span></div>
+      <div class="storage-list" id="storage-list"></div>
+    </div>
   </div>
 
   <div id="hold"></div>
@@ -2033,10 +2044,11 @@ function applyStorageRow(row, m, d) {
 KINDS.storage = { build: buildStorageRow, apply: applyStorageRow };
 
 function renderStorage(s) {
-  const panel = $("storage-panel"), list = $("storage-list");
+  const overview = $("overview"), panel = $("storage-panel"), list = $("storage-list");
   if (!panel || !list) return;
   const models = storageModels(s);
   setProp(panel, "hidden", !models.length);
+  setClass(overview, "overview" + (models.length ? "" : " no-storage"));
   reconcileRows(list, models, dom);
 }
 
