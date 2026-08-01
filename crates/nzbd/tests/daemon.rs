@@ -1399,6 +1399,7 @@ fn unwritable_state_dir_names_the_path_at_startup() {
         .args(["run", "--config"])
         .arg(&cfg_path)
         .args(["--bind", &format!("127.0.0.1:{}", free_port())])
+        .env("RUST_LOG", "info")
         .output()
         .expect("spawn nzbd");
 
