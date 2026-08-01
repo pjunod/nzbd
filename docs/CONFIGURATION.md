@@ -139,6 +139,7 @@ restarts (`servervolumes` in the compat API shows it).
 ```toml
 [api]
 bind = "127.0.0.1:6789"     # use 0.0.0.0:6789 to serve the LAN
+discovery = true             # advertise reachable listeners as _nzbd._tcp
 tls = false                 # true = serve HTTPS (NZBGet SecureControl).
                             # With no cert configured, a self-signed cert is
                             # generated once under the state dir and reused;
@@ -166,6 +167,31 @@ With no password set the API is open (bind to localhost!). With one set,
 every endpoint except `/healthz` requires HTTP Basic (or the Bearer
 token). The *arr apps pass username/password in their NZBGet client
 settings unchanged.
+
+With discovery enabled, nzbd advertises `_nzbd._tcp.local.` over mDNS after
+the API listener starts. The TXT record contains only `path`, `tls`, `auth`,
+and the nzbd version; credentials and queue state are never advertised. A
+loopback listener is skipped even when discovery is enabled because another
+device cannot connect to it. Set `bind = "0.0.0.0:6789"` (or a specific LAN
+address) for the mobile app to find it, and set `discovery = false` to opt out.
+Multicast startup errors are logged but do not stop the API.
+
+A normal Docker bridge is a multicast boundary. The daemon can advertise to
+other containers on that bridge, but phones on the physical LAN will not see
+it. Run the image's advertiser companion with host networking while leaving
+the downloader on its application network:
+
+```bash
+docker run -d --name nzbd-discovery --restart unless-stopped \
+  --network host ghcr.io/pjunod/nzbd:latest \
+  advertise --name nuc3 --port 6789
+```
+
+The companion publishes the API already mapped to host port 6789; it does not
+proxy traffic or read the downloader's configuration. Pass `--tls` and
+`--auth basic`, `bearer`, or `basic,bearer` when those metadata should appear
+in discovery results. The Compose example includes the same companion as the
+`nzbd-discovery` service.
 
 ## `[post]` — post-processing
 

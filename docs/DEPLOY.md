@@ -38,6 +38,12 @@ docker run -d --name nzbd --restart unless-stopped -p 6789:6789 \
   ghcr.io/pjunod/nzbd:latest
 # → http://localhost:6789/ shows the setup form; it writes
 #   /opt/nzbd/config/nzbd.toml and restarts the daemon with it.
+
+# Advertise the host-published API to iPhone, iPad, and Android clients.
+# Host networking is required because mDNS does not cross Docker's bridge.
+docker run -d --name nzbd-discovery --restart unless-stopped \
+  --network host ghcr.io/pjunod/nzbd:latest \
+  advertise --name "$(hostname -s)" --port 6789
 ```
 
 Where the wizard's write actually lands, by deployment shape:

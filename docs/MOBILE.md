@@ -1,0 +1,152 @@
+# Mobile — watch and control nzbd from iPhone, iPad, and Android
+
+Companion to [USAGE.md](USAGE.md) (the daemon and browser UI) — this is how
+to run the native mobile client in [`mobile/`](../mobile/).
+
+The app is one Expo SDK 57 / React Native codebase for iOS, iPadOS, and
+Android. It talks directly to nzbd's native `/api/v1` surface; there is no
+web view and no service in between your device and the daemon.
+
+> The app can use plain HTTP because many nzbd servers live on a trusted LAN.
+> Plain HTTP exposes the NZB, queue metadata, and password or token to anyone
+> who can observe that network. Use HTTPS through a trusted certificate when
+> the connection leaves your LAN. The app does not bypass certificate checks.
+
+## What the app controls
+
+| Surface | Behavior |
+|---|---|
+| Queue state | Reads the full status and job snapshot from the SSE stream; polls every 5 seconds when that stream is stale |
+| Whole queue | Pause and resume |
+| One job | Pause · resume · move top/up/down/bottom · remove from the queue |
+| Add | Picks one `.nzb` from the system document picker and posts the raw file to `/api/v1/jobs` |
+| Discovery | Scans the local network for nzbd's `_nzbd._tcp` DNS-SD service and fills the server address when selected |
+| History | Lists completed, failed, and removed jobs with size, health, completion time, pickup state, and retained job details |
+| Logs | Shows the recent system and job log, refreshes every 4 seconds, and can include per-file detail |
+| Providers | Shows the live rate and blocked state of every configured news server |
+| Authentication | Basic username/password or bearer token, stored in iOS Keychain or Android Keystore |
+
+Removing a job leaves downloaded files in place. When the daemon can park the
+job in history, the success message says it can be restored there. The mobile
+History tab is read-only; use the browser UI for restore, hide, record delete,
+and delete-files actions. Mobile requests carry `X-Nzbd-Role: operator`, so
+opening History does not claim that the app imported a job or replace its
+`picked_up_by` attribution.
+
+## Run it locally
+
+Expo SDK 57 requires Node.js 22.13 or newer, iOS 16.4 or newer, or Android 7
+or newer. Xcode is needed for an iOS build; Android Studio and an Android SDK
+are needed for Android.
+
+```bash
+cd mobile                 # enter the React Native package
+npm install               # install the lockfile-pinned dependencies
+npm run ios               # build and run the iPhone/iPad simulator app
+npm run android           # build and run an Android emulator or device
+npm run ios:device        # choose and build for a connected Apple device
+```
+
+The first native build runs Expo prebuild and creates ignored `ios/` or
+`android/` directories. The committed source of truth remains `app.json` plus
+the TypeScript files; regenerate native folders after changing a config
+plugin.
+
+On the first screen, select a server under **Nearby nzbd** or enter an address
+the device itself can reach. A bare hostname or IP address gains nzbd's
+default port automatically, so `nuc3` becomes `http://nuc3:6789`. Accept the
+Local Network prompt on iOS so the list can populate. Do not enter `localhost`
+unless nzbd is running on the phone. Add a bearer token, or the configured
+control username and password. Open servers need neither.
+
+The daemon advertises only after it has a reachable listener. A default
+loopback-only server is intentionally invisible. Enable LAN listening and
+leave discovery on in `nzbd.toml`:
+
+```toml
+[api]
+bind = "0.0.0.0:6789"
+discovery = true
+```
+
+Discovery stays inside the local multicast domain; it does not cross a VPN,
+router, or VLAN unless that network explicitly reflects mDNS. The advertised
+TXT record contains the API path, TLS flag, accepted authentication modes,
+and server version—not credentials or queue contents. Manual entry remains
+available when multicast is blocked. Android emulators do not reliably pass
+mDNS traffic, so verify discovery on a physical Android device before release.
+
+A daemon in a bridged Docker container cannot send multicast onto the host's
+physical LAN. Use the `nzbd-discovery` host-network companion in
+[`examples/docker-compose/docker-compose.yml`](../examples/docker-compose/docker-compose.yml),
+or run `nzbd advertise --name <host> --port 6789` directly on the host.
+
+## Verify a change
+
+```bash
+cd mobile
+npm run typecheck          # strict TypeScript contract check
+npm test                   # API formatting and incremental SSE parser tests
+npm run doctor             # Expo dependency and app-config compatibility
+npm run export             # bundle every declared platform without a device
+```
+
+`npm run export` is the closest fast check to a native compile: Metro must
+resolve every screen, native module, and asset. Run `npm run ios` and
+`npm run android` before a release because a JavaScript bundle cannot prove
+Xcode signing, Android SDK setup, local-network permissions, or document
+provider behavior on a real device.
+
+## iPad is a first-class layout
+
+The iOS target declares tablet support and leaves full-screen mode off, so it
+participates in iPad Split View and Stage Manager. At 820 points and wider,
+queue rows stay in the main column while rates and providers move into a
+fixed sidebar. Below that width the same information stacks for phone and
+narrow split-screen windows. Rotation is not locked.
+
+## Network and certificate behavior
+
+`app.json` opts Android into cleartext traffic and gives iOS an
+`NSBonjourServices` declaration, a local-network usage string, and an App
+Transport Security exception. Those settings exist because Bonjour access
+must be declared and a user-entered private IP cannot be enumerated as an ATS
+exception at build time. They permit discovery and HTTP; they do not make the
+connection private.
+
+Expo SDK 57 currently targets Android API 36, where the normal `INTERNET`
+permission still grants local-network access. Android 17 enforces a separate
+permission for apps once they target API 37. When this project raises its
+target SDK, add the `ACCESS_LOCAL_NETWORK` runtime flow or move discovery to
+Android's user-mediated NSD picker at the same time; do not silently ship the
+target bump with discovery broken. See Android's
+[local-network permission guide](https://developer.android.com/privacy-and-security/local-network-permission).
+
+HTTPS still uses the platform trust store. A self-generated nzbd certificate
+must be trusted on the device before the app can connect, or nzbd should sit
+behind a reverse proxy with a certificate the device already trusts. There
+is deliberately no "ignore certificate errors" switch: that would also hide
+an intercepted connection.
+
+## Deliberate limits
+
+- **No remote-access relay.** You provide network reachability with LAN,
+  VPN, or a reverse proxy; the app never publishes nzbd to the internet.
+- **No background transfer or notifications.** Queue watching is live while
+  the app is active. The daemon keeps downloading when it is closed.
+- **No settings or history editor.** History and logs are visible, but the
+  browser UI remains the administration surface for configuration and
+  destructive history actions.
+- **One saved server.** Credentials and the current origin are one small
+  secure-store record. A server switch replaces that record.
+
+## Code map
+
+| Path | Job |
+|---|---|
+| [`mobile/App.tsx`](../mobile/App.tsx) | Loads the saved connection and selects setup or dashboard |
+| [`mobile/src/api/`](../mobile/src/api/) | Native API types, authenticated requests, status formatting, and SSE parsing |
+| [`mobile/src/discovery/`](../mobile/src/discovery/) | DNS-SD lifecycle plus safe conversion of advertised hosts into connection URLs |
+| [`mobile/src/hooks/useNzbd.ts`](../mobile/src/hooks/useNzbd.ts) | Owns live-stream reconnects, stale polling, and mutations |
+| [`mobile/src/screens/`](../mobile/src/screens/) | Connection, phone, tablet, queue-control, and NZB-picker UI |
+| [`mobile/__tests__/`](../mobile/__tests__/) | Wire-shape and chunk-boundary regression tests |

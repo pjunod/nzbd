@@ -56,6 +56,13 @@ Optionally runs as a **multi-node cluster** over a shared work volume.
   self-contained page, zero build toolchain — and an **installable PWA**
   on phones, with built-in HTTPS (`[api] tls = true` self-generates a
   persistent certificate) to make browsers treat it as a secure origin.
+- **Native mobile remote** in [`mobile/`](mobile/) — one TypeScript client
+  for iPhone, iPad, and Android: live queue state, whole-queue and per-job
+  controls, provider status, secure saved credentials, and `.nzb` submission
+  through the system document picker. It finds nearby daemons through local
+  DNS-SD, uses the native API directly rather than a web view, and keeps manual
+  addresses available; [docs/MOBILE.md](docs/MOBILE.md) covers builds and
+  LAN/TLS rules.
 - **Clustering** — nodes sharing a POSIX volume (Gluster is the reference)
   elect a leader, distribute downloads and post-processing with
   anti-affinity, partition provider connection budgets, and fail over
@@ -107,6 +114,7 @@ NZBGet configuration and prints a mapping report.
 | [docs/INSTALL.md](docs/INSTALL.md) | Release binaries, Docker, Homebrew, building from source, musl static builds |
 | [docs/CONFIGURATION.md](docs/CONFIGURATION.md) | The complete annotated `nzbd.toml` reference |
 | [docs/USAGE.md](docs/USAGE.md) | CLI, web UI, connecting the *arr apps, RSS feeds + filter language, extension scripts, deobfuscation |
+| [docs/MOBILE.md](docs/MOBILE.md) | Building the iPhone/iPad/Android app, connecting it to nzbd, and its exact control/security boundaries |
 | [docs/DEPLOY.md](docs/DEPLOY.md) | systemd, Docker Compose, Kubernetes, multi-node cluster deployment |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Design: the whole system, phase by phase |
 | [docs/INTEGRATION.md](docs/INTEGRATION.md) | Every seam with monarr and plurx: what each does, where you watch it, and the command that proves it |
