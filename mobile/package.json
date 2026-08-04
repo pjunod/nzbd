@@ -6,6 +6,7 @@
     "@inthepocket/react-native-service-discovery": "^0.2.9",
     "expo": "~57.0.10",
     "expo-build-properties": "~57.0.8",
+    "expo-constants": "~57.0.9",
     "expo-document-picker": "~57.0.1",
     "expo-file-system": "~57.0.1",
     "expo-secure-store": "~57.0.1",

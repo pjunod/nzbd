@@ -1,7 +1,7 @@
 PODS:
-  - EXConstants (57.0.8):
+  - EXConstants (57.0.9):
     - ExpoModulesCore
-  - Expo (57.0.9):
+  - Expo (57.0.10):
     - ExpoModulesCore
     - ExpoModulesJSI
     - hermes-engine
@@ -41,7 +41,7 @@ PODS:
     - ExpoModulesCore
   - ExpoLogBox (57.0.2):
     - React-Core
-  - ExpoModulesCore (57.0.8):
+  - ExpoModulesCore (57.0.9):
     - ExpoModulesJSI
     - hermes-engine
     - RCTRequired
@@ -68,7 +68,7 @@ PODS:
   - ExpoModulesJSI (57.0.4):
     - React-Core
     - ReactCommon
-  - ExpoModulesWorklets (57.0.8):
+  - ExpoModulesWorklets (57.0.9):
     - ExpoModulesCore
     - ExpoModulesJSI
   - ExpoSecureStore (57.0.1):
@@ -1991,7 +1991,7 @@ PODS:
   - Yoga (0.0.0)
 
 DEPENDENCIES:
-  - EXConstants (from `../node_modules/expo/node_modules/expo-constants/ios`)
+  - EXConstants (from `../node_modules/expo-constants/ios`)
   - Expo (from `../node_modules/expo`)
   - ExpoAsset (from `../node_modules/expo/node_modules/expo-asset/ios`)
   - ExpoDocumentPicker (from `../node_modules/expo-document-picker/ios`)
@@ -2085,7 +2085,7 @@ DEPENDENCIES:
 
 EXTERNAL SOURCES:
   EXConstants:
-    :path: "../node_modules/expo/node_modules/expo-constants/ios"
+    :path: "../node_modules/expo-constants/ios"
   Expo:
     :path: "../node_modules/expo"
   ExpoAsset:
@@ -2267,8 +2267,8 @@ EXTERNAL SOURCES:
     :path: "../node_modules/react-native/ReactCommon/yoga"
 
 SPEC CHECKSUMS:
-  EXConstants: 5efe6122eecac2d970aa50a2a502ecc6ce4b7564
-  Expo: cba780b47e8661e90c9fe8e1a92a81cef5773290
+  EXConstants: 05451cfe61c84dd2d840831d05bb0c115f96ec6a
+  Expo: df0ee7c76ff52b8f559e4ac50e70c81d5d61d806
   ExpoAsset: a76534cf7b762978861dd31708308496c676166f
   ExpoDocumentPicker: 6fb67a6f39ba9beb53a4b4a3f2949e0b5e9bc3bf
   ExpoDomWebView: beaec034e51bd028428b98bb1f2633ab79c6d095
@@ -2276,9 +2276,9 @@ SPEC CHECKSUMS:
   ExpoFont: 59e1faf66ba9bcd232ae1e2ce58d202a48b6f65e
   ExpoKeepAwake: c26f14275017370cc8a4b7b43a0e23361f2053a5
   ExpoLogBox: 6bb73c341aca22e699bd4da6cc61afc844e1a648
-  ExpoModulesCore: f11526345acd39ec6eb46900551ac4d810e76bf1
+  ExpoModulesCore: 85ee840e8d238ee15bbefee8b9e2a464fdf2caca
   ExpoModulesJSI: b20fefa4cdd9097e7e6b715466d1900b8c5d4711
-  ExpoModulesWorklets: 6b240031daa3de4df791588fc78236637ff602f6
+  ExpoModulesWorklets: a8986b0872d09df168f5d4e092625e9fbb6b38bb
   ExpoSecureStore: 94793113049a2d7478dfe1a13aa15081e9f61755
   FBLazyVector: 3c3be9a019176b5699455f7f66c5444b78a411c6
   hermes-engine: 807b3a32f63aa7c55775b1bfc3c575e240bc70d2
