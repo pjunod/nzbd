@@ -322,7 +322,7 @@ const makeStyles = (theme: Theme) =>
       justifyContent: 'center',
       backgroundColor: theme.accent,
     },
-    brandMarkText: { color: '#FFFFFF', fontSize: 30, fontWeight: '900' },
+    brandMarkText: { color: theme.onAccent, fontSize: 30, fontWeight: '900' },
     title: { color: theme.text, fontSize: 29, fontWeight: '800', letterSpacing: -0.7 },
     subtitle: { color: theme.textMuted, fontSize: 15, lineHeight: 21, marginBottom: 7 },
     label: { color: theme.text, fontSize: 13, fontWeight: '700' },

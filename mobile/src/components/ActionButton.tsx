@@ -42,7 +42,7 @@ export function ActionButton({
     >
       {loading ? (
         <ActivityIndicator
-          color={variant === 'primary' ? '#FFFFFF' : theme.text}
+          color={variant === 'primary' ? theme.onAccent : theme.text}
           size="small"
         />
       ) : (
@@ -69,7 +69,7 @@ const makeStyles = (theme: Theme) =>
     danger: { backgroundColor: theme.dangerSoft, borderColor: theme.danger },
     ghost: { backgroundColor: 'transparent', borderColor: 'transparent' },
     label: { color: theme.text, fontSize: 14, fontWeight: '700' },
-    primaryLabel: { color: '#FFFFFF' },
+    primaryLabel: { color: theme.onAccent },
     secondaryLabel: { color: theme.text },
     dangerLabel: { color: theme.danger },
     ghostLabel: { color: theme.accent },
