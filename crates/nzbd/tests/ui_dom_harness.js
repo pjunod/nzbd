@@ -953,14 +953,14 @@ const models = (jobs) => jobs.map((j, i) => T.rowModel(j, { idx: i, count: jobs.
 
 // --- 24. title ticker ----------------------------------------------------
 {
-  eq(T.titleFor(null), "nzbd", "no status yet: a plain title");
-  eq(T.titleFor({ download_paused: true, download_rate_bps: 0 }), "⏸ paused — nzbd",
+  eq(T.titleFor(null), "Runner", "no status yet: a plain title");
+  eq(T.titleFor({ download_paused: true, download_rate_bps: 0 }), "⏸ paused — Runner",
     "paused says so");
   const busy = T.titleFor({ download_paused: false, download_rate_bps: 1048576, remaining_bytes: 10485760 });
   ok(busy.startsWith("▼ 1.0 MiB/s"), `rate leads the title (got ${busy})`);
-  ok(busy.endsWith("— nzbd"), "…and the app name still ends it");
+  ok(busy.endsWith("— Runner"), "…and the app name still ends it");
   ok(busy.includes("10s"), "…with the time left, which is the other half of the question");
-  eq(T.titleFor({ download_paused: false, download_rate_bps: 0 }), "nzbd",
+  eq(T.titleFor({ download_paused: false, download_rate_bps: 0 }), "Runner",
     "idle resets — no stale number left in the tab");
 }
 

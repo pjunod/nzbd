@@ -94,7 +94,7 @@ export function isJobPaused(status: JobStatus): boolean {
 
 export function normalizeServerUrl(input: string): string {
   const trimmed = input.trim();
-  if (!trimmed) throw new Error('Enter the address of your nzbd server.');
+  if (!trimmed) throw new Error('Enter the address of your Runner server.');
   const withScheme = /^https?:\/\//i.test(trimmed) ? trimmed : `http://${trimmed}`;
   let parsed: URL;
   try {
@@ -109,7 +109,7 @@ export function normalizeServerUrl(input: string): string {
     throw new Error('Put credentials in the fields below, not in the URL.');
   }
   if (parsed.pathname !== '/' || parsed.search || parsed.hash) {
-    throw new Error('Use the nzbd server origin without a path or query.');
+    throw new Error('Use the Runner server origin without a path or query.');
   }
   if (!hasExplicitPort(withScheme)) {
     parsed.port = String(DEFAULT_NZBD_PORT);

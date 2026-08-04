@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <title>Noirr Runner monochrome mark</title>
+  <g fill="none" stroke="#000000" stroke-width="110" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M335 740 V280 H535 C685 280 685 510 535 510 H335"/>
+    <path d="M535 510 L645 740"/>
+  </g>
+  <path d="M430 720 H520" fill="none" stroke="#000000" stroke-width="48" stroke-linecap="round"/>
+</svg>

@@ -31,7 +31,7 @@ export function LogsView({ config }: { config: ConnectionConfig }) {
         setEntries([...next.entries].reverse());
         setError(null);
       } catch (cause) {
-        setError(cause instanceof Error ? cause.message : 'Could not load nzbd logs.');
+        setError(cause instanceof Error ? cause.message : 'Could not load Runner logs.');
       } finally {
         if (showSpinner) setRefreshing(false);
       }

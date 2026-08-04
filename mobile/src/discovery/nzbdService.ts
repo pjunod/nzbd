@@ -41,7 +41,7 @@ export function toDiscoveredNzbd(service: NetworkService): DiscoveredNzbd | null
 
   return {
     key: serviceKey(service),
-    name: service.name || 'nzbd',
+    name: service.name || 'Runner',
     baseUrl: `${tls ? 'https' : 'http'}://${urlHost}:${service.port}`,
     host,
     port: service.port,

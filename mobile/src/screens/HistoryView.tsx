@@ -30,7 +30,7 @@ export function HistoryView({ config }: { config: ConnectionConfig }) {
       setPage(await client.getHistory());
       setError(null);
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : 'Could not load nzbd history.');
+      setError(cause instanceof Error ? cause.message : 'Could not load Runner history.');
     } finally {
       setRefreshing(false);
     }

@@ -122,10 +122,10 @@ export class NzbdClient {
       });
     } catch (error) {
       if (controller.signal.aborted) {
-        throw new ApiError('The nzbd server did not answer within 12 seconds.');
+        throw new ApiError('The Runner server did not answer within 12 seconds.');
       }
       throw new ApiError(
-        error instanceof Error ? error.message : 'Could not reach the nzbd server.',
+        error instanceof Error ? error.message : 'Could not reach the Runner server.',
       );
     } finally {
       clearTimeout(timeout);
@@ -148,7 +148,7 @@ export class NzbdClient {
           ? String((body as { error: unknown }).error)
           : typeof body === 'string' && body
             ? body
-            : `nzbd returned HTTP ${response.status}.`;
+            : `Runner returned HTTP ${response.status}.`;
       throw new ApiError(message, response.status);
     }
     return body as T;
