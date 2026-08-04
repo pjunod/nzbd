@@ -174,6 +174,8 @@ actions
 
 ## Phase 5 — Beyond parity 🔶
 
+- ✅ Display catalogue shared with plurx/monarr: the previously shipped web UI is preserved as the default **Classic** layout; opt-in Plex and Theater structures work on desktop and phone; Classic, Terminal, noirr, Amber, Giallo, Silver, Void, VHS, Paper, and Tide palettes are independent from Auto/Light/Dark appearance; invalid stored values fall back to Classic and Void/VHS stay midnight-only. Preferences apply before first paint and switching them does not rebuild live queue rows. DOM harness pins the default/fallback catalogue and dark-only behavior.
+
 - ✅ Per-provider adaptive pipelining: AIMD depth controller per connection — climbs one step after sustained clean batches, halves on connection failure; configured `pipeline_depth` is the ceiling, 1 the floor. Weak providers settle low, healthy ones ride the ceiling (exercised by the full e2e suite)
 - ⬜ Native Rust par2 repair swap-in — the GF(2^16) Reed-Solomon engine is a project of its own; the subprocess boundary (`Par2Tool`) was designed for exactly this swap
 - ⬜ COMPRESS DEFLATE (RFC 8054) — carried from phase 1; single-digit % on yEnc bodies

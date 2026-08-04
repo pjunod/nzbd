@@ -28,9 +28,19 @@ let a feed rule accept items ([CONFIGURATION.md](CONFIGURATION.md)
 
 Open `http://<host>:6789/`. One embedded page (no separate frontend to
 deploy): live queue with per-job and per-file actions, pause/resume,
-speed limit control, history, log tail, settings, dark/light. It updates
+speed limit control, history, log tail, settings, layouts and color schemes. It updates
 over SSE at 1 Hz — progress bars, rates and the sparkline move without
 you touching anything.
+
+**Display** in the control row keeps three browser-local choices. **Layout**
+offers Classic, Plex, and Theater; Classic is the exact nzbd layout from before
+the selector and remains the default. Plex moves primary tabs into a pinned
+navigation rail (and bottom tabs on a phone), while Theater opens the dashboard
+into a wider top-deck. **Color scheme** matches plurx and monarr: Classic,
+Terminal, noirr, Amber, Giallo, Silver, Void, VHS, Paper, and Tide. **Appearance**
+independently follows the system or forces Light/Dark. Void and VHS are
+midnight-only and say so in the menu. Switching any choice leaves live rows,
+the active tab, and open detail panels in place.
 
 **Deleting is one click, and undoable.** There is no confirmation dialog
 anywhere in this UI. Click *delete* and the row is gone immediately; a
