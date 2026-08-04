@@ -48,7 +48,8 @@ Optionally runs as a **multi-node cluster** over a shared work volume.
   (`Accept`/`Reject`/`Require`, wildcards, size/age windows, per-rule
   category/priority/dupe options).
 - **Embedded web UI** at `/` — live queue, history, live log tail, speed
-  controls, rate sparkline, per-provider chips, dark/light, first-run
+  controls, rate sparkline, per-provider chips, three opt-in layouts, ten
+  color schemes with independent light/dark appearance, first-run
   setup wizard. Rendered in place from a 1 Hz SSE stream, so clicking,
   selecting and scrolling survive updates; every action applies instantly
   and reverts — loudly — if the daemon disagrees; delete is one click

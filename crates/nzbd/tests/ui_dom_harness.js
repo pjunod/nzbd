@@ -221,6 +221,20 @@ function job(id, over) {
 }
 const models = (jobs) => jobs.map((j, i) => T.rowModel(j, { idx: i, count: jobs.length }));
 
+// --- 0. display choices preserve the shipped layout as Classic ------------
+{
+  const d = T.readDisplay();
+  eq(d.layout, "classic", "Classic is the layout fallback");
+  eq(d.palette, "classic", "Classic is the palette fallback");
+  eq(d.appearance, "auto", "appearance follows the system by default");
+  ok(T.DISPLAY_LAYOUTS.includes("plex") && T.DISPLAY_LAYOUTS.includes("theater"),
+    "both opt-in layouts are registered");
+  ok(T.DISPLAY_PALETTES.includes("terminal") && T.DISPLAY_PALETTES.includes("tide"),
+    "the palette catalogue is registered");
+  eq(T.displayMode("void", "light"), "dark", "Void stays midnight-only");
+  eq(T.displayMode("vhs", "light"), "dark", "VHS stays midnight-only");
+}
+
 // --- 1. rowModel is pure: no DOM, strings and flags only -------------------
 {
   const m = T.rowModel(job(7, { downloaded_bytes: 500 }), { idx: 0, count: 2 });
