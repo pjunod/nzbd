@@ -25,6 +25,7 @@ web view and no service in between your device and the daemon.
 | Logs | Shows the recent system and job log, refreshes every 4 seconds, and can include per-file detail |
 | Providers | Shows the live rate and blocked state of every configured news server |
 | Authentication | Basic username/password or bearer token, stored in iOS Keychain or Android Keystore |
+| Display | Classic/Plex/Theater navigation, ten color schemes, and independent Auto/Light/Dark appearance, stored on the device |
 
 Removing a job leaves downloaded files in place. When the daemon can park the
 job in history, the success message says it can be restored there. The mobile
@@ -104,6 +105,26 @@ participates in iPad Split View and Stage Manager. At 820 points and wider,
 queue rows stay in the main column while rates and providers move into a
 fixed sidebar. Below that width the same information stacks for phone and
 narrow split-screen windows. Rotation is not locked.
+
+## Display choices preserve the original as Classic
+
+Open **Display** from the dashboard header or connection screen. Layout,
+color scheme, and appearance are separate choices:
+
+- **Classic** is the native layout nzbd shipped before the selector and stays
+  the default. **Plex** pins the navigation strip on wide screens and moves it
+  to the bottom on phones. **Theater** turns the primary tabs into a wide top
+  deck.
+- **Color scheme** offers Classic, Terminal, noirr, Amber, Giallo, Silver,
+  Void, VHS, Paper, and Tide. Classic keeps the previous native colors.
+- **Appearance** defaults to Auto, follows the device, and can be held on
+  Light or Dark. Void and VHS are midnight-only, so they remain dark even if
+  Light is selected.
+
+All three settings are stored in iOS Keychain or Android Keystore. Existing
+theme choices migrate through the original `nzbd.theme.v1` key; an upgrade
+therefore changes neither appearance nor navigation until you choose a new
+option.
 
 ## Network and certificate behavior
 

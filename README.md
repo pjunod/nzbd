@@ -60,10 +60,12 @@ Optionally runs as a **multi-node cluster** over a shared work volume.
 - **Native mobile remote** in [`mobile/`](mobile/) — one TypeScript client
   for iPhone, iPad, and Android: live queue state, whole-queue and per-job
   controls, provider status, secure saved credentials, and `.nzb` submission
-  through the system document picker. It finds nearby daemons through local
-  DNS-SD, uses the native API directly rather than a web view, and keeps manual
-  addresses available; [docs/MOBILE.md](docs/MOBILE.md) covers builds and
-  LAN/TLS rules.
+  through the system document picker. Classic preserves its shipped layout;
+  Plex and Theater change the native navigation, and the same ten color
+  schemes remain independent from Auto/Light/Dark appearance. It finds nearby
+  daemons through local DNS-SD, uses the native API directly rather than a web
+  view, and keeps manual addresses available; [docs/MOBILE.md](docs/MOBILE.md)
+  covers display choices, builds, and LAN/TLS rules.
 - **Clustering** — nodes sharing a POSIX volume (Gluster is the reference)
   elect a leader, distribute downloads and post-processing with
   anti-affinity, partition provider connection budgets, and fail over

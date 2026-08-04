@@ -40,7 +40,7 @@ import { ThemeSwitcher } from '../components/ThemeSwitcher';
 import { useNzbd } from '../hooks/useNzbd';
 import { QueueSectionKey, sectionQueueJobs } from '../queueSections';
 import { DOWNLOAD_PRIORITIES, downloadPriorityLabel } from '../priority';
-import { Theme, useTheme } from '../theme';
+import { Theme, useDisplayPreferences, useTheme } from '../theme';
 import { HistoryView } from './HistoryView';
 import { LogsView } from './LogsView';
 
@@ -53,6 +53,7 @@ interface Props {
 
 export function DashboardScreen({ config, onEditConnection }: Props) {
   const theme = useTheme();
+  const { layout } = useDisplayPreferences();
   const styles = useMemo(() => makeStyles(theme), [theme]);
   const { width } = useWindowDimensions();
   const wide = width >= 820;
@@ -136,9 +137,42 @@ export function DashboardScreen({ config, onEditConnection }: Props) {
     setNotice(`Added ${options.name} as job #${result.id}.`);
   };
 
+  const plexBottom = layout === 'plex' && !wide;
+  const sectionTabs = (
+    <View
+      accessibilityRole="tablist"
+      style={[
+        styles.tabs,
+        layout === 'theater' && styles.tabsTheater,
+        layout === 'plex' && wide && styles.tabsPlexWide,
+        plexBottom && styles.tabsPlexBottom,
+      ]}
+    >
+      {(['queue', 'history', 'logs'] as AppSection[]).map((section) => (
+        <Pressable
+          accessibilityRole="tab"
+          accessibilityState={{ selected: activeSection === section }}
+          key={section}
+          onPress={() => setActiveSection(section)}
+          style={({ pressed }) => [
+            styles.tab,
+            layout === 'theater' && styles.tabTheater,
+            layout === 'plex' && styles.tabPlex,
+            activeSection === section && styles.tabSelected,
+            pressed && styles.pressed,
+          ]}
+        >
+          <Text style={[styles.tabText, activeSection === section && styles.tabTextSelected]}>
+            {section[0].toUpperCase() + section.slice(1)}
+          </Text>
+        </Pressable>
+      ))}
+    </View>
+  );
+
   return (
     <SafeAreaView style={styles.safe} edges={['top', 'left', 'right']}>
-      <View style={styles.header}>
+      <View style={[styles.header, layout === 'theater' && styles.headerTheater]}>
         <View style={styles.brandRow}>
           <View style={styles.brandMark}>
             <Text style={styles.brandMarkText}>n</Text>
@@ -198,25 +232,7 @@ export function DashboardScreen({ config, onEditConnection }: Props) {
       ) : null}
       {activeSection === 'queue' && status ? <GuardBanner status={status} styles={styles} /> : null}
 
-      <View accessibilityRole="tablist" style={styles.tabs}>
-        {(['queue', 'history', 'logs'] as AppSection[]).map((section) => (
-          <Pressable
-            accessibilityRole="tab"
-            accessibilityState={{ selected: activeSection === section }}
-            key={section}
-            onPress={() => setActiveSection(section)}
-            style={({ pressed }) => [
-              styles.tab,
-              activeSection === section && styles.tabSelected,
-              pressed && styles.pressed,
-            ]}
-          >
-            <Text style={[styles.tabText, activeSection === section && styles.tabTextSelected]}>
-              {section[0].toUpperCase() + section.slice(1)}
-            </Text>
-          </Pressable>
-        ))}
-      </View>
+      {!plexBottom ? sectionTabs : null}
 
       {activeSection === 'queue' && status ? (
         <View style={styles.overviewDock}>
@@ -314,6 +330,12 @@ export function DashboardScreen({ config, onEditConnection }: Props) {
       ) : (
         <LogsView config={config} />
       )}
+
+      {plexBottom ? (
+        <SafeAreaView edges={['bottom', 'left', 'right']} style={styles.plexBottomSafe}>
+          {sectionTabs}
+        </SafeAreaView>
+      ) : null}
 
       <AddNzbModal
         busy={busyKey === 'add'}
@@ -995,6 +1017,7 @@ const makeStyles = (theme: Theme) =>
       gap: 12,
       flexWrap: 'wrap',
     },
+    headerTheater: { backgroundColor: theme.background, borderBottomWidth: 0, paddingTop: 14 },
     brandRow: { flexDirection: 'row', alignItems: 'center', gap: 11, minWidth: 170, flex: 1 },
     brandMark: {
       width: 40,
@@ -1004,7 +1027,7 @@ const makeStyles = (theme: Theme) =>
       alignItems: 'center',
       justifyContent: 'center',
     },
-    brandMarkText: { color: '#FFFFFF', fontSize: 27, fontWeight: '900' },
+    brandMarkText: { color: theme.onAccent, fontSize: 27, fontWeight: '900' },
     brandText: { flex: 1 },
     brand: { color: theme.text, fontSize: 20, fontWeight: '900', letterSpacing: -0.5 },
     connectionRow: { flexDirection: 'row', alignItems: 'center', gap: 5 },
@@ -1036,6 +1059,24 @@ const makeStyles = (theme: Theme) =>
       justifyContent: 'center',
       gap: 6,
     },
+    tabsTheater: {
+      marginHorizontal: 18,
+      marginTop: 10,
+      marginBottom: 4,
+      borderWidth: 1,
+      borderRadius: 24,
+      borderColor: theme.border,
+      backgroundColor: theme.background,
+      paddingVertical: 5,
+    },
+    tabsPlexWide: { justifyContent: 'flex-start', paddingHorizontal: 22, paddingVertical: 10 },
+    tabsPlexBottom: {
+      borderBottomWidth: 0,
+      borderTopWidth: StyleSheet.hairlineWidth,
+      borderTopColor: theme.border,
+      paddingVertical: 7,
+    },
+    plexBottomSafe: { backgroundColor: theme.panel },
     tab: {
       minWidth: 88,
       minHeight: 36,
@@ -1044,6 +1085,8 @@ const makeStyles = (theme: Theme) =>
       alignItems: 'center',
       justifyContent: 'center',
     },
+    tabTheater: { flex: 1, minWidth: 0, borderRadius: 18 },
+    tabPlex: { flex: 1, minWidth: 0, borderRadius: 13 },
     tabSelected: { backgroundColor: theme.accentSoft },
     tabText: { color: theme.textMuted, fontSize: 12, fontWeight: '800' },
     tabTextSelected: { color: theme.accent },
@@ -1342,7 +1385,7 @@ const makeStyles = (theme: Theme) =>
     },
     priorityChipSelected: { backgroundColor: theme.accent, borderColor: theme.accent },
     priorityChipText: { color: theme.text, fontSize: 11, fontWeight: '700' },
-    priorityChipTextSelected: { color: '#FFFFFF' },
+    priorityChipTextSelected: { color: theme.onAccent },
     priorityHint: { color: theme.textMuted, fontSize: 11, lineHeight: 16 },
     switchRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: 14 },
     switchText: { flex: 1 },
