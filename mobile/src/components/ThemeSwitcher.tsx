@@ -2,6 +2,7 @@ import { useMemo, useState } from 'react';
 import { Modal, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
+import { APP_VERSION } from '../app-version';
 import {
   LAYOUT_OPTIONS,
   PALETTE_OPTIONS,
@@ -98,6 +99,11 @@ export function ThemeSwitcher({ compact = false }: { compact?: boolean }) {
                   />
                 ))}
               </ChoiceSection>
+
+              <View accessibilityLabel={`App version ${APP_VERSION}`} style={styles.appInfo}>
+                <Text style={styles.appInfoName}>nzbd</Text>
+                <Text style={styles.appInfoVersion}>Version {APP_VERSION}</Text>
+              </View>
             </ScrollView>
           </SafeAreaView>
         </View>
@@ -207,5 +213,13 @@ const makeStyles = (theme: Theme) =>
     optionSelected: { borderColor: theme.accent, backgroundColor: theme.accentSoft },
     optionLabel: { color: theme.textMuted, fontSize: 12, fontWeight: '700' },
     optionLabelSelected: { color: theme.accent },
+    appInfo: {
+      borderTopWidth: StyleSheet.hairlineWidth,
+      borderTopColor: theme.border,
+      paddingTop: 16,
+      gap: 3,
+    },
+    appInfoName: { color: theme.text, fontSize: 13, fontWeight: '800' },
+    appInfoVersion: { color: theme.textMuted, fontSize: 11 },
     pressed: { opacity: 0.68 },
   });
