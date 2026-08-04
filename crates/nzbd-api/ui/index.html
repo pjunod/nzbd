@@ -3,16 +3,16 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<title>nzbd</title>
+<title>Noirr Runner</title>
 <link rel="manifest" href="/manifest.webmanifest">
 <meta name="theme-color" content="#f7f7f5" media="(prefers-color-scheme: light)">
 <meta name="theme-color" content="#101010" media="(prefers-color-scheme: dark)">
 <link rel="icon" href="/icons/icon-192.png" type="image/png">
-<link rel="apple-touch-icon" href="/apple-touch-icon.png">
+<link rel="apple-touch-icon" href="/icons/apple-touch-icon.png">
 <meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-<meta name="apple-mobile-web-app-title" content="nzbd">
+<meta name="apple-mobile-web-app-title" content="Runner">
 <script data-display-bootstrap>
 // Paint the saved display before CSS arrives. Classic is the UI nzbd shipped
 // before layout choices and is intentionally the fallback for every bad value.
@@ -147,6 +147,9 @@ try {
 
   header { display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap; }
   header h1 { font-size: 20px; margin: 0; letter-spacing: -.01em; }
+  header h1 .signal { color: #e5484d; }
+  header h1 .product { color: var(--ink2); font-size: .72em; margin-left: .55em; }
+  :root[data-mode="light"] header h1 .signal { color: #c2343a; }
   footer .ver { color: var(--muted); }
   header .spacer { flex: 1; }
 
@@ -714,7 +717,7 @@ try {
 <body>
 <div class="wrap">
   <header>
-    <h1>nzbd</h1>
+    <h1>noirr<span class="signal">_</span><span class="product">runner</span></h1>
     <span class="spacer"></span>
     <span class="badges" id="srv-chips"></span>
     <span class="badges" id="badges"></span>
@@ -929,7 +932,7 @@ try {
   <section id="tab-settings" hidden>
     <div id="restart-banner" hidden>
       <span id="restart-msg"></span>
-      <button id="btn-restart">Restart nzbd</button>
+      <button id="btn-restart">Restart Runner</button>
     </div>
     <div id="cfg-meta" class="cfg-meta"></div>
     <form id="cfg-form" onsubmit="return false"></form>
@@ -954,7 +957,7 @@ try {
     </div>
   </section>
 
-  <footer>nzbd <span class="ver" id="ver"></span> — NZBGet-compatible usenet daemon · <a href="/api/v1/openapi.json" style="color:var(--muted)">API</a> · <a href="/metrics" style="color:var(--muted)">metrics</a></footer>
+  <footer>Noirr Runner <span class="ver" id="ver"></span> — NZBGet-compatible usenet daemon · <a href="/api/v1/openapi.json" style="color:var(--muted)">API</a> · <a href="/metrics" style="color:var(--muted)">metrics</a></footer>
 </div>
 <div id="toasts" aria-live="polite" role="status"></div>
 
@@ -2396,12 +2399,12 @@ function drawSparkline() {
 // ---- title ticker -------------------------------------------------------
 // The answer to "is it still going?" without switching to the tab.
 function titleFor(s) {
-  if (!s) return "nzbd";
-  if (s.download_paused) return "⏸ paused — nzbd";
+  if (!s) return "Runner";
+  if (s.download_paused) return "⏸ paused — Runner";
   if (s.download_rate_bps > 0)
     return "▼ " + fmtRate(s.download_rate_bps) + " · " +
-           fmtEta(s.remaining_bytes, s.download_rate_bps) + " — nzbd";
-  return "nzbd";  // idle: back to a plain title, no stale number left behind
+           fmtEta(s.remaining_bytes, s.download_rate_bps) + " — Runner";
+  return "Runner";  // idle: back to a plain title, no stale number left behind
 }
 function updateTitle() {
   const t = titleFor(store.status);
@@ -4086,7 +4089,7 @@ function showConfigDurability(s) {
   if (s.recovered_from) {
     // Already bitten: say what was lost, what saved it, and what to fix.
     html =
-      "<b>The config file was missing at boot — nzbd recovered it.</b> " +
+      "<b>The config file was missing at boot — Runner recovered it.</b> " +
       "Your settings came back from the copy it keeps beside its data at <code>" +
       esc(s.recovered_from) + "</code>, so this daemon is running configured. " +
       "But <code>" + esc(s.config_path || "the config directory") + "</code> did not " +
@@ -4103,12 +4106,12 @@ function showConfigDurability(s) {
       "an image pull). Mount a volume at it:" +
       mount +
       (s.mirror_path
-        ? "nzbd also keeps a durable copy at <code>" + esc(s.mirror_path) +
+        ? "Runner also keeps a durable copy at <code>" + esc(s.mirror_path) +
           "</code> and restores from it automatically, so you will not lose your " +
           "settings — but fix the mount."
         // No config yet, so no state directory to name: promise the
         // behaviour, not a path we would be guessing at.
-        : "nzbd will keep a durable copy beside its data as soon as you save " +
+        : "Runner will keep a durable copy beside its data as soon as you save " +
           "below, and restore from it automatically — so this is the last time " +
           "a recreate can send you back to this form. Fix the mount anyway.");
   }
@@ -4254,7 +4257,7 @@ async function checkSetup() {
       if (!r.ok) {
         const e = await r.json().catch(() => ({}));
         msg.className = "err"; msg.textContent = e.error || ("setup failed: " + r.status);
-        if (e.toml) showToml(e.toml, e.hint || "copy this into the config file yourself, then restart nzbd");
+        if (e.toml) showToml(e.toml, e.hint || "copy this into the config file yourself, then restart Runner");
         return;
       }
     } catch (e) { msg.className = "err"; msg.textContent = String(e); return; }

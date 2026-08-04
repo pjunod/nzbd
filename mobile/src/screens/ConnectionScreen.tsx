@@ -67,10 +67,10 @@ export function ConnectionScreen({ initial, onConnect, onCancel, onForget }: Pro
       const config = configFromFields();
       const status = await new NzbdClient(config).getStatus();
       setMessageKind('ok');
-      setMessage(`Connection works — nzbd ${status.version} answered at ${config.baseUrl}.`);
+      setMessage(`Connection works — Runner ${status.version} answered at ${config.baseUrl}.`);
     } catch (cause) {
       setMessageKind('error');
-      setMessage(cause instanceof Error ? cause.message : 'Could not connect to nzbd.');
+      setMessage(cause instanceof Error ? cause.message : 'Could not connect to Runner.');
     } finally {
       setBusy(null);
     }
@@ -84,10 +84,10 @@ export function ConnectionScreen({ initial, onConnect, onCancel, onForget }: Pro
       const status = await new NzbdClient(config).getStatus();
       await onConnect(config);
       setMessageKind('ok');
-      setMessage(`Connected to nzbd ${status.version}.`);
+      setMessage(`Connected to Runner ${status.version}.`);
     } catch (cause) {
       setMessageKind('error');
-      setMessage(cause instanceof Error ? cause.message : 'Could not connect to nzbd.');
+      setMessage(cause instanceof Error ? cause.message : 'Could not connect to Runner.');
     } finally {
       setBusy(null);
     }
@@ -110,7 +110,7 @@ export function ConnectionScreen({ initial, onConnect, onCancel, onForget }: Pro
               </View>
               <ThemeSwitcher />
             </View>
-            <Text style={styles.title}>{initial ? 'Server settings' : 'Connect to nzbd'}</Text>
+            <Text style={styles.title}>{initial ? 'Server settings' : 'Connect to Runner'}</Text>
             <Text style={styles.subtitle}>
               Use the address you open from this device. A phone cannot reach your computer at
               localhost.
@@ -119,12 +119,12 @@ export function ConnectionScreen({ initial, onConnect, onCancel, onForget }: Pro
             <View style={styles.nearbySection}>
               <View style={styles.nearbyHeading}>
                 <View style={styles.nearbyTitleRow}>
-                  <Text style={styles.label}>Nearby nzbd</Text>
+                  <Text style={styles.label}>Nearby Runner</Text>
                   {nearby.scanning ? <View style={styles.liveDot} /> : null}
                 </View>
                 <Pressable
                   accessibilityRole="button"
-                  accessibilityLabel="Scan again for nearby nzbd servers"
+                  accessibilityLabel="Scan again for nearby Runner servers"
                   onPress={() => void nearby.scanAgain()}
                   style={styles.scanButton}
                 >
@@ -188,7 +188,7 @@ export function ConnectionScreen({ initial, onConnect, onCancel, onForget }: Pro
               <Text style={styles.optional}>optional</Text>
             </View>
             <Text style={styles.hint}>
-              Use an API token, or the username and password from nzbd. A token takes precedence.
+              Use an API token, or the username and password from Runner. A token takes precedence.
             </Text>
 
             <TextInput

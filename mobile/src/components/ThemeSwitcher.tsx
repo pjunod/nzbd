@@ -101,7 +101,7 @@ export function ThemeSwitcher({ compact = false }: { compact?: boolean }) {
               </ChoiceSection>
 
               <View accessibilityLabel={`App version ${APP_VERSION}`} style={styles.appInfo}>
-                <Text style={styles.appInfoName}>nzbd</Text>
+                <Text style={styles.appInfoName}>Noirr Runner</Text>
                 <Text style={styles.appInfoVersion}>Version {APP_VERSION}</Text>
               </View>
             </ScrollView>

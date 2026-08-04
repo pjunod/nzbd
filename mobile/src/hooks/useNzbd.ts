@@ -56,7 +56,7 @@ export function useNzbd(config: ConnectionConfig): HookResult {
         if (Date.now() - lastFrameAt.current > 7_000) setConnectionState('polling');
       })
       .catch((cause) => {
-        const message = cause instanceof Error ? cause.message : 'Could not refresh nzbd.';
+        const message = cause instanceof Error ? cause.message : 'Could not refresh Runner.';
         setError(message);
         setConnectionState('offline');
         throw cause;
@@ -84,7 +84,7 @@ export function useNzbd(config: ConnectionConfig): HookResult {
           setSnapshot(JSON.parse(data) as QueueSnapshot);
           setLastUpdated(Date.now());
         } catch {
-          setError('nzbd sent a queue update the app could not read.');
+          setError('Runner sent a queue update the app could not read.');
         }
       } else if (event === 'reset' || event === 'lagged') {
         void refresh().catch(() => undefined);
@@ -149,7 +149,7 @@ export function useNzbd(config: ConnectionConfig): HookResult {
         await refresh().catch(() => undefined);
         return result;
       } catch (cause) {
-        setError(cause instanceof Error ? cause.message : 'nzbd rejected the action.');
+        setError(cause instanceof Error ? cause.message : 'Runner rejected the action.');
         throw cause;
       } finally {
         setBusyKey(null);

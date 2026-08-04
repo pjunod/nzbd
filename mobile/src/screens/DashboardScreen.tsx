@@ -178,7 +178,7 @@ export function DashboardScreen({ config, onEditConnection }: Props) {
             <Text style={styles.brandMarkText}>n</Text>
           </View>
           <View style={styles.brandText}>
-            <Text style={styles.brand}>nzbd</Text>
+            <Text style={styles.brand}>runner</Text>
             <View style={styles.connectionRow}>
               <View
                 style={[
@@ -272,7 +272,7 @@ export function DashboardScreen({ config, onEditConnection }: Props) {
                   <Text style={styles.emptyText}>
                     {snapshot
                       ? 'Pick an NZB from Files or Android’s document picker to start a download.'
-                      : 'Waiting for the first snapshot from nzbd.'}
+                      : 'Waiting for the first snapshot from Runner.'}
                   </Text>
                   {snapshot ? (
                     <ActionButton label="Add an NZB" onPress={() => setAddOpen(true)} variant="primary" />
@@ -844,7 +844,7 @@ function AddNzbModal({
       setPriority(0);
       setPaused(false);
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : 'nzbd could not add this file.');
+      setError(cause instanceof Error ? cause.message : 'Runner could not add this file.');
     }
   };
 

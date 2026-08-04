@@ -1,14 +1,14 @@
 {
   "expo": {
-    "name": "nzbd",
+    "name": "Noirr Runner",
     "slug": "nzbd-mobile",
-    "description": "Watch and control an nzbd queue from iPhone, iPad, and Android.",
+    "description": "Watch and control your Runner download queue from iPhone, iPad, and Android.",
     "version": "1.1.0",
     "platforms": ["ios", "android"],
     "orientation": "default",
-    "icon": "./assets/nzbd-icon.png",
+    "icon": "./assets/icon.png",
     "userInterfaceStyle": "automatic",
-    "backgroundColor": "#0B1219",
+    "backgroundColor": "#0a0a0c",
     "scheme": "nzbd",
     "ios": {
       "bundleIdentifier": "com.pjunod.nzbd",
@@ -20,7 +20,7 @@
       },
       "infoPlist": {
         "NSBonjourServices": ["_nzbd._tcp"],
-        "NSLocalNetworkUsageDescription": "nzbd scans for and connects to download servers on your local network.",
+        "NSLocalNetworkUsageDescription": "Runner scans for and connects to download servers on your local network.",
         "NSAppTransportSecurity": {
           "NSAllowsArbitraryLoads": true,
           "NSAllowsLocalNetworking": true
@@ -31,8 +31,9 @@
       "package": "com.pjunod.nzbd",
       "versionCode": 3,
       "adaptiveIcon": {
-        "backgroundColor": "#101010",
-        "foregroundImage": "./assets/nzbd-icon.png"
+        "backgroundColor": "#0a0a0c",
+        "foregroundImage": "./assets/android-icon-foreground.png",
+        "monochromeImage": "./assets/android-icon-monochrome.png"
       },
       "predictiveBackGestureEnabled": false
     },
