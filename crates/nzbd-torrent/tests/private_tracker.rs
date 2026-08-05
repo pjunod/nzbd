@@ -83,9 +83,25 @@ async fn tracker_server(
             assert!(request.starts_with("GET /announce/m0-passkey?"));
             requests.fetch_add(1, Ordering::Relaxed);
 
-            let mut body = b"d8:completei1e10:incompletei0e8:intervali60e5:peers6:".to_vec();
-            body.extend_from_slice(&seeder.ip().octets());
-            body.extend_from_slice(&seeder.port().to_be_bytes());
+            let target = request.split_whitespace().nth(1).unwrap();
+            let announce = url::Url::parse(&format!("http://tracker{target}")).unwrap();
+            let announcing_port = announce
+                .query_pairs()
+                .find(|(key, _)| key == "port")
+                .and_then(|(_, value)| value.parse::<u16>().ok())
+                .unwrap();
+
+            let mut body = b"d8:completei1e10:incompletei0e8:intervali60e5:peers".to_vec();
+            if announcing_port == seeder.port() {
+                // Real trackers do not hand a seeder its own endpoint back.
+                // Returning it here creates a self-connection race that can
+                // poison the synthetic swarm before the downloader announces.
+                body.extend_from_slice(b"0:");
+            } else {
+                body.extend_from_slice(b"6:");
+                body.extend_from_slice(&seeder.ip().octets());
+                body.extend_from_slice(&seeder.port().to_be_bytes());
+            }
             body.push(b'e');
             let headers = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -160,10 +176,18 @@ async fn one_tracker_private_torrent_downloads_and_multiple_trackers_are_rejecte
         )
         .await
         .unwrap();
-    tokio::time::timeout(Duration::from_secs(20), download.wait_until_completed())
-        .await
-        .expect("private tracker transfer timed out")
-        .unwrap();
+    let completed =
+        tokio::time::timeout(Duration::from_secs(20), download.wait_until_completed()).await;
+    if completed.is_err() {
+        panic!(
+            "private tracker transfer timed out: requests={}, tracker_finished={}, seeder={:?}, downloader={:?}",
+            requests.load(Ordering::Relaxed),
+            tracker_task.is_finished(),
+            seed.stats(),
+            download.stats(),
+        );
+    }
+    completed.unwrap().unwrap();
     assert_eq!(
         std::fs::read(download_root.path().join(FILE_NAME)).unwrap(),
         payload
