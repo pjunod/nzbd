@@ -22,12 +22,12 @@ suite. Re-verify every source anchor against HEAD before building. If the
 dependency spike in M0 cannot prove the gates in §4.3, stop and return to the
 engine decision instead of coding around a missing capability.
 
-The 2026-08-05 review accepted the architecture and found that the original
+The first 2026-08-05 review accepted the architecture and found that the original
 draft had attributed uTP and IPv6 support from the 9.x development line to
 the stable 8.1.1 release. This revision deliberately chooses the stable
 release and narrows v1 to TCP and IPv4. It also registers the decision as
 ADR-19, describes downgrade behavior as a whole-queue startup failure, makes
-schema versioning part of M1, removes a premature `nzbd-usenet` extraction,
+schema versioning part of M1a, removes a premature `nzbd-usenet` extraction,
 and treats the enforcing disk guard, qBittorrent login throttling, and torrent
 watch path as construction rather than reuse. The first M0 run is now recorded
 in [BITTORRENT_M0_REPORT.md](BITTORRENT_M0_REPORT.md). It proved the core data
@@ -36,6 +36,14 @@ own complete torrent list before nzbd can reconcile it, and tracker/DHT health
 is not available through the public per-torrent stats model. The isolated
 adapter and schema groundwork may remain; production session wiring stops here
 until ADR-19 is amended with an upstream fix or a different engine.
+
+The Fable review later that day found a real proxy leak boundary and several
+plan inconsistencies. This revision rejects proxy+DHT and proxy+UDP trackers,
+disables process-global DHT persistence, completes v2/hybrid admission checks
+for metainfo, reserves schema version 3 for torrent job records, defines how a
+stalled torrent yields the shared slot, and splits completed M1a schema work
+from blocked M1b backend routing. Review hardening does not change the M0
+no-go: gates 7 and 8 still block production wiring.
 
 > BitTorrent publishes the client’s IP address to peers and may upload data
 > after the download completes. nzbd can provide controls and honest status;
@@ -239,8 +247,9 @@ The first release must:
 
 ### 3.4 Non-goals for the first production release
 
-- BitTorrent v2-only and hybrid swarms (BEP 52), unless M0 proves support and
-  interoperability in the selected stable library.
+- BitTorrent v2-only and hybrid swarms (BEP 52). M0 now rejects both input
+  forms by name; a later release needs a new engine gate and durable v2 hash
+  identity.
 - uTP and IPv6 peer transport. Stable `librqbit` 8.1.1 is TCP/IPv4; revisit
   both when a stable 9.x release passes the M0 build, resume, and interop
   gates.
@@ -338,8 +347,8 @@ M0 passes only if it proves all of the following:
     mixed aws-lc/ring dependency graph cannot reach an ambiguous-provider
     panic.
 11. Stable 8.1.1 has no versioned supported-BEP list and its v1 add path
-    requires `btih`; v2-only and hybrid inputs are rejected with a named
-    error unless an explicit test proves otherwise.
+    requires `btih`; v2-only and hybrid metainfo and magnets are rejected
+    with distinct named errors unless an explicit test proves otherwise.
 
 If gates 1–8 fail and cannot be fixed by a small upstreamable adapter change,
 evaluate `libtorrent-rasterbar`. Do not hide a library gap behind polling,
@@ -437,10 +446,10 @@ policy state, publishes snapshots, and orders events.
 | `nzbd-api` | Native typed API, SSE, combined status | Compatibility-specific state strings |
 | `nzbd-post` | Existing Usenet PP; later, derivative-worktree PP | Mutating a live seed payload |
 
-Do not extract a `nzbd-usenet` crate in M1. `owner.rs`, article leasing, and
+Do not extract a `nzbd-usenet` crate in M1b. `owner.rs`, article leasing, and
 the current snapshot are too interwoven for that to be a mechanical move.
 Introduce the backend seam around the implementation in place; a later crate
-split needs its own review and is not required by BitTorrent. The M1
+split needs its own review and is not required by BitTorrent. The M1b
 acceptance gate is existing Usenet behavior behind a new boundary, not moved
 ownership or a redesigned engine.
 
@@ -519,12 +528,12 @@ This makes old snapshots load with `torrent = None` and leaves compat code’s
 existing field reads intact. A later schema cleanup may introduce a fully
 tagged `TransferRecord`; it is not required to ship the feature safely.
 
-### 6.2 Version the queue envelope before adding the enum variant
+### 6.2 Version 2 is the envelope; torrent jobs require version 3
 
 An additive `Job` field is backward-readable, but `JobKind::Torrent` is not.
 Today one unknown enum value makes the whole `queue.json` fail to deserialize
-and aborts daemon startup, including every Usenet job. Add a version header in
-M1 and preflight it before the typed document is decoded:
+and aborts daemon startup, including every Usenet job. M1a has added this
+version-2 envelope without adding a torrent representation:
 
 ```rust
 pub const QUEUE_SCHEMA_VERSION: u32 = 2;
@@ -536,17 +545,24 @@ pub struct QueueSnapshotDoc {
 }
 ```
 
-`SnapshotStore::load` first decodes a tiny header that ignores the remaining
-JSON values. Version 1 loads through the existing defaults. A version greater
-than the running binary supports returns a named `StateError::Corrupt` before
-the typed `JobKind` pass, for example:
+Version 2 is now spent: it means “the legacy Usenet job shape inside an
+explicit envelope.” M1b must atomically bump the writer to version 3 when it
+adds `JobKind::Torrent`, the defaulted `torrent` record, or any other job
+representation change. Reusing version 2 would let this binary treat a future
+enum as ordinary corruption instead of a version mismatch.
+
+`SnapshotStore::load` parses a healthy typed document once, then validates its
+version. If the typed parse fails, it decodes a tiny header that ignores the
+remaining JSON values so a future enum still produces a named
+`StateError::Corrupt`. Version 1 loads through the existing defaults. A version
+greater than the running binary supports reports, for example:
 
 ```text
 queue.json schema version 3 is newer than this nzbd supports (2);
 upgrade nzbd or restore a compatible queue snapshot
 ```
 
-This improves future version diagnostics; it cannot retrofit an older binary.
+This makes a future *version* fail by name; it cannot retrofit an older binary.
 A pre-torrent nzbd still fails its entire startup when it sees a live torrent
 row. The drain/export procedure in §17.2 is therefore mandatory before a
 downgrade, not optional release-note advice.
@@ -888,6 +904,23 @@ exempt merely because a real qBittorrent installation can trust localhost.
 across Usenet and BitTorrent. Seeding jobs do not consume a download slot;
 they consume upload and peer resources controlled by `[torrent]`.
 
+Metadata fetching and payload downloading consume a slot only while the owner
+has granted backend run permission. If neither metadata nor verified payload
+progresses for 60 seconds and the backend reports no useful peer, the job
+projects as `stalledDL`, the owner revokes run permission, and the job yields
+its slot. A yielded torrent may keep discovery-only activity only if the
+engine can prove that payload transfer remains gated; otherwise nzbd pauses it
+and probes again only when a slot would otherwise be idle. A newly useful peer
+or an explicit retry returns the job to its priority band, but it must reacquire
+a slot before requesting metadata or pieces.
+
+This policy means one dead magnet cannot hold the default single slot forever
+and starve Usenet. It also depends on the tracker/peer facts missing from the
+8.1.1 public API: until gate 7 is resolved, M1b cannot claim to implement slot
+yielding honestly. Its fake-backend acceptance test must prove a stalled
+torrent yields, a following Usenet job runs, and the torrent later reacquires
+capacity without transferring while unselected.
+
 The owner selects the highest-priority schedulable jobs regardless of
 protocol, then grants/revokes backend run permission. Within the same priority,
 the existing queue order remains the tiebreaker. Force priority may bypass a
@@ -902,7 +935,7 @@ knob. There is no contradictory torrent-specific download-slot setting.
 
 The current cap is a scheduling bound, not a byte-in-flight invariant: a
 Usenet job whose remaining articles are already leased can overlap briefly
-with another job granted new work. M1 preserves that behavior and documents
+with another job granted new work. M1b preserves that behavior and documents
 the same eventual bound across protocols rather than promising a hard network
 concurrency guarantee the current engine does not enforce.
 
@@ -1088,6 +1121,8 @@ source_redirects = 5
   it. Failure to bind is a startup error when the feature is enabled.
 - `dht = true`, `pex = true`: magnets and public swarm discovery need them;
   the engine must suppress both for private torrents regardless of config.
+  When `socks_proxy_url` is set, settings validation requires `dht = false`
+  because librqbit 8.1.1 does not proxy DHT UDP traffic.
 - `local_discovery = false`: LAN multicast reveals torrent participation and
   is unnecessary for the normal server deployment.
 - `upnp_port_forwarding = false`: router mutation requires explicit consent.
@@ -1102,6 +1137,15 @@ source_redirects = 5
   `socks_proxy_password` uses the existing whole-field secret-mask and restore
   path. The adapter constructs an authenticated URL only in memory. This
   avoids exposing a password inside a partly masked URL.
+- proxy routing is fail-closed: proxy+DHT is invalid, and metainfo or magnets
+  containing `udp://` trackers are rejected because 8.1.1 does not proxy UDP
+  announces. HTTP(S) tracker announces and TCP peers remain eligible. DHT
+  persistence stays disabled until nzbd can place it under its own state
+  directory instead of rqbit's process-global cache.
+- the M0 adapter accepts only URL-unreserved ASCII in proxy credentials. M2
+  must either percent-encode punctuation with redaction fixtures or expose
+  this as a named validation limit; it may not silently broaden the accepted
+  secret form while returning partly encoded URLs in errors.
 
 ### 10.2 Category seed overrides
 
@@ -1151,10 +1195,12 @@ BitTorrent enabled: listen=:6881 dht=on pex=on lsd=off upnp=off proxy=none
 
 The Settings UI repeats that state and warns when the API is LAN-exposed but
 has no password/token. It also states that a proxy setting does not prove a
-VPN kill switch. The public `librqbit::SessionOptions` reviewed for this
-proposal exposes a SOCKS URL and listen port range; it does not by itself
-prove interface-bound leak prevention. M0 must not turn “traffic probably
-uses the VPN” into a supported claim.
+VPN kill switch. In stable 8.1.1, SOCKS covers peer TCP and HTTP tracker
+announces but does not cover DHT or UDP trackers. nzbd therefore rejects
+proxy+DHT and proxy+`udp://` tracker combinations instead of leaking through a
+second transport. The public `librqbit::SessionOptions` exposes a SOCKS URL
+and listen port range; it does not prove interface-bound leak prevention. M0
+must not turn “traffic probably uses the VPN” into a supported claim.
 
 For deployments requiring a hard privacy boundary, document container/network
 namespace routing through the VPN and firewall rules that reject non-VPN
@@ -1174,6 +1220,21 @@ For metainfo marked private:
 If the selected library cannot prove this per torrent, M0 fails. Private
 tracker rules are not a UI preference.
 
+Stable 8.1.1 also loses tracker tier order before selecting the first private
+tracker. The v1 adapter therefore accepts exactly one unique private tracker
+and returns a named `422 private_tracker_count` failure for metainfo with
+backup announce tiers. The qBittorrent shim projects that as an add failure;
+Sonarr/Radarr may retry another release, but nzbd does not rewrite or discard
+trackers silently.
+
+Many private trackers whitelist client peer IDs or approved client families;
+rqbit is not assumed to be accepted. Before M4, the operator documentation and
+compatibility test matrix must name each supported tracker policy. An
+unapproved client response is a tracker/account-policy failure, not a network
+retry, and nzbd must warn that using the qBittorrent shim does not make the
+wire client identify as qBittorrent. No private-tracker compatibility claim is
+made until that disclosure and an allowed-account fixture exist.
+
 ### 11.3 Secret redaction
 
 Treat these as secrets: full magnet URIs · HTTP source query strings · tracker
@@ -1183,7 +1244,9 @@ announce URLs · tracker response bodies · proxy credentials · auth forms.
 `mask_secrets`, and `merge_masked_secrets` together. A URL containing
 userinfo is rejected, so no second hidden credential representation can leak
 through `GET /api/v1/config`. A password without a proxy URL/username is also
-invalid; a credential-free local proxy remains supported.
+invalid; a credential-free local proxy remains supported. The M0 boundary
+accepts URL-unreserved ASCII credentials only; punctuation support is an M2
+contract item with percent-encoding and round-trip redaction tests.
 
 Logs and events may include scheme + host and a stable short digest for
 correlation, for example `https://tracker.example/<redacted>#a91c03`. They may
@@ -1401,6 +1464,9 @@ dashboard migration.
 | Magnet has no metadata peers | Live, not ready | Stay queued/stalled; do not call failed | Metadata age, DHT/tracker facts |
 | Tracker error | Live | Back off per engine; continue DHT/other trackers when allowed | Redacted tracker host + last error |
 | No peers | Live | Stay stalled | `stalledDL`, availability/last activity |
+| No metadata/payload progress for 60 s and no useful peer | Live, slot yielded | Revoke run permission; discovery-only or idle-capacity probe per §8.1 | `stalledDL`, last progress, next probe |
+| Proxy configured with DHT or UDP tracker | No live job/session for invalid input | Reject before traffic starts; never downgrade to direct UDP | Named config or `422` privacy error |
+| Private metainfo has backup announce tiers | No live job | Reject rather than choose a nondeterministic tracker | `422 private_tracker_count`; *arr add fails visibly |
 | Bad piece | Not counted complete | Discard and redownload | Hash-failure counter; no false progress |
 | ENOSPC/EDQUOT | Live, download paused | Latch disk guard; keep API, seed existing data when possible | Full path/root signal and observed error |
 | Process kill mid-piece | Piece untrusted | Resume/recheck; never ready from partial write | `checking` after restart when needed |
@@ -1440,34 +1506,45 @@ seeds deterministic generated content with the internet disabled; the build
 matrix and a short spike report state pass/fail for all eleven §4.3 gates.
 
 **Result:** the deterministic adapter suite passes, but gates 7 and 8 do not.
-Per the stop condition, do not start the M1 backend-routing portion or any M2
+Per the stop condition, do not start M1b backend routing or any M2
 session integration. See [BITTORRENT_M0_REPORT.md](BITTORRENT_M0_REPORT.md).
 
-### 15.2 M1 — protocol-neutral queue seam, Usenet behavior unchanged (schema groundwork only)
+### 15.2 M1a — queue schema envelope (complete)
 
-**Work:** add queue schema preflight/version 2 · add `JobKind::Torrent` and
-defaulted `torrent` field · add `kind`/readiness to `JobSummary` · introduce
-backend commands/facts around the current Usenet executor in place · keep one
-queue owner and snapshot · add schema migration and old-mobile projection
-tests. Do not extract a `nzbd-usenet` crate.
+**Work:** add queue schema version 2 · treat a missing version as legacy v1 ·
+name future/retired version failures · refuse non-current writes · avoid a
+second parse on healthy production snapshots.
+
+**Acceptance:** `cargo test --workspace` and the NZBGet golden suite remain
+unchanged; a v1 queue fixture round-trips, a version-3 document containing an
+unknown job kind fails with the named version error, the v2 snapshot cannot be
+written as schema 1, and a production-sized current snapshot round-trips.
+
+**Result:** complete. Version 2 contains no torrent job representation and is
+useful hardening on its own.
+
+### 15.3 M1b — protocol-neutral backend seam (blocked on ADR-19)
+
+**Work:** atomically bump the queue writer to schema version 3 · add
+`JobKind::Torrent` and the defaulted `torrent` field · add `kind`/readiness to
+`JobSummary` · introduce backend commands/facts around the current Usenet
+executor in place · keep one queue owner and snapshot · add schema migration
+and old-mobile projection tests. Do not extract a `nzbd-usenet` crate.
 
 Do not start `librqbit` from the daemon in this milestone. A fake torrent
-backend proves queue command routing and coalesced progress without network or
-disk behavior.
+backend proves queue command routing, stalled-slot yield, and coalesced
+progress without network or disk behavior. This work waits for the ADR-19
+engine decision; adding it now would build product architecture on a failed
+M0 assumption.
 
-**Acceptance:** `cargo test --workspace` and the NZBGet golden suite are
-unchanged; a v1 queue fixture round-trips, a future schema fails with the named
-version error, and the v2 snapshot cannot be written with schema 1; fake
-Usenet and torrent jobs obey one priority/pause/max-active schedule; a progress
-flood cannot delay a delete command beyond the bounded test threshold.
+**Acceptance:** v2 fixtures migrate to v3 without semantic change; a v3
+torrent row makes the current v2 binary fail by schema version; fake Usenet
+and torrent jobs obey one priority/pause/max-active schedule; a stalled
+torrent yields so a following Usenet job completes and later reacquires only
+when eligible; a progress flood cannot delay a delete command beyond the
+bounded test threshold.
 
-The schema preflight/version-2 envelope is implemented independently because
-it removes an existing downgrade ambiguity without starting or admitting a
-torrent. `JobKind::Torrent`, fake-backend routing, and scheduler changes wait
-for the ADR-19 engine decision; adding them now would build product architecture
-on a failed M0 assumption.
-
-### 15.3 M2 — single-node torrent download, resume, and seeding
+### 15.4 M2 — single-node torrent download, resume, and seeding
 
 **Work:** add `[torrent]` and paths · start one session only when enabled · raw
 metainfo/magnet/URL admission · durable descriptor before start · handle map ·
@@ -1488,7 +1565,7 @@ downloads exact generated bytes, durably publishes `ready=true`, seeds to a
 second client, survives kill/restart, honors limits, and deletes only the
 requested payload. With `[torrent].enabled=false`, it opens no peer listener.
 
-### 15.4 M3 — native API, web UI, and mobile
+### 15.5 M3 — native API, web UI, and mobile
 
 **Work:** typed native admission · torrent detail/export · file projection ·
 protocol chip · upload/ratio/peer/seed views · controls · metrics · mobile
@@ -1503,7 +1580,7 @@ client fixture receives only existing top-level status values; an idle seed
 produces no repeated full-queue tick; UI controls revert loudly on backend
 failure; no displayed/logged value contains a tracker passkey fixture.
 
-### 15.5 M4 — qBittorrent compatibility for Sonarr and Radarr
+### 15.6 M4 — qBittorrent compatibility for Sonarr and Radarr
 
 **Work:** new `nzbd-qbit-compat` crate · endpoint set in §7.4 · Bearer and
 cookie auth · category overlay · state and field projections · request/client
@@ -1518,7 +1595,7 @@ keep/delete data.
 unsupported qBittorrent endpoints remain absent; the NZBGet golden suite is
 byte-identical and torrent rows never appear through it.
 
-### 15.6 M5 — adversarial hardening and release gate
+### 15.7 M5 — adversarial hardening and release gate
 
 **Work:** fuzz/preflight malformed metainfo · traversal/symlink/case collision ·
 source redirect/size/time bounds · auth failure limiting · private torrent
@@ -1531,7 +1608,7 @@ passes; Linux glibc/musl, macOS, Windows, Docker, and MSRV artifacts build; the
 reviewer can verify public traffic, ports, paths, seed policy, and deletion
 from docs without reading code.
 
-### 15.7 M6 — cluster torrent leases (separate approval)
+### 15.8 M6 — cluster torrent leases (separate approval)
 
 **Work:** implement §12 only after single-node field data exists · lease kind ·
 fenced resume/write authority · heartbeat stats · leader proxying · failover
@@ -1541,7 +1618,7 @@ harness · config compatibility removal.
 bytes, and enabling torrent+cluster no longer weakens any existing single-node
 or Usenet cluster invariant.
 
-### 15.8 Milestone commit rule
+### 15.9 Milestone commit rule
 
 One milestone may take several commits, but no commit may expose a config/API
 switch that starts a half-wired backend. Behavior, tests, docs, configuration
@@ -1555,15 +1632,17 @@ becomes reachable.
 ### 16.1 Unit and property tests
 
 - Source parsing: v1 magnet forms, base32/hex `btih`, duplicate parameters,
-  oversize input, missing hash, unsupported v2-only `btmh`.
+  oversize input, missing hash, and named v2-only/hybrid rejection for both
+  magnets and metainfo.
 - Path validation: every platform prefix/separator, traversal, normalization,
   symlinks, case collisions, padding files, exact-root delete proof.
 - State projection: every `TorrentPhase` maps to the expected native and
   qBittorrent status, with units/sentinel values pinned.
 - Seed policy: add/category/global precedence, ratio precision, time across
   restarts, limits pause but never delete.
-- Scheduler: mixed priorities/protocols, force semantics, slot release on
-  readiness, seeding excluded from download slots.
+- Scheduler: mixed priorities/protocols, force semantics, stalled-slot yield
+  and later reacquisition, slot release on readiness, seeding excluded from
+  download slots.
 - Redaction: tracker/query/proxy credentials never survive into safe errors,
   logs, events, or metrics.
 
@@ -1577,6 +1656,12 @@ flakiness, and dependency on a third-party swarm.
 Cover: single/multi-file · empty file · boundary piece sizes · magnet metadata ·
 bad-piece peer · disconnect/reconnect · pause/resume · selective file fixture ·
 rate changes · seed upload · restart · delete keep/data · ENOSPC fault injection.
+
+The SOCKS fixture binds the proxy's outbound TCP source and places a recording
+relay before the seeder, then asserts that every observed connection came from
+that source. Separate admission tests reject proxy+DHT and proxy+UDP-tracker
+inputs before any session or torrent traffic. Proxy-use evidence without the
+absence-of-direct-path assertion is not leak-prevention evidence.
 
 ### 16.3 Consumer integration
 
@@ -1594,10 +1679,11 @@ new supported consumer version.
 | v1 magnet (`btih`) over TCP/IPv4 | Yes | metadata exchange + restart |
 | HTTP(S) `.torrent` URL | Yes | redirect/auth/redaction/limit tests |
 | Private v1 torrent, primary tracker | Yes | network capture proves no DHT/PEX/LSD; first-tracker behavior recorded |
+| Private v1 torrent, backup announce tiers | No in 8.1.1 | named `private_tracker_count` rejection; no nondeterministic tracker choice |
 | uTP peer transport | No | named stable-8.1.1 limitation |
 | IPv6 peer transport | No | named stable-8.1.1 limitation |
 | v2-only (`btmh`) | No | named rejection |
-| Hybrid v1/v2 | No unless M0 proves it | named rejection or explicit interop fixtures |
+| Hybrid v1/v2 | No | named rejection for metainfo and magnets |
 | Sonarr qBittorrent client | Yes | real-container workflow |
 | Radarr qBittorrent client | Yes | real-container workflow |
 | General qBittorrent Web UI/API clients | No claim | unsupported routes are explicit |
@@ -1642,16 +1728,17 @@ measurements on its own build.
 - Disabling with live torrents: startup refuses and names the live job count,
   unless an explicit `allow_paused_state = true` migration option is designed.
   Silently forgetting seeds is not a safe default.
-- Downgrade to a pre-torrent binary: its single typed `queue.json` decode sees
-  unknown `JobKind::Torrent`, reports `queue.json: unknown variant 'torrent'`
-  (exact serde wording may include the expected variants), and aborts the
-  entire daemon startup. It does not isolate or skip the torrent row; Usenet
+- Downgrade from schema 3 to this schema-2 binary: it reports that version 3
+  is newer than supported and aborts the entire queue load before serving.
+  Downgrade to a pre-envelope binary: its single typed `queue.json` decode
+  sees unknown `JobKind::Torrent`, reports an unknown-variant error, and also
+  aborts startup. Neither binary isolates or skips the torrent row; Usenet
   jobs are unavailable too. Before downgrade, pause and export torrent
   metainfo, let the importer finish, remove/drain every live torrent record,
-  verify a torrent-free snapshot, and only then install the old binary. This
-  drain/export procedure is mandatory. The schema preflight added in M1 makes
-  future-version failures clearer in new binaries but cannot change already
-  released old binaries.
+  verify a torrent-free snapshot written in the target schema, and only then
+  install the old binary. This drain/export procedure is mandatory. The
+  version fallback added in M1a makes future-version failures clearer in new
+  binaries but cannot change already released old binaries.
 
 ### 17.3 Rollback
 
@@ -1670,11 +1757,12 @@ data-loss change, not a feature toggle.
 | `librqbit` lacks a required control or platform | Feature cannot meet nzbd’s contract | M0 gates before production architecture; `libtorrent` is the named fallback. |
 | Stable library lacks BEP 52 | Some modern torrents reject | Honest v1 scope and named rejection; revisit on proven stable support. |
 | Stable library is TCP/IPv4 and private torrents use one tracker | Some peers/networks and tracker failover are unavailable | Publish the exact v1 matrix, verify primary-tracker private downloads, revisit only on a stable 9.x gate. |
+| Private tracker rejects or bans an unapproved rqbit client | Grab fails or tracker account is penalized | No qBittorrent wire-identity claim; disclose whitelist requirements and gate each supported tracker policy before M4. |
 | Torrent PP corrupts seeds | Tracker hash failures and broken uploads | No torrent PP in v1; future reflink-or-copy derivative only. |
 | Passkeys leak in logs/UI | Tracker account compromise | Secret classification, boundary redaction, fixtures in every output path. |
 | qBittorrent shim drifts from *arr | Adds/imports fail after upgrades | Minimal surface, current-source contract table, pinned real-container tests. |
 | Two persistence systems disagree | Ghost or duplicate torrents | nzbd authoritative; library persistence only accelerates explicit restore. |
-| VPN/proxy claim is false | Public IP exposure | No anonymity claim; document network namespace/firewall boundary; M0 records bind capability. |
+| VPN/proxy claim is false | Public IP exposure | Reject proxy+DHT and proxy+UDP trackers; prove peer TCP has no direct path; still make no anonymity claim and document the network namespace/firewall boundary. |
 | Unlimited seeding surprises operator | Ongoing bandwidth/storage use | Visible status/warning and explicit upload control; do not guess a potentially harmful default. |
 | Automatic seed limit races import | Data removed before consumer copies it | Limit pauses only; caller performs explicit removal. |
 | Torrent stats flood owner/API | Queue actions lag | Coalesced watched progress; structural bounded events; latency test. |
@@ -1685,24 +1773,27 @@ data-loss change, not a feature toggle.
 
 ---
 
-## 19. Review disposition — review accepted; M0 now blocks backend wiring
+## 19. Review disposition — both reviews accepted; M0 still blocks wiring
 
-The 2026-08-05 review approved the architecture and rejected the original
-engine capability claim. This revision resolves the M0/M1 decisions as
-follows:
+The first 2026-08-05 review approved the architecture and rejected the
+original engine capability claim. Fable's follow-up review found the proxy
+leak boundary and plan inconsistencies described above. This revision resolves
+both review passes as follows:
 
 | Decision | Disposition |
 |---|---|
 | Engine | Pin stable `librqbit =8.1.1` subject to the eleven M0 gates; evaluate `libtorrent-rasterbar` only if a required stable capability fails. |
 | Transport | Accept TCP/IPv4-only for the first release; uTP and IPv6 wait for a stable 9.x line and repeatable resume/interop proof. |
-| Torrent format | Accept v1 `.torrent`/`btih` magnets only; reject v2/hybrid inputs by name unless M0 proves an explicitly documented safe subset. |
+| Torrent format | Accept v1 `.torrent`/`btih` magnets only; the M0 adapter rejects v2-only and hybrid metainfo/magnets with distinct named errors. |
+| Queue schema | Version 2 is the torrent-free envelope; M1b must write version 3 in the same change that adds any torrent job representation. |
 | Compatibility | qBittorrent Web API 2.8.1 is the one supported *arr surface; do not also build Transmission RPC. |
 | Post-processing | No torrent PP in v1; future PP operates on a reflink-or-copy derivative, never a hardlinked seed tree. |
 | Seeding | Unlimited default; per-add/category limits pause and retain data rather than deleting it. |
 | Paths | Use a separate immutable `torrent_dir`; display names never own storage. |
 | Categories | Use a durable runtime overlay so Sonarr's connection test does not edit config or require restart. |
-| Concurrency | Keep one shared `max_active_downloads` knob and its existing default of 1; do not add `download_slots` or silently change Usenet concurrency. |
-| Privacy | SOCKS is supported with split/masked credentials; v1 makes no interface-binding, kill-switch, VPN, or anonymity claim. Network namespace/firewall enforcement remains the hard boundary. |
+| Concurrency | Keep one shared `max_active_downloads` knob and its existing default of 1; a torrent with no progress/useful peer for 60 s yields so it cannot starve Usenet. |
+| Privacy | SOCKS is supported with split/masked credentials only when DHT is off and no UDP tracker is present; peer TCP must prove no direct path. v1 still makes no interface-binding, kill-switch, VPN, or anonymity claim. |
+| Private trackers | Exactly one unique tracker only in 8.1.1; backup tiers fail visibly, and tracker client-whitelist compatibility must be disclosed and tested before M4. |
 | Readiness | Add authoritative snapshot fields, not a duplicate Usenet event; keep `job_pp_finished` unchanged and do not emit it for unprocessed torrents. |
 | Quota | Count verified torrent payload and successfully written decoded NNTP payload; do not count upload or NNTP protocol overhead. |
 | UPnP | Disabled by default; router mutation requires explicit opt-in. |

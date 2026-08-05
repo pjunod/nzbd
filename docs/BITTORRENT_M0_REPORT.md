@@ -27,15 +27,15 @@ peer listener, or production torrent admission path has been added.
 |---:|---|---|
 | 1. Rust 1.85 and platform packaging | **Partial** | A real Rust 1.85.1 macOS build passes after compatible transitive versions were pinned. The release harness links only macOS system libraries, not OpenSSL. Windows GNU and Linux musl dependency builds reach `ring`/`aws-lc-sys`, then stop because this Mac does not have `x86_64-w64-mingw32-gcc` or `x86_64-linux-musl-gcc`. Native CI still has to close this gate. |
 | 2. v1 `.torrent`, magnet, TCP/IPv4, then seed | **Pass** | Deterministic generated payloads download through both admission paths; a local seeder accounts for both uploads and exact bytes match. |
-| 3. Controls and live limits | **Pass** | Pause/resume, live download-limit removal, idempotent keep-data delete, idempotent delete-data, and unrelated-sibling retention pass. |
+| 3. Controls and live limits | **Pass** | Pause/resume is exercised before completion, the live download limit is removed during transfer, and idempotent keep-data delete, idempotent delete-data, and unrelated-sibling retention pass. |
 | 4. Kill/restart never trusts partial data | **Blocked** | The accepted fast-resume design cannot be constructed without failing gate 8. A persistence-disabled full hash recheck is a possible safe but slower product decision, not an equivalent test of the accepted design. |
-| 5. Private-torrent discovery | **Partial** | A one-tracker private torrent downloads through a loopback HTTP tracker. Stable source disables DHT and ignores/suppresses PEX for private torrents. Because tracker order is lost through a hash set before truncation, the adapter rejects private metainfo unless it has exactly one unique tracker. A packet-capture leak test still belongs in the native platform matrix. |
+| 5. Private-torrent discovery | **Partial** | A one-tracker private torrent downloads through a loopback HTTP tracker. Stable source disables DHT and ignores/suppresses PEX for private torrents. Because the downloader test disables DHT globally, it does not independently prove private-flag DHT suppression. Tracker order is also lost through a hash set before truncation, so the adapter rejects private metainfo unless it has exactly one unique tracker. A packet-capture leak test still belongs in the native platform matrix. |
 | 6. Path and delete safety | **Pass** | Traversal metainfo is rejected before an escape file exists. Delete-data removes only parsed torrent content; an unrelated sibling survives. Higher layers must still prove the persisted canonical root before requesting deletion. |
 | 7. Public observability | **Fail** | Public stats expose phase, total/progress/upload bytes, file progress, rates, ETA inputs, peer counts, completion, and error. They do not expose per-torrent tracker state, DHT state, or last tracker error. “No peers” cannot safely substitute for those facts. |
 | 8. nzbd-authoritative persistence | **Fail** | The contract test proves that `Session::new_with_opts` auto-restores the library record before returning. The persistence module and store injection point are private in 8.1.1, so nzbd cannot filter first. |
 | 9. Resource, package, and license delta | **Partial** | Measurements are recorded in §4. They need reviewer acceptance and a RustSec audit in release CI before this gate can pass. |
 | 10. One explicit rustls provider | **Pass** | The process starts without a provider, explicitly installs aws-lc, and constructs librqbit’s rustls client without the mixed-provider panic. |
-| 11. v1-only boundary | **Pass** | Stable input uses `btih`; v2-only `btmh` and v1/v2 hybrid magnets return separate named errors. |
+| 11. v1-only boundary | **Pass** | Stable input uses v1 pieces/`btih`; v2-only and hybrid `.torrent` files and magnets return separate named errors before librqbit admission. |
 
 Gates 7 and 8 are stop conditions in §4.3 of the proposal. This is an M0
 **no-go**, even though the data-path tests are healthy.
@@ -50,51 +50,64 @@ Gates 7 and 8 are stop conditions in §4.3 of the proposal. This is an M0
 code. The daemon does not depend on it. The boundary currently provides:
 
 - explicit process-wide aws-lc provider installation;
-- session construction with DHT and UPnP off by default;
+- session construction with DHT and UPnP off by default, DHT persistence
+  disabled unconditionally, and proxy+DHT rejected because DHT bypasses the
+  engine's SOCKS path;
 - raw v1 metainfo and v1 magnet admission;
-- named v2-only and hybrid rejection;
+- named v2-only and hybrid rejection for both metainfo and magnets;
 - exact-one-tracker validation for private metainfo;
 - pause, resume, idempotent forget, and bounded delete-data delegation;
 - live session upload/download rate changes;
 - info hash, phase, progress, upload, per-file progress, rates, derived ETA,
   peer aggregates, completion, and error facts;
-- split SOCKS URL/username/password input with password redaction and a strict
-  credential form; and
+- split SOCKS URL/username/password input with password redaction, a strict
+  credential form, named rejection of UDP trackers, and a recording relay
+  proving the peer path did not also connect directly; and
 - an idle release harness used only for M0 measurements.
 
 The crate forbids unsafe code. It is intentionally not a complete production
 backend: there is no queue owner channel, durable torrent record, config/API,
 URL fetcher, watch folder, seed policy, or session lifecycle in the daemon.
 
+The dependency graph also required a production-daemon TLS correction outside
+the isolated crate: `crates/nzbd/src/main.rs` and `crates/nzbd/src/tls.rs`
+install the process-wide aws-lc provider before any daemon rustls client or
+server is constructed. That idempotent provider selection is the only runtime
+daemon behavior changed by the spike.
+
 ### 2.2 Deterministic tests
 
-The nine isolated tests cover:
+The ten isolated tests cover:
 
 - `.torrent` and magnet download from one local TCP seeder;
 - exact-byte verification and upload accounting;
 - a live 16 KiB/s limit followed by an unlimited transfer;
-- pause and resume;
+- pause and resume before download completion;
 - keep-data and delete-data behavior, including idempotence;
-- authenticated SOCKS5 peer routing through a loopback proxy;
+- authenticated SOCKS5 peer routing through a loopback proxy, with a
+  recording relay proving no parallel direct connection;
+- named rejection of proxy+DHT and proxy+UDP-tracker leak paths;
 - password redaction and invalid proxy combinations;
 - one-tracker private-torrent discovery and multi-tracker rejection;
 - traversal rejection before filesystem escape;
 - the explicit aws-lc provider invariant;
-- v2-only and hybrid named rejection; and
+- v2-only and hybrid named rejection for metainfo and magnets; and
 - the persistence auto-restore behavior that fails gate 8.
 
 All peers, trackers, and proxies in the suite are local and generated by the
 test. The tests require permission to bind loopback ports but do not need the
 internet.
 
-### 2.3 Queue schema preflight
+### 2.3 Queue schema version fallback
 
-The independent M1 groundwork adds a versioned queue envelope:
+The independent M1a groundwork adds a versioned queue envelope:
 
 - missing `schema_version` reads as legacy version 1;
 - new writes use version 2;
-- a future version fails before typed job deserialization, so a future enum
-  cannot masquerade as generic corruption;
+- a future version fails by name. Healthy current snapshots parse once; if a
+  typed parse fails, a header-only fallback distinguishes a future version
+  from ordinary corruption so a future enum cannot masquerade as a generic
+  parse failure;
 - versions older than the supported floor fail by name; and
 - the writer refuses to emit a non-current schema.
 
@@ -200,7 +213,7 @@ Preferred path:
 2. pin the first stable release containing those APIs;
 3. rerun all eleven M0 gates on native macOS, Linux glibc/musl, and Windows;
 4. run the packet-capture private-mode test and RustSec/license review; and
-5. only then resume fake-backend M1 routing and M2 daemon integration.
+5. only then resume fake-backend M1b routing and M2 daemon integration.
 
 Two alternatives require an explicit ADR-19 amendment:
 

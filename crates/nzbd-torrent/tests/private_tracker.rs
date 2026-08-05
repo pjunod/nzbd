@@ -103,7 +103,8 @@ async fn one_tracker_private_torrent_downloads_and_multiple_trackers_are_rejecte
         .map(|index| ((index * 19 + 5) % 251) as u8)
         .collect::<Vec<_>>();
     let seeder_ports = free_port_range();
-    let seeder_address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, seeder_ports.start);
+    let seeder_port = seeder_ports.start;
+    let seeder_address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, seeder_port);
 
     let tracker_listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
         .await
@@ -129,6 +130,7 @@ async fn one_tracker_private_torrent_downloads_and_multiple_trackers_are_rejecte
     )
     .await
     .unwrap();
+    assert_eq!(seeder.tcp_listen_port(), Some(seeder_port));
     let seed = seeder
         .add_metainfo(
             torrent.clone(),

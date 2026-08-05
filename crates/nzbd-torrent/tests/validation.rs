@@ -1,4 +1,6 @@
-use nzbd_torrent::{TorrentAddConfig, TorrentError, TorrentSession, TorrentSessionConfig};
+use nzbd_torrent::{
+    TorrentAddConfig, TorrentError, TorrentProxyConfig, TorrentSession, TorrentSessionConfig,
+};
 
 fn bencode_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
     out.extend_from_slice(bytes.len().to_string().as_bytes());
@@ -6,7 +8,7 @@ fn bencode_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
     out.extend_from_slice(bytes);
 }
 
-fn single_file_metainfo(name: &[u8]) -> Vec<u8> {
+fn single_file_info(name: &[u8]) -> Vec<u8> {
     let mut info = Vec::new();
     info.push(b'd');
     bencode_bytes(&mut info, b"length");
@@ -18,16 +20,44 @@ fn single_file_metainfo(name: &[u8]) -> Vec<u8> {
     bencode_bytes(&mut info, b"pieces");
     bencode_bytes(&mut info, &[0; 20]);
     info.push(b'e');
+    info
+}
 
-    let mut torrent = Vec::new();
-    torrent.extend_from_slice(b"d4:info");
-    torrent.extend_from_slice(&info);
+fn metainfo(info: &[u8], announce: Option<&str>) -> Vec<u8> {
+    let mut torrent = vec![b'd'];
+    if let Some(announce) = announce {
+        bencode_bytes(&mut torrent, b"announce");
+        bencode_bytes(&mut torrent, announce.as_bytes());
+    }
+    bencode_bytes(&mut torrent, b"info");
+    torrent.extend_from_slice(info);
     torrent.push(b'e');
     torrent
 }
 
+fn single_file_metainfo(name: &[u8]) -> Vec<u8> {
+    metainfo(&single_file_info(name), None)
+}
+
+fn v2_metainfo(hybrid: bool) -> Vec<u8> {
+    let mut info = b"d9:file treede12:meta versioni2e4:name2:v212:piece lengthi16384e".to_vec();
+    if hybrid {
+        bencode_bytes(&mut info, b"pieces");
+        bencode_bytes(&mut info, &[0; 20]);
+    }
+    info.push(b'e');
+    metainfo(&info, None)
+}
+
+fn proxy() -> TorrentProxyConfig {
+    TorrentProxyConfig {
+        url: "socks5://127.0.0.1:1".into(),
+        ..Default::default()
+    }
+}
+
 #[tokio::test]
-async fn rejects_v2_and_hybrid_magnets_by_name() {
+async fn rejects_v2_and_hybrid_inputs_by_name() {
     let root = tempfile::tempdir().unwrap();
     let session = TorrentSession::start(root.path().to_path_buf(), TorrentSessionConfig::default())
         .await
@@ -47,6 +77,77 @@ async fn rejects_v2_and_hybrid_magnets_by_name() {
             .add_magnet(hybrid, TorrentAddConfig::default())
             .await,
         Err(TorrentError::UnsupportedHybridMagnet)
+    ));
+    assert!(matches!(
+        session
+            .add_metainfo(v2_metainfo(false), TorrentAddConfig::default())
+            .await,
+        Err(TorrentError::UnsupportedV2Metainfo)
+    ));
+    assert!(matches!(
+        session
+            .add_metainfo(v2_metainfo(true), TorrentAddConfig::default())
+            .await,
+        Err(TorrentError::UnsupportedHybridMetainfo)
+    ));
+    let framed_marker = session
+        .add_metainfo(
+            single_file_metainfo(b"meta version"),
+            TorrentAddConfig {
+                paused: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("a v2 key inside a length-framed filename is still v1");
+    session.delete(&framed_marker, false).await.unwrap();
+    session.stop().await;
+}
+
+#[tokio::test]
+async fn proxy_rejects_dht_and_udp_tracker_leak_paths() {
+    let root = tempfile::tempdir().unwrap();
+    assert!(matches!(
+        TorrentSession::start(
+            root.path().to_path_buf(),
+            TorrentSessionConfig {
+                dht: true,
+                proxy: Some(proxy()),
+                ..Default::default()
+            },
+        )
+        .await,
+        Err(TorrentError::ProxyWithDht)
+    ));
+
+    let session = TorrentSession::start(
+        root.path().to_path_buf(),
+        TorrentSessionConfig {
+            proxy: Some(proxy()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let udp_metainfo = metainfo(
+        &single_file_info(b"udp-tracker"),
+        Some("udp://127.0.0.1:1/announce"),
+    );
+    assert!(matches!(
+        session
+            .add_metainfo(udp_metainfo, TorrentAddConfig::default())
+            .await,
+        Err(TorrentError::ProxyWithUdpTracker)
+    ));
+    let udp_magnet = format!(
+        "magnet:?xt=urn:btih:{}&tr=udp%3A%2F%2F127.0.0.1%3A1%2Fannounce",
+        "00".repeat(20)
+    );
+    assert!(matches!(
+        session
+            .add_magnet(udp_magnet, TorrentAddConfig::default())
+            .await,
+        Err(TorrentError::ProxyWithUdpTracker)
     ));
     session.stop().await;
 }

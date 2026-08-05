@@ -329,8 +329,8 @@ fn sanitize_suffix(s: &str) -> String {
 ///
 /// Version 1 is the unversioned shape written before BitTorrent groundwork;
 /// missing `schema_version` therefore means 1 on read. Version 2 adds the
-/// explicit envelope. The next incompatible domain addition can now fail
-/// before serde reaches an unknown enum variant buried in a job.
+/// explicit envelope. The next incompatible domain addition can now report
+/// its version instead of exposing an unknown enum variant buried in a job.
 pub const QUEUE_SCHEMA_VERSION: u32 = 2;
 const OLDEST_QUEUE_SCHEMA_VERSION: u32 = 1;
 
@@ -369,9 +369,10 @@ impl Default for QueueSnapshotDoc {
     }
 }
 
-/// Read before the typed queue document. Unknown fields — including a future
-/// job representation — are skipped, so a newer schema produces an actionable
-/// version error rather than an incidental serde enum failure.
+/// Read only when the typed queue document fails. Unknown fields — including
+/// a future job representation — are skipped, so a newer schema still
+/// produces an actionable version error without making every successful boot
+/// parse a production-sized queue twice.
 #[derive(Deserialize)]
 struct QueueSnapshotHeader {
     #[serde(default = "legacy_queue_schema_version")]
@@ -449,24 +450,35 @@ impl SnapshotStore {
             Err(e) if e.is_not_found() => return Ok(None),
             Err(e) => return Err(e),
         };
-        let header: QueueSnapshotHeader = serde_json::from_slice(&bytes)
-            .map_err(|e| StateError::Corrupt(format!("queue.json: {e}")))?;
-        if header.schema_version > QUEUE_SCHEMA_VERSION {
-            return Err(StateError::Corrupt(format!(
-                "queue.json schema version {} is newer than this nzbd supports ({}); upgrade nzbd or restore a compatible queue snapshot",
-                header.schema_version, QUEUE_SCHEMA_VERSION
-            )));
+        match serde_json::from_slice::<QueueSnapshotDoc>(&bytes) {
+            Ok(doc) => {
+                validate_queue_schema_version(doc.schema_version)?;
+                Ok(Some(doc))
+            }
+            Err(typed_error) => {
+                if let Ok(header) = serde_json::from_slice::<QueueSnapshotHeader>(&bytes) {
+                    validate_queue_schema_version(header.schema_version)?;
+                }
+                Err(StateError::Corrupt(format!("queue.json: {typed_error}")))
+            }
         }
-        if header.schema_version < OLDEST_QUEUE_SCHEMA_VERSION {
-            return Err(StateError::Corrupt(format!(
-                "queue.json schema version {} is older than this nzbd supports ({})",
-                header.schema_version, OLDEST_QUEUE_SCHEMA_VERSION
-            )));
-        }
-        let doc = serde_json::from_slice(&bytes)
-            .map_err(|e| StateError::Corrupt(format!("queue.json: {e}")))?;
-        Ok(Some(doc))
     }
+}
+
+fn validate_queue_schema_version(schema_version: u32) -> Result<(), StateError> {
+    if schema_version > QUEUE_SCHEMA_VERSION {
+        return Err(StateError::Corrupt(format!(
+            "queue.json schema version {} is newer than this nzbd supports ({}); upgrade nzbd or restore a compatible queue snapshot",
+            schema_version, QUEUE_SCHEMA_VERSION
+        )));
+    }
+    if schema_version < OLDEST_QUEUE_SCHEMA_VERSION {
+        return Err(StateError::Corrupt(format!(
+            "queue.json schema version {} is older than this nzbd supports ({})",
+            schema_version, OLDEST_QUEUE_SCHEMA_VERSION
+        )));
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -804,7 +816,7 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_rejects_a_future_schema_before_typed_jobs() {
+    fn snapshot_reports_future_schema_instead_of_nested_job_error() {
         let dir = tempfile::tempdir().unwrap();
         let store = SnapshotStore::open(dir.path()).unwrap();
         std::fs::write(
@@ -820,7 +832,7 @@ mod tests {
         );
         assert!(
             !err.contains("unknown variant"),
-            "header preflight must win over a nested enum error: {err}"
+            "version fallback must win over a nested enum error: {err}"
         );
     }
 

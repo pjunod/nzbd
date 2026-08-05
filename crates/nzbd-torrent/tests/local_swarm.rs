@@ -87,6 +87,10 @@ async fn downloader(
             !handle.stats().finished,
             "16 KiB/s limit should hold a 256 KiB local transfer"
         );
+        session.pause(&handle).await.unwrap();
+        assert!(handle.is_paused(), "pause must apply before completion");
+        session.resume(&handle).await.unwrap();
+        assert!(!handle.is_paused(), "resume must return a live download");
         session.set_download_limit_bps(None);
     }
     tokio::time::timeout(Duration::from_secs(20), handle.wait_until_completed())

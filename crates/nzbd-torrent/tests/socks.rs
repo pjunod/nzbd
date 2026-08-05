@@ -2,6 +2,7 @@ use nzbd_torrent::{TorrentAddConfig, TorrentProxyConfig, TorrentSession, Torrent
 use sha1::{Digest, Sha1};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener};
 use std::ops::Range;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -46,6 +47,7 @@ fn free_port_range() -> Range<u16> {
 async fn authenticated_socks5_proxy(
     listener: tokio::net::TcpListener,
     expected_target: SocketAddr,
+    target_socket: tokio::net::TcpSocket,
     authenticated: tokio::sync::oneshot::Sender<()>,
 ) {
     let (mut client, _) = listener.accept().await.unwrap();
@@ -82,7 +84,7 @@ async fn authenticated_socks5_proxy(
     let requested = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::from(ip), port));
     assert_eq!(requested, expected_target);
 
-    let mut target = tokio::net::TcpStream::connect(requested).await.unwrap();
+    let mut target = target_socket.connect(requested).await.unwrap();
     client
         .write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 0])
         .await
@@ -91,6 +93,23 @@ async fn authenticated_socks5_proxy(
     tokio::io::copy_bidirectional(&mut client, &mut target)
         .await
         .unwrap();
+}
+
+async fn recording_relay(
+    listener: tokio::net::TcpListener,
+    target: SocketAddr,
+    sources: Arc<Mutex<Vec<SocketAddr>>>,
+) {
+    loop {
+        let (mut client, source) = listener.accept().await.unwrap();
+        sources.lock().unwrap().push(source);
+        tokio::spawn(async move {
+            let mut target = tokio::net::TcpStream::connect(target).await.unwrap();
+            tokio::io::copy_bidirectional(&mut client, &mut target)
+                .await
+                .unwrap();
+        });
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -103,7 +122,8 @@ async fn peer_traffic_uses_authenticated_socks5() {
     let seed_root = tempfile::tempdir().unwrap();
     std::fs::write(seed_root.path().join(FILE_NAME), &payload).unwrap();
     let listen = free_port_range();
-    let peer = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, listen.start));
+    let seeder_port = listen.start;
+    let peer = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, seeder_port));
     let seeder = TorrentSession::start(
         seed_root.path().to_path_buf(),
         TorrentSessionConfig {
@@ -113,6 +133,7 @@ async fn peer_traffic_uses_authenticated_socks5() {
     )
     .await
     .unwrap();
+    assert_eq!(seeder.tcp_listen_port(), Some(seeder_port));
     let seed = seeder
         .add_metainfo(
             torrent.clone(),
@@ -125,14 +146,30 @@ async fn peer_traffic_uses_authenticated_socks5() {
         .unwrap();
     seed.wait_until_completed().await.unwrap();
 
+    // Put a recording relay in front of the seeder. The proxy connects to
+    // the relay from a pre-bound source socket; any direct peer connection
+    // has a different source and makes the privacy assertion fail.
+    let relay_listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let relay_address = relay_listener.local_addr().unwrap();
+    let relay_sources = Arc::new(Mutex::new(Vec::new()));
+    let relay = tokio::spawn(recording_relay(relay_listener, peer, relay_sources.clone()));
+
     let proxy_listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
         .await
         .unwrap();
     let proxy_address = proxy_listener.local_addr().unwrap();
+    let proxy_target_socket = tokio::net::TcpSocket::new_v4().unwrap();
+    proxy_target_socket
+        .bind(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)))
+        .unwrap();
+    let proxy_source = proxy_target_socket.local_addr().unwrap();
     let (authenticated_tx, authenticated_rx) = tokio::sync::oneshot::channel();
     let proxy = tokio::spawn(authenticated_socks5_proxy(
         proxy_listener,
-        peer,
+        relay_address,
+        proxy_target_socket,
         authenticated_tx,
     ));
 
@@ -155,7 +192,7 @@ async fn peer_traffic_uses_authenticated_socks5() {
             torrent,
             TorrentAddConfig {
                 overwrite: true,
-                initial_peers: vec![peer],
+                initial_peers: vec![relay_address],
                 ..Default::default()
             },
         )
@@ -175,9 +212,16 @@ async fn peer_traffic_uses_authenticated_socks5() {
     );
 
     downloader.stop().await;
-    seeder.stop().await;
     tokio::time::timeout(Duration::from_secs(5), proxy)
         .await
         .expect("proxy did not close")
         .unwrap();
+    relay.abort();
+    let sources = relay_sources.lock().unwrap().clone();
+    assert_eq!(
+        sources,
+        vec![proxy_source],
+        "the seeder relay must observe only the proxy's pre-bound connection"
+    );
+    seeder.stop().await;
 }

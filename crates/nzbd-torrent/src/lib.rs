@@ -38,8 +38,20 @@ pub enum TorrentError {
     UnsupportedV2Magnet,
     #[error("hybrid BitTorrent v1/v2 magnets are not supported in the first release")]
     UnsupportedHybridMagnet,
+    #[error("BitTorrent v2-only metainfo is not supported by librqbit 8.1.1")]
+    UnsupportedV2Metainfo,
+    #[error("hybrid BitTorrent v1/v2 metainfo is not supported in the first release")]
+    UnsupportedHybridMetainfo,
     #[error("invalid SOCKS proxy configuration: {0}")]
     InvalidProxy(&'static str),
+    #[error(
+        "SOCKS proxy cannot be combined with DHT because librqbit 8.1.1 sends DHT traffic outside the proxy"
+    )]
+    ProxyWithDht,
+    #[error(
+        "SOCKS proxy cannot be used with UDP trackers because librqbit 8.1.1 sends UDP announces outside the proxy"
+    )]
+    ProxyWithUdpTracker,
     #[error(
         "private torrents must declare exactly one unique tracker in the first release (found {0})"
     )]
@@ -154,6 +166,7 @@ pub struct TorrentAddConfig {
 #[derive(Clone)]
 pub struct TorrentSession {
     inner: Arc<Session>,
+    proxy_enabled: bool,
 }
 
 impl TorrentSession {
@@ -162,6 +175,10 @@ impl TorrentSession {
         config: TorrentSessionConfig,
     ) -> Result<Self, TorrentError> {
         install_process_crypto_provider()?;
+        let proxy_enabled = config.proxy.is_some();
+        if proxy_enabled && config.dht {
+            return Err(TorrentError::ProxyWithDht);
+        }
         let socks_proxy_url = config
             .proxy
             .as_ref()
@@ -169,7 +186,10 @@ impl TorrentSession {
             .transpose()?;
         let options = SessionOptions {
             disable_dht: !config.dht,
-            disable_dht_persistence: !config.dht,
+            // librqbit's default persistent DHT state lives in rqbit's
+            // process-global cache directory. nzbd must not share a listen
+            // port or routing table with another session on the same host.
+            disable_dht_persistence: true,
             listen_port_range: config.listen_port_range,
             enable_upnp_port_forwarding: config.upnp_port_forwarding,
             socks_proxy_url,
@@ -178,7 +198,10 @@ impl TorrentSession {
         let inner = Session::new_with_opts(output_root, options)
             .await
             .map_err(engine_error)?;
-        Ok(Self { inner })
+        Ok(Self {
+            inner,
+            proxy_enabled,
+        })
     }
 
     pub fn tcp_listen_port(&self) -> Option<u16> {
@@ -198,7 +221,7 @@ impl TorrentSession {
         bytes: Vec<u8>,
         config: TorrentAddConfig,
     ) -> Result<TorrentHandle, TorrentError> {
-        validate_private_tracker_contract(&bytes)?;
+        validate_metainfo_contract(&bytes, self.proxy_enabled)?;
         self.add(AddTorrent::from_bytes(bytes), config).await
     }
 
@@ -215,6 +238,7 @@ impl TorrentSession {
             (false, true) => return Err(TorrentError::UnsupportedV2Magnet),
             _ => {}
         }
+        validate_magnet_proxy_contract(&magnet, self.proxy_enabled)?;
         self.add(AddTorrent::from_url(magnet), config).await
     }
 
@@ -273,9 +297,17 @@ impl TorrentSession {
     }
 }
 
-fn validate_private_tracker_contract(bytes: &[u8]) -> Result<(), TorrentError> {
+fn validate_metainfo_contract(bytes: &[u8], proxy_enabled: bool) -> Result<(), TorrentError> {
+    validate_metainfo_version(bytes)?;
     let metainfo =
         librqbit::torrent_from_bytes::<librqbit::ByteBuf<'_>>(bytes).map_err(engine_error)?;
+    if proxy_enabled
+        && metainfo
+            .iter_announce()
+            .any(|tracker| tracker_uses_udp(AsRef::<[u8]>::as_ref(tracker)))
+    {
+        return Err(TorrentError::ProxyWithUdpTracker);
+    }
     if !metainfo.info.private {
         return Ok(());
     }
@@ -287,6 +319,180 @@ fn validate_private_tracker_contract(bytes: &[u8]) -> Result<(), TorrentError> {
         return Err(TorrentError::PrivateTrackerCount(trackers.len()));
     }
     Ok(())
+}
+
+fn validate_metainfo_version(bytes: &[u8]) -> Result<(), TorrentError> {
+    let (has_v1, has_v2) = MetainfoVersionScanner::new(bytes).scan()?;
+    match (has_v1, has_v2) {
+        (true, true) => Err(TorrentError::UnsupportedHybridMetainfo),
+        (false, true) => Err(TorrentError::UnsupportedV2Metainfo),
+        _ => Ok(()),
+    }
+}
+
+/// Read only the direct keys of the metainfo `info` dictionary. librqbit's
+/// v1 struct deliberately ignores unknown BEP 52 fields, so using that struct
+/// alone would silently accept hybrid input. This scanner skips length-framed
+/// bencode values without inspecting payload bytes, which avoids false hits
+/// inside piece hashes or filenames.
+struct MetainfoVersionScanner<'a> {
+    bytes: &'a [u8],
+    position: usize,
+}
+
+impl<'a> MetainfoVersionScanner<'a> {
+    const MAX_DEPTH: usize = 128;
+
+    fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, position: 0 }
+    }
+
+    fn scan(mut self) -> Result<(bool, bool), TorrentError> {
+        self.expect(b'd', "metainfo root must be a dictionary")?;
+        let mut version = None;
+        while self.peek()? != b'e' {
+            let key = self.byte_string()?;
+            if key == b"info" {
+                if version.is_some() {
+                    return Err(Self::malformed("metainfo has duplicate info dictionaries"));
+                }
+                version = Some(self.scan_info_dictionary()?);
+            } else {
+                self.skip_value(0)?;
+            }
+        }
+        self.position += 1;
+        if self.position != self.bytes.len() {
+            return Err(Self::malformed("metainfo has trailing bytes"));
+        }
+        version.ok_or_else(|| Self::malformed("metainfo has no info dictionary"))
+    }
+
+    fn scan_info_dictionary(&mut self) -> Result<(bool, bool), TorrentError> {
+        self.expect(b'd', "metainfo info value must be a dictionary")?;
+        let mut has_v1 = false;
+        let mut has_v2 = false;
+        while self.peek()? != b'e' {
+            let key = self.byte_string()?;
+            has_v1 |= key == b"pieces";
+            has_v2 |= key == b"meta version";
+            self.skip_value(0)?;
+        }
+        self.position += 1;
+        Ok((has_v1, has_v2))
+    }
+
+    fn skip_value(&mut self, depth: usize) -> Result<(), TorrentError> {
+        if depth > Self::MAX_DEPTH {
+            return Err(Self::malformed("metainfo nesting is too deep"));
+        }
+        match self.peek()? {
+            b'i' => {
+                self.position += 1;
+                let integer_start = self.position;
+                while self.peek()? != b'e' {
+                    self.position += 1;
+                }
+                if self.position == integer_start {
+                    return Err(Self::malformed("metainfo contains an empty integer"));
+                }
+                self.position += 1;
+            }
+            b'l' => {
+                self.position += 1;
+                while self.peek()? != b'e' {
+                    self.skip_value(depth + 1)?;
+                }
+                self.position += 1;
+            }
+            b'd' => {
+                self.position += 1;
+                while self.peek()? != b'e' {
+                    self.byte_string()?;
+                    self.skip_value(depth + 1)?;
+                }
+                self.position += 1;
+            }
+            b'0'..=b'9' => {
+                self.byte_string()?;
+            }
+            _ => return Err(Self::malformed("metainfo contains invalid bencode")),
+        }
+        Ok(())
+    }
+
+    fn byte_string(&mut self) -> Result<&'a [u8], TorrentError> {
+        let mut len = 0usize;
+        let mut saw_digit = false;
+        loop {
+            let byte = self.peek()?;
+            if byte == b':' {
+                if !saw_digit {
+                    return Err(Self::malformed("metainfo byte string has no length"));
+                }
+                self.position += 1;
+                break;
+            }
+            if !byte.is_ascii_digit() {
+                return Err(Self::malformed(
+                    "metainfo byte string has an invalid length",
+                ));
+            }
+            saw_digit = true;
+            len = len
+                .checked_mul(10)
+                .and_then(|value| value.checked_add((byte - b'0') as usize))
+                .ok_or_else(|| Self::malformed("metainfo byte string length overflows"))?;
+            self.position += 1;
+        }
+        let end = self
+            .position
+            .checked_add(len)
+            .filter(|end| *end <= self.bytes.len())
+            .ok_or_else(|| Self::malformed("metainfo byte string is truncated"))?;
+        let value = &self.bytes[self.position..end];
+        self.position = end;
+        Ok(value)
+    }
+
+    fn expect(&mut self, expected: u8, message: &'static str) -> Result<(), TorrentError> {
+        if self.peek()? != expected {
+            return Err(Self::malformed(message));
+        }
+        self.position += 1;
+        Ok(())
+    }
+
+    fn peek(&self) -> Result<u8, TorrentError> {
+        self.bytes
+            .get(self.position)
+            .copied()
+            .ok_or_else(|| Self::malformed("metainfo is truncated"))
+    }
+
+    fn malformed(message: &'static str) -> TorrentError {
+        TorrentError::Engine(message.into())
+    }
+}
+
+fn validate_magnet_proxy_contract(magnet: &str, proxy_enabled: bool) -> Result<(), TorrentError> {
+    if !proxy_enabled {
+        return Ok(());
+    }
+    let url = url::Url::parse(magnet).map_err(engine_error)?;
+    if url.query_pairs().any(|(key, tracker)| {
+        key.eq_ignore_ascii_case("tr") && tracker_uses_udp(tracker.as_bytes())
+    }) {
+        return Err(TorrentError::ProxyWithUdpTracker);
+    }
+    Ok(())
+}
+
+fn tracker_uses_udp(tracker: &[u8]) -> bool {
+    std::str::from_utf8(tracker)
+        .ok()
+        .and_then(|tracker| url::Url::parse(tracker).ok())
+        .is_some_and(|tracker| tracker.scheme().eq_ignore_ascii_case("udp"))
 }
 
 #[derive(Clone)]
