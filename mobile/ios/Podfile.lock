@@ -2276,12 +2276,12 @@ SPEC CHECKSUMS:
   ExpoFont: 59e1faf66ba9bcd232ae1e2ce58d202a48b6f65e
   ExpoKeepAwake: c26f14275017370cc8a4b7b43a0e23361f2053a5
   ExpoLogBox: 6bb73c341aca22e699bd4da6cc61afc844e1a648
-  ExpoModulesCore: 85ee840e8d238ee15bbefee8b9e2a464fdf2caca
+  ExpoModulesCore: 74ea66f812717f237568110158f62f2992a14028
   ExpoModulesJSI: b20fefa4cdd9097e7e6b715466d1900b8c5d4711
   ExpoModulesWorklets: a8986b0872d09df168f5d4e092625e9fbb6b38bb
   ExpoSecureStore: 94793113049a2d7478dfe1a13aa15081e9f61755
   FBLazyVector: 3c3be9a019176b5699455f7f66c5444b78a411c6
-  hermes-engine: 807b3a32f63aa7c55775b1bfc3c575e240bc70d2
+  hermes-engine: 6e57efe4e0dc9ed28b9c3f383ebbf50ccdb73e20
   RCTDeprecation: bccb6545c26db881ecddfd83a3f9ea82aba1605f
   RCTRequired: b2f74764d596fc0051f00fee94b49bf41a6f7f5a
   RCTSwiftUI: c6d6a31b849b9dfa64c33b55dc91ac15dd55774c
