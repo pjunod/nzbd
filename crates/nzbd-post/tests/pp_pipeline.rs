@@ -65,6 +65,7 @@ fn completed_job(id: u32, name: &str, files: Vec<FileEntry>) -> Job {
         files,
         totals: JobTotals::default(),
         status: JobStatus::Completed,
+        torrent: None,
         stages: Vec::new(),
     }
 }

@@ -213,7 +213,7 @@ Preferred path:
 2. pin the first stable release containing those APIs;
 3. rerun all eleven M0 gates on native macOS, Linux glibc/musl, and Windows;
 4. run the packet-capture private-mode test and RustSec/license review; and
-5. only then resume fake-backend M1b routing and M2 daemon integration.
+5. only then resume M2 daemon integration.
 
 Two alternatives require an explicit ADR-19 amendment:
 
@@ -222,9 +222,12 @@ Two alternatives require an explicit ADR-19 amendment:
 - evaluate `libtorrent-rasterbar`, accepting its C++/FFI and packaging cost in
   exchange for the required resume and observability surface.
 
-Until one path is approved, keep `nzbd-torrent` as a tested spike boundary and
-the queue schema change as standalone hardening. Do not expose a half-wired
-feature flag.
+The later ADR-19 re-check separated M1b from this engine gate: a fake-only,
+protocol-neutral queue/backend seam is useful for either engine and starts no
+networking, so it may proceed under the dormant limits recorded in
+[BITTORRENT_M1B_REPORT.md](BITTORRENT_M1B_REPORT.md). Until an engine path is
+approved, keep `nzbd-torrent` as a tested spike boundary and do not expose a
+half-wired feature flag, admission route, or peer listener.
 
 ---
 

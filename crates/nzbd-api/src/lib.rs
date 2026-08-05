@@ -2637,6 +2637,7 @@ mod tests {
     fn summary(id: u32, status: JobStatus) -> JobSummary {
         JobSummary {
             id: nzbd_types::JobId(id),
+            kind: nzbd_types::JobKind::Nzb,
             name: format!("job {id}"),
             status,
             category: None,
@@ -2656,11 +2657,24 @@ mod tests {
             retried_articles: 0,
             assigned_node: None,
             pp_done: false,
+            ready: false,
+            ready_at_unix: None,
             dupe_key: String::new(),
             dupe_score: 0,
             params: vec![],
             stages: vec![],
         }
+    }
+
+    #[test]
+    fn neutral_transfer_fields_are_additive_and_keep_status_vocabulary() {
+        let value = serde_json::to_value(summary(7, JobStatus::Downloading)).unwrap();
+        assert_eq!(value["kind"], "nzb");
+        assert_eq!(value["ready"], false);
+        assert!(value["ready_at_unix"].is_null());
+        assert_eq!(value["status"], "downloading");
+        assert_eq!(value["id"], 7);
+        assert_eq!(value["name"], "job 7");
     }
 
     /// Every job in the queue lands in exactly one of the three counts.

@@ -511,7 +511,7 @@ impl Owner {
 
         if persist {
             if let Some(doc) = snap_store.load()? {
-                state = QueueState::from_doc(doc);
+                state = QueueState::from_runtime_doc(doc)?;
             }
 
             // Legacy phase-1 global journal: fold once, then retire it.
@@ -673,8 +673,12 @@ impl Owner {
     /// happens once per stale job — after which it is `Queued` and no
     /// longer a candidate.
     fn settle_download_labels(&mut self) {
-        let demoted =
-            crate::queue::jobs_to_requeue(&self.state, &self.delegated, self.quota_reached);
+        let demoted = crate::queue::jobs_to_requeue(
+            &self.state,
+            &self.delegated,
+            self.quota_reached,
+            unix_now(),
+        );
         if demoted.is_empty() {
             return;
         }
@@ -2519,6 +2523,7 @@ impl Owner {
                     .sum();
                 let mut summary = JobSummary {
                     id: j.id,
+                    kind: j.kind,
                     name: j.name.clone(),
                     status: j.status,
                     category: j.category.clone(),
@@ -2536,6 +2541,8 @@ impl Owner {
                     critical_health: critical.0,
                     assigned_node: self.delegated.get(&j.id).cloned(),
                     pp_done: j.params.iter().any(|(k, _)| k == nzbd_types::PP_DONE_PARAM),
+                    ready: j.ready(),
+                    ready_at_unix: j.ready_at_unix(),
                     dupe_key: j.dupe.key.clone(),
                     dupe_score: j.dupe.score,
                     params: j
@@ -2869,6 +2876,7 @@ mod tests {
             files: vec![],
             totals: Default::default(),
             status: JobStatus::PostQueued,
+            torrent: None,
             stages: vec![],
         }
     }

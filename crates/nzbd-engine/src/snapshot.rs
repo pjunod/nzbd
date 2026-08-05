@@ -4,13 +4,14 @@
 //! engine (ARCHITECTURE.md §8.1).
 
 use arc_swap::ArcSwap;
-use nzbd_types::{JobId, JobStatus, StageSpan};
+use nzbd_types::{JobId, JobKind, JobStatus, StageSpan};
 use serde::Serialize;
 use std::sync::Arc;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct JobSummary {
     pub id: JobId,
+    pub kind: JobKind,
     pub name: String,
     pub status: JobStatus,
     pub category: Option<String>,
@@ -39,6 +40,11 @@ pub struct JobSummary {
     pub assigned_node: Option<String>,
     /// Post-processing already finished (the `*PP:done` stamp is present).
     pub pp_done: bool,
+    /// Protocol-neutral content readiness. For Usenet this is the durable
+    /// post-processing completion stamp; for torrents it is set only after
+    /// selected payload bytes pass piece verification.
+    pub ready: bool,
+    pub ready_at_unix: Option<i64>,
     /// Duplicate-detection metadata (empty key = no dupe tracking).
     pub dupe_key: String,
     pub dupe_score: i32,

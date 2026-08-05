@@ -1734,6 +1734,7 @@ mod tests {
                 ..Default::default()
             },
             status: nzbd_types::JobStatus::Completed,
+            torrent: None,
             stages: vec![],
         }
     }

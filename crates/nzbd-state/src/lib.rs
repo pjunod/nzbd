@@ -329,9 +329,11 @@ fn sanitize_suffix(s: &str) -> String {
 ///
 /// Version 1 is the unversioned shape written before BitTorrent groundwork;
 /// missing `schema_version` therefore means 1 on read. Version 2 adds the
-/// explicit envelope. The next incompatible domain addition can now report
-/// its version instead of exposing an unknown enum variant buried in a job.
-pub const QUEUE_SCHEMA_VERSION: u32 = 2;
+/// explicit envelope. Version 3 reserves the torrent job variant and its
+/// defaulted durable transfer record. Older schema-2 documents continue to
+/// decode as their original Usenet jobs and are rewritten as version 3 on the
+/// next owner snapshot.
+pub const QUEUE_SCHEMA_VERSION: u32 = 3;
 const OLDEST_QUEUE_SCHEMA_VERSION: u32 = 1;
 
 const fn legacy_queue_schema_version() -> u32 {
@@ -726,6 +728,27 @@ mod tests {
         }
     }
 
+    fn minimal_job() -> Job {
+        Job {
+            id: JobId(7),
+            kind: nzbd_types::JobKind::Nzb,
+            name: "legacy".into(),
+            dir_name: "legacy".into(),
+            name_provisional: false,
+            queued_at_unix: 0,
+            original_name: String::new(),
+            category: None,
+            priority: 0,
+            dupe: nzbd_types::DupeInfo::default(),
+            params: Vec::new(),
+            files: Vec::new(),
+            totals: nzbd_types::JobTotals::default(),
+            status: nzbd_types::JobStatus::Paused,
+            torrent: None,
+            stages: Vec::new(),
+        }
+    }
+
     #[test]
     fn journal_roundtrip_and_compact() {
         let dir = tempfile::tempdir().unwrap();
@@ -816,18 +839,97 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_loads_schema_2_jobs_without_changing_usenet_meaning() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SnapshotStore::open(dir.path()).unwrap();
+        let mut value = serde_json::to_value(QueueSnapshotDoc {
+            schema_version: 2,
+            jobs: vec![minimal_job()],
+            next_job_id: 7,
+            next_file_id: 0,
+            download_paused: false,
+            speed_limit_bps: None,
+            max_active_downloads: 1,
+        })
+        .unwrap();
+        value["jobs"][0].as_object_mut().unwrap().remove("torrent");
+        std::fs::write(
+            dir.path().join("queue.json"),
+            serde_json::to_vec(&value).unwrap(),
+        )
+        .unwrap();
+
+        let loaded = store.load().unwrap().unwrap();
+        assert_eq!(loaded.schema_version, 2);
+        assert_eq!(loaded.jobs.len(), 1);
+        assert_eq!(loaded.jobs[0].kind, nzbd_types::JobKind::Nzb);
+        assert!(loaded.jobs[0].torrent.is_none());
+        assert_eq!(loaded.jobs[0].status, nzbd_types::JobStatus::Paused);
+    }
+
+    #[test]
+    fn snapshot_roundtrips_schema_3_torrent_control_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SnapshotStore::open(dir.path()).unwrap();
+        let mut job = minimal_job();
+        job.kind = nzbd_types::JobKind::Torrent;
+        job.name = "torrent".into();
+        job.torrent = Some(nzbd_types::TorrentRecord {
+            info_hash_v1: "0123456789abcdef0123456789abcdef01234567".into(),
+            source: nzbd_types::TorrentSource::Metainfo,
+            metadata_file: "meta/0123.torrent".into(),
+            phase: nzbd_types::TorrentPhase::PausedDownload,
+            files: vec![nzbd_types::TorrentFileRecord {
+                path: "payload.bin".into(),
+                length: 42,
+                selected: true,
+            }],
+            total_bytes: 42,
+            selected_bytes: 42,
+            downloaded_bytes: 21,
+            uploaded_bytes: 5,
+            seeding_seconds: 0,
+            ready_at_unix: None,
+            content_path: None,
+            seed_policy: nzbd_types::SeedPolicy::default(),
+            last_activity_unix: Some(1_800_000_000),
+            last_error: None,
+        });
+        store
+            .save(&QueueSnapshotDoc {
+                jobs: vec![job],
+                next_job_id: 7,
+                max_active_downloads: 1,
+                ..Default::default()
+            })
+            .unwrap();
+
+        let loaded = store.load().unwrap().unwrap();
+        assert_eq!(loaded.schema_version, 3);
+        let torrent = loaded.jobs[0].torrent.as_ref().unwrap();
+        assert_eq!(torrent.downloaded_bytes, 21);
+        assert_eq!(torrent.files[0].path, PathBuf::from("payload.bin"));
+
+        // This envelope is the downgrade guard: a schema-2 binary rejects
+        // the document before it can misread or skip the torrent variant.
+        let raw: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join("queue.json")).unwrap()).unwrap();
+        assert_eq!(raw["schema_version"], 3);
+    }
+
+    #[test]
     fn snapshot_reports_future_schema_instead_of_nested_job_error() {
         let dir = tempfile::tempdir().unwrap();
         let store = SnapshotStore::open(dir.path()).unwrap();
         std::fs::write(
             dir.path().join("queue.json"),
-            br#"{"schema_version":3,"jobs":[{"kind":"future_transfer"}]}"#,
+            br#"{"schema_version":4,"jobs":[{"kind":"future_transfer"}]}"#,
         )
         .unwrap();
 
         let err = store.load().unwrap_err().to_string();
         assert!(
-            err.contains("queue.json schema version 3 is newer than this nzbd supports (2)"),
+            err.contains("queue.json schema version 4 is newer than this nzbd supports (3)"),
             "unexpected error: {err}"
         );
         assert!(
@@ -847,7 +949,7 @@ mod tests {
 
         let err = store.save(&doc).unwrap_err().to_string();
         assert!(
-            err.contains("refusing to write queue schema version 1; this nzbd writes 2"),
+            err.contains("refusing to write queue schema version 1; this nzbd writes 3"),
             "unexpected error: {err}"
         );
         assert!(!dir.path().join("queue.json").exists());
@@ -909,6 +1011,7 @@ mod tests {
                     files: (j * 100..j * 100 + 100).map(file).collect(),
                     totals: JobTotals::default(),
                     status: JobStatus::Downloading,
+                    torrent: None,
                     stages: Vec::new(),
                 })
                 .collect(),

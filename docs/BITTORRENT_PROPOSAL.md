@@ -1,7 +1,7 @@
 # BitTorrent support — one queue, two transfer protocols
 
-**Status:** review incorporated; M0 complete with a no-go on daemon wiring ·
-**Decision:** ADR-19, proposed but blocked on engine API gaps ·
+**Status:** review incorporated; M0 no-go; M1b implemented for review; M2 blocked ·
+**Decision:** ADR-19, production engine blocked; neutral queue seam authorized ·
 **Written:** 2026-08-05 · **Revised:** 2026-08-05 ·
 **Verified against:** `83efc9da7` ·
 **Scope:** architecture, contracts, milestones, and review questions; no
@@ -37,13 +37,20 @@ is not available through the public per-torrent stats model. The isolated
 adapter and schema groundwork may remain; production session wiring stops here
 until ADR-19 is amended with an upstream fix or a different engine.
 
+A same-day re-check of stable 8.1.1 and rqbit's unreleased 9.0 branch found
+that both M0 blockers remain. That result changes the milestone dependency,
+not the production gate: M1b's queue schema, scheduler boundary, and fake
+backend are useful for any embedded engine and start no peer session, so they
+may proceed independently. M2 still cannot add config, admission, a listener,
+or daemon wiring until the engine gates pass.
+
 The Fable review later that day found a real proxy leak boundary and several
 plan inconsistencies. This revision rejects proxy+DHT and proxy+UDP trackers,
 disables process-global DHT persistence, completes v2/hybrid admission checks
 for metainfo, reserves schema version 3 for torrent job records, defines how a
-stalled torrent yields the shared slot, and splits completed M1a schema work
-from blocked M1b backend routing. Review hardening does not change the M0
-no-go: gates 7 and 8 still block production wiring.
+stalled torrent yields the shared slot, and originally split completed M1a
+schema work from then-blocked M1b routing. The §4.3.2 amendment now permits
+that dormant routing seam; gates 7 and 8 still block production wiring.
 
 > BitTorrent publishes the client’s IP address to peers and may upload data
 > after the download completes. nzbd can provide controls and honest status;
@@ -277,7 +284,7 @@ path.
 
 ## 4. ADR-19 — embed a torrent library behind a backend adapter
 
-**Status:** Proposed
+**Status:** Amended; backend boundary accepted, production engine unresolved
 
 **Deciders:** maintainer · security reviewer · operator representative
 
@@ -386,6 +393,40 @@ safe but operationally different from the accepted fast-resume requirement;
 adopting it requires an explicit ADR change. If the upstream surface cannot be
 made stable and small, evaluate `libtorrent-rasterbar` as already specified.
 
+#### 4.3.2 Upstream re-check and M1b amendment
+
+The 2026-08-05 follow-up checked crates.io's current stable release and rqbit
+main at `4e5f94c`. Stable remains 8.1.1. The unreleased tree identifies itself
+as 9.0.0-rc.0, but it still constructs persistence and then streams every
+stored torrent through `add_torrent` before `Session::new_with_opts` returns.
+Its tracker statistics provider carries transfer counters into announce
+requests; it is not a public tracker-health snapshot and does not retain a
+redacted last announce failure. Its public DHT statistics are session-wide,
+not a per-job discovery result.
+
+That evidence keeps gates 7 and 8 failed. nzbd will not pin a release
+candidate, vendor rqbit's private persistence format, or interpret an internal
+tracker counter as health. The preferred route remains two small upstream
+APIs followed by a stable release and a complete M0 rerun; the existing
+libtorrent fallback remains the next engine evaluation if those APIs cannot
+be made stable.
+
+It does not follow that M1b must wait. A serializable transfer record, one
+owner-controlled active set, reliable structural facts, and coalesced progress
+are required whichever embedded engine wins. M1b is therefore authorized with
+these hard limits:
+
+- no torrent config, admission endpoint, daemon dependency, listener, DHT, or
+  tracker task;
+- fake backend only, with production recovery refusing a persisted torrent
+  row rather than guessing how to run it; and
+- no M2 work until ADR-19 records an engine that passes every stop gate.
+
+Primary evidence: [crates.io stable release](https://crates.io/crates/librqbit),
+[unreleased session construction](https://github.com/ikatson/rqbit/blob/4e5f94cbcf1d57ec500885c77cf1e24d70232d89/crates/librqbit/src/session.rs),
+[tracker provider state](https://github.com/ikatson/rqbit/blob/4e5f94cbcf1d57ec500885c77cf1e24d70232d89/crates/tracker_comms/src/tracker_comms.rs),
+and [public torrent statistics](https://docs.rs/librqbit/8.1.1/librqbit/struct.TorrentStats.html).
+
 ### 4.4 Consequences
 
 **What gets easier:** peer protocol correctness, DHT/tracker behavior, piece
@@ -469,19 +510,20 @@ pub enum BackendCommand {
 
 pub enum BackendFact {
     MetadataReady { job: JobId, torrent: TorrentMetadata },
-    Progress { job: JobId, progress: TransferProgress },
     Ready { job: JobId, content_path: PathBuf },
     Stopped { job: JobId, reason: StopReason },
     Failed { job: JobId, error: SafeError },
 }
+
+adapter.progress(job, TransferProgress { /* latest counters */ });
 ```
 
-`Progress` is coalescible: only the latest value per job matters. `Ready`,
-`Stopped`, and `Failed` are structural: they are never dropped. A practical
-implementation uses separate bounded channels or a watched per-job progress
-slot plus a bounded structural event channel. One bounded FIFO for thousands
-of peer-stat updates and delete commands would recreate the queue starvation
-the owner design exists to prevent.
+Progress is a watched latest-value map: only the newest value per job matters.
+`MetadataReady`, `Ready`, `Stopped`, and `Failed` use a separate bounded
+structural channel and are never replaced by progress. Commands have their own
+bounded channel in the opposite direction. One FIFO for thousands of
+peer-stat updates, facts, and delete commands would recreate the queue
+starvation the owner design exists to prevent.
 
 ### 5.3 One session, many torrents
 
@@ -533,10 +575,11 @@ tagged `TransferRecord`; it is not required to ship the feature safely.
 An additive `Job` field is backward-readable, but `JobKind::Torrent` is not.
 Today one unknown enum value makes the whole `queue.json` fail to deserialize
 and aborts daemon startup, including every Usenet job. M1a has added this
-version-2 envelope without adding a torrent representation:
+version-2 envelope without adding a torrent representation. M1b now writes
+version 3:
 
 ```rust
-pub const QUEUE_SCHEMA_VERSION: u32 = 2;
+pub const QUEUE_SCHEMA_VERSION: u32 = 3;
 
 pub struct QueueSnapshotDoc {
     #[serde(default = "legacy_queue_schema_version")]
@@ -545,17 +588,19 @@ pub struct QueueSnapshotDoc {
 }
 ```
 
-Version 2 is now spent: it means “the legacy Usenet job shape inside an
-explicit envelope.” M1b must atomically bump the writer to version 3 when it
-adds `JobKind::Torrent`, the defaulted `torrent` record, or any other job
-representation change. Reusing version 2 would let this binary treat a future
-enum as ordinary corruption instead of a version mismatch.
+Version 2 is spent: it means “the legacy Usenet job shape inside an explicit
+envelope.” Version 3 adds `JobKind::Torrent` and the defaulted `torrent`
+record. A version-2 document loads with the same Usenet meaning and is rewritten
+as version 3 on the next owner snapshot. Reusing version 2 would have let the
+old binary treat the new enum as ordinary corruption instead of a version
+mismatch.
 
 `SnapshotStore::load` parses a healthy typed document once, then validates its
 version. If the typed parse fails, it decodes a tiny header that ignores the
 remaining JSON values so a future enum still produces a named
 `StateError::Corrupt`. Version 1 loads through the existing defaults. A version
-greater than the running binary supports reports, for example:
+greater than the running binary supports reports, for example when a
+schema-2 binary sees the M1b document:
 
 ```text
 queue.json schema version 3 is newer than this nzbd supports (2);
@@ -1516,14 +1561,14 @@ name future/retired version failures · refuse non-current writes · avoid a
 second parse on healthy production snapshots.
 
 **Acceptance:** `cargo test --workspace` and the NZBGet golden suite remain
-unchanged; a v1 queue fixture round-trips, a version-3 document containing an
-unknown job kind fails with the named version error, the v2 snapshot cannot be
-written as schema 1, and a production-sized current snapshot round-trips.
+unchanged; a v1 queue fixture round-trips, a future-version document containing
+an unknown job kind fails with the named version error, the v2 snapshot cannot
+be written as schema 1, and a production-sized current snapshot round-trips.
 
 **Result:** complete. Version 2 contains no torrent job representation and is
 useful hardening on its own.
 
-### 15.3 M1b — protocol-neutral backend seam (blocked on ADR-19)
+### 15.3 M1b — protocol-neutral backend seam (implemented; pending review)
 
 **Work:** atomically bump the queue writer to schema version 3 · add
 `JobKind::Torrent` and the defaulted `torrent` field · add `kind`/readiness to
@@ -1533,9 +1578,8 @@ and old-mobile projection tests. Do not extract a `nzbd-usenet` crate.
 
 Do not start `librqbit` from the daemon in this milestone. A fake torrent
 backend proves queue command routing, stalled-slot yield, and coalesced
-progress without network or disk behavior. This work waits for the ADR-19
-engine decision; adding it now would build product architecture on a failed
-M0 assumption.
+progress without network or disk behavior. The amendment in §4.3.2 permits
+this engine-independent boundary while keeping all M2 networking blocked.
 
 **Acceptance:** v2 fixtures migrate to v3 without semantic change; a v3
 torrent row makes the current v2 binary fail by schema version; fake Usenet
@@ -1543,6 +1587,13 @@ and torrent jobs obey one priority/pause/max-active schedule; a stalled
 torrent yields so a following Usenet job completes and later reacquires only
 when eligible; a progress flood cannot delay a delete command beyond the
 bounded test threshold.
+
+**Result:** implemented for review. The queue writer emits schema 3, schema-2
+Usenet rows retain their meaning, the combined active set accounts for fake
+torrent work, and backend progress cannot consume control/structural FIFO
+capacity. The daemon has no torrent config or admission path and rejects a
+persisted torrent row with a named M1b error before starting any peer session.
+See [BITTORRENT_M1B_REPORT.md](BITTORRENT_M1B_REPORT.md).
 
 ### 15.4 M2 — single-node torrent download, resume, and seeding
 
@@ -1785,7 +1836,7 @@ both review passes as follows:
 | Engine | Pin stable `librqbit =8.1.1` subject to the eleven M0 gates; evaluate `libtorrent-rasterbar` only if a required stable capability fails. |
 | Transport | Accept TCP/IPv4-only for the first release; uTP and IPv6 wait for a stable 9.x line and repeatable resume/interop proof. |
 | Torrent format | Accept v1 `.torrent`/`btih` magnets only; the M0 adapter rejects v2-only and hybrid metainfo/magnets with distinct named errors. |
-| Queue schema | Version 2 is the torrent-free envelope; M1b must write version 3 in the same change that adds any torrent job representation. |
+| Queue schema | Version 2 is the torrent-free envelope; M1b writes version 3 with the torrent variant and defaulted record. |
 | Compatibility | qBittorrent Web API 2.8.1 is the one supported *arr surface; do not also build Transmission RPC. |
 | Post-processing | No torrent PP in v1; future PP operates on a reflink-or-copy derivative, never a hardlinked seed tree. |
 | Seeding | Unlimited default; per-add/category limits pause and retain data rather than deleting it. |
@@ -1800,10 +1851,10 @@ both review passes as follows:
 | Cluster | Keep torrent+cluster as a startup error. M6 still requires separate approval after single-node evidence. |
 
 The review authorized groundwork and the M0 spike, not a production torrent
-listener. That spike has now failed gates 7 and 8. Backend routing and M2 remain
-blocked until ADR-19 records an engine/API resolution; M2 also remains blocked
-on disk-guard F1–F3 and the durable history-delete fix. M3 remains blocked on
-the named mobile P0 fixes.
+listener. That spike has now failed gates 7 and 8. The engine-neutral M1b seam
+is implemented for review under §4.3.2; M2 remains blocked until ADR-19 records
+an engine/API resolution, disk-guard F1–F3 land, and the durable history-delete
+fix lands. M3 remains blocked on the named mobile P0 fixes.
 
 ---
 
