@@ -388,6 +388,7 @@ Native config is **TOML** (`nzbd.toml`): typed, serde-validated, sectioned (`[pa
 | 16 | **Cluster state: per-job fenced journals + queue snapshot on the shared volume; journal replay = union across lease files; SQLite never on the network FS** (CLUSTERING.md §6.4) | Global journal (can't reclaim jobs independently); FS locks per job (see 13); SQLite/WAL on Gluster (shared-memory WAL doesn't span nodes; known corruption class) |
 | 17 | **Web UI: one embedded no-build page with a hand-rolled keyed reconciler** (§12) | Svelte 5 + Vite SPA (a Node build chain in CI, permanently, for component structure we don't need at this size); vendoring preact+htm (13 KB of third-party JS in-tree to diff one `<table>` that ~150 lines diff fine). Trade-off accepted knowingly: no virtualized tables and no i18n scaffolding, revisit past ~500 rows or ~120 KB |
 | 18 | **Delete parks the regenerated NZB to history and is undoable; no `confirm()` anywhere** (§12) | Confirmation dialogs (interrupt before anything happens, then say nothing afterwards — the worst of both ends); bare instant delete (a misclick on a 60 GiB job costs a full re-download); two-step inline arming for everything (still two clicks, the thing being complained about). Arming is kept for the one action nothing can undo: deleting downloaded files |
+| 19 | **BitTorrent: stable `librqbit` behind the existing queue owner; immutable seed tree; readiness is durable state** ([proposal](BITTORRENT_PROPOSAL.md), [M0 report](BITTORRENT_M0_REPORT.md)). **Proposed, blocked:** the 8.1.1 spike passed the data path but failed authoritative fast-resume and discovery-observability gates. | A second daemon (two queue authorities and lifecycle stores); pretending pieces/peers are NNTP articles/servers (dishonest state); `libtorrent` FFI before a stable-Rust spike fails (packaging and unsafe boundary). First release is deliberately v1 TCP/IPv4 and single-node. |
 
 ## 16. Roadmap
 
@@ -418,6 +419,4 @@ Rough sizing honesty: phases 1–3 are each multiple weeks of focused work; nzbg
 Failover: retries=3, retry-interval=10 s, timeout=60 s, idle-hold=5 s, random pick among free same-tier connections, groups fail together, fill servers never stall, retention pre-fails. Health = per-mille formulas §3.2. Speed window 30×1 s. Cache flush at 90%. Downloader cap concept (`2 + Σ connections`) replaced by pool-native limits. PP strategies sequential/balanced/aggressive(3,1)/rocket(6,2). Script exits 92/93/94/95. Priorities −100/−50/0/50/100/900-force. Sonarr `drone` param is sacred. Sizes cross the shim as Lo/Hi/MB triplets. Default port 6789.
 
 *Sources: full source analysis of nzbgetcom/nzbget v26.2/26.3 (July 2026); Sonarr develop-branch NzbgetProxy.cs; SABnzbd performance discussions (#2352, #3366); 2026 crates.io/GitHub ecosystem survey (tokio, rustls, axum, rapidyenc, par2cmdline-turbo, prior-art projects).*
-
-
 

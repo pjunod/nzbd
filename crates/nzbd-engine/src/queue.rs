@@ -8,7 +8,7 @@
 
 use crate::failover::{Candidates, Ladder, SegmentAttempt};
 use nzbd_nzb::ParsedNzb;
-use nzbd_state::QueueSnapshotDoc;
+use nzbd_state::{QueueSnapshotDoc, QUEUE_SCHEMA_VERSION};
 use nzbd_types::{
     DupeInfo, FileEntry, FileId, Health, Job, JobId, JobKind, JobStatus, Segment, SegmentState,
     ServerDef, ServerId,
@@ -153,6 +153,7 @@ impl QueueState {
 
     pub fn to_doc(&self) -> QueueSnapshotDoc {
         QueueSnapshotDoc {
+            schema_version: QUEUE_SCHEMA_VERSION,
             jobs: self.jobs.clone(),
             next_job_id: self.next_job_id,
             next_file_id: self.next_file_id,
@@ -1658,6 +1659,7 @@ mod tests {
         // A queue.json written before the setting existed deserializes
         // the field as 0; loading it must not stop the daemon.
         let doc = nzbd_state::QueueSnapshotDoc {
+            schema_version: nzbd_state::QUEUE_SCHEMA_VERSION,
             jobs: vec![],
             next_job_id: 1,
             next_file_id: 1,

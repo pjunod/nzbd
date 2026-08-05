@@ -83,6 +83,10 @@ enum Command {
 }
 
 fn main() -> anyhow_lite::Result<()> {
+    // Must precede every rustls client/server construction. The workspace can
+    // compile both aws-lc and ring through independent dependencies, and
+    // rustls 0.23 intentionally will not choose between them implicitly.
+    tls::install_process_crypto_provider()?;
     use tracing_subscriber::layer::SubscriberExt as _;
     use tracing_subscriber::util::SubscriberInitExt as _;
     // The daemon log ring backs `GET /api/v1/logs` and the compat `log`

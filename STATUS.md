@@ -27,6 +27,7 @@ actions
 | 3c — compat C2 + XML-RPC + golden tests | ✅ complete | `fe6d2be` |
 | 4 — Web UI + ecosystem | ✅ complete | `77b7660` |
 | 5 — Beyond parity (+ C3) | 🔶 adaptive pipelining done; rest scoped | this commit |
+| BT — BitTorrent backend | 🔶 proposal reviewed; M0 data path passes, daemon wiring blocked on two engine API gaps | [proposal](docs/BITTORRENT_PROPOSAL.md), [M0 report](docs/BITTORRENT_M0_REPORT.md) |
 
 ---
 
@@ -93,6 +94,8 @@ actions
 
 ## Docs ✅
 
+- 🔶 BitTorrent ADR-19 (2026-08-05): review corrections are incorporated in `docs/BITTORRENT_PROPOSAL.md`; stable `librqbit` 8.1.1 is pinned behind an isolated `nzbd-torrent` adapter. Deterministic local `.torrent`/magnet, seeding, control, SOCKS, private-tracker, provider, path, delete, and format-boundary tests pass. `docs/BITTORRENT_M0_REPORT.md` records a no-go for daemon integration because fast-resume persistence auto-restores its own torrent list and public stats omit tracker/DHT health. No production switch or listener exists
+- ✅ Queue snapshot schema preflight v2 (2026-08-05): legacy unversioned snapshots still load as v1; new writes are v2; future/too-old versions and stale writes fail by name before a future job enum can be misreported as generic corruption
 - ✅ Operator documentation (2026-07-18): reworked `README` (accurate status, quickstart, doc index) + `docs/INSTALL.md` (binaries/Docker/Homebrew/source/musl), `docs/CONFIGURATION.md` (full annotated `nzbd.toml` reference), `docs/USAGE.md` (CLI, UI, *arr hookup, feed filter language, scripts, deobfuscation), `docs/DEPLOY.md` (copy-paste recipes: Docker by hand incl. volume map + lifecycle, Compose, Kubernetes, systemd, multi-node cluster)
 - ✅ Docker config mount fixed (2026-07-25): the shipped Compose recipe delivered the config through a Compose `configs:` entry — always mounted **read-only** — so every settings-editor save failed with `Read-only file system (os error 30)`; `docs/INSTALL.md`, `docs/DEPLOY.md` and the README used `:ro` config binds for the same net effect. All four now bind the config **directory** read-write (`./config:/etc/nzbd`), which also sidesteps the Docker-invents-a-directory trap for a missing config file and lets the first-run wizard write one. `dev/docker-compose.yml`'s ownership hint corrected to `chown -R 1000:1000` (the container runs as UID 1000; `$USER` only works if you happen to be 1000). Guard test `shipped_compose_files_mount_the_config_writable` fails the build if a shipped compose file goes read-only again; Kubernetes stays deliberately read-only and DEPLOY.md now says the editor is view-and-copy there
 - ✅ Deployable examples under `examples/`: `docker-compose/` (compose + `nzbd.toml.example`), `kubernetes/` (namespace/secret/PVC/deployment/service/kustomization + README incl. RWX cluster shape), `systemd/` (hardened unit)
