@@ -22,12 +22,32 @@ fn err(msg: String) -> anyhow_lite::Error {
     anyhow_lite::Error::msg(msg)
 }
 
+/// Select one rustls 0.23 provider before any client or server builder runs.
+///
+/// Some workspace dependencies enable ring while nzbd uses aws-lc. rustls
+/// deliberately refuses to guess when both are compiled, so this process-wide
+/// choice is an explicit startup invariant rather than a feature-resolution
+/// accident.
+pub fn install_process_crypto_provider() -> anyhow_lite::Result<()> {
+    if rustls::crypto::CryptoProvider::get_default().is_some() {
+        return Ok(());
+    }
+    match rustls::crypto::aws_lc_rs::default_provider().install_default() {
+        Ok(()) => Ok(()),
+        Err(_) if rustls::crypto::CryptoProvider::get_default().is_some() => Ok(()),
+        Err(_) => Err(err(
+            "could not install the process rustls aws-lc crypto provider".into(),
+        )),
+    }
+}
+
 /// Build the server TLS config, generating a persistent self-signed cert
 /// when none is configured. Returns None when `[api] tls` is off.
 pub fn server_config(
     cfg: &nzbd_config::Config,
     state_dir: &Path,
 ) -> anyhow_lite::Result<Option<TlsSetup>> {
+    install_process_crypto_provider()?;
     if !cfg.api.tls {
         return Ok(None);
     }

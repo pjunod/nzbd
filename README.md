@@ -121,6 +121,8 @@ NZBGet configuration and prints a mapping report.
 | [docs/MOBILE_REVIEW.md](docs/MOBILE_REVIEW.md) | Independent review of the mobile app (2026-08): code, performance, UI, release readiness, and the Google TV / Apple TV gap |
 | [docs/DEPLOY.md](docs/DEPLOY.md) | systemd, Docker Compose, Kubernetes, multi-node cluster deployment |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Design: the whole system, phase by phase |
+| [docs/BITTORRENT_PROPOSAL.md](docs/BITTORRENT_PROPOSAL.md) | Proposed first-class BitTorrent backend: engine choice, queue/storage contracts, *arr compatibility, security, rollout, and review decisions |
+| [docs/BITTORRENT_M0_REPORT.md](docs/BITTORRENT_M0_REPORT.md) | BitTorrent engine spike: passing data-path evidence, measurements, and the API gaps blocking daemon integration |
 | [docs/INTEGRATION.md](docs/INTEGRATION.md) | Every seam with monarr and plurx: what each does, where you watch it, and the command that proves it |
 | [docs/INTEGRATION_PLAN.md](docs/INTEGRATION_PLAN.md) | The event/cursor contract consumers build against, and how it was built |
 | [docs/DEFECT_HISTORY_DELETE.md](docs/DEFECT_HISTORY_DELETE.md) | Open defect: why forgetting a history entry doesn't stick, and the two ways to fix it |

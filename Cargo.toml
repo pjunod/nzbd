@@ -16,6 +16,7 @@ members = [
     "crates/nzbd",
     "crates/nzbd-nserv",
     "crates/nzbd-cluster",
+    "crates/nzbd-torrent",
 ]
 
 [workspace.package]
@@ -47,6 +48,7 @@ nzbd-compat = { path = "crates/nzbd-compat" }
 
 nzbd-nserv = { path = "crates/nzbd-nserv" }
 nzbd-cluster = { path = "crates/nzbd-cluster" }
+nzbd-torrent = { path = "crates/nzbd-torrent" }
 
 flate2 = "1"
 serde = { version = "1", features = ["derive"] }
@@ -79,6 +81,8 @@ clap = { version = "4", features = ["derive"] }
 toml = "1"
 bytes = "1"
 mdns-sd = "0.20.3"
+librqbit = { version = "=8.1.1", default-features = false, features = ["rust-tls"] }
+url = "2"
 
 [profile.release]
 lto = "thin"

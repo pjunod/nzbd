@@ -325,9 +325,24 @@ fn sanitize_suffix(s: &str) -> String {
 // Queue snapshot
 // ---------------------------------------------------------------------------
 
+/// The queue document written by this binary.
+///
+/// Version 1 is the unversioned shape written before BitTorrent groundwork;
+/// missing `schema_version` therefore means 1 on read. Version 2 adds the
+/// explicit envelope. The next incompatible domain addition can now report
+/// its version instead of exposing an unknown enum variant buried in a job.
+pub const QUEUE_SCHEMA_VERSION: u32 = 2;
+const OLDEST_QUEUE_SCHEMA_VERSION: u32 = 1;
+
+const fn legacy_queue_schema_version() -> u32 {
+    OLDEST_QUEUE_SCHEMA_VERSION
+}
+
 /// Everything needed to reconstruct the queue after a restart.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueueSnapshotDoc {
+    #[serde(default = "legacy_queue_schema_version")]
+    pub schema_version: u32,
     pub jobs: Vec<Job>,
     pub next_job_id: u32,
     pub next_file_id: u32,
@@ -338,6 +353,30 @@ pub struct QueueSnapshotDoc {
     /// resulting 0 up to 1 rather than treating it as "none may".
     #[serde(default)]
     pub max_active_downloads: u32,
+}
+
+impl Default for QueueSnapshotDoc {
+    fn default() -> Self {
+        Self {
+            schema_version: QUEUE_SCHEMA_VERSION,
+            jobs: Vec::new(),
+            next_job_id: 0,
+            next_file_id: 0,
+            download_paused: false,
+            speed_limit_bps: None,
+            max_active_downloads: 0,
+        }
+    }
+}
+
+/// Read only when the typed queue document fails. Unknown fields — including
+/// a future job representation — are skipped, so a newer schema still
+/// produces an actionable version error without making every successful boot
+/// parse a production-sized queue twice.
+#[derive(Deserialize)]
+struct QueueSnapshotHeader {
+    #[serde(default = "legacy_queue_schema_version")]
+    schema_version: u32,
 }
 
 pub struct SnapshotStore {
@@ -380,6 +419,12 @@ impl SnapshotStore {
         doc: &QueueSnapshotDoc,
         guard: &dyn Fn() -> bool,
     ) -> Result<u64, StateError> {
+        if doc.schema_version != QUEUE_SCHEMA_VERSION {
+            return Err(StateError::Corrupt(format!(
+                "refusing to write queue schema version {}; this nzbd writes {}",
+                doc.schema_version, QUEUE_SCHEMA_VERSION
+            )));
+        }
         let bytes = serde_json::to_vec(doc)?;
         let mut f = fsx::create(&self.tmp)?;
         fsx::write_whole(&mut f, &bytes, &self.tmp)?;
@@ -405,10 +450,35 @@ impl SnapshotStore {
             Err(e) if e.is_not_found() => return Ok(None),
             Err(e) => return Err(e),
         };
-        let doc = serde_json::from_slice(&bytes)
-            .map_err(|e| StateError::Corrupt(format!("queue.json: {e}")))?;
-        Ok(Some(doc))
+        match serde_json::from_slice::<QueueSnapshotDoc>(&bytes) {
+            Ok(doc) => {
+                validate_queue_schema_version(doc.schema_version)?;
+                Ok(Some(doc))
+            }
+            Err(typed_error) => {
+                if let Ok(header) = serde_json::from_slice::<QueueSnapshotHeader>(&bytes) {
+                    validate_queue_schema_version(header.schema_version)?;
+                }
+                Err(StateError::Corrupt(format!("queue.json: {typed_error}")))
+            }
+        }
     }
+}
+
+fn validate_queue_schema_version(schema_version: u32) -> Result<(), StateError> {
+    if schema_version > QUEUE_SCHEMA_VERSION {
+        return Err(StateError::Corrupt(format!(
+            "queue.json schema version {} is newer than this nzbd supports ({}); upgrade nzbd or restore a compatible queue snapshot",
+            schema_version, QUEUE_SCHEMA_VERSION
+        )));
+    }
+    if schema_version < OLDEST_QUEUE_SCHEMA_VERSION {
+        return Err(StateError::Corrupt(format!(
+            "queue.json schema version {} is older than this nzbd supports ({})",
+            schema_version, OLDEST_QUEUE_SCHEMA_VERSION
+        )));
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -703,6 +773,7 @@ mod tests {
         assert!(store.load().unwrap().is_none());
 
         let doc = QueueSnapshotDoc {
+            schema_version: QUEUE_SCHEMA_VERSION,
             jobs: vec![],
             next_job_id: 7,
             next_file_id: 42,
@@ -719,10 +790,67 @@ mod tests {
             "save reports exactly what landed on disk"
         );
         let loaded = store.load().unwrap().unwrap();
+        assert_eq!(loaded.schema_version, QUEUE_SCHEMA_VERSION);
         assert_eq!(loaded.next_job_id, 7);
         assert_eq!(loaded.next_file_id, 42);
         assert!(loaded.download_paused);
         assert_eq!(loaded.speed_limit_bps, Some(1_000_000));
+        assert!(!dir.path().join("queue.json.tmp").exists());
+    }
+
+    #[test]
+    fn snapshot_loads_an_unversioned_document_as_v1() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SnapshotStore::open(dir.path()).unwrap();
+        std::fs::write(
+            dir.path().join("queue.json"),
+            br#"{"jobs":[],"next_job_id":7,"next_file_id":9,"download_paused":false,"speed_limit_bps":null}"#,
+        )
+        .unwrap();
+
+        let loaded = store.load().unwrap().unwrap();
+        assert_eq!(loaded.schema_version, 1);
+        assert_eq!(loaded.next_job_id, 7);
+        assert_eq!(loaded.next_file_id, 9);
+        assert_eq!(loaded.max_active_downloads, 0);
+    }
+
+    #[test]
+    fn snapshot_reports_future_schema_instead_of_nested_job_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SnapshotStore::open(dir.path()).unwrap();
+        std::fs::write(
+            dir.path().join("queue.json"),
+            br#"{"schema_version":3,"jobs":[{"kind":"future_transfer"}]}"#,
+        )
+        .unwrap();
+
+        let err = store.load().unwrap_err().to_string();
+        assert!(
+            err.contains("queue.json schema version 3 is newer than this nzbd supports (2)"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            !err.contains("unknown variant"),
+            "version fallback must win over a nested enum error: {err}"
+        );
+    }
+
+    #[test]
+    fn snapshot_refuses_to_write_a_noncurrent_schema() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SnapshotStore::open(dir.path()).unwrap();
+        let doc = QueueSnapshotDoc {
+            schema_version: 1,
+            ..Default::default()
+        };
+
+        let err = store.save(&doc).unwrap_err().to_string();
+        assert!(
+            err.contains("refusing to write queue schema version 1; this nzbd writes 2"),
+            "unexpected error: {err}"
+        );
+        assert!(!dir.path().join("queue.json").exists());
         assert!(!dir.path().join("queue.json.tmp").exists());
     }
 
@@ -764,6 +892,7 @@ mod tests {
             finalized: false,
         };
         let doc = QueueSnapshotDoc {
+            schema_version: QUEUE_SCHEMA_VERSION,
             jobs: (0..4u32)
                 .map(|j| Job {
                     id: JobId(j),
