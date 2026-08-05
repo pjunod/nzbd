@@ -1,0 +1,161 @@
+# BitTorrent M1b report — one queue contract, still no peer session
+
+**Status:** implemented; pending review · **Date:** 2026-08-05 ·
+**Branch:** `codex/bittorrent-engine-unblock` ·
+**Decision owner:** ADR-19 in [BITTORRENT_PROPOSAL.md](BITTORRENT_PROPOSAL.md)
+
+M1b adds the protocol-neutral state and message boundary needed by any future
+embedded BitTorrent engine. It does not make BitTorrent usable yet. The daemon
+still has no torrent configuration, admission route, listener, DHT node,
+tracker task, or dependency on `nzbd-torrent`.
+
+This milestone was originally blocked with M2 after stable `librqbit` failed
+the authoritative-resume and discovery-health gates. A re-check found the same
+gaps in rqbit's unreleased 9.0 line, but also made the dependency distinction
+clear: the queue/backend seam is engine-independent and testable with no
+network or payload I/O. ADR-19 now authorizes that dormant seam while keeping
+production wiring blocked.
+
+---
+
+## 1. Delivered contracts
+
+### 1.1 Schema 3 owns the torrent job representation
+
+`JobKind` now reserves `torrent`, and a defaulted `Job.torrent` record carries
+only durable control facts: v1 info hash, non-secret source class, relative
+metadata path, phase, selected file layout, cumulative accounting, readiness,
+seed policy, canonical content path, recent activity, and a redacted bounded
+error.
+
+The queue writer now emits schema 3. Reads retain the compatibility rules:
+
+- an unversioned document is version 1;
+- schema 2 loads existing `nzb` and `url` jobs with `torrent = None` and no
+  semantic change;
+- schema 3 round-trips the torrent control record; and
+- a future version still wins over a nested unknown-enum error and fails by
+  version name.
+
+This is intentionally a one-way downgrade boundary. A schema-2 binary sees
+`schema_version: 3` and refuses the whole queue rather than silently skipping a
+torrent job and serving a partial truth.
+
+### 1.2 Native read models gain additive neutral facts
+
+`JobSummary` now includes:
+
+```json
+{
+  "kind": "nzb | url | torrent",
+  "ready": false,
+  "ready_at_unix": null
+}
+```
+
+Existing fields and `JobStatus` spellings are unchanged. Usenet readiness
+continues to derive from its durable `*PP:done` stamp; torrent readiness comes
+only from `TorrentRecord.ready_at_unix`. No torrent-only lifecycle value is
+inserted into `JobStatus`, so older consumers do not receive a new status enum
+case.
+
+### 1.3 Backend traffic cannot starve control
+
+The new backend channel has three independent paths:
+
+| Path | Direction | Delivery rule |
+|---|---|---|
+| Commands | owner → adapter | Bounded FIFO for start, pause, resume, remove, priority, and limit changes |
+| Structural facts | adapter → owner | Bounded reliable FIFO for metadata, ready, stopped, and failed facts |
+| Progress | adapter → owner | Watched latest-value map, one replaceable value per job |
+
+A progress flood therefore cannot sit ahead of a delete command or displace a
+ready/failure fact. The tests send 50,000 progress updates into a one-command
+channel and observe the remove command next; the owner sees only the latest
+progress value for the job.
+
+`SafeError` accepts only an already-redacted message from the adapter and
+enforces the proposal's 2 KiB UTF-8-safe persistence bound. Engine-specific
+redaction remains an M2 adapter responsibility.
+
+### 1.4 One active set spans both protocols
+
+The existing priority, queue order, global pause, force priority, and
+`max_active_downloads` rules now compute eligibility across Usenet work and a
+fake torrent record. With the default cap of one, a higher-priority active
+torrent owns the slot and NNTP does not borrow it. With two slots, both appear
+in the active set and NNTP may progress in its own slot.
+
+A torrent in `downloading` yields after 60 seconds with neither payload
+progress nor a useful-peer fact. It remains live; a later activity fact makes
+it eligible again. Checking/metadata work remains eligible, while seeding does
+not consume a download slot.
+
+---
+
+## 2. Safety boundary
+
+M1b is dormant by construction:
+
+- `nzbd` still does not depend on or start `nzbd-torrent`;
+- no config parser, API handler, watch directory, UI control, qBittorrent
+  compatibility route, or peer listener was added;
+- all mixed-protocol scheduling uses constructed fake records; and
+- production recovery refuses a persisted torrent row with a named error and
+  leaves the queue unchanged.
+
+That last refusal is deliberate. Schema support proves durability and
+downgrade behavior, but the daemon may not infer that durable representation
+means an engine exists. M2 will replace the refusal only after ADR-19 names a
+stable engine/API that passes M0 gates 7 and 8 plus the remaining platform
+matrix.
+
+---
+
+## 3. Acceptance evidence
+
+| Requirement | Evidence |
+|---|---|
+| Schema-2 Usenet migration | Fixture removes the new field, loads as schema 2, and preserves kind/status with `torrent = None` |
+| Schema-3 torrent round trip | Durable record including file selection and accounting saves and reloads |
+| Downgrade guard | Emitted document carries `schema_version: 3`; future-version fallback remains named |
+| Shared priority/pause/cap | Mixed fake-torrent and real Usenet queue-selection tests |
+| Stalled yield/reacquire | Boundary tests at 59/60 seconds and mixed active-set test after new activity |
+| Progress backpressure | 50,000 updates coalesce while remove remains immediately receivable |
+| Existing behavior | Workspace formatting, lint, tests, and Rust 1.85 checks are required before publication |
+
+---
+
+## 4. What remains blocked
+
+M1b does not soften any M0 stop condition. Before M2:
+
+1. rqbit must expose authoritative restore and honest discovery health in a
+   stable release, or ADR-19 must select and prove another engine;
+2. all eleven M0 gates must pass on native macOS, Linux glibc/musl, and
+   Windows, including private-mode capture and dependency review;
+3. [`REGRAB_LOOP_PLAN.md`](REGRAB_LOOP_PLAN.md) F1–F3 must enforce the second
+   payload root; and
+4. [`DEFECT_HISTORY_DELETE.md`](DEFECT_HISTORY_DELETE.md) must land its durable
+   history deletion fix.
+
+No production BitTorrent networking should appear in review of this milestone.
+If it does, that is a scope and safety defect, not an optional follow-up.
+
+---
+
+## 5. Review focus
+
+Reviewers should concentrate on four questions:
+
+1. Does schema 3 preserve every schema-2 Usenet meaning while producing a
+   loud downgrade boundary?
+2. Can any progress volume delay a control command or erase a structural
+   fact?
+3. Does the mixed active set preserve current Usenet behavior at the default
+   cap while preventing either protocol from stealing the other's slot?
+4. Is every path that could start production peer traffic still absent or
+   explicitly refused?
+
+The engine choice, tracker API shape, and end-user torrent API remain M0/M2
+review questions; they are not smuggled into this seam.

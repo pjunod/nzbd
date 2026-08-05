@@ -5,6 +5,7 @@
 //! `FileEntry` ≈ FileInfo, `Segment` ≈ ArticleInfo.
 
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 
 pub mod metrics;
 
@@ -39,6 +40,92 @@ pub const PRIORITY_FORCE: i32 = 900;
 pub enum JobKind {
     Nzb,
     Url,
+    Torrent,
+}
+
+/// Durable origin of a BitTorrent job. Secrets such as source URLs and
+/// tracker passkeys do not belong here; they are stored through the secret
+/// boundary and only a non-secret source class reaches the queue snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TorrentSource {
+    Metainfo,
+    Magnet,
+    Url,
+}
+
+/// Durable BitTorrent lifecycle state. Volatile peer/tracker counters stay in
+/// the backend and its detail projection rather than turning queue snapshots
+/// into a high-frequency engine database.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TorrentPhase {
+    FetchingSource,
+    FetchingMetadata,
+    Queued,
+    Checking,
+    Downloading,
+    Seeding,
+    PausedDownload,
+    PausedSeed,
+    MissingFiles,
+    Failed,
+}
+
+impl TorrentPhase {
+    /// Whether this phase may compete for a shared active-download slot.
+    pub fn wants_download_slot(self) -> bool {
+        matches!(
+            self,
+            Self::FetchingSource
+                | Self::FetchingMetadata
+                | Self::Queued
+                | Self::Checking
+                | Self::Downloading
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub struct SeedPolicy {
+    pub ratio_limit: Option<f64>,
+    pub time_limit_secs: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TorrentFileRecord {
+    pub path: PathBuf,
+    pub length: u64,
+    pub selected: bool,
+}
+
+/// Queue-owned BitTorrent control state. Engine resume data (piece maps,
+/// peers, tracker timers) remains an accelerator below this record and may
+/// never admit a job on its own.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TorrentRecord {
+    /// Lowercase 40-character v1 info hash.
+    pub info_hash_v1: String,
+    pub source: TorrentSource,
+    /// Relative to the configured torrent state root.
+    pub metadata_file: PathBuf,
+    pub phase: TorrentPhase,
+    pub files: Vec<TorrentFileRecord>,
+    pub total_bytes: u64,
+    pub selected_bytes: u64,
+    /// Advisory checkpoint; piece verification remains authoritative.
+    pub downloaded_bytes: u64,
+    /// Cumulative across restarts.
+    pub uploaded_bytes: u64,
+    /// Cumulative across restarts.
+    pub seeding_seconds: u64,
+    pub ready_at_unix: Option<i64>,
+    /// Canonical payload path after verification.
+    pub content_path: Option<PathBuf>,
+    pub seed_policy: SeedPolicy,
+    pub last_activity_unix: Option<i64>,
+    /// Redacted, display-safe, and bounded by the backend before persistence.
+    pub last_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -381,6 +468,10 @@ pub struct Job {
     pub files: Vec<FileEntry>,
     pub totals: JobTotals,
     pub status: JobStatus,
+    /// Present only for [`JobKind::Torrent`]. Defaulted so version-1/2 queue
+    /// documents retain their exact Usenet meaning when read by schema 3.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub torrent: Option<TorrentRecord>,
     /// Post-processing stages this job has entered, in order. Appended on
     /// every transition and persisted with the snapshot, so a daemon
     /// restart mid-pipeline does not erase where the time went. Defaulted
@@ -393,6 +484,22 @@ pub struct Job {
 impl Job {
     pub fn force_priority(&self) -> bool {
         self.priority >= PRIORITY_FORCE
+    }
+
+    /// A protocol-neutral readiness fact for native consumers. Existing
+    /// Usenet readiness remains the durable post-processing stamp; torrents
+    /// become ready only after their selected payload passes piece checks.
+    pub fn ready_at_unix(&self) -> Option<i64> {
+        self.torrent
+            .as_ref()
+            .and_then(|torrent| torrent.ready_at_unix)
+    }
+
+    pub fn ready(&self) -> bool {
+        match self.kind {
+            JobKind::Torrent => self.ready_at_unix().is_some(),
+            JobKind::Nzb | JobKind::Url => self.params.iter().any(|(key, _)| key == PP_DONE_PARAM),
+        }
     }
 }
 
@@ -487,6 +594,7 @@ mod tests {
             files: vec![],
             totals: JobTotals::default(),
             status: JobStatus::Queued,
+            torrent: None,
             stages: Vec::new(),
         };
         assert!(!job.force_priority());

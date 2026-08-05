@@ -6,6 +6,7 @@
 //! `PropagationDelay` filters too-young files; the failover ladder decides
 //! which servers may take the segment at its current tier.
 
+use crate::backend::torrent_wants_download_slot;
 use crate::failover::{Candidates, Ladder, SegmentAttempt};
 use nzbd_nzb::ParsedNzb;
 use nzbd_state::{QueueSnapshotDoc, QUEUE_SCHEMA_VERSION};
@@ -72,6 +73,25 @@ pub struct SegRef {
 
 impl QueueState {
     // -- persistence ---------------------------------------------------------
+
+    /// Production recovery boundary for M1b. Schema 3 can represent and test
+    /// torrent control state, but no daemon backend exists yet, so accepting
+    /// such a row would let generic Usenet recovery mutate it dishonestly.
+    pub(crate) fn from_runtime_doc(
+        doc: QueueSnapshotDoc,
+    ) -> Result<QueueState, nzbd_state::StateError> {
+        if doc
+            .jobs
+            .iter()
+            .any(|job| matches!(job.kind, JobKind::Torrent))
+        {
+            return Err(nzbd_state::StateError::Corrupt(
+                "queue.json contains BitTorrent jobs, but this M1b build has no production torrent backend; no peer session was started and the queue was left unchanged"
+                    .into(),
+            ));
+        }
+        Ok(Self::from_doc(doc))
+    }
 
     pub fn from_doc(doc: QueueSnapshotDoc) -> QueueState {
         let mut state = QueueState {
@@ -218,6 +238,7 @@ impl QueueState {
             files,
             totals: Default::default(),
             status: JobStatus::Queued,
+            torrent: None,
             stages: Vec::new(),
         };
         recompute_job_totals(&mut job);
@@ -288,6 +309,7 @@ impl QueueState {
             files: Vec::new(),
             totals: Default::default(),
             status: JobStatus::Fetching,
+            torrent: None,
             stages: Vec::new(),
         });
         job_id
@@ -951,7 +973,7 @@ pub fn next_for_server(
         // work to hand out. Letting it hold an active slot would spend
         // the slot on nothing, and would stall the pipe at the tail of
         // every job — which is the one place nzbd has always overlapped.
-        .filter(|j| has_pending(j))
+        .filter(|j| has_backend_work(j, ctx.now_unix))
         .collect();
     // Stable sort: equal priorities keep their queue-vec order, which is
     // user-controlled (move top/up/down/bottom) and persisted.
@@ -1022,14 +1044,19 @@ pub fn next_for_server(
 
 /// Does this job have at least one segment that could be handed out?
 /// Short-circuits on the first hit, so the common "yes" case is cheap.
-fn has_pending(job: &Job) -> bool {
-    job.files.iter().any(|f| {
-        !f.paused
-            && !f.is_terminal()
-            && f.segments
-                .iter()
-                .any(|s| matches!(s.state, SegmentState::Pending))
-    })
+fn has_backend_work(job: &Job, now_unix: i64) -> bool {
+    match job.kind {
+        JobKind::Torrent => job.torrent.as_ref().is_some_and(|torrent| {
+            torrent_wants_download_slot(torrent, job.queued_at_unix, now_unix)
+        }),
+        JobKind::Nzb | JobKind::Url => job.files.iter().any(|f| {
+            !f.paused
+                && !f.is_terminal()
+                && f.segments
+                    .iter()
+                    .any(|s| matches!(s.state, SegmentState::Pending))
+        }),
+    }
 }
 
 /// Is any segment of this job currently out with a connection? A job with
@@ -1049,13 +1076,14 @@ pub fn active_set(
     state: &QueueState,
     delegated: &HashMap<JobId, String>,
     soft_hold: bool,
+    now_unix: i64,
 ) -> Vec<JobId> {
     let mut order: Vec<&Job> = state
         .jobs
         .iter()
         .filter(|j| !delegated.contains_key(&j.id))
         .filter(|j| job_schedulable(j, state.download_paused || soft_hold))
-        .filter(|j| has_pending(j))
+        .filter(|j| has_backend_work(j, now_unix))
         .collect();
     order.sort_by_key(|j| std::cmp::Reverse(j.priority));
     order.truncate(clamp_active_downloads(state.max_active_downloads) as usize);
@@ -1072,8 +1100,9 @@ pub fn jobs_to_requeue(
     state: &QueueState,
     delegated: &HashMap<JobId, String>,
     soft_hold: bool,
+    now_unix: i64,
 ) -> Vec<JobId> {
-    let active: Vec<JobId> = active_set(state, delegated, soft_hold);
+    let active: Vec<JobId> = active_set(state, delegated, soft_hold, now_unix);
     state
         .jobs
         .iter()
@@ -1456,6 +1485,51 @@ mod tests {
         nzbd_nzb::parse(xml.as_bytes()).unwrap()
     }
 
+    fn admit_fake_torrent(
+        queue: &mut QueueState,
+        priority: i32,
+        phase: nzbd_types::TorrentPhase,
+        last_activity_unix: Option<i64>,
+    ) -> JobId {
+        queue.next_job_id += 1;
+        let id = JobId(queue.next_job_id);
+        queue.jobs.push(Job {
+            id,
+            kind: JobKind::Torrent,
+            name: "fake torrent".into(),
+            dir_name: "fake-torrent".into(),
+            name_provisional: false,
+            queued_at_unix: 1_799_999_900,
+            original_name: String::new(),
+            category: None,
+            priority,
+            dupe: DupeInfo::default(),
+            params: Vec::new(),
+            files: Vec::new(),
+            totals: Default::default(),
+            status: JobStatus::Downloading,
+            torrent: Some(nzbd_types::TorrentRecord {
+                info_hash_v1: "0123456789abcdef0123456789abcdef01234567".into(),
+                source: nzbd_types::TorrentSource::Magnet,
+                metadata_file: "meta/fake.torrent".into(),
+                phase,
+                files: Vec::new(),
+                total_bytes: 100,
+                selected_bytes: 100,
+                downloaded_bytes: 0,
+                uploaded_bytes: 0,
+                seeding_seconds: 0,
+                ready_at_unix: None,
+                content_path: None,
+                seed_policy: nzbd_types::SeedPolicy::default(),
+                last_activity_unix,
+                last_error: None,
+            }),
+            stages: Vec::new(),
+        });
+        id
+    }
+
     /// The re-grab loop's first defect: every paused recovery volume of an
     /// obfuscated post is hash-named, `vol_par_blocks` prices none of them,
     /// and the old filter dropped what it could not price — so repair asked
@@ -1625,6 +1699,92 @@ mod tests {
         assert_eq!(count(low), 0, "lowest priority waits its turn");
     }
 
+    #[test]
+    fn fake_torrent_and_usenet_share_priority_pause_and_active_slots() {
+        const NOW: i64 = 1_800_000_000;
+        let mut queue = QueueState::default();
+        let torrent = admit_fake_torrent(
+            &mut queue,
+            100,
+            nzbd_types::TorrentPhase::Downloading,
+            Some(NOW),
+        );
+        let usenet = queue.admit_nzb("usenet".into(), &sample_nzb(&[("u.bin", 2)]), None, 0, true);
+        let none = HashMap::new();
+
+        assert_eq!(active_set(&queue, &none, false, NOW), vec![torrent]);
+        assert!(
+            grant(&mut queue, &[server(1, 0)], 1).is_empty(),
+            "NNTP cannot take a slot currently owned by a higher-priority torrent"
+        );
+
+        queue.job_mut(torrent).unwrap().status = JobStatus::Paused;
+        assert_eq!(active_set(&queue, &none, false, NOW), vec![usenet]);
+
+        queue.job_mut(torrent).unwrap().status = JobStatus::Downloading;
+        queue.max_active_downloads = 2;
+        assert_eq!(active_set(&queue, &none, false, NOW), vec![torrent, usenet]);
+        assert_eq!(grant(&mut queue, &[server(1, 0)], 1), vec![usenet]);
+    }
+
+    #[test]
+    fn runtime_recovery_refuses_dormant_torrent_rows() {
+        let mut queue = QueueState::default();
+        admit_fake_torrent(
+            &mut queue,
+            0,
+            nzbd_types::TorrentPhase::PausedDownload,
+            None,
+        );
+
+        let error = QueueState::from_runtime_doc(queue.to_doc())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("this M1b build has no production torrent backend"));
+        assert!(error.contains("no peer session was started"));
+    }
+
+    #[test]
+    fn stalled_fake_torrent_yields_then_reacquires_the_shared_slot() {
+        const NOW: i64 = 1_800_000_000;
+        let mut queue = QueueState::default();
+        let torrent = admit_fake_torrent(
+            &mut queue,
+            100,
+            nzbd_types::TorrentPhase::Downloading,
+            Some(NOW - crate::backend::STALLED_SLOT_YIELD_SECS),
+        );
+        let usenet = queue.admit_nzb("usenet".into(), &sample_nzb(&[("u.bin", 2)]), None, 0, true);
+        let none = HashMap::new();
+
+        assert_eq!(
+            active_set(&queue, &none, false, NOW),
+            vec![usenet],
+            "the stalled torrent yields without being removed"
+        );
+        assert_eq!(
+            grant(&mut queue, &[server(1, 0)], 2),
+            vec![usenet, usenet],
+            "the following Usenet job can drain all of its download work"
+        );
+        assert!(
+            active_set(&queue, &none, false, NOW).is_empty(),
+            "fully leased Usenet work does not keep a slot"
+        );
+        queue
+            .job_mut(torrent)
+            .unwrap()
+            .torrent
+            .as_mut()
+            .unwrap()
+            .last_activity_unix = Some(NOW + 1);
+        assert_eq!(
+            active_set(&queue, &none, false, NOW + 1),
+            vec![torrent],
+            "new useful activity makes the torrent eligible again"
+        );
+    }
+
     /// A job whose every remaining segment is already out with a
     /// connection has nothing to hand out, so it must not hold a slot —
     /// otherwise the pipe stalls at the tail of every job, which is the
@@ -1683,7 +1843,7 @@ mod tests {
         q.admit_nzb("c".into(), &sample_nzb(&[("c.bin", 4)]), None, 0, true);
 
         let no_delegation: HashMap<JobId, String> = HashMap::new();
-        assert_eq!(active_set(&q, &no_delegation, false), vec![a, b]);
+        assert_eq!(active_set(&q, &no_delegation, false, 0), vec![a, b]);
 
         let got = grant(&mut q, &[server(1, 0)], 4);
         let served: std::collections::HashSet<JobId> = got.into_iter().collect();
@@ -1708,14 +1868,14 @@ mod tests {
         // b caught one lease at a's tail and is now labelled Downloading.
         q.job_mut(a).unwrap().status = JobStatus::Downloading;
         q.job_mut(b).unwrap().status = JobStatus::Downloading;
-        assert_eq!(active_set(&q, &none, false), vec![a]);
+        assert_eq!(active_set(&q, &none, false, 0), vec![a]);
         assert_eq!(
-            jobs_to_requeue(&q, &none, false),
+            jobs_to_requeue(&q, &none, false, 0),
             vec![b],
             "b is outside the set and holds nothing, so it is not downloading"
         );
         assert!(
-            !jobs_to_requeue(&q, &none, false).contains(&a),
+            !jobs_to_requeue(&q, &none, false, 0).contains(&a),
             "the job actually being served keeps its label"
         );
 
@@ -1733,7 +1893,7 @@ mod tests {
             server: ServerId(1),
         };
         assert!(
-            jobs_to_requeue(&q, &none, false).is_empty(),
+            jobs_to_requeue(&q, &none, false, 0).is_empty(),
             "a job with work in flight is never demoted"
         );
     }
@@ -1976,6 +2136,7 @@ mod tests {
             files: vec![],
             totals: Default::default(),
             status: JobStatus::Fetching,
+            torrent: None,
             stages: vec![],
         }
     }
