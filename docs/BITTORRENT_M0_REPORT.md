@@ -25,7 +25,7 @@ peer listener, or production torrent admission path has been added.
 
 | Gate | Result | Evidence and consequence |
 |---:|---|---|
-| 1. Rust 1.85 and platform packaging | **Partial** | A real Rust 1.85.1 macOS build passes after compatible transitive versions were pinned. The release harness links only macOS system libraries, not OpenSSL. Windows GNU and Linux musl dependency builds reach `ring`/`aws-lc-sys`, then stop because this Mac does not have `x86_64-w64-mingw32-gcc` or `x86_64-linux-musl-gcc`. Native CI still has to close this gate. |
+| 1. Rust 1.85 and platform packaging | **Partial** | A real Rust 1.85.1 macOS build passes after compatible transitive versions were pinned. The release harness links only macOS system libraries, not OpenSSL. The checked-in `BitTorrent M0` workflow now runs the isolated adapter suite on Linux glibc, macOS arm64, Windows MSVC, and x86-64/aarch64 musl under Rust 1.85, but this report will not call the gate passed until its first complete native run is linked here. |
 | 2. v1 `.torrent`, magnet, TCP/IPv4, then seed | **Pass** | Deterministic generated payloads download through both admission paths; a local seeder accounts for both uploads and exact bytes match. |
 | 3. Controls and live limits | **Pass** | Pause/resume is exercised before completion, the live download limit is removed during transfer, and idempotent keep-data delete, idempotent delete-data, and unrelated-sibling retention pass. |
 | 4. Kill/restart never trusts partial data | **Blocked** | The accepted fast-resume design cannot be constructed without failing gate 8. A persistence-disabled full hash recheck is a possible safe but slower product decision, not an equivalent test of the accepted design. |
@@ -113,6 +113,38 @@ The independent M1a groundwork adds a versioned queue envelope:
 
 This is useful even while the engine decision is blocked. No torrent enum
 variant or scheduler path was added.
+
+### 2.4 Executable platform and dependency gate
+
+`.github/workflows/bittorrent-m0.yml` turns gate 1 from a workstation claim
+into a repeatable native matrix. Under Rust 1.85 it runs the real isolated
+adapter suite — local seeder, tracker, authenticated SOCKS relay, persistence
+contract, provider check, and input validation — on:
+
+- Linux x86-64 glibc;
+- macOS arm64;
+- Windows x86-64 MSVC;
+- Linux x86-64 musl; and
+- Linux arm64 musl.
+
+The two musl jobs run on their native CPU architectures and link and execute
+the tests; they are not `cargo check` substitutes. The workflow is path-gated
+to the adapter, lockfile, workspace dependency declaration, daemon TLS
+provider initialization, its own workflow, and the policy script, so unrelated
+documentation changes do not burn five native builders.
+
+Before those builders run, `scripts/check-bittorrent-deps.sh` checks the normal
+and feature graphs under the MSRV toolchain. It requires exactly
+`librqbit 8.1.1`, requires `rust-tls`, rejects librqbit's default feature set,
+and rejects `openssl`, `openssl-sys`, or `native-tls` anywhere in the adapter's
+normal dependency closure. This guards the accepted dependency shape; it does
+not replace binary linkage inspection or the gate 9 license/vulnerability
+review.
+
+Adding the gate starts no session in the daemon and changes no config, API,
+listener, admission, or recovery behavior. Until the first complete GitHub run
+passes, gate 1 remains partial. Gates 4, 7, and 8 remain blocked regardless of
+the platform result.
 
 ---
 
@@ -236,6 +268,7 @@ half-wired feature flag, admission route, or peer listener.
 The key local gates are:
 
 ```sh
+scripts/check-bittorrent-deps.sh
 cargo test -p nzbd-torrent -- --nocapture
 cargo test -p nzbd-state snapshot
 cargo check -p nzbd-torrent
