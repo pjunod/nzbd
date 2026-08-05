@@ -1,27 +1,33 @@
 # Defect — "forget" doesn't forget, and the history cursor pays for it
 
-**Status:** open · confirmed by probe 2026-07-26 · **Found:** during the
-post-build review of integration phase 1 ([INTEGRATION_PLAN.md](INTEGRATION_PLAN.md))
-· **Present since:** `1fdad15` (2026-07-17), when delete and the JSONL
-rebuild first shipped together — though until `9f402d8` (same day, cluster
-C2) added the throttled `refresh()` on the read path, the entry only came
-back at the next daemon start, which is rare enough to look like something
-else · **Needs:** a decision before a fix (§5)
+**Status:** resolved with shared JSONL tombstones · **Resolved:** 2026-08-05 ·
+**Confirmed:** probe 2026-07-26 · **Found:** during the post-build review of
+integration phase 1 ([INTEGRATION_PLAN.md](INTEGRATION_PLAN.md)) ·
+**Present since:** `1fdad15` (2026-07-17), when delete and the JSONL rebuild
+first shipped together — though until `9f402d8` (same day, cluster C2) added
+the throttled `refresh()` on the read path, the entry only came back at the
+next daemon start, which is rare enough to look like something else
 
 Companion to [ARCHITECTURE.md](ARCHITECTURE.md) §8.6 (how history is
-stored) — this is *one specific thing that store gets wrong and what to do
-about it*.
+stored) — this is *one specific thing that store got wrong, the decision that
+fixed it, and the tests that keep it fixed*.
 
-`HistoryDb::delete` removes the SQLite index row and leaves the
-append-only JSONL line in place, so the next `refresh()` imports the entry
-straight back with a fresh, higher rowid. Two consequences, one for
+The fix chooses “forget it everywhere.” `HistoryDb::delete` now appends one
+portable tombstone for every matching `(job, completed_at)` key before it
+removes the derived SQLite row. Every node unions entry lines and tombstones;
+a tombstone wins regardless of file order, so a peer's old copy cannot
+resurrect the row. The cursor never publishes the forgotten completion again.
+
+Before the fix, `HistoryDb::delete` removed the SQLite index row and left the
+append-only JSONL line in place, so the next `refresh()` imported the entry
+straight back with a fresh, higher rowid. That had two consequences, one for
 operators and one for the integration surface:
 
-- **The UI's "forget" is undone within one history poll.** Clicking it
-  again just repeats the cycle. There is no way to remove a history entry.
-- **`GET /api/v1/history?since_seq=` delivers that entry twice**, under two
-  different cursor values, because the resurrected row is a new row as far
-  as the index is concerned.
+- **The UI's "forget" was undone within one history poll.** Clicking it again
+  repeated the cycle. There was no way to remove a history entry.
+- **`GET /api/v1/history?since_seq=` delivered that entry twice**, under two
+  different cursor values, because the resurrected row was new as far as the
+  index was concerned.
 
 The second is why this was found: phase 1 made the rowid a public cursor,
 which turned a latent storage bug into a wrong answer on a documented API.
@@ -29,25 +35,25 @@ The first is the one users actually hit, and it predates all of that.
 
 ---
 
-## 1. Root cause — delete is the only transition that isn't durable
+## 1. Root cause — delete was the only transition that was not durable
 
-The JSONL is the authoritative, mergeable log; the SQLite index is a
-derived read model rebuilt from it (ARCHITECTURE §8.6 / ADR-16). Every
-state change to a history entry is written back to the log so it survives a
-rebuild — except one:
+The JSONL is the authoritative, mergeable log; the SQLite index is a derived
+read model rebuilt from it (ARCHITECTURE §8.6 / ADR-16). Before this fix,
+every state change to a history entry was written back to the log so it
+survived a rebuild — except one:
 
-| Transition | Written to the JSONL? | Survives a rebuild? |
+| Transition | Written before the fix? | Survived a rebuild? |
 |---|---|---|
 | `record` (a job finished) | yes — the entry is appended | yes |
 | `hide` (a client imported it) | yes — `set_hidden` re-appends the updated entry | yes |
 | `restore` (un-hide) | yes — same path | yes |
 | `mark_seen` (a client's poll listed it) | no — index-local by design, and cheap to lose | n/a, advisory |
-| **`delete` (forget this entry)** | **no** | **no — it comes back** |
+| **`delete` (forget this entry)** | **no** | **no — it came back** |
 
-`hide` re-appends deliberately, with a comment saying why: *"so the hidden
-state survives an index rebuild (the upsert makes the last JSONL line
-win)"*. `delete` has no equivalent, so the rebuild's `INSERT … ON CONFLICT`
-puts the row back with nothing to say it shouldn't.
+`hide` already re-appended deliberately, with a comment saying why: *"so the
+hidden state survives an index rebuild (the upsert makes the last JSONL line
+win)"*. Before tombstones, `delete` had no equivalent, so the rebuild's
+`INSERT … ON CONFLICT` put the row back with nothing to say it should not.
 
 The rebuild is not a rare recovery path. `refresh()` runs on **every**
 `GET /api/v1/history`, on the compat `history` method, and in the
@@ -119,27 +125,26 @@ ordering is unaffected.
 
 ---
 
-## 3. What it breaks, concretely
+## 3. What it broke, concretely
 
 **Operators.** The UI's per-entry **forget** ("remove the history record,
 keep files") and **delete files** both call `HistoryDb::delete`. Neither
-sticks. The entry is back on the next render, and clicking again just
-repeats the cycle — with the spool already dropped, so the row that comes
-back has `can_requeue: false` and has lost its Undo. This is very likely
+stuck before tombstones. The entry returned on the next render, and clicking
+again repeated the cycle — with the spool already dropped, so the row that
+came back had `can_requeue: false` and had lost its Undo. This was very likely
 one of the two mechanisms behind the *"deleted items came back after
 refresh"* field report of 2026-07-26 (STATUS.md, round 5); that
 investigation found and fixed a queue-side cause, and this history-side
 cause was never in scope.
 
-**The undo-a-delete flow.** `history_requeue` re-adds the job and then
-deletes the parked `DELETED` record, on the reasoning that *"the job is
-queued again, so a `DELETED` record for it would be a lie"*. That delete
-does not stick either, so after an Undo the operator has both a live job
-and a `DELETED` history row claiming otherwise — exactly the lie the code
-set out to avoid.
+**The undo-a-delete flow.** `history_requeue` re-adds the job and then deletes
+the parked `DELETED` record, on the reasoning that *"the job is queued again,
+so a `DELETED` record for it would be a lie"*. That delete did not stick
+either, so after an Undo the operator had both a live job and a `DELETED`
+history row claiming otherwise — exactly the lie the code set out to avoid.
 
 **Compat clients.** `HistoryFinalDelete` (nzbget's permanent-delete verb)
-maps to the same call and is equally ineffective. Low blast radius: the
+mapped to the same call and was equally ineffective. Low blast radius: the
 *arrs use `HistoryDelete` (which hides, and which works), not this.
 
 **Native consumers on the cursor.** Duplicate delivery, as above. monarr's
@@ -148,72 +153,67 @@ a redundant scan notification rather than a double import — but "the
 duplicate happens to be harmless downstream" is not a property this
 repo gets to assume about every future consumer.
 
-**Disk.** The JSONL never shrinks for deletes. It already never shrinks
-(append-only), so this is not a new leak, but a fix that adds tombstones
-should say what it does about compaction rather than leaving it open.
+**Disk.** The JSONL still does not need a synchronous rewrite for a delete.
+Later retention compaction drops obsolete entry lines but keeps tombstones;
+the mutation is one small line per forgotten completion key.
 
 ---
 
-## 4. Workarounds, such as they are
+## 4. Retired workarounds
 
-- **Consumers:** dedupe on `(job, completed_at)` — the key the index is
-  already `UNIQUE` on, so a duplicate is guaranteed byte-identical to the
-  entry you already have. Documented in [USAGE.md](USAGE.md) and at
-  `HistoryDb::list_since`.
-- **Operators:** none. Deleting again does not help. Stopping the daemon
-  and hand-editing `history*.jsonl` does, and nothing in the product should
-  require that.
+- **Consumers previously had to dedupe on `(job, completed_at)`.** The key
+  remains useful for consumer idempotency, but nzbd no longer emits a second
+  cursor row because of its own delete/rebuild cycle.
+- **Operators previously had no workaround.** Deleting again did not help;
+  stopping the daemon and hand-editing `history*.jsonl` did. The tombstone is
+  now the supported durable form of that intent.
 
 ---
 
-## 5. The decision this needs before anyone writes code
+## 5. Decision — forget means everywhere
 
-The fix is small either way. What it isn't is obvious, because it turns on
-a semantic question nobody has answered yet:
+The design question was:
 
 > **When an operator forgets a history entry, do they mean "forget it
 > here" or "forget it everywhere"?**
 
-Today's code says "here" — `delete` is index-local, and the existing test
-`record_list_delete_and_jsonl_rebuild` asserts on purpose that a fresh
-index on another node still rebuilds the locally-deleted row. That is
-defensible for a derived read model. It is also almost certainly not what
-someone clicking "forget" expects, and it is unimplementable as stated,
-because *this* node's own index is rebuilt constantly from the same log.
+The answer is **everywhere**. History JSONL is the portable authority; an
+operator action that disappears when another node rebuilds from that authority
+is not a delete. The implementation combines the durable Option A record with
+an Option B-shaped *derived* SQLite table so concurrent refreshes cannot expose
+a deleted row between log replay steps.
 
-### Option A — durable tombstone in the JSONL
+### Accepted — durable tombstone in the JSONL
 
-Append a tombstone record for `(job, completed_at)`; `rebuild_from_jsonl`
-skips any key with a later tombstone than its entry.
+`delete` appends this backward-skippable record before changing SQLite:
+
+```json
+{"op":"tombstone","job":2,"completed_at_unix":1721952000}
+```
 
 - **Semantics:** forget means everywhere. Tombstones ride the shared
   volume like any other record and every node converges.
-- **Cost:** a JSONL record shape that isn't a `HistoryEntry`, so the
-  reader gains a variant (today it is "parse or skip the line"). The
-  existing test's asserted behavior changes and its comment needs
-  rewriting. Compaction needs a rule — a tombstone can be dropped only
-  once every entry it covers has been dropped, which realistically means
-  never, which is fine at this scale but should be a sentence in
-  ARCHITECTURE rather than an accident.
-- **Ordering:** the last line wins, as it already does for `hidden`, so a
-  delete followed by a re-record of the same `(job, completed_at)` behaves
-  the way the rest of the log does.
+- **Compatibility:** old binaries fail to parse the mutation as a
+  `HistoryEntry` and skip it, exactly as they skip an unknown or torn line.
+  A rolling cluster must therefore finish upgrading before it relies on a
+  forget issued by the new version; upgraded nodes converge immediately.
+- **Ordering:** file names and clocks are not a cross-node total order, so
+  tombstones are monotone for their immutable completion key. A new completion
+  has a different `completed_at`; rewriting the same key does not revive it.
+- **Compaction:** entry lines for a forgotten key may disappear, but the
+  tombstone remains. A peer can retain its old entry indefinitely, so no node
+  can prove the tombstone is globally safe to drop.
 
-### Option B — local tombstone table in SQLite
+### Declined as authority — local-only tombstones
 
-A `deleted (job_id, completed_at)` table; the rebuild's insert skips
-matching keys.
+A local-only `deleted (job_id, completed_at)` table would make refresh work on
+the serving node but leave another node free to show the entry. The new
+`history_tombstones` table is instead a read-optimized projection of the JSONL
+mutations. Wiping SQLite reconstructs the same tombstone set from authority.
 
-- **Semantics:** exactly today's stated design — index-local — but
-  actually implemented, so it survives the refresh that currently undoes
-  it. A wiped local index resurrects everything, which is correct: that
-  is a rebuild from authority, and the authority never heard about the
-  delete.
-- **Cost:** the smallest change here. One table, one `NOT EXISTS` in the
-  insert, no JSONL format change, no cross-node question opened.
-- **Consequence to accept:** in a cluster, forgetting an entry on node A
-  leaves it on node B. Whether that is a bug or the design is precisely
-  the question above.
+That alternative was smaller—one table and one `NOT EXISTS`—but its
+consequence was unacceptable: forgetting an entry on node A would leave it on
+node B, and wiping A's derived index would resurrect it there too.
 
 ### Rejected
 
@@ -230,35 +230,25 @@ matching keys.
   has already been handed. The cursor exists so that the server doesn't
   have to.
 
-**Recommendation:** Option B if the answer is "forget it here", Option A
-if it's "forget it everywhere". Option A is the better product behavior and
-the one worth the extra work, but it is a cross-node semantic change and
-therefore Paul's call, not an implementer's.
-
 ---
 
-## 6. Acceptance — what a fix has to demonstrate
+## 6. Acceptance — the defect stays fixed across every rebuild path
 
-Runnable checks, so "fixed" isn't a feeling:
+The implementation carries runnable evidence for every original requirement:
 
-1. `delete` then `refresh()` on the same `HistoryDb`: the entry is gone
-   and stays gone across three further refresh cycles.
-2. Same, for an entry that was `hide`-ed first — the tombstone must beat
-   the hidden re-append regardless of which line is last in the log.
-3. `list_since(0, …)` never returns two rows with the same
-   `(job, completed_at)`, across a delete/refresh cycle.
-4. A consumer holding cursor `N` from before the delete is never handed
-   the deleted entry at any cursor after it.
-5. `history_requeue` leaves no `DELETED` row behind for a job it put back
-   in the queue — the symptom in §3, asserted end to end.
-6. Option A only: a second `HistoryDb` opened on the same JSONL directory
-   with an empty index does not rebuild the deleted entry. Option B only:
-   it *does*, and the test says in its name that this is the chosen
-   semantics rather than an oversight.
-7. `crates/nzbd-compat/tests/golden.rs` passes unmodified.
-
-Update in the same commit: this file's status line,
-[ARCHITECTURE.md](ARCHITECTURE.md) §8.6 (the durability table in §1 above
-belongs there once it's true), the `HistoryDb::list_since` doc comment,
-[USAGE.md](USAGE.md)'s dedupe advice (it can go away under either option),
-and the "Flagged, not fixed" entry in [STATUS.md](../STATUS.md).
+1. `delete_survives_refresh_and_never_replays_on_the_cursor` runs three full
+   replay cycles and proves both the full view and a pre-delete cursor stay
+   clear.
+2. `tombstone_beats_hidden_and_peer_copies_regardless_of_file_order` puts the
+   original and hidden re-append in a peer file and rebuilds a fresh index.
+3. `durable_delete_converges_on_a_fresh_index` proves a second node reads the
+   shared decision, not the locally deleted row.
+4. `compaction_keeps_tombstones_that_guard_against_peer_resurrection` proves a
+   later retention rewrite cannot discard the only durable delete evidence.
+5. `failed_tombstone_append_does_not_delete_the_index_row` proves a failed
+   authority write leaves both the visible row and its Undo spool intact.
+6. `requeue_durably_removes_the_deleted_history_record` drives the native API
+   delete → Undo path and proves the obsolete `DELETED` row stays absent on a
+   fresh node.
+7. `crates/nzbd-compat/tests/golden.rs` remains byte-identical; the wire
+   surface did not change.

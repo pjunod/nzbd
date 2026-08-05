@@ -2872,6 +2872,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn requeue_durably_removes_the_deleted_history_record() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = test_engine(&tmp).await;
+        let shared = tmp.path().join("history-log");
+        let db =
+            Arc::new(HistoryDb::open(&tmp.path().join("history.sqlite"), Some(&shared)).unwrap());
+        let app = router_with(ApiState {
+            engine: engine.clone(),
+            history: Some(db.clone()),
+            log: None,
+            setup: None,
+            clients: None,
+            shutdown: None,
+            pp_stats: None,
+            pp_manager: None,
+            events: None,
+        });
+
+        let added = app
+            .clone()
+            .oneshot(
+                axum::http::Request::post("/api/v1/jobs?name=undo-me")
+                    .body(axum::body::Body::from(NZB))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let old_id = body_json(added).await["id"].as_u64().unwrap();
+        let deleted = app
+            .clone()
+            .oneshot(
+                axum::http::Request::post(format!("/api/v1/jobs/{old_id}/actions/delete"))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(deleted.status(), StatusCode::OK);
+        assert_eq!(body_json(deleted).await["parked"], true);
+        assert_eq!(db.list_filtered(10, true).unwrap()[0].status, "DELETED");
+
+        let requeued = app
+            .clone()
+            .oneshot(
+                axum::http::Request::post(format!("/api/v1/history/{old_id}/actions/requeue"))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(requeued.status(), StatusCode::OK);
+        let new_id = body_json(requeued).await["id"].as_u64().unwrap();
+        assert_ne!(new_id, old_id, "the transfer is a new live queue job");
+        assert!(db.list_filtered(10, true).unwrap().is_empty());
+        assert!(!db.has_spool(JobId(old_id as u32)));
+
+        db.refresh().unwrap();
+        assert!(db.list_since(0, 10).unwrap().is_empty());
+        let peer = HistoryDb::open(&tmp.path().join("peer.sqlite"), Some(&shared)).unwrap();
+        assert!(
+            peer.list_filtered(10, true).unwrap().is_empty(),
+            "a fresh node must not rebuild the obsolete DELETED record"
+        );
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn add_list_status_and_actions() {
         let tmp = tempfile::tempdir().unwrap();
         let engine = test_engine(&tmp).await;

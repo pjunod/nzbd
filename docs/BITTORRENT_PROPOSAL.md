@@ -1,6 +1,6 @@
 # BitTorrent support — one queue, two transfer protocols
 
-**Status:** review incorporated; M0 no-go; M1b implemented for review; M2 blocked ·
+**Status:** review incorporated; M0 no-go; M1b merged; M2 blocked ·
 **Decision:** ADR-19, production engine blocked; neutral queue seam authorized ·
 **Written:** 2026-08-05 · **Revised:** 2026-08-05 ·
 **Verified against:** `83efc9da7` ·
@@ -147,7 +147,7 @@ surface that must be extended:
 | Native REST, SSE, and replay (`nzbd-api`) | Routing/auth shell, event ring, `Last-Event-ID` recovery | Content-type admission, torrent detail/export, additive snapshot projection |
 | Basic/Bearer auth and TLS (`nzbd-api`, `nzbd/src/tls.rs`) | Credential comparison, existing token, rustls serving policy | qBittorrent `SID` sessions and per-IP failed-login throttling; no such limiter exists today |
 | Configured categories (`nzbd-config`, `nzbd-post`) | Existing labels and Usenet post-processing rules | Torrent paths/seed policy plus a restart-free runtime overlay for *arr-created categories |
-| History store (`nzbd-state/src/history.rs`) | Terminal record format and ordering seam | Torrent terminal records; the open durable-delete defect must land before M2 relies on it |
+| History store (`nzbd-state/src/history.rs`) | Terminal record format, cursor ordering, and cluster-wide durable tombstones | Torrent terminal records and payload-aware delete outcomes |
 | Client registry (`nzbd-api`) | Consumer attribution model | qBittorrent polling attribution |
 | UI and mobile shells (`nzbd-api/ui`, `mobile/`) | Existing navigation, controls, and additive JSON parsing | Protocol presentation and old-client tests for new values, not just new fields |
 | Enforcing disk guard (`nzbd-engine`) | ENOSPC latch and one-root `dest_dir` forecast | Multi-root enforcement and limiting-path publication after `REGRAB_LOOP_PLAN` F1–F3 |
@@ -1568,7 +1568,7 @@ be written as schema 1, and a production-sized current snapshot round-trips.
 **Result:** complete. Version 2 contains no torrent job representation and is
 useful hardening on its own.
 
-### 15.3 M1b — protocol-neutral backend seam (implemented; pending review)
+### 15.3 M1b — protocol-neutral backend seam (merged in PR #9)
 
 **Work:** atomically bump the queue writer to schema version 3 · add
 `JobKind::Torrent` and the defaulted `torrent` field · add `kind`/readiness to
@@ -1602,11 +1602,12 @@ metainfo/magnet/URL admission · durable descriptor before start · handle map �
 stats coalescing · readiness · pause/resume/delete · seed policy · download and
 upload limits · disk guard · watch directory · terminal history.
 
-**Prerequisites:** land [`REGRAB_LOOP_PLAN.md`](REGRAB_LOOP_PLAN.md) F1–F3 and
-the durable history-delete fix in
-[`DEFECT_HISTORY_DELETE.md`](DEFECT_HISTORY_DELETE.md). M2 adds a second write
-root and relies on terminal history; it must not inherit known failures in
-either subsystem.
+**Prerequisites already met:** [`REGRAB_LOOP_PLAN.md`](REGRAB_LOOP_PLAN.md)
+F1–F3 landed on 2026-07-31, and
+[`DEFECT_HISTORY_DELETE.md`](DEFECT_HISTORY_DELETE.md) is resolved with shared
+JSONL tombstones. M2 may rely on the enforcing disk guard and terminal-history
+delete semantics; neither is still a reason to start production networking.
+The engine/API gates in ADR-19 remain the blocking prerequisite.
 
 Keep native UI changes minimal in this milestone; the API and logs must make
 every state observable.
@@ -1852,9 +1853,10 @@ both review passes as follows:
 
 The review authorized groundwork and the M0 spike, not a production torrent
 listener. That spike has now failed gates 7 and 8. The engine-neutral M1b seam
-is implemented for review under §4.3.2; M2 remains blocked until ADR-19 records
-an engine/API resolution, disk-guard F1–F3 land, and the durable history-delete
-fix lands. M3 remains blocked on the named mobile P0 fixes.
+is implemented under §4.3.2. Disk-guard F1–F3 and durable history deletion are
+now complete; M2 remains blocked until ADR-19 records an engine/API resolution
+and the complete M0 matrix passes. M3 remains blocked on the named mobile P0
+fixes.
 
 ---
 

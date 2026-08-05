@@ -182,7 +182,11 @@ The **History** tab shows each stage of that pull:
 Manual controls per entry: **restore** re-exposes a hidden entry so a
 connected *arr re-imports it on its next poll (the fix for "imported
 but the files went missing"); **hide** does the reverse; **forget**
-drops the record and keeps files; **delete files** removes both.
+drops the record and keeps files; **delete files** removes both. Forget is
+durable cluster-wide: nzbd writes a shared history tombstone before the local
+row disappears, so a refresh, restart, or peer rebuild cannot bring it back.
+Finish a rolling upgrade before relying on that guarantee; older binaries skip
+the new mutation record and cannot enforce a forget they do not understand.
 
 ## Subscribing to the handoff
 
