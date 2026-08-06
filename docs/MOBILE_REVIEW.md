@@ -1,7 +1,8 @@
 # Mobile app review — code, architecture, UI, and the TV gap
 
-**Status:** findings for discussion · **Reviewed at:** `2ae83b0` (main) ·
-**Written:** 2026-08-02 · **Reviewer:** Claude (independent code review)
+**Status:** P0 findings reconciled; remaining punch list is open ·
+**Reviewed at:** `2ae83b0` (main) · **Written:** 2026-08-02 ·
+**P0 reconciled:** 2026-08-06 · **Reviewer:** Claude (independent code review)
 
 Companion to [MOBILE.md](MOBILE.md) (how to build and run the app) — this is
 an outside audit of the app in [`mobile/`](../mobile/): code quality,
@@ -15,7 +16,7 @@ client-side wire assumption was cross-checked against the server handlers in
 [`crates/nzbd-api/src/lib.rs`](../crates/nzbd-api/src/lib.rs) (SSE event
 names and heartbeat timing, query parameters, DTO field names, auth and
 role headers). Claims below that say "verified" mean checked against both
-sides, not assumed.
+sides, not assumed. At the P0 reconciliation point, all 48 Jest tests pass.
 
 **Scope note.** The repo contains one Expo SDK 57 / React Native 0.86 app
 targeting iOS, iPadOS, and Android phones/tablets. There is no tvOS target,
@@ -36,14 +37,16 @@ handled more correctly than most production dashboards manage, and the tests
 sit at exactly the fragile joints (chunk-split SSE parsing, URL
 normalization, discovery host selection). For a v1 remote, it is well built.
 
-The risks worth acting on are concentrated in four places:
+The original review's highest risks were concentrated in four places. The two
+P0 defects are now closed; their sections retain the original finding and add
+the implemented resolution:
 
-| # | Risk | Where | Severity |
-|---|---|---|---|
-| §4.1 | No list virtualization + whole-tree re-render on every SSE tick | all three tabs | High (perf/battery) |
-| §7.1 | Release builds signed with the committed debug keystore | `android/app/build.gradle` | High (release blocker) |
-| §3.1 | Basic-auth header crashes on non-Latin-1 passwords | `src/api/client.ts` | Medium (correctness) |
-| §8 | Stated platform ambition (TV) has no target in the repo | everywhere | Strategic |
+| # | Risk | Where | Severity | Status |
+|---|---|---|---|---|
+| §4.1 | No list virtualization + whole-tree re-render on every SSE tick | all three tabs | High (perf/battery) | Open |
+| §7.1 | Release builds used the committed debug keystore | `android/app/build.gradle` | High (release blocker) | Complete 2026-08-06 |
+| §3.1 | Basic-auth header crashed on non-Latin-1 passwords | `src/api/client.ts` | Medium (correctness) | Complete 2026-08-06 |
+| §8 | Stated platform ambition (TV) has no target in the repo | everywhere | Strategic | Open |
 
 Everything else is listed by area below, each with the failure it causes and
 a concrete fix. §11 is the prioritized punch list.
@@ -118,6 +121,11 @@ const b64 = btoa(String.fromCharCode(...bytes));
 
 (`TextEncoder` is already in scope via Expo's winter runtime — the SSE
 reader uses `TextDecoder`.) One test with a non-ASCII password pins it.
+
+**Resolved 2026-08-06:** the client now encodes the complete credential pair
+as UTF-8 before Base64 encoding. A wire-level unit test pins an exact header
+containing non-ASCII username and password characters, and a second test keeps
+Bearer-token precedence explicit.
 
 ### 3.2 History "load more" races the moving list
 
@@ -421,7 +429,7 @@ label tying dot color to meaning — add
 
 ## 7. Native config and release readiness
 
-### 7.1 Release builds are signed with the committed debug keystore
+### 7.1 Release builds used the committed debug keystore
 
 `android/app/build.gradle` wires `release { signingConfig
 signingConfigs.debug }`, and `debug.keystore` (password `android`, the
@@ -435,6 +443,14 @@ upload keystore, reference it via `gradle.properties`-outside-VCS or env,
 and keep the debug config for debug only. The gradle comment already
 warns about this; the review's job is to say it *now blocks* anything
 beyond sideloading to your own hardware.
+
+**Resolved 2026-08-06:** debug builds retain the development keystore, but a
+release artifact can only be assembled, bundled, installed, published, or
+signed when all four external upload-key settings are present. Partial
+configuration and missing release configuration both fail with named errors;
+the secrets and keystore remain outside version control. CI proves the
+secretless release path fails closed, and [MOBILE.md](MOBILE.md) documents the
+signed-release procedure.
 
 ### 7.2 ATS is fully disabled; cleartext is app-wide
 
@@ -474,6 +490,11 @@ and `npm test` for `mobile/` — both finish in seconds and would have
 caught any of §3's regressions the day they were introduced. Add them as
 a job (Node 22, `npm ci --prefix mobile`).
 
+**Partially resolved 2026-08-06:** CI now uses Node 22 and runs lockfile-clean
+installation, the strict typecheck, all Jest tests, and the Android
+release-signing refusal check. ESLint/Prettier and a single authoritative
+version-bump path remain open.
+
 ### 7.5 Doc drift: MOBILE.md contradicts the repo about native dirs
 
 MOBILE.md says the first build "creates ignored `ios/` or `android/`
@@ -488,6 +509,11 @@ State it in MOBILE.md: "config plugins and `app.json` are authoritative;
 after changing them run `npx expo prebuild --clean` and commit the
 regenerated native dirs" — and fix the "ignored" sentence. A doc that
 contradicts the tree it ships in costs trust beyond this one paragraph.
+
+**Resolved 2026-08-06:** MOBILE.md now states that the native projects are
+committed, defines `app.json` plus config plugins as the configuration source,
+and requires a clean prebuild plus a committed native-project diff after
+configuration changes.
 
 ---
 
@@ -606,24 +632,24 @@ since discovery is the one capability with no first-party fallback).
 
 ## 11. Priority punch list
 
-| P | Item | Effort | Section |
-|---|---|---|---|
-| P0 | Real release keystore (blocks any distribution) | S | §7.1 |
-| P0 | UTF-8 basic-auth encoding | S | §3.1 |
-| P1 | Virtualize lists + memoized rows | M | §4.1 |
-| P1 | `.nzb` open-in / share-sheet intake (+ `url=` add) | M | §5.1 |
-| P1 | 401 → stop retrying, offer Edit connection | S | §5.2 |
-| P1 | History pagination dedupe | S | §3.2 |
-| P1 | Mobile typecheck+jest in CI; eslint | S | §7.4, §9 |
-| P2 | Logs via SSE `log` events (or `after` cursor) | S–M | §4.2 |
-| P2 | Type ramp ≥10pt + Dynamic Type policy | M | §6.1 |
-| P2 | ENOSPC / health-abort / speed-limit in guard banner | S | §5.3 |
-| P2 | Refresh-vs-tick guard; scoped busy state | S | §3.3, §4.3 |
-| P2 | `https` port default fix; upload timeout | S | §3.4, §3.5 |
-| P2 | MOBILE.md native-dirs correction + prebuild rule | S | §7.5 |
-| P3 | noirr token adoption (shared with web UI) | M–L | §6.2 |
-| P3 | TV: tvos fork + config-tv + read-mostly TV mode | L | §8 |
-| P3 | Requeue/restore from mobile history | S | §5.4 |
+| P | Item | Status | Effort | Section |
+|---|---|---|---|---|
+| P0 | Real release keystore (blocks any distribution) | Complete 2026-08-06 | S | §7.1 |
+| P0 | UTF-8 basic-auth encoding | Complete 2026-08-06 | S | §3.1 |
+| P1 | Virtualize lists + memoized rows | Open | M | §4.1 |
+| P1 | `.nzb` open-in / share-sheet intake (+ `url=` add) | Open | M | §5.1 |
+| P1 | 401 → stop retrying, offer Edit connection | Open | S | §5.2 |
+| P1 | History pagination dedupe | Open | S | §3.2 |
+| P1 | Mobile typecheck+jest in CI; eslint | Partial: CI complete; lint open | S | §7.4, §9 |
+| P2 | Logs via SSE `log` events (or `after` cursor) | Open | S–M | §4.2 |
+| P2 | Type ramp ≥10pt + Dynamic Type policy | Open | M | §6.1 |
+| P2 | ENOSPC / health-abort / speed-limit in guard banner | Open | S | §5.3 |
+| P2 | Refresh-vs-tick guard; scoped busy state | Open | S | §3.3, §4.3 |
+| P2 | `https` port default fix; upload timeout | Open | S | §3.4, §3.5 |
+| P2 | MOBILE.md native-dirs correction + prebuild rule | Complete 2026-08-06 | S | §7.5 |
+| P3 | noirr token adoption (shared with web UI) | Open | M–L | §6.2 |
+| P3 | TV: tvos fork + config-tv + read-mostly TV mode | Open | L | §8 |
+| P3 | Requeue/restore from mobile history | Open | S | §5.4 |
 
 S ≈ under an hour · M ≈ an afternoon · L ≈ multi-day. P0 before anyone
 else installs a build; P1 before calling it 1.0; P2 opportunistic; P3

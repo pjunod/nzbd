@@ -590,7 +590,10 @@ pub fn require_auth(router: Router, auth: AuthConfig) -> Router {
                 } else {
                     (
                         StatusCode::UNAUTHORIZED,
-                        [(axum::http::header::WWW_AUTHENTICATE, "Basic realm=\"nzbd\"")],
+                        [(
+                            axum::http::header::WWW_AUTHENTICATE,
+                            "Basic realm=\"nzbd\", charset=\"UTF-8\"",
+                        )],
                         "unauthorized",
                     )
                         .into_response()
@@ -3138,6 +3141,16 @@ mod tests {
             &basic_only,
             Some(&format!("Basic {}", b64("paul:pw")))
         ));
+
+        let unicode = AuthConfig {
+            username: "møbiłe".into(),
+            password: Some("päss—🔒".into()),
+            token: None,
+        };
+        assert!(authorized(
+            &unicode,
+            Some(&format!("Basic {}", b64("møbiłe:päss—🔒")))
+        ));
     }
 
     #[tokio::test]
@@ -3173,7 +3186,12 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-        assert!(resp.headers().contains_key("www-authenticate"));
+        assert_eq!(
+            resp.headers()
+                .get(axum::http::header::WWW_AUTHENTICATE)
+                .unwrap(),
+            "Basic realm=\"nzbd\", charset=\"UTF-8\""
+        );
 
         let resp = app
             .clone()

@@ -1,5 +1,100 @@
 // Top-level build file where you can add configuration options common to all sub-projects/modules.
 
+def nzbdReleaseSigningNames = [
+  'NZBD_ANDROID_STORE_FILE',
+  'NZBD_ANDROID_STORE_PASSWORD',
+  'NZBD_ANDROID_KEY_ALIAS',
+  'NZBD_ANDROID_KEY_PASSWORD',
+]
+def nzbdReleaseSigningValues = nzbdReleaseSigningNames.collectEntries { name ->
+  def value = providers.gradleProperty(name)
+    .orElse(providers.environmentVariable(name))
+    .orNull
+  [(name): value]
+}
+def nzbdReleaseSigningCount = nzbdReleaseSigningValues.values().count { it }
+def nzbdReleaseSigningConfigured =
+  nzbdReleaseSigningCount == nzbdReleaseSigningNames.size()
+
+if (nzbdReleaseSigningCount > 0 && !nzbdReleaseSigningConfigured) {
+  throw new GradleException(
+    'Android release signing is partially configured. Set all of ' +
+    nzbdReleaseSigningNames.join(', ') + '.'
+  )
+}
+
+ext.nzbdReleaseSigningValues = nzbdReleaseSigningValues
+ext.nzbdReleaseSigningConfigured = nzbdReleaseSigningConfigured
+
+def nzbdReleaseArtifactTask = { taskName ->
+  def name = taskName.toLowerCase()
+  def artifactTask = ['assemble', 'bundle', 'package', 'install', 'publish', 'sign']
+    .any { name.startsWith(it) }
+  artifactTask && name.contains('release')
+}
+
+// Every Android application or dynamic-feature module gets its own validation
+// task. Release artifact tasks depend on it, so the check runs on configuration
+// cache hits as well as fresh configurations. A future module cannot bypass the
+// guard simply because its tasks belong to a project other than :app.
+def registerNzbdSigningGuard = { module ->
+  def existing = module.tasks.findByName('validateNzbdReleaseSigning')
+  if (existing != null) {
+    return module.tasks.named('validateNzbdReleaseSigning')
+  }
+
+  def validation = module.tasks.register('validateNzbdReleaseSigning') {
+    group = 'verification'
+    description = 'Refuse release artifacts without external signing credentials.'
+    inputs.property('releaseSigningConfigured', nzbdReleaseSigningConfigured)
+    doLast { task ->
+      if (!task.inputs.properties.releaseSigningConfigured) {
+        throw new GradleException(
+          'Android release signing is not configured. Set ' +
+          'NZBD_ANDROID_STORE_FILE, NZBD_ANDROID_STORE_PASSWORD, ' +
+          'NZBD_ANDROID_KEY_ALIAS, and NZBD_ANDROID_KEY_PASSWORD in ' +
+          '~/.gradle/gradle.properties or the build environment.'
+        )
+      }
+    }
+  }
+
+  module.tasks.configureEach { candidate ->
+    if (nzbdReleaseArtifactTask(candidate.name)) {
+      candidate.dependsOn(validation)
+    }
+  }
+  validation
+}
+
+subprojects { module ->
+  module.pluginManager.withPlugin('com.android.application') {
+    def validation = registerNzbdSigningGuard(module)
+    module.afterEvaluate {
+      def androidExtension = module.extensions.getByName('android')
+      def releaseSigningConfig = androidExtension.signingConfigs.findByName('release')
+      def releaseSigningAttached = nzbdReleaseSigningConfigured &&
+        releaseSigningConfig != null &&
+        androidExtension.buildTypes.release.signingConfig == releaseSigningConfig
+      validation.configure {
+        inputs.property('releaseSigningAttached', releaseSigningAttached)
+        doLast { task ->
+          if (!task.inputs.properties.releaseSigningAttached) {
+            throw new GradleException(
+              'Android release signing credentials are configured but ' +
+              'signingConfigs.release is not attached to buildTypes.release.'
+            )
+          }
+        }
+      }
+    }
+  }
+
+  module.pluginManager.withPlugin('com.android.dynamic-feature') {
+    registerNzbdSigningGuard(module)
+  }
+}
+
 buildscript {
   repositories {
     google()
