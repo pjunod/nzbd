@@ -178,8 +178,11 @@ pub(crate) enum QueueCommand {
     },
     /// Become the queue authority: load the shared snapshot (local jobs
     /// win on conflict — the executor copy is fresher), fold all journals,
-    /// enable persistence.
-    AdoptAuthority { reply: oneshot::Sender<()> },
+    /// enable persistence. Unsupported durable rows refuse the transition
+    /// without changing the local queue or shared snapshot.
+    AdoptAuthority {
+        reply: oneshot::Sender<Result<(), nzbd_state::StateError>>,
+    },
     /// Crash-only demotion: drop authority persistence and every job not
     /// in `keep` (the leases this node still executes).
     RetainJobs {
@@ -1201,8 +1204,8 @@ impl Owner {
                 let _ = reply.send(applied);
             }
             QueueCommand::AdoptAuthority { reply } => {
-                self.adopt_authority();
-                let _ = reply.send(());
+                let result = self.adopt_authority();
+                let _ = reply.send(result);
             }
             QueueCommand::SetJobStatus { job, status, reply } => {
                 let ok = match self.state.job_mut(job) {
@@ -1419,11 +1422,24 @@ impl Owner {
         }
     }
 
-    fn adopt_authority(&mut self) {
-        self.persist = true;
+    fn adopt_authority(&mut self) -> Result<(), nzbd_state::StateError> {
         match self.snap_store.load() {
             Ok(Some(doc)) => {
-                let snapshot_state = QueueState::from_doc(doc);
+                // Cluster takeover is a production recovery path just like
+                // daemon startup. Validate before flipping persistence or
+                // touching local state: an M1b node must not generically
+                // recover, publish, or rewrite a dormant torrent row.
+                let snapshot_state = match QueueState::from_runtime_doc(doc) {
+                    Ok(state) => state,
+                    Err(error) => {
+                        self.persist = false;
+                        tracing::error!(
+                            error = %error,
+                            "authority adoption refused; shared snapshot and local queue unchanged"
+                        );
+                        return Err(error);
+                    }
+                };
                 self.state.next_job_id = self.state.next_job_id.max(snapshot_state.next_job_id);
                 self.state.next_file_id = self.state.next_file_id.max(snapshot_state.next_file_id);
                 self.state.download_paused = snapshot_state.download_paused;
@@ -1445,6 +1461,8 @@ impl Owner {
             }
         }
 
+        self.persist = true;
+
         // Fold every job's journals (union across lease files).
         let ids: Vec<JobId> = self.state.jobs.iter().map(|j| j.id).collect();
         for id in &ids {
@@ -1458,6 +1476,7 @@ impl Owner {
         self.publish_now();
         self.bump_epoch();
         tracing::info!(jobs = self.state.jobs.len(), "adopted queue authority");
+        Ok(())
     }
 
     // -- scheduling ----------------------------------------------------------

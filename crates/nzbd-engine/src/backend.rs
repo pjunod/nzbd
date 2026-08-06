@@ -193,9 +193,11 @@ pub fn backend_channel(
 }
 
 /// Whether a torrent currently competes for one shared active-download slot.
-/// Seeding never consumes a download slot. A stalled live download yields
-/// without being stopped, so Usenet can progress and the torrent can later
-/// reacquire a slot when a useful-peer/progress fact updates its activity.
+/// Seeding never consumes a download slot. Active source/metadata/checking or
+/// payload work yields when stalled, so a dead magnet cannot monopolize the
+/// default single slot before it reaches `Downloading`. `Queued` stays
+/// eligible without a clock: yielding a job that has not started would deny
+/// it the only transition capable of producing new activity.
 pub fn torrent_wants_download_slot(
     torrent: &TorrentRecord,
     queued_at_unix: i64,
@@ -204,7 +206,7 @@ pub fn torrent_wants_download_slot(
     if !torrent.phase.wants_download_slot() {
         return false;
     }
-    if torrent.phase != TorrentPhase::Downloading {
+    if torrent.phase == TorrentPhase::Queued {
         return true;
     }
     let last_activity = torrent.last_activity_unix.unwrap_or(queued_at_unix);
@@ -297,12 +299,26 @@ mod tests {
     }
 
     #[test]
-    fn stalled_download_yields_and_new_activity_reacquires() {
+    fn stalled_active_phases_yield_and_new_activity_reacquires() {
+        for phase in [
+            TorrentPhase::FetchingSource,
+            TorrentPhase::FetchingMetadata,
+            TorrentPhase::Checking,
+            TorrentPhase::Downloading,
+        ] {
+            let record = torrent(phase, Some(100));
+            assert!(torrent_wants_download_slot(&record, 90, 159), "{phase:?}");
+            assert!(!torrent_wants_download_slot(&record, 90, 160), "{phase:?}");
+        }
+
         let mut record = torrent(TorrentPhase::Downloading, Some(100));
-        assert!(torrent_wants_download_slot(&record, 90, 159));
-        assert!(!torrent_wants_download_slot(&record, 90, 160));
         record.last_activity_unix = Some(161);
         assert!(torrent_wants_download_slot(&record, 90, 161));
+        record.phase = TorrentPhase::Queued;
+        assert!(
+            torrent_wants_download_slot(&record, 90, 10_000),
+            "a not-yet-started job must not permanently yield itself"
+        );
         record.phase = TorrentPhase::Seeding;
         assert!(!torrent_wants_download_slot(&record, 90, 161));
     }

@@ -439,6 +439,7 @@ pub fn spawn_leader_task(
 ) {
     tracker.spawn(async move {
         let mut was_leader = false;
+        let mut authority_ready = false;
         loop {
             if cancel.is_cancelled() {
                 break;
@@ -448,12 +449,26 @@ pub fn spawn_leader_task(
                 // Taking office: authority adoption; leases arrive via
                 // worker heartbeats (adoption) or fresh grants.
                 shared.leases.lock().unwrap().clear();
-                let _ = shared.engine.adopt_authority().await;
-                tracing::info!(epoch = shared.epoch(), "leader task active");
+                match shared.engine.adopt_authority().await {
+                    Ok(()) => {
+                        authority_ready = true;
+                        tracing::info!(epoch = shared.epoch(), "leader task active");
+                    }
+                    Err(error) => {
+                        authority_ready = false;
+                        tracing::error!(
+                            epoch = shared.epoch(),
+                            error = %error,
+                            "leader scheduling disabled because queue authority adoption failed"
+                        );
+                    }
+                }
+            } else if !is_leader {
+                authority_ready = false;
             }
             was_leader = is_leader;
 
-            if is_leader {
+            if is_leader && authority_ready {
                 sweep_expired(&shared).await;
                 schedule(&shared).await;
             }

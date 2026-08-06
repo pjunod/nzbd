@@ -720,8 +720,12 @@ impl EngineHandle {
 
     /// Become the queue authority (cluster leader took office).
     pub async fn adopt_authority(&self) -> Result<(), EngineError> {
-        self.roundtrip_unit(|reply| QueueCommand::AdoptAuthority { reply })
-            .await
+        let (tx, rx) = oneshot::channel();
+        self.send(QueueCommand::AdoptAuthority { reply: tx })
+            .await?;
+        rx.await
+            .map_err(|_| EngineError::Closed)?
+            .map_err(EngineError::State)
     }
 
     /// Crash-only demotion: keep only `keep` (leases still executing),

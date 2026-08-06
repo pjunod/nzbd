@@ -1781,6 +1781,9 @@ measurements on its own build.
   Silently forgetting seeds is not a safe default.
 - Downgrade from schema 3 to this schema-2 binary: it reports that version 3
   is newer than supported and aborts the entire queue load before serving.
+  Schema 3 is emitted for every queue snapshot, including a pure-Usenet queue,
+  so one save by the newer daemon is enough to make this rollback fail even if
+  BitTorrent was never enabled and no torrent row ever existed.
   Downgrade to a pre-envelope binary: its single typed `queue.json` decode
   sees unknown `JobKind::Torrent`, reports an unknown-variant error, and also
   aborts startup. Neither binary isolates or skips the torrent row; Usenet

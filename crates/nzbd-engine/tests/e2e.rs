@@ -9,6 +9,43 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::sync::broadcast;
 
+fn dormant_torrent_job() -> nzbd_types::Job {
+    nzbd_types::Job {
+        id: JobId(77),
+        kind: nzbd_types::JobKind::Torrent,
+        name: "foreign-torrent".into(),
+        dir_name: "foreign-torrent".into(),
+        name_provisional: false,
+        queued_at_unix: 1_800_000_000,
+        original_name: String::new(),
+        category: None,
+        priority: 0,
+        dupe: Default::default(),
+        params: Vec::new(),
+        files: Vec::new(),
+        totals: Default::default(),
+        status: JobStatus::Downloading,
+        torrent: Some(nzbd_types::TorrentRecord {
+            info_hash_v1: "0123456789abcdef0123456789abcdef01234567".into(),
+            source: nzbd_types::TorrentSource::Magnet,
+            metadata_file: "torrent/0123.torrent".into(),
+            phase: nzbd_types::TorrentPhase::Downloading,
+            files: Vec::new(),
+            total_bytes: 42,
+            selected_bytes: 42,
+            downloaded_bytes: 21,
+            uploaded_bytes: 0,
+            seeding_seconds: 0,
+            ready_at_unix: None,
+            content_path: None,
+            seed_policy: Default::default(),
+            last_activity_unix: Some(1_800_000_000),
+            last_error: None,
+        }),
+        stages: Vec::new(),
+    }
+}
+
 fn server_def(id: u32, port: u16, tier: u8, connections: u16, pipeline: u8) -> ServerDef {
     ServerDef {
         id: ServerId(id),
@@ -49,6 +86,50 @@ async fn spawn_engine(dir: &Path, servers: Vec<ServerDef>) -> EngineHandle {
     ))
     .await
     .expect("engine spawn")
+}
+
+#[tokio::test]
+async fn cluster_authority_adoption_refuses_dormant_torrent_rows_without_rewrite() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state_dir = tmp.path().join("state");
+    let store = nzbd_state::SnapshotStore::open(&state_dir).unwrap();
+    store
+        .save(&nzbd_state::QueueSnapshotDoc {
+            jobs: vec![dormant_torrent_job()],
+            next_job_id: 78,
+            max_active_downloads: 1,
+            ..Default::default()
+        })
+        .unwrap();
+    let snapshot_path = state_dir.join("queue.json");
+    let before = std::fs::read(&snapshot_path).unwrap();
+
+    // A cluster worker deliberately ignores the authority snapshot at boot;
+    // it must apply the same dormant-row guard when it later takes office.
+    let mut config = EngineConfig::single_node(
+        Vec::new(),
+        state_dir,
+        tmp.path().join("dest"),
+        test_tuning(),
+        None,
+    );
+    config.persist_queue = false;
+    config.journal_suffix = "worker".into();
+    let engine = Engine::spawn(config).await.unwrap();
+    assert!(engine.snapshot().jobs.is_empty());
+
+    let error = engine.adopt_authority().await.unwrap_err().to_string();
+    assert!(error.contains("this M1b build has no production torrent backend"));
+    assert!(
+        engine.snapshot().jobs.is_empty(),
+        "local worker queue changed"
+    );
+    assert_eq!(
+        std::fs::read(&snapshot_path).unwrap(),
+        before,
+        "unsupported authority snapshot was rewritten"
+    );
+    engine.shutdown().await;
 }
 
 async fn wait_finished(

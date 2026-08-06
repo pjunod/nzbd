@@ -39,7 +39,12 @@ The queue writer now emits schema 3. Reads retain the compatibility rules:
 
 This is intentionally a one-way downgrade boundary. A schema-2 binary sees
 `schema_version: 3` and refuses the whole queue rather than silently skipping a
-torrent job and serving a partial truth.
+torrent job and serving a partial truth. The writer emits schema 3 even when
+the queue contains only Usenet jobs, so merely running this build through one
+snapshot save makes an older schema-2 binary refuse rollback. That collateral
+cost is deliberate: conditional schema emission would make the downgrade
+boundary depend on queue history and crash timing rather than one durable
+format version.
 
 ### 1.2 Native read models gain additive neutral facts
 
@@ -159,3 +164,29 @@ Reviewers should concentrate on four questions:
 
 The engine choice, tracker API shape, and end-user torrent API remain M0/M2
 review questions; they are not smuggled into this seam.
+
+---
+
+## 6. Post-merge Fable review reconciliation
+
+Fable reviewed merged PR #9 at `f8ab647` and found one blocking recovery gap
+plus two non-blocking design risks. The follow-up disposition is:
+
+1. **Accepted and strengthened — cluster authority adoption.** Startup already
+   used `QueueState::from_runtime_doc`, but leader takeover used the generic
+   document converter. Takeover now validates through the same production
+   boundary before enabling persistence or touching local state. An
+   unsupported torrent row returns the named error, leaves `queue.json` and
+   the worker queue byte-for-byte unchanged, and keeps leader scheduling
+   disabled. The suggested journals-only fallback was not used because saving
+   that reconstructed state could erase a foreign torrent row. An end-to-end
+   engine test drives the worker-to-authority path and pins all three claims.
+2. **Accepted — pre-download starvation.** Fetching source, fetching magnet
+   metadata, checking, and downloading now share the 60-second no-activity
+   yield. `Queued` deliberately does not: a job that has not started cannot
+   generate the activity needed to reacquire a slot. M2 must stamp activity on
+   every transition into active backend work.
+3. **Adapted — schema-3 rollback warning.** The one-way boundary remains, but
+   §1.1 now states the easily missed consequence: a pure-Usenet queue is
+   rewritten as schema 3 on its first save, so rollback to a schema-2 binary
+   fails even when no torrent job has ever existed.
