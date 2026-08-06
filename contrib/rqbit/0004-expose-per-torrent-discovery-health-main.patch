@@ -1,21 +1,5 @@
-From 03a288536d9b8b9b23a2968346fcba0fbc197f93 Mon Sep 17 00:00:00 2001
-From: Paul Junod <donujp@gmail.com>
-Date: Thu, 6 Aug 2026 08:37:38 -0700
-Subject: [PATCH] feat: expose per-torrent discovery health
-
----
- crates/dht/src/dht.rs                     | 160 ++++++-
- crates/dht/src/lib.rs                     |   4 +-
- crates/librqbit/src/discovery_health.rs   | 162 +++++++
- crates/librqbit/src/lib.rs                |   5 +
- crates/librqbit/src/session.rs            | 111 ++++-
- crates/librqbit/src/torrent_state/mod.rs  |   7 +
- crates/tracker_comms/src/tracker_comms.rs | 491 ++++++++++++++++++++--
- 7 files changed, 878 insertions(+), 62 deletions(-)
- create mode 100644 crates/librqbit/src/discovery_health.rs
-
 diff --git a/crates/dht/src/dht.rs b/crates/dht/src/dht.rs
-index c2defd3..8adc9dc 100644
+index c2defd32cb7f66c90494da77f7624103973079f4..8adc9dc50494b0264eff277f370fccd4afc275a2 100644
 --- a/crates/dht/src/dht.rs
 +++ b/crates/dht/src/dht.rs
 @@ -4,7 +4,7 @@ use std::{
@@ -274,7 +258,7 @@ index c2defd3..8adc9dc 100644
 +    }
 +}
 diff --git a/crates/dht/src/lib.rs b/crates/dht/src/lib.rs
-index af4e29f..cbfa8c4 100644
+index af4e29f0824a03ab9cfd788870dca8ff9b1fafea..cbfa8c4f72c936d869db4ea6ec23f891bd63b35c 100644
 --- a/crates/dht/src/lib.rs
 +++ b/crates/dht/src/lib.rs
 @@ -12,7 +12,9 @@ use std::time::Duration;
@@ -290,7 +274,7 @@ index af4e29f..cbfa8c4 100644
  
 diff --git a/crates/librqbit/src/discovery_health.rs b/crates/librqbit/src/discovery_health.rs
 new file mode 100644
-index 0000000..be5e5ce
+index 0000000000000000000000000000000000000000..be5e5ce105fdc91573a332b0d5606707c1490e56
 --- /dev/null
 +++ b/crates/librqbit/src/discovery_health.rs
 @@ -0,0 +1,162 @@
@@ -457,7 +441,7 @@ index 0000000..be5e5ce
 +    }
 +}
 diff --git a/crates/librqbit/src/lib.rs b/crates/librqbit/src/lib.rs
-index 29843e0..4cd1daf 100644
+index 29843e008030f6809616a2c8ec431a10b13dd77a..4cd1daf5fdfc9be3a07bcdabdf8cd193c2dd9f86 100644
 --- a/crates/librqbit/src/lib.rs
 +++ b/crates/librqbit/src/lib.rs
 @@ -48,6 +48,7 @@ mod bitv_factory;
@@ -480,7 +464,7 @@ index 29843e0..4cd1daf 100644
  pub use listen::{ListenerMode, ListenerOptions};
  pub use peer_connection::PeerConnectionOptions;
 diff --git a/crates/librqbit/src/session.rs b/crates/librqbit/src/session.rs
-index 75071b9..2c4925e 100644
+index 75071b9c59f8e568b59401bf382a7121bc7c6097..2c4925e6438f68094bf622cbcef0b7afba99cd7a 100644
 --- a/crates/librqbit/src/session.rs
 +++ b/crates/librqbit/src/session.rs
 @@ -19,6 +19,7 @@ use crate::{
@@ -683,7 +667,7 @@ index 75071b9..2c4925e 100644
 +    }
  }
 diff --git a/crates/librqbit/src/torrent_state/mod.rs b/crates/librqbit/src/torrent_state/mod.rs
-index cfe483c..f7d5c71 100644
+index cfe483cdd836413d3a633c4ded93929764f1e124..f7d5c7167b0bae09bf0e7bc9235f252456c71563 100644
 --- a/crates/librqbit/src/torrent_state/mod.rs
 +++ b/crates/librqbit/src/torrent_state/mod.rs
 @@ -39,6 +39,7 @@ use tracing::warn;
@@ -715,7 +699,7 @@ index cfe483c..f7d5c71 100644
      pub fn stats(&self) -> TorrentStats {
          use stats::TorrentStatsState as S;
 diff --git a/crates/tracker_comms/src/tracker_comms.rs b/crates/tracker_comms/src/tracker_comms.rs
-index 7614b1d..e15fe9d 100644
+index 7614b1dd7d1d520f53eb380c91ef2a0a6d052f5b..3ab33d3fcceb2c0ef8ac2b948cc320fc40abef73 100644
 --- a/crates/tracker_comms/src/tracker_comms.rs
 +++ b/crates/tracker_comms/src/tracker_comms.rs
 @@ -1,9 +1,10 @@
@@ -740,7 +724,7 @@ index 7614b1d..e15fe9d 100644
  use tracing::Instrument;
  use tracing::debug;
  use tracing::debug_span;
-@@ -36,6 +39,204 @@ pub struct TrackerComms {
+@@ -36,6 +39,212 @@ pub struct TrackerComms {
      announce_port: u16,
      reqwest_client: reqwest::Client,
      key: u32,
@@ -824,11 +808,19 @@ index 7614b1d..e15fe9d 100644
 +}
 +
 +/// Shared tracker-monitor state for one torrent.
-+#[derive(Clone, Debug, Default)]
++#[derive(Clone, Default)]
 +pub struct TrackerHealth {
-+    // Keys are full URLs so distinct announce endpoints do not overwrite each
-+    // other. Keys never leave this private, non-serializable state.
++    // Full URLs remain private lookup keys. Debug is implemented below using
++    // only the credential-safe public snapshots.
 +    inner: Arc<RwLock<BTreeMap<String, TrackerHealthEntry>>>,
++}
++
++impl fmt::Debug for TrackerHealth {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        f.debug_struct("TrackerHealth")
++            .field("trackers", &self.snapshot())
++            .finish()
++    }
 +}
 +
 +impl TrackerHealth {
@@ -945,7 +937,7 @@ index 7614b1d..e15fe9d 100644
  }
  
  #[derive(Default)]
-@@ -90,8 +291,9 @@ enum SupportedTracker {
+@@ -90,8 +299,9 @@ enum SupportedTracker {
  impl std::fmt::Debug for SupportedTracker {
      fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
          match self {
@@ -957,7 +949,7 @@ index 7614b1d..e15fe9d 100644
          }
      }
  }
-@@ -150,13 +352,47 @@ impl TrackerComms {
+@@ -150,13 +360,47 @@ impl TrackerComms {
          reqwest_client: reqwest::Client,
          udp_client: UdpTrackerClient,
      ) -> Option<BoxStream<'static, SocketAddr>> {
@@ -1006,7 +998,7 @@ index 7614b1d..e15fe9d 100644
                      None
                  }
              })
-@@ -181,7 +417,9 @@ impl TrackerComms {
+@@ -181,7 +425,9 @@ impl TrackerComms {
                  announce_port,
                  reqwest_client,
                  key: rand::random(),
@@ -1016,7 +1008,7 @@ index 7614b1d..e15fe9d 100644
              let mut futures = FuturesUnordered::new();
              for tracker in trackers {
                  futures.push(comms.add_tracker(tracker, &udp_client))
-@@ -216,7 +454,7 @@ impl TrackerComms {
+@@ -216,7 +462,7 @@ impl TrackerComms {
          let info_hash = self.info_hash;
          match url {
              SupportedTracker::Udp(url) => {
@@ -1025,7 +1017,7 @@ index 7614b1d..e15fe9d 100644
                  self.task_single_tracker_monitor_udp(url, client.clone())
                      .instrument(span)
                      .right_future()
-@@ -225,7 +463,7 @@ impl TrackerComms {
+@@ -225,7 +471,7 @@ impl TrackerComms {
                  let span = debug_span!(
                      parent: None,
                      "http_tracker",
@@ -1034,7 +1026,7 @@ index 7614b1d..e15fe9d 100644
                      info_hash = ?info_hash
                  );
                  self.task_single_tracker_monitor_http(url)
-@@ -236,7 +474,7 @@ impl TrackerComms {
+@@ -236,7 +482,7 @@ impl TrackerComms {
      }
  
      async fn task_single_tracker_monitor_http(&self, tracker_url: Url) -> anyhow::Result<()> {
@@ -1043,7 +1035,7 @@ index 7614b1d..e15fe9d 100644
          let mut event = Some(tracker_comms_http::TrackerRequestEvent::Started);
  
          loop {
-@@ -249,12 +487,16 @@ impl TrackerComms {
+@@ -249,12 +495,16 @@ impl TrackerComms {
                          .with_min_delay(Duration::from_secs(10))
                          .with_max_delay(Duration::from_secs(600)),
                  )
@@ -1061,7 +1053,7 @@ index 7614b1d..e15fe9d 100644
              debug!("sleeping for {:?} after calling tracker", interval);
              tokio::time::sleep(interval).await;
          }
-@@ -264,7 +506,8 @@ impl TrackerComms {
+@@ -264,7 +514,8 @@ impl TrackerComms {
          &self,
          tracker_url: &Url,
          event: Option<tracker_comms_http::TrackerRequestEvent>,
@@ -1071,7 +1063,7 @@ index 7614b1d..e15fe9d 100644
          let stats = self.stats.get();
          let request = tracker_comms_http::TrackerRequest {
              info_hash: &self.info_hash,
-@@ -290,28 +533,47 @@ impl TrackerComms {
+@@ -290,28 +541,47 @@ impl TrackerComms {
          }
          url.set_query(Some(&queries));
  
@@ -1128,7 +1120,7 @@ index 7614b1d..e15fe9d 100644
          }
          Ok(Duration::from_secs(
              response.min_interval.unwrap_or(response.interval),
-@@ -324,7 +586,7 @@ impl TrackerComms {
+@@ -324,7 +594,7 @@ impl TrackerComms {
          client: UdpTrackerClient,
      ) -> anyhow::Result<()> {
          if url.scheme() != "udp" {
@@ -1137,7 +1129,7 @@ index 7614b1d..e15fe9d 100644
          }
          let (host, port) = (
              url.host().context("missing host")?,
-@@ -352,11 +614,22 @@ impl TrackerComms {
+@@ -352,11 +622,22 @@ impl TrackerComms {
                      .with_max_delay(Duration::from_secs(60))
                      .with_jitter(),
              )
@@ -1161,7 +1153,7 @@ index 7614b1d..e15fe9d 100644
  
              match addrs {
                  UdpTrackerResolveResult::One(addr) => {
-@@ -365,9 +638,14 @@ impl TrackerComms {
+@@ -365,9 +646,14 @@ impl TrackerComms {
                          .instrument(trace_span!("udp request", ?addr))
                          .await
                      {
@@ -1179,7 +1171,7 @@ index 7614b1d..e15fe9d 100644
                          }
                      }
                  }
-@@ -378,12 +656,17 @@ impl TrackerComms {
+@@ -378,12 +664,17 @@ impl TrackerComms {
                          self.tracker_one_request_udp(v6.into(), &client)
                              .instrument(trace_span!("udp request", addr=?v6))
                      );
@@ -1203,7 +1195,7 @@ index 7614b1d..e15fe9d 100644
                  }
              }
          }
-@@ -393,7 +676,7 @@ impl TrackerComms {
+@@ -393,7 +684,7 @@ impl TrackerComms {
          &self,
          addr: SocketAddr,
          client: &UdpTrackerClient,
@@ -1212,7 +1204,7 @@ index 7614b1d..e15fe9d 100644
          use tracker_comms_udp::*;
  
          let stats = self.stats.get();
-@@ -423,7 +706,12 @@ impl TrackerComms {
+@@ -423,7 +714,12 @@ impl TrackerComms {
              Ok(response) => {
                  trace!(len = response.addrs.len(), "received announce response");
                  for addr in response.addrs {
@@ -1226,7 +1218,7 @@ index 7614b1d..e15fe9d 100644
                  }
                  let sleep = response.interval.max(5);
                  let sleep = Duration::from_secs(sleep as u64);
-@@ -431,8 +719,145 @@ impl TrackerComms {
+@@ -431,8 +727,150 @@ impl TrackerComms {
              }
              Err(e) => {
                  debug!(?addr, "error reading announce response: {e:#}");
@@ -1251,6 +1243,11 @@ index 7614b1d..e15fe9d 100644
 +        )
 +        .unwrap();
 +        let health = TrackerHealth::new([&tracker]);
++        let debug = format!("{health:?}");
++        assert!(debug.contains("https://tracker.example:8443/<redacted>"));
++        for secret in ["user", "secret", "passkey", "token="] {
++            assert!(!debug.contains(secret), "{} leaked through Debug", secret);
++        }
 +
 +        let initial = health.snapshot();
 +        assert_eq!(initial.len(), 1);
@@ -1373,5 +1370,3 @@ index 7614b1d..e15fe9d 100644
 +        assert!(!failure.message.contains("passkey"));
 +    }
 +}
--- 
-2.50.1 (Apple Git-155)
