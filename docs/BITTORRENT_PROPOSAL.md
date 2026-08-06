@@ -371,6 +371,13 @@ The detailed commands, measurements, and evidence are in
   seeding, pause/resume/delete, live limits, authenticated SOCKS, path
   rejection, explicit rustls provider, v1-only format boundary, one-tracker
   private mode, and public progress/rate/peer facts work.
+- The private-mode evidence now includes a peer-wire positive control: a
+  public torrent contacts a canary learned only through PEX, while the same
+  message cannot make a private torrent contact it. A Linux packet-capture
+  harness also runs live DHT behind a local redirect, requires a public
+  info-hash control to appear, and rejects the private hash in DHT or
+  LSD-style UDP payloads. Gate 5 stays partial until the first Actions run of
+  that harness succeeds.
 - Rust 1.85 works after pinning compatible transitive versions. The first
   checked-in matrix caught an additional target-specific incompatibility:
   Tokio 1.53.0's Windows signal path uses an API stabilized after Rust 1.85.
@@ -1584,10 +1591,10 @@ config, API, or peer listener.
 
 **Work:** pin `librqbit` 8.1.1 with Rust TLS · compile every target · generate
 a local v1 torrent · run loopback seeder/downloader through `.torrent` and
-magnet paths over TCP/IPv4 · test private mode/first-tracker behavior ·
-kill/resume · live limits · path rejection · install/assert the process rustls
-provider · measure binary/memory/package/license deltas · record the public API
-needed by §5.2.
+magnet paths over TCP/IPv4 · test private mode/first-tracker behavior with PEX
+and DHT/LSD capture controls · kill/resume · live limits · path rejection ·
+install/assert the process rustls provider · measure
+binary/memory/package/license deltas · record the public API needed by §5.2.
 
 **Stop conditions:** any §4.3 gate fails without a small maintainable fix ·
 Rust 1.85 or musl cannot build · private mode leaks discovery · safe delete
