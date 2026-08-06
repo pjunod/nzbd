@@ -376,8 +376,10 @@ The detailed commands, measurements, and evidence are in
   Tokio 1.53.0's Windows signal path uses an API stabilized after Rust 1.85.
   The workspace now pins Tokio 1.52.4, and the `BitTorrent M0` workflow makes
   Linux glibc, macOS arm64, Windows MSVC, and x86-64/aarch64 musl execute the
-  isolated adapter suite under that toolchain. Gate 1 remains partial until a
-  complete corrected native run is recorded in the M0 report.
+  isolated adapter suite under that toolchain. The
+  [corrected native run](https://github.com/pjunod/nzbd/actions/runs/31060326800)
+  passed on all five platforms, along with the exact-engine/Rust-TLS dependency
+  policy, so gate 1 passes. Gates 4, 7, and 8 still block production wiring.
 - Gate 7 fails the full observability contract: public stats provide transfer
   and peer facts, but not a durable per-torrent tracker/DHT status or last
   tracker error.
