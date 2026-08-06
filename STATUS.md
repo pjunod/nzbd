@@ -27,7 +27,7 @@ actions
 | 3c — compat C2 + XML-RPC + golden tests | ✅ complete | `fe6d2be` |
 | 4 — Web UI + ecosystem | ✅ complete | `77b7660` |
 | 5 — Beyond parity (+ C3) | 🔶 adaptive pipelining done; rest scoped | this commit |
-| BT — BitTorrent backend | 🔶 proposal and Fable review reconciled; M0 data path passes, daemon wiring blocked on two engine API gaps | [proposal](docs/BITTORRENT_PROPOSAL.md), [M0 report](docs/BITTORRENT_M0_REPORT.md) |
+| BT — BitTorrent backend | 🔶 proposal and Fable review reconciled; M0 data path passes, upstream contribution kit prepared, daemon wiring blocked on two unreleased engine APIs | [proposal](docs/BITTORRENT_PROPOSAL.md), [M0 report](docs/BITTORRENT_M0_REPORT.md), [rqbit contribution kit](contrib/rqbit/README.md) |
 
 ---
 

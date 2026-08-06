@@ -360,6 +360,12 @@ Preferred path:
    the recorded resource, package, license, and advisory dispositions; and
 7. only then resume M2 daemon integration.
 
+The human-review checklist, submission order, issue draft, PR draft, exact
+patch mapping, and reproduction commands are collected in the
+[`contrib/rqbit` contribution kit](../contrib/rqbit/README.md). Nothing in that
+kit has been posted upstream, and rqbit's AI policy requires human review and
+editing before it is.
+
 The two upstream changes may be designed, reviewed, and released separately,
 but they are not separate production gates. Starting M2 with authoritative
 restore alone would leave gate 7 failed and make tracker or DHT failure
