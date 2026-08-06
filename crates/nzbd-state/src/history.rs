@@ -45,6 +45,15 @@ enum HistoryLogLine {
     Entry(Box<HistoryEntry>),
 }
 
+/// Cheap first-pass discriminator for portable mutations. Entry lines can
+/// contain a large embedded `JobRecord`; borrowing only the optional tag lets
+/// the tombstone pass skip that payload without allocating or materialising it.
+#[derive(Debug, serde::Deserialize)]
+struct HistoryMutationProbe<'a> {
+    #[serde(borrow)]
+    op: Option<&'a str>,
+}
+
 /// How much history to keep. `0` disables that bound; whichever bound
 /// bites first wins. See [`nzbd_config::HistorySection`] for why there are
 /// two of them.
@@ -282,33 +291,27 @@ impl HistoryDb {
         };
         files.sort();
         let floor = self.ingest_floor()?;
-        let mut entries = Vec::new();
         let mut tombstones = std::collections::HashSet::new();
-        let mut dropped = 0usize;
-        for path in files {
-            let Ok(file) = fsx::open(&path) else {
+        for path in &files {
+            let Ok(file) = fsx::open(path) else {
                 continue;
             };
             for line in BufReader::new(file).split(b'\n') {
-                let line = fsx::ctx(line, "read", &path)?;
+                let line = fsx::ctx(line, "read", path)?;
                 if line.is_empty() {
                     continue;
                 }
-                match serde_json::from_slice::<HistoryLogLine>(&line) {
-                    Ok(HistoryLogLine::Mutation(HistoryMutation::Tombstone {
+                let Ok(probe) = serde_json::from_slice::<HistoryMutationProbe<'_>>(&line) else {
+                    continue;
+                };
+                if probe.op == Some("tombstone") {
+                    if let Ok(HistoryMutation::Tombstone {
                         job,
                         completed_at_unix,
-                    })) => {
+                    }) = serde_json::from_slice::<HistoryMutation>(&line)
+                    {
                         tombstones.insert((job.0, completed_at_unix));
                     }
-                    Ok(HistoryLogLine::Entry(entry)) => {
-                        if entry.completed_at_unix < floor {
-                            dropped += 1;
-                        } else {
-                            entries.push(entry);
-                        }
-                    }
-                    Err(_) => continue, // torn tail / unknown old format
                 }
             }
         }
@@ -318,9 +321,24 @@ impl HistoryDb {
         // every copy of this immutable completion key on every node.
         let removed = self.apply_tombstones(&tombstones)?;
         let before = self.row_count()?;
-        for entry in entries {
-            if !tombstones.contains(&(entry.job.0, entry.completed_at_unix)) {
-                self.insert(&entry, false)?;
+        let mut dropped = 0usize;
+        for path in &files {
+            let Ok(file) = fsx::open(path) else {
+                continue;
+            };
+            for line in BufReader::new(file).split(b'\n') {
+                let line = fsx::ctx(line, "read", path)?;
+                if line.is_empty() {
+                    continue;
+                }
+                let Ok(entry) = serde_json::from_slice::<HistoryEntry>(&line) else {
+                    continue; // tombstone / torn tail / unknown old format
+                };
+                if entry.completed_at_unix < floor {
+                    dropped += 1;
+                } else if !tombstones.contains(&(entry.job.0, entry.completed_at_unix)) {
+                    self.insert(&entry, false)?;
+                }
             }
         }
         let imported = self.row_count()?.saturating_sub(before);
@@ -340,9 +358,10 @@ impl HistoryDb {
         Ok(())
     }
 
-    /// Merge portable tombstones into the derived index, then remove any
-    /// rows they cover in one transaction. Replaying the same set is
-    /// idempotent, which is required for every five-second refresh.
+    /// Merge previously unseen portable tombstones into the derived index,
+    /// then remove the rows they cover in one transaction. The portable set
+    /// is monotone, so diffing it against SQLite avoids two no-op writes per
+    /// historical tombstone on every five-second refresh.
     fn apply_tombstones(
         &self,
         tombstones: &std::collections::HashSet<HistoryKey>,
@@ -351,11 +370,28 @@ impl HistoryDb {
             return Ok(0);
         }
         let mut conn = self.conn.lock().unwrap();
+        let existing = {
+            let mut statement = conn
+                .prepare("SELECT job_id, completed_at FROM history_tombstones")
+                .map_err(|e| StateError::Corrupt(format!("sqlite tombstone select: {e}")))?;
+            let rows = statement
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .map_err(|e| StateError::Corrupt(format!("sqlite tombstone query: {e}")))?;
+            rows.collect::<Result<std::collections::HashSet<HistoryKey>, _>>()
+                .map_err(|e| StateError::Corrupt(format!("sqlite tombstone read: {e}")))?
+        };
+        let pending = tombstones
+            .difference(&existing)
+            .copied()
+            .collect::<Vec<_>>();
+        if pending.is_empty() {
+            return Ok(0);
+        }
         let tx = conn
             .transaction()
             .map_err(|e| StateError::Corrupt(format!("sqlite tombstone transaction: {e}")))?;
         let mut removed = 0usize;
-        for (job, completed_at) in tombstones {
+        for (job, completed_at) in pending {
             tx.execute(
                 "INSERT OR IGNORE INTO history_tombstones (job_id, completed_at)
                  VALUES (?1, ?2)",
@@ -600,7 +636,7 @@ impl HistoryDb {
                 // Tombstones are the only durable proof that a peer's old
                 // entry must stay forgotten. They are monotone and remain
                 // forever; dropping one would make compaction resurrect data.
-                Ok(HistoryLogLine::Mutation(_)) => {
+                Ok(HistoryLogLine::Mutation(HistoryMutation::Tombstone { .. })) => {
                     kept.extend_from_slice(&line);
                     kept.push(b'\n');
                 }
