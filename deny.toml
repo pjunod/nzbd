@@ -1,0 +1,69 @@
+# Repository-wide dependency policy. Keep this deliberately small: licenses
+# are allow-listed, unusual copyleft is scoped to exact reviewed crates, and
+# every non-crates.io source must be added here explicitly before it can land.
+
+[advisories]
+# A vulnerable or yanked locked crate is always an error. Treat a transitive
+# "unmaintained" notice as release-blocking only when nzbd depends on that
+# crate directly; transitive maintainership is still reported for review.
+unmaintained = "workspace"
+
+# librqbit 8.1.1 unconditionally compiles its UPnP helper against quick-xml
+# 0.37, even when port forwarding is disabled. Both advisories are reachable
+# only through that opt-in UPnP path, which remains disabled by M0. These exact
+# exceptions must be removed (or UPnP must remain unavailable) before the
+# production BitTorrent gate can allow port forwarding.
+ignore = [
+    "RUSTSEC-2026-0194",
+    "RUSTSEC-2026-0195",
+    # rcgen compiles time without its parsing feature. The vulnerable RFC 2822
+    # parser is therefore absent, while the fixed time 0.3.47 requires Rust
+    # 1.88 and nzbd's tested MSRV remains 1.85.
+    "RUSTSEC-2026-0009",
+]
+
+[licenses]
+include-dev = true
+confidence-threshold = 0.93
+unused-allowed-license = "allow"
+allow = [
+    "0BSD",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CC0-1.0",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "MIT",
+    "MIT-0",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+
+# MPL-2.0 is file-level copyleft. Keep the acceptance narrow instead of
+# allowing future MPL dependencies without a fresh review.
+[[licenses.exceptions]]
+name = "option-ext"
+version = "=0.2.0"
+allow = ["MPL-2.0"]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+highlight = "all"
+
+# nzbd's accepted TLS boundary is rustls. These stay forbidden across the
+# whole workspace in addition to the BitTorrent adapter's feature-graph gate.
+deny = [
+    { name = "native-tls", reason = "nzbd uses the explicit rustls boundary" },
+    { name = "openssl", reason = "nzbd must not acquire an OpenSSL runtime dependency" },
+    { name = "openssl-sys", reason = "nzbd must not acquire an OpenSSL runtime dependency" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

@@ -1,0 +1,42 @@
+name: Supply chain
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  schedule:
+    # Refresh the RustSec result even when the lockfile has not changed.
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  policy:
+    name: licenses, bans, and sources
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      # cargo-deny-action v2.1.1, cargo-deny 0.20.2. Pin the immutable
+      # revision so the supply-chain gate cannot change underneath a run.
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25
+        with:
+          rust-version: "1.85"
+          command: check bans licenses sources
+          arguments: --all-features --locked
+
+  advisories:
+    name: RustSec advisories
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25
+        with:
+          rust-version: "1.85"
+          command: check advisories
+          arguments: --all-features --locked
