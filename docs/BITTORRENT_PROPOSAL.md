@@ -377,8 +377,10 @@ The detailed commands, measurements, and evidence are in
   harness also runs live DHT behind a local redirect and requires separate
   public info-hash controls before and during a 15-second private canary
   window. It rejects the private hash across all captured UDP, including raw
-  DHT and LSD-style text payloads. Gate 5 stays partial until the first Actions
-  run of that harness succeeds.
+  DHT and LSD-style text payloads. The
+  [first successful capture run](https://github.com/pjunod/nzbd/actions/runs/31128106994)
+  observed both DHT controls and no private DHT/LSD hash on 2026-08-06 UTC, so
+  gate 5 passes.
 - Rust 1.85 works after pinning compatible transitive versions. The first
   checked-in matrix caught an additional target-specific incompatibility:
   Tokio 1.53.0's Windows signal path uses an API stabilized after Rust 1.85.
