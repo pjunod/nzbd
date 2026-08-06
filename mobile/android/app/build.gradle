@@ -4,30 +4,8 @@ apply plugin: "com.facebook.react"
 
 def projectRoot = rootDir.getAbsoluteFile().getParentFile().getAbsolutePath()
 
-def releaseSigningValue = { name ->
-    def value = findProperty(name) ?: System.getenv(name)
-    value?.toString()
-}
-def releaseStoreFile = releaseSigningValue('NZBD_ANDROID_STORE_FILE')
-def releaseStorePassword = releaseSigningValue('NZBD_ANDROID_STORE_PASSWORD')
-def releaseKeyAlias = releaseSigningValue('NZBD_ANDROID_KEY_ALIAS')
-def releaseKeyPassword = releaseSigningValue('NZBD_ANDROID_KEY_PASSWORD')
-def releaseSigningValues = [
-    releaseStoreFile,
-    releaseStorePassword,
-    releaseKeyAlias,
-    releaseKeyPassword,
-]
-def releaseSigningCount = releaseSigningValues.count { it }
-def releaseSigningConfigured = releaseSigningCount == releaseSigningValues.size()
-
-if (releaseSigningCount > 0 && !releaseSigningConfigured) {
-    throw new GradleException(
-        'Android release signing is partially configured. Set all of ' +
-        'NZBD_ANDROID_STORE_FILE, NZBD_ANDROID_STORE_PASSWORD, ' +
-        'NZBD_ANDROID_KEY_ALIAS, and NZBD_ANDROID_KEY_PASSWORD.'
-    )
-}
+def releaseSigningValues = rootProject.ext.nzbdReleaseSigningValues
+def releaseSigningConfigured = rootProject.ext.nzbdReleaseSigningConfigured
 
 /**
  * This is the configuration block to customize your React Native Android app.
@@ -131,10 +109,10 @@ android {
         }
         if (releaseSigningConfigured) {
             release {
-                storeFile rootProject.file(releaseStoreFile)
-                storePassword releaseStorePassword
-                keyAlias releaseKeyAlias
-                keyPassword releaseKeyPassword
+                storeFile rootProject.file(releaseSigningValues.NZBD_ANDROID_STORE_FILE)
+                storePassword releaseSigningValues.NZBD_ANDROID_STORE_PASSWORD
+                keyAlias releaseSigningValues.NZBD_ANDROID_KEY_ALIAS
+                keyPassword releaseSigningValues.NZBD_ANDROID_KEY_PASSWORD
             }
         }
     }
@@ -162,27 +140,6 @@ android {
     }
     androidResources {
         ignoreAssetsPattern '!.svn:!.git:!.ds_store:!*.scc:!CVS:!thumbs.db:!picasa.ini:!*~'
-    }
-}
-
-// Debug builds may use the committed development key. Any task graph that
-// produces or installs a release artifact fails closed unless a private upload
-// key is fully configured outside version control.
-gradle.taskGraph.whenReady { graph ->
-    def releaseArtifactRequested = graph.allTasks.any { task ->
-        if (task.project != project) return false
-        def name = task.name.toLowerCase()
-        def artifactTask = ['assemble', 'bundle', 'package', 'install', 'publish', 'sign']
-            .any { name.startsWith(it) }
-        artifactTask && name.contains('release')
-    }
-    if (releaseArtifactRequested && !releaseSigningConfigured) {
-        throw new GradleException(
-            'Android release signing is not configured. Set ' +
-            'NZBD_ANDROID_STORE_FILE, NZBD_ANDROID_STORE_PASSWORD, ' +
-            'NZBD_ANDROID_KEY_ALIAS, and NZBD_ANDROID_KEY_PASSWORD in ' +
-            '~/.gradle/gradle.properties or the build environment.'
-        )
     }
 }
 

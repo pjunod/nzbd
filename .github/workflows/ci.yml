@@ -31,12 +31,38 @@ jobs:
       - name: release signing fails closed without an upload key
         working-directory: mobile/android
         run: |
-          if ./gradlew :app:assembleRelease --dry-run > "$RUNNER_TEMP/release-signing.log" 2>&1; then
+          if ./gradlew :app:validateNzbdReleaseSigning \
+              --configuration-cache --configuration-cache-problems=warn \
+              > "$RUNNER_TEMP/release-signing.log" 2>&1; then
             cat "$RUNNER_TEMP/release-signing.log"
             echo "release build unexpectedly accepted missing signing credentials"
             exit 1
           fi
           grep -F "Android release signing is not configured" "$RUNNER_TEMP/release-signing.log"
+      - name: release signing accepts and attaches an external upload key
+        working-directory: mobile/android
+        env:
+          NZBD_ANDROID_STORE_FILE: ${{ runner.temp }}/nzbd-upload-key.p12
+          NZBD_ANDROID_STORE_PASSWORD: ci-test-password
+          NZBD_ANDROID_KEY_ALIAS: nzbd-upload
+          NZBD_ANDROID_KEY_PASSWORD: ci-test-password
+        run: |
+          keytool -genkeypair -storetype PKCS12 \
+            -noprompt \
+            -keystore "$NZBD_ANDROID_STORE_FILE" \
+            -storepass "$NZBD_ANDROID_STORE_PASSWORD" \
+            -keypass "$NZBD_ANDROID_KEY_PASSWORD" \
+            -alias "$NZBD_ANDROID_KEY_ALIAS" \
+            -keyalg RSA -keysize 2048 -validity 1 \
+            -dname "CN=nzbd CI, OU=CI, O=nzbd, L=Test, ST=Test, C=US"
+          ./gradlew :app:validateNzbdReleaseSigning \
+            --configuration-cache --configuration-cache-problems=warn
+          ./gradlew :app:validateNzbdReleaseSigning \
+            --configuration-cache --configuration-cache-problems=warn \
+            | tee "$RUNNER_TEMP/release-signing-cache.log"
+          grep -F "Reusing configuration cache." "$RUNNER_TEMP/release-signing-cache.log"
+          ./gradlew :app:validateSigningRelease
+          ./gradlew :app:assembleRelease --dry-run
 
   test:
     name: unit + e2e
