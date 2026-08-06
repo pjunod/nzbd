@@ -259,6 +259,64 @@ async fn three_nodes_elect_exactly_one_leader() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn leader_retries_authority_adoption_after_snapshot_repair() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state_dir = tmp.path().join(".nzbd-cluster");
+    std::fs::create_dir_all(&state_dir).unwrap();
+    let snapshot_path = state_dir.join("queue.json");
+    let unreadable = br#"{"schema_version":4,"jobs":[{"kind":"future_transfer"}]}"#;
+    std::fs::write(&snapshot_path, unreadable).unwrap();
+
+    let post = build_post("repaired", &[("payload.bin", prng_bytes(9, 16_000))], 4_000);
+    let ns = NservBuilder::new().with_post(&post).start().await.unwrap();
+    let node = start_node(
+        tmp.path(),
+        "a",
+        NodeOpts {
+            coordinator: true,
+            priority: 0,
+            download: true,
+            max_download_jobs: 1,
+            post_process: false,
+        },
+        ns.port(),
+        2,
+    )
+    .await;
+
+    wait_for("leader elected", 15, || {
+        get_json(&node.url, "/api/v1/cluster")["is_leader"].as_bool() == Some(true)
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        std::fs::read(&snapshot_path).unwrap(),
+        unreadable,
+        "failed adoption rewrote the future snapshot"
+    );
+
+    // Repair the snapshot while leadership remains stable. The leader task
+    // must re-attempt adoption on its next tick and resume scheduling.
+    nzbd_state::SnapshotStore::open(&state_dir)
+        .unwrap()
+        .save(&nzbd_state::QueueSnapshotDoc::default())
+        .unwrap();
+    let (code, body) = http(
+        &node.url,
+        "POST",
+        "/api/v1/jobs?name=repaired",
+        post.nzb.as_bytes(),
+    );
+    assert_eq!(code, 201, "add after snapshot repair failed: {body}");
+    wait_for("scheduling after snapshot repair", 20, || {
+        get_json(&node.url, "/api/v1/jobs")["jobs"][0]["status"] == "completed"
+    })
+    .await;
+
+    node.kill().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn distributed_download_via_any_node_with_budgets() {
     let tmp = tempfile::tempdir().unwrap();
     let files = [("one.bin".to_string(), prng_bytes(11, 120_000))];
