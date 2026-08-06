@@ -29,10 +29,10 @@ peer listener, or production torrent admission path has been added.
 | 2. v1 `.torrent`, magnet, TCP/IPv4, then seed | **Pass** | Deterministic generated payloads download through both admission paths; a local seeder accounts for both uploads and exact bytes match. |
 | 3. Controls and live limits | **Pass** | Pause/resume is exercised before completion, the live download limit is removed during transfer, and idempotent keep-data delete, idempotent delete-data, and unrelated-sibling retention pass. |
 | 4. Kill/restart never trusts partial data | **Blocked** | The accepted fast-resume design cannot be constructed without failing gate 8. A persistence-disabled full hash recheck is a possible safe but slower product decision, not an equivalent test of the accepted design. |
-| 5. Private-torrent discovery | **Partial** | A one-tracker private torrent downloads through a loopback HTTP tracker. Stable source disables DHT and ignores/suppresses PEX for private torrents. Because the downloader test disables DHT globally, it does not independently prove private-flag DHT suppression. Tracker order is also lost through a hash set before truncation, so the adapter rejects private metainfo unless it has exactly one unique tracker. A packet-capture leak test still belongs in the native platform matrix. |
+| 5. Private-torrent discovery | **Partial** | A one-tracker private torrent downloads through a loopback HTTP tracker, and a deterministic peer-wire control proves public torrents consume an injected PEX peer while private torrents ignore it. A new Linux capture harness starts live DHT, redirects both stable-8.1.1 bootstrap ports to a local KRPC probe, and observes separate public control hashes before and during a 15-second private canary window. It scans all captured UDP—not just redirected DHT—for the private hash in binary or LSD-style text form. The gate remains partial until that harness has a successful Actions run. Tracker order is also lost through a hash set before truncation, so the adapter rejects private metainfo unless it has exactly one unique tracker. |
 | 6. Path and delete safety | **Pass** | Traversal metainfo is rejected before an escape file exists. Delete-data removes only parsed torrent content; an unrelated sibling survives. Higher layers must still prove the persisted canonical root before requesting deletion. |
-| 7. Public observability | **Fail** | Public stats expose phase, total/progress/upload bytes, file progress, rates, ETA inputs, peer counts, completion, and error. They do not expose per-torrent tracker state, DHT state, or last tracker error. “No peers” cannot safely substitute for those facts. |
-| 8. nzbd-authoritative persistence | **Fail** | The contract test proves that `Session::new_with_opts` auto-restores the library record before returning. The persistence module and store injection point are private in 8.1.1, so nzbd cannot filter first. |
+| 7. Public observability | **Fail** | Public stats expose phase, total/progress/upload bytes, file progress, rates, ETA inputs, peer counts, completion, and error. Stable 8.1.1 does not expose per-torrent tracker state, DHT state, or last tracker error. A tested upstream patch now supplies that snapshot, but this gate remains failed until an accepted stable release contains it. “No peers” cannot safely substitute for those facts. |
+| 8. nzbd-authoritative persistence | **Fail** | The contract test proves that `Session::new_with_opts` auto-restores the library record before returning. The persistence module and store injection point are private in 8.1.1, so nzbd cannot filter first. A tested upstream patch now supplies the missing opt-out, but this gate remains failed until an accepted stable release contains it. |
 | 9. Resource, package, and license delta | **Partial** | Measurements are recorded in §4. A blocking cargo-deny 0.20.2 policy passes locally across all features and the locked graph, and its [first Actions run passed](https://github.com/pjunod/nzbd/actions/runs/31064446916) on 2026-08-06 UTC. It runs on every PR, main/tag push, and a daily schedule. Gate 9 still needs reviewer acceptance of the measurements and three exact, unreachable-path advisory exceptions. |
 | 10. One explicit rustls provider | **Pass** | The process starts without a provider, explicitly installs aws-lc, and constructs librqbit’s rustls client without the mixed-provider panic. |
 | 11. v1-only boundary | **Pass** | Stable input uses v1 pieces/`btih`; v2-only and hybrid `.torrent` files and magnets return separate named errors before librqbit admission. |
@@ -77,7 +77,7 @@ daemon behavior changed by the spike.
 
 ### 2.2 Deterministic tests
 
-The ten isolated tests cover:
+The isolated suite covers:
 
 - `.torrent` and magnet download from one local TCP seeder;
 - exact-byte verification and upload accounting;
@@ -89,14 +89,22 @@ The ten isolated tests cover:
 - named rejection of proxy+DHT and proxy+UDP-tracker leak paths;
 - password redaction and invalid proxy combinations;
 - one-tracker private-torrent discovery and multi-tracker rejection;
+- a positive-control PEX peer that public torrents contact and private torrents
+  ignore; the canary address is available only through the peer-wire message;
 - traversal rejection before filesystem escape;
 - the explicit aws-lc provider invariant;
 - v2-only and hybrid named rejection for metainfo and magnets; and
 - the persistence auto-restore behavior that fails gate 8.
 
-All peers, trackers, and proxies in the suite are local and generated by the
-test. The tests require permission to bind loopback ports but do not need the
-internet.
+All peers, trackers, proxies, and DHT responders in the suite are local and
+generated by the tests. The ordinary suite requires permission to bind
+loopback ports but does not need the internet. The Linux-only capture harness
+resolves rqbit's two bootstrap names, redirects their IPv4 UDP traffic to its
+local DHT probe, and blocks matching IPv6 bootstrap traffic before the capture
+point. Separate public lookups prove the probe is live before and throughout a
+15-second private canary window. The harness scans every captured UDP packet,
+not only redirected DHT traffic, for the private binary hash and the ASCII hash
+used by LSD.
 
 ### 2.3 Queue schema version fallback
 
@@ -213,6 +221,65 @@ tracker can return no peers, and a failed tracker can coexist with live peers.
 The accepted observability contract therefore needs a public discovery-health
 snapshot or events with stable meanings.
 
+### 3.3 The authoritative-restore patch is ready, not released
+
+[`contrib/rqbit/0001-allow-persistence-without-auto-restore.patch`](../contrib/rqbit/0001-allow-persistence-without-auto-restore.patch)
+targets rqbit v8.1.1 commit `00b97485160ff5b5aa2b379ea0815d568ec665f0`.
+It adds one backwards-compatible `SessionOptions::disable_auto_restore` flag.
+The default remains false, so existing rqbit callers still restore every
+record. Setting it true keeps JSON persistence and fast resume active while
+skipping only the constructor's implicit admission loop.
+
+Both the exact v8.1.1 backport and the contribution patch for rqbit main at
+`4e5f94cbcf1d57ec500885c77cf1e24d70232d89` carry the same contract. The test
+persists two paused torrents, constructs a session that
+starts empty, explicitly restores only the authoritative torrent with its
+persisted `preferred_id`, and finally proves that a legacy session still
+restores both records. That verifies the ownership seam without exposing the
+private persistence schema or deleting library state before startup.
+It does not independently prove restoration of non-empty piece progress, so
+the patch comment is deliberately limited to the persistence identity the
+test demonstrates.
+
+[`scripts/check-rqbit-authoritative-restore-patch.sh`](../scripts/check-rqbit-authoritative-restore-patch.sh)
+clones a supplied clean v8.1.1 or rqbit-main tree locally, requires the exact
+stable tag or a descendant of the documented main base, reports the verified
+SHA, applies the matching patch directly or by three-way fallback on main,
+verifies formatting, and runs the isolated Rust-TLS test. The dedicated
+`rqbit contribution patches` workflow checks both variants on relevant changes
+and weekly for upstream-main drift. Both variants passed locally on 2026-08-06. This is
+contribution evidence, not a production dependency: nzbd still pins
+unmodified stable 8.1.1, gate 8 remains failed, and no daemon session consumes
+the new option.
+
+### 3.4 The discovery-health patch is ready, not released
+
+[`contrib/rqbit/0003-expose-per-torrent-discovery-health.patch`](../contrib/rqbit/0003-expose-per-torrent-discovery-health.patch)
+targets the exact v8.1.1 commit. Its public `ManagedTorrent::discovery_health`
+snapshot distinguishes disabled, private-suppressed, inactive, searching,
+working, and degraded DHT states, with current-run request and peer counters.
+Each tracker reports a stable state, next-announcement delay, and bounded last
+failure category. Public endpoints retain only scheme, host, and port; path,
+query, user information, response body, and credentials never enter the
+snapshot.
+
+The corresponding rqbit-main patch starts at the same documented main base as
+the authoritative-restore contribution. Tests prove endpoint and serialized
+snapshot redaction, private-torrent DHT suppression, DHT success/failure
+transitions, HTTP failure classification, tracker backoff, and rejected
+tracker retention. The focused stable suites pass 37 tests with three
+pre-existing network tests ignored; the focused main suites pass 69 tests
+with six upstream integration tests ignored.
+
+[`scripts/check-rqbit-discovery-health-patch.sh`](../scripts/check-rqbit-discovery-health-patch.sh)
+uses the same exact-stable and descendant-of-main rules as the restore
+verifier, reports the tested SHA, allows a three-way fallback only for main,
+checks formatting, and runs all three affected crate suites. The dedicated
+workflow tests both contributions against stable and main on relevant changes
+and weekly for upstream drift. This is contribution evidence only: nzbd still
+pins unmodified stable 8.1.1, gate 7 remains failed, and production wiring
+remains prohibited.
+
 ---
 
 ## 4. Measurements and dependency review
@@ -280,13 +347,24 @@ exception is not evidence that the underlying code became safe to enable.
 
 Preferred path:
 
-1. propose a small upstream 8.x librqbit API for authoritative restore and a
-   public discovery-health snapshot;
-2. pin the first stable release containing those APIs;
-3. rerun all eleven M0 gates on native macOS, Linux glibc/musl, and Windows;
-4. run the packet-capture private-mode test and obtain reviewer acceptance of
+1. open an upstream design issue for the discovery-health contract before
+   submitting its multi-crate implementation, so rqbit maintainers can shape
+   the public surface before nzbd treats the patch as an integration plan;
+2. review and submit the prepared authoritative-restore patch and the agreed
+   discovery-health implementation upstream;
+3. reconcile both changes with upstream feedback without weakening nzbd's
+   ownership, privacy, or observability contracts;
+4. pin the first stable release containing both accepted APIs;
+5. rerun all eleven M0 gates on native macOS, Linux glibc/musl, and Windows;
+6. run the packet-capture private-mode test and obtain reviewer acceptance of
    the recorded resource, package, license, and advisory dispositions; and
-5. only then resume M2 daemon integration.
+7. only then resume M2 daemon integration.
+
+The two upstream changes may be designed, reviewed, and released separately,
+but they are not separate production gates. Starting M2 with authoritative
+restore alone would leave gate 7 failed and make tracker or DHT failure
+indistinguishable from an ordinary lack of peers. That degraded view is not an
+accepted shortcut around the observability contract.
 
 Two alternatives require an explicit ADR-19 amendment:
 
@@ -315,6 +393,13 @@ cargo deny --all-features --locked check advisories
 cargo test -p nzbd-torrent -- --nocapture
 cargo test -p nzbd-state snapshot
 cargo check -p nzbd-torrent
+
+# Linux only; requires passwordless sudo, iptables/ip6tables, and tcpdump.
+scripts/check-private-discovery-leaks.sh
+
+# Against a clean local checkout of rqbit v8.1.1 or main at the documented SHA.
+scripts/check-rqbit-authoritative-restore-patch.sh /path/to/rqbit
+scripts/check-rqbit-discovery-health-patch.sh /path/to/rqbit
 ```
 
 The Rust 1.85 check must select both the 1.85 Cargo and `rustc`; this host also

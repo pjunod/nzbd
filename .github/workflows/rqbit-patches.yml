@@ -1,0 +1,86 @@
+name: rqbit contribution patches
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - contrib/rqbit/*.patch
+      - scripts/check-rqbit-authoritative-restore-patch.sh
+      - scripts/check-rqbit-discovery-health-patch.sh
+      - .github/workflows/rqbit-patches.yml
+  pull_request:
+    paths:
+      - contrib/rqbit/*.patch
+      - scripts/check-rqbit-authoritative-restore-patch.sh
+      - scripts/check-rqbit-discovery-health-patch.sh
+      - .github/workflows/rqbit-patches.yml
+  schedule:
+    # Surface upstream-main drift even when nzbd has not changed.
+    - cron: "29 7 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  authoritative-restore:
+    name: authoritative restore / ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: rqbit v8.1.1 patch
+            ref: v8.1.1
+            pr: true
+          - name: rqbit main patch
+            ref: main
+            pr: false
+    steps:
+      - uses: actions/checkout@v5
+        if: github.event_name != 'pull_request' || matrix.pr
+      - uses: dtolnay/rust-toolchain@stable
+        if: github.event_name != 'pull_request' || matrix.pr
+      - name: Clone rqbit ${{ matrix.ref }}
+        if: github.event_name != 'pull_request' || matrix.pr
+        run: git clone --branch "${{ matrix.ref }}" https://github.com/ikatson/rqbit.git "$RUNNER_TEMP/rqbit"
+      - uses: Swatinem/rust-cache@v2
+        if: github.event_name != 'pull_request' || matrix.pr
+        with:
+          shared-key: rqbit-${{ matrix.ref }}
+          workspaces: ${{ runner.temp }}/rqbit -> target
+      - name: Apply and test the contribution patch
+        if: github.event_name != 'pull_request' || matrix.pr
+        run: scripts/check-rqbit-authoritative-restore-patch.sh "$RUNNER_TEMP/rqbit"
+
+  discovery-health:
+    name: discovery health / ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: rqbit v8.1.1 patch
+            ref: v8.1.1
+            pr: true
+          - name: rqbit main patch
+            ref: main
+            pr: false
+    steps:
+      - uses: actions/checkout@v5
+        if: github.event_name != 'pull_request' || matrix.pr
+      - uses: dtolnay/rust-toolchain@stable
+        if: github.event_name != 'pull_request' || matrix.pr
+      - name: Clone rqbit ${{ matrix.ref }}
+        if: github.event_name != 'pull_request' || matrix.pr
+        run: git clone --branch "${{ matrix.ref }}" https://github.com/ikatson/rqbit.git "$RUNNER_TEMP/rqbit"
+      - uses: Swatinem/rust-cache@v2
+        if: github.event_name != 'pull_request' || matrix.pr
+        with:
+          shared-key: rqbit-${{ matrix.ref }}
+          workspaces: ${{ runner.temp }}/rqbit -> target
+      - name: Apply and test the contribution patch
+        if: github.event_name != 'pull_request' || matrix.pr
+        run: scripts/check-rqbit-discovery-health-patch.sh "$RUNNER_TEMP/rqbit"

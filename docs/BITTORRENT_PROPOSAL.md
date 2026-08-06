@@ -2,8 +2,8 @@
 
 **Status:** review incorporated; M0 no-go; M1b merged; M2 blocked ·
 **Decision:** ADR-19, production engine blocked; neutral queue seam authorized ·
-**Written:** 2026-08-05 · **Revised:** 2026-08-05 ·
-**Verified against:** `83efc9da7` ·
+**Written:** 2026-08-05 · **Revised:** 2026-08-06 ·
+**Verified against:** `5dfebb9` ·
 **Scope:** architecture, contracts, milestones, and review questions; no
 production BitTorrent path is authorized before the gates below pass
 
@@ -371,6 +371,14 @@ The detailed commands, measurements, and evidence are in
   seeding, pause/resume/delete, live limits, authenticated SOCKS, path
   rejection, explicit rustls provider, v1-only format boundary, one-tracker
   private mode, and public progress/rate/peer facts work.
+- The private-mode evidence now includes a peer-wire positive control: a
+  public torrent contacts a canary learned only through PEX, while the same
+  message cannot make a private torrent contact it. A Linux packet-capture
+  harness also runs live DHT behind a local redirect and requires separate
+  public info-hash controls before and during a 15-second private canary
+  window. It rejects the private hash across all captured UDP, including raw
+  DHT and LSD-style text payloads. Gate 5 stays partial until the first Actions
+  run of that harness succeeds.
 - Rust 1.85 works after pinning compatible transitive versions. The first
   checked-in matrix caught an additional target-specific incompatibility:
   Tokio 1.53.0's Windows signal path uses an API stabilized after Rust 1.85.
@@ -415,6 +423,37 @@ tracker counter as health. The preferred route remains two small upstream
 APIs followed by a stable release and a complete M0 rerun; the existing
 libtorrent fallback remains the next engine evaluation if those APIs cannot
 be made stable.
+
+The first of those changes is now concrete. The tested
+[`disable_auto_restore` patch](../contrib/rqbit/0001-allow-persistence-without-auto-restore.patch)
+targets the exact v8.1.1 tag and preserves rqbit's default behavior. Its
+contract proves that persistence can retain two records while the constructor
+admits none, after which nzbd can explicitly restore only its authoritative ID
+and select the matching persistence identity. The focused test does not yet
+assert restoration of non-empty piece progress. The reproducible verifier,
+scheduled drift check, and full result are recorded in
+[BITTORRENT_M0_REPORT.md](BITTORRENT_M0_REPORT.md#33-the-authoritative-restore-patch-is-ready-not-released).
+This preparation does not make gate 8 pass: the API must survive upstream
+review and ship in a stable release before nzbd can consume it.
+
+The second API is now concrete as well. The tested
+[`discovery_health` patch](../contrib/rqbit/0003-expose-per-torrent-discovery-health.patch)
+adds a public, per-torrent snapshot with explicit DHT states, current-run DHT
+counters, tracker states, next-announcement delays, and bounded last-failure
+categories. Tracker paths, queries, user information, response bodies, and
+credentials are excluded; only scheme, host, and port reach the public
+endpoint label. Exact-stable and rqbit-main variants, focused tests, and the
+scheduled drift verifier are recorded in
+[BITTORRENT_M0_REPORT.md](BITTORRENT_M0_REPORT.md#34-the-discovery-health-patch-is-ready-not-released).
+This preparation does not make gate 7 pass: the API must survive upstream
+review and ship in a stable release before nzbd can consume it.
+
+Because this contribution spans `librqbit`, `librqbit-dht`, and
+`librqbit-tracker-comms`, submit its public contract as an upstream design
+issue before asking maintainers to review the full patch. The two rqbit APIs
+may move through upstream independently, but M2 does not ship on the restore
+API alone: a degraded discovery view still fails gate 7 and cannot distinguish
+an idle swarm from a tracker or DHT failure.
 
 It does not follow that M1b must wait. A serializable transfer record, one
 owner-controlled active set, reliable structural facts, and coalesced progress
@@ -1553,10 +1592,10 @@ config, API, or peer listener.
 
 **Work:** pin `librqbit` 8.1.1 with Rust TLS · compile every target · generate
 a local v1 torrent · run loopback seeder/downloader through `.torrent` and
-magnet paths over TCP/IPv4 · test private mode/first-tracker behavior ·
-kill/resume · live limits · path rejection · install/assert the process rustls
-provider · measure binary/memory/package/license deltas · record the public API
-needed by §5.2.
+magnet paths over TCP/IPv4 · test private mode/first-tracker behavior with PEX
+and DHT/LSD capture controls · kill/resume · live limits · path rejection ·
+install/assert the process rustls provider · measure
+binary/memory/package/license deltas · record the public API needed by §5.2.
 
 **Stop conditions:** any §4.3 gate fails without a small maintainable fix ·
 Rust 1.85 or musl cannot build · private mode leaks discovery · safe delete

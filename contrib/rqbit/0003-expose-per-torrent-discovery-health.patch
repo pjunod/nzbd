@@ -1,0 +1,1310 @@
+From c501d6d8a0c5df605d70ef896b66dc5672ca721d Mon Sep 17 00:00:00 2001
+From: Paul Junod <donujp@gmail.com>
+Date: Thu, 6 Aug 2026 09:10:14 -0700
+Subject: [PATCH] feat: expose per-torrent discovery health
+
+---
+ crates/dht/src/dht.rs                      | 151 +++++++++++-
+ crates/dht/src/lib.rs                      |   4 +-
+ crates/librqbit/src/discovery_health.rs    | 162 +++++++++++++
+ crates/librqbit/src/lib.rs                 |   5 +
+ crates/librqbit/src/session.rs             | 104 ++++++--
+ crates/librqbit/src/torrent_state/mod.rs   |   7 +
+ crates/tracker_comms/src/lib.rs            |   4 +
+ crates/tracker_comms/src/tracker_comms.rs  | 204 +++++++++++++---
+ crates/tracker_comms/src/tracker_health.rs | 268 +++++++++++++++++++++
+ 9 files changed, 852 insertions(+), 57 deletions(-)
+ create mode 100644 crates/librqbit/src/discovery_health.rs
+ create mode 100644 crates/tracker_comms/src/tracker_health.rs
+
+diff --git a/crates/dht/src/dht.rs b/crates/dht/src/dht.rs
+index c255e75..cef5740 100644
+--- a/crates/dht/src/dht.rs
++++ b/crates/dht/src/dht.rs
+@@ -3,7 +3,7 @@ use std::{
+     net::SocketAddr,
+     str::FromStr,
+     sync::{
+-        atomic::{AtomicU16, Ordering},
++        atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering},
+         Arc,
+     },
+     task::Poll,
+@@ -53,6 +53,79 @@ pub struct DhtStats {
+     pub routing_table_size: usize,
+ }
+ 
++/// A point-in-time view of one torrent's DHT peer-discovery activity.
++///
++/// The counters describe this handle's current discovery run. They are reset
++/// whenever a new `RequestPeersStream` starts with the handle.
++#[derive(Clone, Copy, Debug, Default, Serialize, PartialEq, Eq)]
++pub struct RequestPeersHealthSnapshot {
++    pub active: bool,
++    pub successful_requests: u64,
++    pub failed_requests: u64,
++    pub peers_found: u64,
++    pub last_request_succeeded: Option<bool>,
++}
++
++#[derive(Debug, Default)]
++struct RequestPeersHealthInner {
++    active: AtomicBool,
++    successful_requests: AtomicU64,
++    failed_requests: AtomicU64,
++    peers_found: AtomicU64,
++    // 0 = no request completed, 1 = success, 2 = failure.
++    last_request_result: AtomicU16,
++}
++
++/// Shared health state for one torrent's DHT peer-discovery stream.
++#[derive(Clone, Debug, Default)]
++pub struct RequestPeersHealth {
++    inner: Arc<RequestPeersHealthInner>,
++}
++
++impl RequestPeersHealth {
++    pub fn snapshot(&self) -> RequestPeersHealthSnapshot {
++        RequestPeersHealthSnapshot {
++            active: self.inner.active.load(Ordering::Relaxed),
++            successful_requests: self.inner.successful_requests.load(Ordering::Relaxed),
++            failed_requests: self.inner.failed_requests.load(Ordering::Relaxed),
++            peers_found: self.inner.peers_found.load(Ordering::Relaxed),
++            last_request_succeeded: match self.inner.last_request_result.load(Ordering::Relaxed) {
++                1 => Some(true),
++                2 => Some(false),
++                _ => None,
++            },
++        }
++    }
++
++    fn start(&self) {
++        self.inner.active.store(true, Ordering::Relaxed);
++        self.inner.successful_requests.store(0, Ordering::Relaxed);
++        self.inner.failed_requests.store(0, Ordering::Relaxed);
++        self.inner.peers_found.store(0, Ordering::Relaxed);
++        self.inner.last_request_result.store(0, Ordering::Relaxed);
++    }
++
++    fn stop(&self) {
++        self.inner.active.store(false, Ordering::Relaxed);
++    }
++
++    fn record_request(&self, succeeded: bool) {
++        if succeeded {
++            self.inner
++                .successful_requests
++                .fetch_add(1, Ordering::Relaxed);
++            self.inner.last_request_result.store(1, Ordering::Relaxed);
++        } else {
++            self.inner.failed_requests.fetch_add(1, Ordering::Relaxed);
++            self.inner.last_request_result.store(2, Ordering::Relaxed);
++        }
++    }
++
++    fn record_peer(&self) {
++        self.inner.peers_found.fetch_add(1, Ordering::Relaxed);
++    }
++}
++
+ struct OutstandingRequest {
+     done: tokio::sync::oneshot::Sender<anyhow::Result<ResponseOrError>>,
+ }
+@@ -106,6 +179,7 @@ struct RecursiveRequestCallbacksGetPeers {
+     // Id20::from_str("00000fffffffffffffffffffffffffffffffffff").unwrap()
+     min_distance_to_announce: Id20,
+     announce_port: Option<u16>,
++    health: RequestPeersHealth,
+ }
+ 
+ impl RecursiveRequestCallbacks for RecursiveRequestCallbacksGetPeers {
+@@ -118,6 +192,8 @@ impl RecursiveRequestCallbacks for RecursiveRequestCallbacksGetPeers {
+         addr: SocketAddr,
+         resp: &anyhow::Result<ResponseOrError>,
+     ) {
++        self.health
++            .record_request(matches!(resp, Ok(ResponseOrError::Response(_))));
+         let announce_port = match self.announce_port {
+             Some(a) => a,
+             None => return,
+@@ -195,10 +271,17 @@ struct RecursiveRequest<C: RecursiveRequestCallbacks> {
+ pub struct RequestPeersStream {
+     rx: tokio::sync::mpsc::UnboundedReceiver<SocketAddr>,
+     cancel_join_handle: tokio::task::JoinHandle<()>,
++    health: RequestPeersHealth,
+ }
+ 
+ impl RequestPeersStream {
+-    fn new(dht: Arc<DhtState>, info_hash: Id20, announce_port: Option<u16>) -> Self {
++    fn new(
++        dht: Arc<DhtState>,
++        info_hash: Id20,
++        announce_port: Option<u16>,
++        health: RequestPeersHealth,
++    ) -> Self {
++        health.start();
+         let (peer_tx, peer_rx) = unbounded_channel();
+         let (node_tx, node_rx) = unbounded_channel();
+         let rp = Arc::new(RecursiveRequest {
+@@ -216,12 +299,14 @@ impl RequestPeersStream {
+                 )
+                 .unwrap(),
+                 announce_port,
++                health: health.clone(),
+             },
+         });
+         let join_handle = rp.request_peers_forever(node_rx);
+         Self {
+             rx: peer_rx,
+             cancel_join_handle: join_handle,
++            health,
+         }
+     }
+ }
+@@ -229,6 +314,7 @@ impl RequestPeersStream {
+ impl Drop for RequestPeersStream {
+     fn drop(&mut self) {
+         self.cancel_join_handle.abort();
++        self.health.stop();
+     }
+ }
+ 
+@@ -240,7 +326,13 @@ impl Stream for RequestPeersStream {
+         mut self: std::pin::Pin<&mut Self>,
+         cx: &mut std::task::Context<'_>,
+     ) -> Poll<Option<Self::Item>> {
+-        self.rx.poll_recv(cx)
++        match self.rx.poll_recv(cx) {
++            Poll::Ready(Some(peer)) => {
++                self.health.record_peer();
++                Poll::Ready(Some(peer))
++            }
++            other => other,
++        }
+     }
+ }
+ 
+@@ -342,6 +434,7 @@ impl RecursiveRequest<RecursiveRequestCallbacksGetPeers> {
+                                 Ok(n) if n < 8 => REQUERY_INTERVAL / 8 * (n as u32),
+                                 Ok(_) => REQUERY_INTERVAL,
+                                 Err(e) => {
++                                    this.callbacks.health.record_request(false);
+                                     error!("error in get_peers_root(): {e:#}");
+                                     return Err::<(), anyhow::Error>(e);
+                                 }
+@@ -414,7 +507,7 @@ impl<C: RecursiveRequestCallbacks> RecursiveRequest<C> {
+             self.callbacks.on_request_end(self, id, addr, &response);
+         }
+ 
+-        let response = match self.dht.request(self.request.clone(), addr).await {
++        let response = match response {
+             Ok(ResponseOrError::Response(r)) => r,
+             Ok(ResponseOrError::Error(e)) => bail!("error response: {:?}", e),
+             Err(e) => {
+@@ -819,6 +912,45 @@ impl DhtState {
+     }
+ }
+ 
++#[cfg(test)]
++mod health_tests {
++    use super::*;
++
++    #[test]
++    fn request_peers_health_tracks_current_run() {
++        let health = RequestPeersHealth::default();
++        assert_eq!(health.snapshot(), RequestPeersHealthSnapshot::default());
++
++        health.start();
++        health.record_request(false);
++        health.record_request(true);
++        health.record_peer();
++
++        assert_eq!(
++            health.snapshot(),
++            RequestPeersHealthSnapshot {
++                active: true,
++                successful_requests: 1,
++                failed_requests: 1,
++                peers_found: 1,
++                last_request_succeeded: Some(true),
++            }
++        );
++
++        health.stop();
++        assert!(!health.snapshot().active);
++
++        health.start();
++        assert_eq!(
++            health.snapshot(),
++            RequestPeersHealthSnapshot {
++                active: true,
++                ..Default::default()
++            }
++        );
++    }
++}
++
+ #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+ enum Request {
+     GetPeers(Id20),
+@@ -1206,7 +1338,16 @@ impl DhtState {
+         info_hash: Id20,
+         announce_port: Option<u16>,
+     ) -> RequestPeersStream {
+-        RequestPeersStream::new(self.clone(), info_hash, announce_port)
++        self.get_peers_with_health(info_hash, announce_port, RequestPeersHealth::default())
++    }
++
++    pub fn get_peers_with_health(
++        self: &Arc<Self>,
++        info_hash: Id20,
++        announce_port: Option<u16>,
++        health: RequestPeersHealth,
++    ) -> RequestPeersStream {
++        RequestPeersStream::new(self.clone(), info_hash, announce_port, health)
+     }
+ 
+     pub fn listen_addr(&self) -> SocketAddr {
+diff --git a/crates/dht/src/lib.rs b/crates/dht/src/lib.rs
+index 7096d52..7c2234f 100644
+--- a/crates/dht/src/lib.rs
++++ b/crates/dht/src/lib.rs
+@@ -9,7 +9,9 @@ use std::sync::Arc;
+ use std::time::Duration;
+ 
+ pub use crate::dht::DhtStats;
+-pub use crate::dht::{DhtConfig, DhtState, RequestPeersStream};
++pub use crate::dht::{
++    DhtConfig, DhtState, RequestPeersHealth, RequestPeersHealthSnapshot, RequestPeersStream,
++};
+ pub use librqbit_core::hash_id::Id20;
+ pub use persistence::{PersistentDht, PersistentDhtConfig};
+ 
+diff --git a/crates/librqbit/src/discovery_health.rs b/crates/librqbit/src/discovery_health.rs
+new file mode 100644
+index 0000000..be5e5ce
+--- /dev/null
++++ b/crates/librqbit/src/discovery_health.rs
+@@ -0,0 +1,162 @@
++use dht::RequestPeersHealth;
++use serde::Serialize;
++use tracker_comms::TrackerHealth;
++use url::Url;
++
++pub use tracker_comms::{
++    TrackerFailure, TrackerFailureKind, TrackerHealthSnapshot, TrackerHealthState,
++};
++
++/// The observed state of DHT peer discovery for one torrent.
++#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
++#[serde(rename_all = "snake_case")]
++pub enum DhtDiscoveryStatus {
++    /// DHT is disabled for the whole session.
++    Disabled,
++    /// The torrent is private, so DHT is intentionally suppressed.
++    SuppressedPrivate,
++    /// DHT is enabled, but this torrent has no active discovery stream.
++    Inactive,
++    /// Discovery is active and no DHT request has completed yet.
++    Searching,
++    /// The most recently completed DHT request succeeded.
++    Working,
++    /// The most recently completed DHT request failed.
++    Degraded,
++}
++
++/// A point-in-time view of one torrent's DHT peer discovery.
++#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
++pub struct DhtDiscoveryHealth {
++    pub status: DhtDiscoveryStatus,
++    pub successful_requests: u64,
++    pub failed_requests: u64,
++    pub peers_found: u64,
++}
++
++/// A credential-safe, point-in-time view of one torrent's peer discovery.
++#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
++pub struct DiscoveryHealth {
++    pub dht: DhtDiscoveryHealth,
++    pub trackers: Vec<TrackerHealthSnapshot>,
++}
++
++#[derive(Clone, Debug)]
++enum DhtDiscoveryHealthSource {
++    Disabled,
++    SuppressedPrivate,
++    Enabled(RequestPeersHealth),
++}
++
++#[derive(Clone, Debug)]
++pub(crate) struct DiscoveryHealthHandle {
++    dht: DhtDiscoveryHealthSource,
++    trackers: TrackerHealth,
++}
++
++impl DiscoveryHealthHandle {
++    pub(crate) fn new<'a>(
++        dht_enabled: bool,
++        private: bool,
++        trackers: impl IntoIterator<Item = &'a Url>,
++    ) -> Self {
++        let dht = if private {
++            DhtDiscoveryHealthSource::SuppressedPrivate
++        } else if dht_enabled {
++            DhtDiscoveryHealthSource::Enabled(RequestPeersHealth::default())
++        } else {
++            DhtDiscoveryHealthSource::Disabled
++        };
++        Self {
++            dht,
++            trackers: TrackerHealth::new(trackers),
++        }
++    }
++
++    pub(crate) fn dht(&self) -> Option<RequestPeersHealth> {
++        match &self.dht {
++            DhtDiscoveryHealthSource::Enabled(health) => Some(health.clone()),
++            DhtDiscoveryHealthSource::Disabled | DhtDiscoveryHealthSource::SuppressedPrivate => {
++                None
++            }
++        }
++    }
++
++    pub(crate) fn trackers(&self) -> TrackerHealth {
++        self.trackers.clone()
++    }
++
++    pub(crate) fn snapshot(&self) -> DiscoveryHealth {
++        let dht = match &self.dht {
++            DhtDiscoveryHealthSource::Disabled => DhtDiscoveryHealth {
++                status: DhtDiscoveryStatus::Disabled,
++                successful_requests: 0,
++                failed_requests: 0,
++                peers_found: 0,
++            },
++            DhtDiscoveryHealthSource::SuppressedPrivate => DhtDiscoveryHealth {
++                status: DhtDiscoveryStatus::SuppressedPrivate,
++                successful_requests: 0,
++                failed_requests: 0,
++                peers_found: 0,
++            },
++            DhtDiscoveryHealthSource::Enabled(health) => {
++                let snapshot = health.snapshot();
++                let status = if !snapshot.active {
++                    DhtDiscoveryStatus::Inactive
++                } else {
++                    match snapshot.last_request_succeeded {
++                        None => DhtDiscoveryStatus::Searching,
++                        Some(true) => DhtDiscoveryStatus::Working,
++                        Some(false) => DhtDiscoveryStatus::Degraded,
++                    }
++                };
++                DhtDiscoveryHealth {
++                    status,
++                    successful_requests: snapshot.successful_requests,
++                    failed_requests: snapshot.failed_requests,
++                    peers_found: snapshot.peers_found,
++                }
++            }
++        };
++        DiscoveryHealth {
++            dht,
++            trackers: self.trackers.snapshot(),
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn tracker_endpoints_are_redacted_in_public_snapshot() {
++        let tracker = Url::parse(
++            "https://user:secret@tracker.example:8443/private/passkey/announce?token=secret",
++        )
++        .unwrap();
++        let health = DiscoveryHealthHandle::new(false, false, [&tracker]);
++
++        let snapshot = health.snapshot();
++        assert_eq!(snapshot.dht.status, DhtDiscoveryStatus::Disabled);
++        assert_eq!(snapshot.trackers.len(), 1);
++        assert_eq!(
++            snapshot.trackers[0].endpoint,
++            "https://tracker.example:8443/<redacted>"
++        );
++        let json = serde_json::to_string(&snapshot).unwrap();
++        assert!(!json.contains("user"));
++        assert!(!json.contains("secret"));
++        assert!(!json.contains("passkey"));
++    }
++
++    #[test]
++    fn private_torrent_reports_dht_suppression() {
++        let health = DiscoveryHealthHandle::new(true, true, std::iter::empty());
++        assert_eq!(
++            health.snapshot().dht.status,
++            DhtDiscoveryStatus::SuppressedPrivate
++        );
++    }
++}
+diff --git a/crates/librqbit/src/lib.rs b/crates/librqbit/src/lib.rs
+index ef2e96b..d93aa83 100644
+--- a/crates/librqbit/src/lib.rs
++++ b/crates/librqbit/src/lib.rs
+@@ -46,6 +46,7 @@ mod blocklist;
+ mod chunk_tracker;
+ mod create_torrent_file;
+ mod dht_utils;
++mod discovery_health;
+ pub mod file_info;
+ mod file_ops;
+ #[cfg(feature = "http-api")]
+@@ -78,6 +79,10 @@ pub use api::Api;
+ pub use api_error::ApiError;
+ pub use create_torrent_file::{create_torrent, CreateTorrentOptions};
+ pub use dht;
++pub use discovery_health::{
++    DhtDiscoveryHealth, DhtDiscoveryStatus, DiscoveryHealth, TrackerFailure, TrackerFailureKind,
++    TrackerHealthSnapshot, TrackerHealthState,
++};
+ pub use peer_connection::PeerConnectionOptions;
+ pub use session::{
+     AddTorrent, AddTorrentOptions, AddTorrentResponse, ListOnlyResponse, Session, SessionOptions,
+diff --git a/crates/librqbit/src/session.rs b/crates/librqbit/src/session.rs
+index f0edb50..d85719b 100644
+--- a/crates/librqbit/src/session.rs
++++ b/crates/librqbit/src/session.rs
+@@ -13,6 +13,7 @@ use crate::{
+     bitv_factory::{BitVFactory, NonPersistentBitVFactory},
+     blocklist,
+     dht_utils::{read_metainfo_from_peer_receiver, ReadMetainfoResult},
++    discovery_health::DiscoveryHealthHandle,
+     limits::{Limits, LimitsConfig},
+     merge_streams::merge_streams,
+     peer_connection::PeerConnectionOptions,
+@@ -1042,15 +1043,19 @@ impl Session {
+         } = add_res;
+ 
+         let private = metadata.as_ref().is_some_and(|m| m.info.private);
++        let effective_trackers = self.effective_trackers(trackers.clone(), private);
++        let discovery_health =
++            DiscoveryHealthHandle::new(self.dht.is_some(), private, effective_trackers.iter());
+ 
+         let make_peer_rx = || {
+             self.make_peer_rx(
+                 info_hash,
+-                trackers.clone(),
++                effective_trackers.clone(),
+                 !opts.paused && !opts.list_only,
+                 opts.force_tracker_interval,
+                 opts.initial_peers.clone().unwrap_or_default(),
+                 private,
++                &discovery_health,
+             )
+         };
+ 
+@@ -1173,6 +1178,7 @@ impl Session {
+                 connector: self.connector.clone(),
+                 session: Arc::downgrade(self),
+                 magnet_name: name,
++                discovery_health,
+             });
+ 
+             let initializing = Arc::new(TorrentStateInitializing::new(
+@@ -1320,47 +1326,61 @@ impl Session {
+         announce: bool,
+     ) -> Option<PeerStream> {
+         let is_private = t.with_metadata(|m| m.info.private).unwrap_or(false);
++        let trackers =
++            self.effective_trackers(t.shared().trackers.iter().cloned().collect(), is_private);
+         self.make_peer_rx(
+             t.info_hash(),
+-            t.shared().trackers.iter().cloned().collect(),
++            trackers,
+             announce,
+             t.shared().options.force_tracker_interval,
+             t.shared().options.initial_peers.clone(),
+             is_private,
++            &t.shared().discovery_health,
+         )
+     }
+ 
++    fn effective_trackers(&self, mut trackers: Vec<url::Url>, is_private: bool) -> Vec<url::Url> {
++        if is_private && trackers.len() > 1 {
++            warn!("private trackers are not fully implemented, so using only the first tracker");
++            trackers.truncate(1);
++        } else {
++            trackers.extend(self.trackers.iter().cloned());
++        }
++        trackers
++    }
++
+     // Get a peer stream from both DHT and trackers.
++    #[allow(clippy::too_many_arguments)]
+     fn make_peer_rx(
+         self: &Arc<Self>,
+         info_hash: Id20,
+-        mut trackers: Vec<url::Url>,
++        trackers: Vec<url::Url>,
+         announce: bool,
+         force_tracker_interval: Option<Duration>,
+         initial_peers: Vec<SocketAddr>,
+         is_private: bool,
++        discovery_health: &DiscoveryHealthHandle,
+     ) -> Option<PeerStream> {
+         let announce_port = if announce { self.tcp_listen_port } else { None };
+         let dht_rx = if is_private {
+             None
+         } else {
+-            self.dht
+-                .as_ref()
+-                .map(|dht| dht.get_peers(info_hash, announce_port))
++            self.dht.as_ref().map(|dht| {
++                dht.get_peers_with_health(
++                    info_hash,
++                    announce_port,
++                    discovery_health
++                        .dht()
++                        .expect("public torrent with DHT enabled must have DHT health"),
++                )
++            })
+         };
+ 
+-        if is_private && trackers.len() > 1 {
+-            warn!("private trackers are not fully implemented, so using only the first tracker");
+-            trackers.truncate(1);
+-        } else {
+-            trackers.extend(self.trackers.iter().cloned());
+-        }
+-
+         let tracker_rx_stats = PeerRxTorrentInfo {
+             info_hash,
+             session: self.clone(),
+         };
+-        let tracker_rx = TrackerComms::start(
++        let tracker_rx = TrackerComms::start_with_health(
+             info_hash,
+             self.peer_id,
+             trackers.into_iter().collect(),
+@@ -1369,6 +1389,7 @@ impl Session {
+             announce_port,
+             self.reqwest_client.clone(),
+             self.udp_tracker_client.clone(),
++            discovery_health.trackers(),
+         );
+ 
+         let initial_peers_rx = if initial_peers.is_empty() {
+@@ -1552,7 +1573,9 @@ mod tests {
+     use itertools::Itertools;
+     use librqbit_core::torrent_metainfo::{torrent_from_bytes_ext, TorrentMetaV1};
+ 
+-    use super::torrent_file_from_info_bytes;
++    use super::{
++        torrent_file_from_info_bytes, AddTorrent, AddTorrentOptions, Session, SessionOptions,
++    };
+ 
+     #[test]
+     fn test_torrent_file_from_info_and_bytes() {
+@@ -1577,4 +1600,55 @@ mod tests {
+         assert_eq!(parsed.info_bytes, generated_parsed.info_bytes);
+         assert_eq!(parsed_trackers, get_trackers(&generated_parsed.meta));
+     }
++
++    #[tokio::test]
++    async fn public_discovery_health_is_redacted() {
++        let mut info = b"d6:lengthi1e4:name8:test.bin12:piece lengthi16384e6:pieces20:".to_vec();
++        info.extend([0; 20]);
++        info.push(b'e');
++        let tracker = url::Url::parse(
++            "https://user:secret@tracker.example:8443/private/passkey/announce?token=secret",
++        )
++        .unwrap();
++        let torrent = torrent_file_from_info_bytes(&info, std::slice::from_ref(&tracker)).unwrap();
++        let output = tempfile::tempdir().unwrap();
++        let session = Session::new_with_opts(
++            output.path().to_owned(),
++            SessionOptions {
++                disable_dht: true,
++                disable_dht_persistence: true,
++                ..Default::default()
++            },
++        )
++        .await
++        .unwrap();
++        let handle = session
++            .add_torrent(
++                AddTorrent::from_bytes(torrent),
++                Some(AddTorrentOptions {
++                    paused: true,
++                    ..Default::default()
++                }),
++            )
++            .await
++            .unwrap()
++            .into_handle()
++            .unwrap();
++
++        let discovery = handle.discovery_health();
++        assert_eq!(discovery.dht.status, crate::DhtDiscoveryStatus::Disabled);
++        assert_eq!(discovery.trackers.len(), 1);
++        assert_eq!(
++            discovery.trackers[0].endpoint,
++            "https://tracker.example:8443/<redacted>"
++        );
++        assert_eq!(
++            discovery.trackers[0].state,
++            crate::TrackerHealthState::Inactive
++        );
++        let json = serde_json::to_string(&discovery).unwrap();
++        assert!(!json.contains("user"));
++        assert!(!json.contains("secret"));
++        assert!(!json.contains("passkey"));
++    }
+ }
+diff --git a/crates/librqbit/src/torrent_state/mod.rs b/crates/librqbit/src/torrent_state/mod.rs
+index 5181609..ea29530 100644
+--- a/crates/librqbit/src/torrent_state/mod.rs
++++ b/crates/librqbit/src/torrent_state/mod.rs
+@@ -38,6 +38,7 @@ use tracing::trace;
+ use tracing::warn;
+ 
+ use crate::chunk_tracker::ChunkTracker;
++use crate::discovery_health::DiscoveryHealthHandle;
+ use crate::file_info::FileInfo;
+ use crate::limits::LimitsConfig;
+ use crate::session::TorrentId;
+@@ -198,6 +199,7 @@ pub struct ManagedTorrentShared {
+ 
+     // "dn" from magnet link
+     pub(crate) magnet_name: Option<String>,
++    pub(crate) discovery_health: DiscoveryHealthHandle,
+ }
+ 
+ pub struct ManagedTorrent {
+@@ -446,6 +448,11 @@ impl ManagedTorrent {
+         }
+     }
+ 
++    /// Return credential-safe tracker and DHT discovery health for this torrent.
++    pub fn discovery_health(&self) -> crate::DiscoveryHealth {
++        self.shared.discovery_health.snapshot()
++    }
++
+     /// Get stats.
+     pub fn stats(&self) -> TorrentStats {
+         use stats::TorrentStatsState as S;
+diff --git a/crates/tracker_comms/src/lib.rs b/crates/tracker_comms/src/lib.rs
+index cdae214..06a4f1c 100644
+--- a/crates/tracker_comms/src/lib.rs
++++ b/crates/tracker_comms/src/lib.rs
+@@ -1,6 +1,10 @@
+ mod tracker_comms;
+ mod tracker_comms_http;
+ mod tracker_comms_udp;
++mod tracker_health;
+ 
+ pub use tracker_comms::*;
+ pub use tracker_comms_udp::UdpTrackerClient;
++pub use tracker_health::{
++    TrackerFailure, TrackerFailureKind, TrackerHealth, TrackerHealthSnapshot, TrackerHealthState,
++};
+diff --git a/crates/tracker_comms/src/tracker_comms.rs b/crates/tracker_comms/src/tracker_comms.rs
+index e32a9da..3e5daea 100644
+--- a/crates/tracker_comms/src/tracker_comms.rs
++++ b/crates/tracker_comms/src/tracker_comms.rs
+@@ -19,6 +19,8 @@ use url::Url;
+ use crate::tracker_comms_http;
+ use crate::tracker_comms_udp;
+ use crate::tracker_comms_udp::UdpTrackerClient;
++use crate::tracker_health::{safe_tracker_endpoint, TrackerHealthActivityGuard};
++use crate::{TrackerFailure, TrackerFailureKind, TrackerHealth};
+ use librqbit_core::hash_id::Id20;
+ 
+ pub struct TrackerComms {
+@@ -29,6 +31,7 @@ pub struct TrackerComms {
+     tx: Sender,
+     tcp_listen_port: Option<u16>,
+     reqwest_client: reqwest::Client,
++    health: TrackerHealth,
+ }
+ 
+ #[derive(Default)]
+@@ -83,8 +86,9 @@ enum SupportedTracker {
+ impl std::fmt::Debug for SupportedTracker {
+     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+         match self {
+-            SupportedTracker::Udp(u) => std::fmt::Display::fmt(u, f),
+-            SupportedTracker::Http(u) => std::fmt::Display::fmt(u, f),
++            SupportedTracker::Udp(u) | SupportedTracker::Http(u) => {
++                f.write_str(&safe_tracker_endpoint(u))
++            }
+         }
+     }
+ }
+@@ -101,13 +105,46 @@ impl TrackerComms {
+         reqwest_client: reqwest::Client,
+         udp_client: UdpTrackerClient,
+     ) -> Option<BoxStream<'static, SocketAddr>> {
++        Self::start_with_health(
++            info_hash,
++            peer_id,
++            trackers,
++            stats,
++            force_interval,
++            tcp_listen_port,
++            reqwest_client,
++            udp_client,
++            TrackerHealth::default(),
++        )
++    }
++
++    #[allow(clippy::too_many_arguments)]
++    pub fn start_with_health(
++        info_hash: Id20,
++        peer_id: Id20,
++        trackers: HashSet<Url>,
++        stats: Box<dyn TorrentStatsProvider>,
++        force_interval: Option<Duration>,
++        tcp_listen_port: Option<u16>,
++        reqwest_client: reqwest::Client,
++        udp_client: UdpTrackerClient,
++        health: TrackerHealth,
++    ) -> Option<BoxStream<'static, SocketAddr>> {
++        health.configure(trackers.iter());
+         let trackers = trackers
+             .into_iter()
+             .filter_map(|t| match t.scheme() {
+                 "http" | "https" => Some(SupportedTracker::Http(t)),
+                 "udp" => Some(SupportedTracker::Udp(t)),
+                 _ => {
+-                    debug!("unsuppoted tracker URL: {}", t);
++                    health.reject(
++                        &t,
++                        TrackerFailure::new(
++                            TrackerFailureKind::UnsupportedScheme,
++                            "tracker scheme is unsupported",
++                        ),
++                    );
++                    debug!(tracker = %safe_tracker_endpoint(&t), "unsupported tracker scheme");
+                     None
+                 }
+             })
+@@ -130,8 +167,10 @@ impl TrackerComms {
+                 force_tracker_interval: force_interval,
+                 tx,
+                 tcp_listen_port,
+-                reqwest_client
++                reqwest_client,
++                health: health.clone(),
+             });
++            let _health_activity = TrackerHealthActivityGuard(health);
+             let mut futures = FuturesUnordered::new();
+             for tracker in trackers {
+                 futures.push(comms.add_tracker(tracker, &udp_client))
+@@ -166,7 +205,7 @@ impl TrackerComms {
+         let info_hash = self.info_hash;
+         match url {
+             SupportedTracker::Udp(url) => {
+-                let span = error_span!(parent: None, "udp_tracker", tracker = %url, info_hash = ?info_hash);
++                let span = error_span!(parent: None, "udp_tracker", tracker = %safe_tracker_endpoint(&url), info_hash = ?info_hash);
+                 self.task_single_tracker_monitor_udp(url, client.clone())
+                     .instrument(span)
+                     .right_future()
+@@ -175,7 +214,7 @@ impl TrackerComms {
+                 let span = error_span!(
+                     parent: None,
+                     "http_tracker",
+-                    tracker = %url,
++                    tracker = %safe_tracker_endpoint(&url),
+                     info_hash = ?info_hash
+                 );
+                 self.task_single_tracker_monitor_http(url)
+@@ -186,8 +225,9 @@ impl TrackerComms {
+     }
+ 
+     async fn task_single_tracker_monitor_http(&self, mut tracker_url: Url) -> anyhow::Result<()> {
++        let tracker_key = tracker_url.clone();
+         let mut event = Some(tracker_comms_http::TrackerRequestEvent::Started);
+-        trace!(url=%tracker_url, "starting monitor");
++        trace!(tracker=%safe_tracker_endpoint(&tracker_key), "starting monitor");
+         loop {
+             let stats = self.stats.get();
+             let request = tracker_comms_http::TrackerRequest {
+@@ -208,6 +248,7 @@ impl TrackerComms {
+ 
+             let request_query = request.as_querystring();
+             tracker_url.set_query(Some(&request_query));
++            self.health.announcing(&tracker_key);
+ 
+             match self.tracker_one_request_http(tracker_url.clone()).await {
+                 Ok(interval) => {
+@@ -215,38 +256,56 @@ impl TrackerComms {
+                     let interval = self
+                         .force_tracker_interval
+                         .unwrap_or_else(|| Duration::from_secs(interval));
+-                    debug!(
+-                        "sleeping for {:?} after calling tracker {}",
+-                        interval,
+-                        tracker_url.host().unwrap()
+-                    );
++                    self.health.working(&tracker_key, interval);
++                    debug!("sleeping for {:?} after calling tracker", interval,);
+                     tokio::time::sleep(interval).await;
+                 }
+-                Err(e) => {
+-                    debug!("error calling the tracker {}: {:#}", tracker_url, e);
+-                    tokio::time::sleep(Duration::from_secs(60)).await;
++                Err(error) => {
++                    let retry = Duration::from_secs(60);
++                    self.health.backing_off(&tracker_key, retry, error.clone());
++                    debug!(error_kind=?error.kind, ?retry, "error calling tracker");
++                    tokio::time::sleep(retry).await;
+                 }
+             };
+         }
+     }
+ 
+-    async fn tracker_one_request_http(&self, tracker_url: Url) -> anyhow::Result<u64> {
+-        debug!(url = %tracker_url, "calling tracker over http");
+-        let response: reqwest::Response = self.reqwest_client.get(tracker_url).send().await?;
++    async fn tracker_one_request_http(&self, tracker_url: Url) -> Result<u64, TrackerFailure> {
++        let response: reqwest::Response = self
++            .reqwest_client
++            .get(tracker_url)
++            .send()
++            .await
++            .map_err(|error| TrackerFailure::request(&error))?;
+         if !response.status().is_success() {
+-            anyhow::bail!("tracker responded with {:?}", response.status());
++            return Err(TrackerFailure::new(
++                TrackerFailureKind::HttpStatus,
++                format!("tracker returned HTTP {}", response.status().as_u16()),
++            ));
+         }
+-        let bytes = response.bytes().await?;
++        let bytes = response
++            .bytes()
++            .await
++            .map_err(|error| TrackerFailure::request(&error))?;
+         if let Ok(error) = bencode::from_bytes::<tracker_comms_http::TrackerError>(&bytes) {
+-            anyhow::bail!(
+-                "tracker returned failure. Failure reason: {}",
+-                error.failure_reason
+-            )
++            let _ = error.failure_reason;
++            return Err(TrackerFailure::new(
++                TrackerFailureKind::Rejected,
++                "tracker rejected announce",
++            ));
+         };
+-        let response = bencode::from_bytes::<tracker_comms_http::TrackerResponse>(&bytes)?;
++        let response =
++            bencode::from_bytes::<tracker_comms_http::TrackerResponse>(&bytes).map_err(|_| {
++                TrackerFailure::new(
++                    TrackerFailureKind::InvalidResponse,
++                    "tracker returned an invalid response",
++                )
++            })?;
+ 
+         for peer in response.peers.iter_sockaddrs() {
+-            self.tx.send(peer).await?;
++            self.tx.send(peer).await.map_err(|_| {
++                TrackerFailure::new(TrackerFailureKind::Internal, "tracker peer channel closed")
++            })?;
+         }
+         Ok(response.interval)
+     }
+@@ -259,7 +318,7 @@ impl TrackerComms {
+         use tracker_comms_udp::*;
+ 
+         if url.scheme() != "udp" {
+-            bail!("expected UDP scheme in {}", url);
++            bail!("expected UDP tracker scheme");
+         }
+         let hp: (String, u16) = (
+             url.host_str().context("missing host")?.to_owned(),
+@@ -274,6 +333,7 @@ impl TrackerComms {
+             }
+ 
+             let stats = self.stats.get();
++            self.health.announcing(&url);
+             let request = AnnounceFields {
+                 info_hash: self.info_hash,
+                 peer_id: self.peer_id,
+@@ -307,18 +367,90 @@ impl TrackerComms {
+                     }
+                     let new_interval = response.interval.max(5);
+                     let new_interval = Duration::from_secs(new_interval as u64);
+-                    sleep_interval = Some(self.force_tracker_interval.unwrap_or(new_interval));
++                    let next = self.force_tracker_interval.unwrap_or(new_interval);
++                    self.health.working(&url, next);
++                    sleep_interval = Some(next);
+                 }
+-                Err(e) => {
+-                    debug!(url = %url, "error reading announce response: {e:#}");
+-                    if sleep_interval.is_none() {
+-                        sleep_interval = Some(
+-                            self.force_tracker_interval
+-                                .unwrap_or(Duration::from_secs(60)),
+-                        );
+-                    }
++                Err(_error) => {
++                    let retry = sleep_interval.unwrap_or_else(|| {
++                        self.force_tracker_interval
++                            .unwrap_or(Duration::from_secs(60))
++                    });
++                    self.health.backing_off(
++                        &url,
++                        retry,
++                        TrackerFailure::new(
++                            TrackerFailureKind::Transport,
++                            "UDP tracker transport failed",
++                        ),
++                    );
++                    debug!("error reading UDP announce response");
++                    sleep_interval = Some(retry);
+                 }
+             }
+         }
+     }
+ }
++
++#[cfg(test)]
++mod health_tests {
++    use super::*;
++
++    #[tokio::test]
++    async fn http_failure_is_classified_without_exposing_tracker_secrets() {
++        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
++            .await
++            .unwrap();
++        let addr = listener.local_addr().unwrap();
++        let server = tokio::spawn(async move {
++            let (socket, _) = listener.accept().await.unwrap();
++            let mut request = [0_u8; 4096];
++            let mut filled = 0;
++            while filled < request.len() {
++                socket.readable().await.unwrap();
++                match socket.try_read(&mut request[filled..]) {
++                    Ok(0) => break,
++                    Ok(read) => {
++                        filled += read;
++                        if request[..filled]
++                            .windows(4)
++                            .any(|window| window == b"\r\n\r\n")
++                        {
++                            break;
++                        }
++                    }
++                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => continue,
++                    Err(error) => panic!("error reading request: {}", error),
++                }
++            }
++            socket.writable().await.unwrap();
++            socket
++                .try_write(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
++                .unwrap();
++        });
++        let tracker = Url::parse(&format!(
++            "http://user:secret@{addr}/private/passkey/announce?token=secret"
++        ))
++        .unwrap();
++        let health = TrackerHealth::new([&tracker]);
++        let (tx, _rx) = tokio::sync::mpsc::channel(1);
++        let comms = TrackerComms {
++            info_hash: Id20::default(),
++            peer_id: Id20::default(),
++            stats: Box::new(()),
++            force_tracker_interval: None,
++            tx,
++            tcp_listen_port: Some(4240),
++            reqwest_client: reqwest::Client::builder().no_proxy().build().unwrap(),
++            health,
++        };
++
++        let failure = comms.tracker_one_request_http(tracker).await.unwrap_err();
++        server.await.unwrap();
++        assert_eq!(failure.kind, TrackerFailureKind::HttpStatus);
++        assert_eq!(failure.message, "tracker returned HTTP 500");
++        assert!(!failure.message.contains("user"));
++        assert!(!failure.message.contains("secret"));
++        assert!(!failure.message.contains("passkey"));
++    }
++}
+diff --git a/crates/tracker_comms/src/tracker_health.rs b/crates/tracker_comms/src/tracker_health.rs
+new file mode 100644
+index 0000000..2bd80f7
+--- /dev/null
++++ b/crates/tracker_comms/src/tracker_health.rs
+@@ -0,0 +1,268 @@
++use std::collections::BTreeMap;
++use std::fmt;
++use std::sync::Arc;
++use std::time::{Duration, Instant};
++
++use parking_lot::RwLock;
++use serde::Serialize;
++use url::Url;
++
++/// The last observed state of one tracker monitor.
++#[derive(Clone, Copy, Debug, Default, Serialize, PartialEq, Eq)]
++#[serde(rename_all = "snake_case")]
++pub enum TrackerHealthState {
++    #[default]
++    Inactive,
++    Announcing,
++    Working,
++    BackingOff,
++    Rejected,
++}
++
++/// A stable, credential-safe tracker failure category.
++#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
++#[serde(rename_all = "snake_case")]
++pub enum TrackerFailureKind {
++    UnsupportedScheme,
++    Resolve,
++    Timeout,
++    Transport,
++    HttpStatus,
++    Rejected,
++    InvalidResponse,
++    Internal,
++}
++
++/// A bounded tracker error containing no URL, response body, or credentials.
++#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
++pub struct TrackerFailure {
++    pub kind: TrackerFailureKind,
++    pub message: String,
++}
++
++impl TrackerFailure {
++    pub(crate) fn new(kind: TrackerFailureKind, message: impl Into<String>) -> Self {
++        Self {
++            kind,
++            message: message.into(),
++        }
++    }
++
++    pub(crate) fn request(error: &reqwest::Error) -> Self {
++        if error.is_timeout() {
++            Self::new(TrackerFailureKind::Timeout, "tracker request timed out")
++        } else {
++            Self::new(TrackerFailureKind::Transport, "tracker transport failed")
++        }
++    }
++}
++
++impl fmt::Display for TrackerFailure {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        f.write_str(&self.message)
++    }
++}
++
++impl std::error::Error for TrackerFailure {}
++
++/// A point-in-time, credential-safe view of one tracker monitor.
++#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
++pub struct TrackerHealthSnapshot {
++    /// Scheme, host, and port only. Path, query, and userinfo are always redacted.
++    pub endpoint: String,
++    pub state: TrackerHealthState,
++    pub next_announce_in: Option<Duration>,
++    pub last_error: Option<TrackerFailure>,
++}
++
++#[derive(Clone, Debug)]
++struct TrackerHealthEntry {
++    endpoint: String,
++    state: TrackerHealthState,
++    next_announce_at: Option<Instant>,
++    last_error: Option<TrackerFailure>,
++}
++
++/// Shared tracker-monitor state for one torrent.
++#[derive(Clone, Debug, Default)]
++pub struct TrackerHealth {
++    // Keys are full URLs so distinct announce endpoints do not overwrite each
++    // other. Keys never leave this private, non-serializable state.
++    inner: Arc<RwLock<BTreeMap<String, TrackerHealthEntry>>>,
++}
++
++impl TrackerHealth {
++    pub fn new<'a>(trackers: impl IntoIterator<Item = &'a Url>) -> Self {
++        let health = Self::default();
++        health.configure(trackers);
++        health
++    }
++
++    pub fn snapshot(&self) -> Vec<TrackerHealthSnapshot> {
++        let now = Instant::now();
++        let mut snapshot = self
++            .inner
++            .read()
++            .values()
++            .map(|entry| TrackerHealthSnapshot {
++                endpoint: entry.endpoint.clone(),
++                state: entry.state,
++                next_announce_in: entry
++                    .next_announce_at
++                    .map(|deadline| deadline.saturating_duration_since(now)),
++                last_error: entry.last_error.clone(),
++            })
++            .collect::<Vec<_>>();
++        snapshot.sort_by(|a, b| a.endpoint.cmp(&b.endpoint));
++        snapshot
++    }
++
++    pub(crate) fn configure<'a>(&self, trackers: impl IntoIterator<Item = &'a Url>) {
++        let mut entries = self.inner.write();
++        *entries = trackers
++            .into_iter()
++            .map(|tracker| {
++                (
++                    tracker.as_str().to_owned(),
++                    TrackerHealthEntry {
++                        endpoint: safe_tracker_endpoint(tracker),
++                        state: TrackerHealthState::Inactive,
++                        next_announce_at: None,
++                        last_error: None,
++                    },
++                )
++            })
++            .collect();
++    }
++
++    fn update(&self, tracker: &Url, update: impl FnOnce(&mut TrackerHealthEntry)) {
++        if let Some(entry) = self.inner.write().get_mut(tracker.as_str()) {
++            update(entry);
++        }
++    }
++
++    pub(crate) fn announcing(&self, tracker: &Url) {
++        self.update(tracker, |entry| {
++            entry.state = TrackerHealthState::Announcing;
++            entry.next_announce_at = None;
++        });
++    }
++
++    pub(crate) fn working(&self, tracker: &Url, next_announce_in: Duration) {
++        self.update(tracker, |entry| {
++            entry.state = TrackerHealthState::Working;
++            entry.next_announce_at = Instant::now().checked_add(next_announce_in);
++            entry.last_error = None;
++        });
++    }
++
++    pub(crate) fn backing_off(&self, tracker: &Url, retry_in: Duration, error: TrackerFailure) {
++        self.update(tracker, |entry| {
++            entry.state = TrackerHealthState::BackingOff;
++            entry.next_announce_at = Instant::now().checked_add(retry_in);
++            entry.last_error = Some(error);
++        });
++    }
++
++    pub(crate) fn reject(&self, tracker: &Url, error: TrackerFailure) {
++        self.update(tracker, |entry| {
++            entry.state = TrackerHealthState::Rejected;
++            entry.next_announce_at = None;
++            entry.last_error = Some(error);
++        });
++    }
++
++    pub(crate) fn stop(&self) {
++        for entry in self.inner.write().values_mut() {
++            if entry.state != TrackerHealthState::Rejected {
++                entry.state = TrackerHealthState::Inactive;
++                entry.next_announce_at = None;
++            }
++        }
++    }
++}
++
++pub(crate) struct TrackerHealthActivityGuard(pub(crate) TrackerHealth);
++
++impl Drop for TrackerHealthActivityGuard {
++    fn drop(&mut self) {
++        self.0.stop();
++    }
++}
++
++pub(crate) fn safe_tracker_endpoint(url: &Url) -> String {
++    let host = match url.host() {
++        Some(url::Host::Domain(host)) => host.to_owned(),
++        Some(url::Host::Ipv4(host)) => host.to_string(),
++        Some(url::Host::Ipv6(host)) => format!("[{host}]"),
++        None => "<missing-host>".to_owned(),
++    };
++    let port = url
++        .port()
++        .map(|port| format!(":{port}"))
++        .unwrap_or_default();
++    format!("{}://{host}{port}/<redacted>", url.scheme())
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn tracker_health_redacts_endpoint_and_retains_safe_failure() {
++        let tracker = Url::parse(
++            "https://user:secret@tracker.example:8443/private/passkey/announce?token=secret",
++        )
++        .unwrap();
++        let health = TrackerHealth::new([&tracker]);
++
++        let initial = health.snapshot();
++        assert_eq!(initial.len(), 1);
++        assert_eq!(
++            initial[0].endpoint,
++            "https://tracker.example:8443/<redacted>"
++        );
++        assert_eq!(initial[0].state, TrackerHealthState::Inactive);
++
++        health.announcing(&tracker);
++        assert_eq!(health.snapshot()[0].state, TrackerHealthState::Announcing);
++
++        let failure =
++            TrackerFailure::new(TrackerFailureKind::Rejected, "tracker rejected announce");
++        health.backing_off(&tracker, Duration::from_secs(30), failure.clone());
++        let failed = health.snapshot();
++        assert_eq!(failed[0].state, TrackerHealthState::BackingOff);
++        assert_eq!(failed[0].last_error, Some(failure));
++        assert!(failed[0].next_announce_in.unwrap() <= Duration::from_secs(30));
++
++        health.stop();
++        let stopped = health.snapshot();
++        assert_eq!(stopped[0].state, TrackerHealthState::Inactive);
++        assert!(stopped[0].next_announce_in.is_none());
++        assert_eq!(
++            stopped[0].last_error.as_ref().unwrap().message,
++            "tracker rejected announce"
++        );
++    }
++
++    #[test]
++    fn unsupported_tracker_remains_rejected_when_other_monitors_stop() {
++        let tracker = Url::parse("ws://tracker.example/private?token=secret").unwrap();
++        let health = TrackerHealth::new([&tracker]);
++        health.reject(
++            &tracker,
++            TrackerFailure::new(
++                TrackerFailureKind::UnsupportedScheme,
++                "tracker scheme is unsupported",
++            ),
++        );
++        health.stop();
++
++        let snapshot = health.snapshot();
++        assert_eq!(snapshot[0].state, TrackerHealthState::Rejected);
++        assert_eq!(
++            snapshot[0].last_error.as_ref().unwrap().kind,
++            TrackerFailureKind::UnsupportedScheme
++        );
++    }
++}
+-- 
+2.50.1 (Apple Git-155)

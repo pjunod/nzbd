@@ -10,6 +10,7 @@ on:
       - crates/nzbd/src/main.rs
       - crates/nzbd/src/tls.rs
       - scripts/check-bittorrent-deps.sh
+      - scripts/check-private-discovery-leaks.sh
       - .github/workflows/bittorrent-m0.yml
   pull_request:
     paths:
@@ -19,6 +20,7 @@ on:
       - crates/nzbd/src/main.rs
       - crates/nzbd/src/tls.rs
       - scripts/check-bittorrent-deps.sh
+      - scripts/check-private-discovery-leaks.sh
       - .github/workflows/bittorrent-m0.yml
   workflow_dispatch:
 
@@ -43,6 +45,23 @@ jobs:
           key: bittorrent-m0-dependency-policy
       - name: Check the pinned engine and TLS graph
         run: scripts/check-bittorrent-deps.sh
+
+  private-discovery-capture:
+    name: private torrent DHT/LSD packet capture
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.85"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: bittorrent-m0-private-discovery-capture
+      - name: Install packet-capture tools
+        run: sudo apt-get update && sudo apt-get install -y iptables tcpdump
+      - name: Prove private discovery does not enter DHT or LSD
+        run: scripts/check-private-discovery-leaks.sh
 
   native:
     name: ${{ matrix.name }} (Rust 1.85)
