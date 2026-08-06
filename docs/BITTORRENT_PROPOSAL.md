@@ -2,8 +2,8 @@
 
 **Status:** review incorporated; M0 no-go; M1b merged; M2 blocked ·
 **Decision:** ADR-19, production engine blocked; neutral queue seam authorized ·
-**Written:** 2026-08-05 · **Revised:** 2026-08-05 ·
-**Verified against:** `83efc9da7` ·
+**Written:** 2026-08-05 · **Revised:** 2026-08-06 ·
+**Verified against:** `5dfebb9` ·
 **Scope:** architecture, contracts, milestones, and review questions; no
 production BitTorrent path is authorized before the gates below pass
 
@@ -415,6 +415,17 @@ tracker counter as health. The preferred route remains two small upstream
 APIs followed by a stable release and a complete M0 rerun; the existing
 libtorrent fallback remains the next engine evaluation if those APIs cannot
 be made stable.
+
+The first of those changes is now concrete. The tested
+[`disable_auto_restore` patch](../contrib/rqbit/0001-allow-persistence-without-auto-restore.patch)
+targets the exact v8.1.1 tag and preserves rqbit's default behavior. Its
+contract proves that persistence can retain two records while the constructor
+admits none, after which nzbd can explicitly restore only its authoritative ID
+and reuse the matching fast-resume identity. The reproducible verifier and
+full result are recorded in
+[BITTORRENT_M0_REPORT.md](BITTORRENT_M0_REPORT.md#33-the-authoritative-restore-patch-is-ready-not-released).
+This preparation does not make gate 8 pass: the API must survive upstream
+review and ship in a stable release before nzbd can consume it.
 
 It does not follow that M1b must wait. A serializable transfer record, one
 owner-controlled active set, reliable structural facts, and coalesced progress
