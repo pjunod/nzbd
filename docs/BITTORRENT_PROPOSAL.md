@@ -374,10 +374,11 @@ The detailed commands, measurements, and evidence are in
 - The private-mode evidence now includes a peer-wire positive control: a
   public torrent contacts a canary learned only through PEX, while the same
   message cannot make a private torrent contact it. A Linux packet-capture
-  harness also runs live DHT behind a local redirect, requires a public
-  info-hash control to appear, and rejects the private hash in DHT or
-  LSD-style UDP payloads. Gate 5 stays partial until the first Actions run of
-  that harness succeeds.
+  harness also runs live DHT behind a local redirect and requires separate
+  public info-hash controls before and during a 15-second private canary
+  window. It rejects the private hash across all captured UDP, including raw
+  DHT and LSD-style text payloads. Gate 5 stays partial until the first Actions
+  run of that harness succeeds.
 - Rust 1.85 works after pinning compatible transitive versions. The first
   checked-in matrix caught an additional target-specific incompatibility:
   Tokio 1.53.0's Windows signal path uses an API stabilized after Rust 1.85.

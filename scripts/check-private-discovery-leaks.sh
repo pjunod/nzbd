@@ -15,6 +15,7 @@ done
 
 probe_port=45123
 runner_uid="$(id -u)"
+runner_user="$(id -un)"
 capture_file="$(mktemp)"
 capture_log="$(mktemp)"
 test_log="$(mktemp)"
@@ -41,11 +42,14 @@ trap cleanup EXIT
 
 # Force both stable-8.1.1 bootstrap names through DNS before installing the
 # redirect. The DHT never reaches those hosts: IPv4 is redirected to the local
-# probe and IPv6 is rejected while the capture remains able to observe it.
+# probe, while matching IPv6 bootstrap traffic is blocked before the device
+# capture point and is therefore deliberately unobserved.
 getent ahostsv4 dht.transmissionbt.com >/dev/null
 getent ahostsv4 dht.libtorrent.org >/dev/null
 
-sudo tcpdump -i any -U -s 0 -w "$capture_file" udp >"$capture_log" 2>&1 &
+# Keep tcpdump's capture process under the runner account so it can open the
+# runner-owned mktemp file after dropping root privileges.
+sudo tcpdump -Z "$runner_user" -i any -U -s 0 -w "$capture_file" udp >"$capture_log" 2>&1 &
 tcpdump_pid=$!
 for _ in {1..50}; do
   if grep -q "listening on" "$capture_log"; then
@@ -80,9 +84,10 @@ wait "$tcpdump_pid" || true
 capture_stopped=1
 
 public_hash="$(sed -n 's/.*NZBD_PUBLIC_INFO_HASH=\([0-9a-f]\{40\}\).*/\1/p' "$test_log" | tail -n 1)"
+window_control_hash="$(sed -n 's/.*NZBD_WINDOW_CONTROL_INFO_HASH=\([0-9a-f]\{40\}\).*/\1/p' "$test_log" | tail -n 1)"
 private_hash="$(sed -n 's/.*NZBD_PRIVATE_INFO_HASH=\([0-9a-f]\{40\}\).*/\1/p' "$test_log" | tail -n 1)"
-if [[ -z "$public_hash" || -z "$private_hash" ]]; then
-  echo "test did not report both packet-capture markers" >&2
+if [[ -z "$public_hash" || -z "$window_control_hash" || -z "$private_hash" ]]; then
+  echo "test did not report all three packet-capture markers" >&2
   exit 1
 fi
 
@@ -90,6 +95,10 @@ od -An -v -tx1 "$capture_file" | tr -d ' \n' >"$capture_hex_file"
 
 if ! grep -Fq "$public_hash" "$capture_hex_file"; then
   echo "public DHT control hash was absent from the packet capture" >&2
+  exit 1
+fi
+if ! grep -Fq "$window_control_hash" "$capture_hex_file"; then
+  echo "private-window DHT control hash was absent from the packet capture" >&2
   exit 1
 fi
 if grep -Fq "$private_hash" "$capture_hex_file"; then
@@ -104,4 +113,4 @@ if grep -Fq "$private_ascii_hex" "$capture_hex_file" || grep -Fq "$private_upper
   exit 1
 fi
 
-echo "private discovery capture passed: live DHT control observed; no private DHT/LSD hash observed"
+echo "private discovery capture passed: DHT controls observed before and during the private window; no private DHT/LSD hash observed"

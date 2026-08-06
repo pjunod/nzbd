@@ -79,17 +79,22 @@ fn dht_response(transaction_id: [u8; 2]) -> Vec<u8> {
 
 async fn dht_probe(
     socket: UdpSocket,
-    public_hash: [u8; 20],
+    initial_control_hash: [u8; 20],
+    window_control_hash: [u8; 20],
     private_hash: [u8; 20],
-    public_seen: Arc<AtomicBool>,
+    initial_control_seen: Arc<AtomicBool>,
+    window_control_seen: Arc<AtomicBool>,
     private_seen: Arc<AtomicBool>,
-) {
+) -> std::io::Result<()> {
     let mut packet = [0_u8; 2048];
     loop {
-        let (length, source) = socket.recv_from(&mut packet).await.unwrap();
+        let (length, source) = socket.recv_from(&mut packet).await?;
         let packet = &packet[..length];
-        if contains(packet, &public_hash) {
-            public_seen.store(true, Ordering::SeqCst);
+        if contains(packet, &initial_control_hash) {
+            initial_control_seen.store(true, Ordering::SeqCst);
+        }
+        if contains(packet, &window_control_hash) {
+            window_control_seen.store(true, Ordering::SeqCst);
         }
         if contains(packet, &private_hash) {
             private_seen.store(true, Ordering::SeqCst);
@@ -97,8 +102,7 @@ async fn dht_probe(
         if let Some(transaction_id) = transaction_id(packet) {
             socket
                 .send_to(&dht_response(transaction_id), source)
-                .await
-                .unwrap();
+                .await?;
         }
     }
 }
@@ -126,23 +130,35 @@ async fn private_torrent_never_queries_dht_when_the_session_dht_is_live() {
         .and_then(|value| value.parse().ok())
         .unwrap_or(DEFAULT_DHT_PROBE_PORT);
 
-    let (public_metainfo, public_hash) =
+    let (initial_control_metainfo, initial_control_hash) =
         metainfo(b"public DHT capture control", "public-control.bin", false);
+    let (window_control_metainfo, window_control_hash) = metainfo(
+        b"public DHT live-window control",
+        "window-control.bin",
+        false,
+    );
     let (private_metainfo, private_hash) =
         metainfo(b"private DHT leak canary", "private-canary.bin", true);
-    println!("NZBD_PUBLIC_INFO_HASH={}", hex(&public_hash));
+    println!("NZBD_PUBLIC_INFO_HASH={}", hex(&initial_control_hash));
+    println!(
+        "NZBD_WINDOW_CONTROL_INFO_HASH={}",
+        hex(&window_control_hash)
+    );
     println!("NZBD_PRIVATE_INFO_HASH={}", hex(&private_hash));
 
-    let public_seen = Arc::new(AtomicBool::new(false));
+    let initial_control_seen = Arc::new(AtomicBool::new(false));
+    let window_control_seen = Arc::new(AtomicBool::new(false));
     let private_seen = Arc::new(AtomicBool::new(false));
     let probe = UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, probe_port))
         .await
         .unwrap();
     let probe_task = tokio::spawn(dht_probe(
         probe,
-        public_hash,
+        initial_control_hash,
+        window_control_hash,
         private_hash,
-        public_seen.clone(),
+        initial_control_seen.clone(),
+        window_control_seen.clone(),
         private_seen.clone(),
     ));
 
@@ -156,25 +172,47 @@ async fn private_torrent_never_queries_dht_when_the_session_dht_is_live() {
     )
     .await
     .unwrap();
-    let _public = session
-        .add_metainfo(public_metainfo, TorrentAddConfig::default())
+    let _initial_control = session
+        .add_metainfo(initial_control_metainfo, TorrentAddConfig::default())
         .await
         .unwrap();
     assert!(
         wait_until(
-            || public_seen.load(Ordering::SeqCst),
+            || initial_control_seen.load(Ordering::SeqCst),
             Duration::from_secs(15)
         )
         .await,
         "the public control never reached the DHT probe; the capture cannot prove suppression"
+    );
+    assert!(
+        !probe_task.is_finished(),
+        "the DHT probe exited after the initial control"
     );
 
     let _private = session
         .add_metainfo(private_metainfo, TorrentAddConfig::default())
         .await
         .unwrap();
-    tokio::time::sleep(Duration::from_secs(3)).await;
-    assert!(public_seen.load(Ordering::SeqCst));
+    let private_window = Duration::from_secs(15);
+    let private_window_deadline = tokio::time::Instant::now() + private_window;
+    let _window_control = session
+        .add_metainfo(window_control_metainfo, TorrentAddConfig::default())
+        .await
+        .unwrap();
+    let window_control_observed = wait_until(
+        || window_control_seen.load(Ordering::SeqCst),
+        private_window,
+    )
+    .await;
+    tokio::time::sleep_until(private_window_deadline).await;
+    assert!(
+        window_control_observed,
+        "a fresh public control did not reach the DHT probe during the private canary window"
+    );
+    assert!(
+        !probe_task.is_finished(),
+        "the DHT probe exited during the private canary window"
+    );
     assert!(
         !private_seen.load(Ordering::SeqCst),
         "private torrent info hash escaped through DHT"
@@ -182,6 +220,7 @@ async fn private_torrent_never_queries_dht_when_the_session_dht_is_live() {
 
     session.stop().await;
     probe_task.abort();
+    let _ = probe_task.await;
 }
 
 #[test]
