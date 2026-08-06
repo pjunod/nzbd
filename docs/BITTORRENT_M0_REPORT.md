@@ -25,7 +25,7 @@ peer listener, or production torrent admission path has been added.
 
 | Gate | Result | Evidence and consequence |
 |---:|---|---|
-| 1. Rust 1.85 and platform packaging | **Partial** | A real Rust 1.85.1 macOS build passes after compatible transitive versions were pinned. The release harness links only macOS system libraries, not OpenSSL. The checked-in `BitTorrent M0` workflow now runs the isolated adapter suite on Linux glibc, macOS arm64, Windows MSVC, and x86-64/aarch64 musl under Rust 1.85, but this report will not call the gate passed until its first complete native run is linked here. |
+| 1. Rust 1.85 and platform packaging | **Partial** | A real Rust 1.85.1 macOS build passes after compatible transitive versions were pinned. The release harness links only macOS system libraries, not OpenSSL. The first checked-in `BitTorrent M0` run caught Tokio 1.53.0 using Rust 1.86's `OnceLock::wait` on Windows; the workspace now pins Tokio 1.52.4, whose declared MSRV is 1.71 and whose Windows signal implementation avoids that API. The workflow runs the isolated adapter suite on Linux glibc, macOS arm64, Windows MSVC, and x86-64/aarch64 musl under Rust 1.85, but this report will not call the gate passed until a complete corrected run is linked here. |
 | 2. v1 `.torrent`, magnet, TCP/IPv4, then seed | **Pass** | Deterministic generated payloads download through both admission paths; a local seeder accounts for both uploads and exact bytes match. |
 | 3. Controls and live limits | **Pass** | Pause/resume is exercised before completion, the live download limit is removed during transfer, and idempotent keep-data delete, idempotent delete-data, and unrelated-sibling retention pass. |
 | 4. Kill/restart never trusts partial data | **Blocked** | The accepted fast-resume design cannot be constructed without failing gate 8. A persistence-disabled full hash recheck is a possible safe but slower product decision, not an equivalent test of the accepted design. |
@@ -132,6 +132,14 @@ the tests; they are not `cargo check` substitutes. The workflow is path-gated
 to the adapter, lockfile, workspace dependency declaration, daemon TLS
 provider initialization, its own workflow, and the policy script, so unrelated
 documentation changes do not burn five native builders.
+
+The first matrix run did its job before this report claimed success: Windows
+failed while compiling Tokio 1.53.0 because that target's signal path calls
+`OnceLock::wait`, which is unstable on Rust 1.85. The Linux-only workspace MSRV
+check could not see the target-specific code. The workspace therefore pins
+Tokio 1.52.4: upstream declares Rust 1.71 and its Windows signal path uses
+`OnceLock::get_or_init` instead. The corrected Windows job must still pass
+before gate 1 changes from partial to pass.
 
 Before those builders run, `scripts/check-bittorrent-deps.sh` checks the normal
 and feature graphs under the MSRV toolchain. It requires exactly
