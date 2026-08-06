@@ -10,10 +10,10 @@ that must be accepted and released before nzbd starts M2.
 
 Read and review this kit in order. Submit the discovery-health design issue
 before its implementation, because that patch crosses three rqbit crates and
-the maintainer should shape the public contract before reviewing 1,300 lines.
-The smaller authoritative-restore change can move independently. Neither
-submission makes an nzbd production gate pass until an accepted stable rqbit
-release contains both contracts.
+the maintainer should shape the public contract before reviewing the large
+current-main candidate. The smaller authoritative-restore change can move
+independently. Neither submission makes an nzbd production gate pass until an
+accepted stable rqbit release contains both contracts.
 
 ## 1. Human submission boundary — rqbit requires more than disclosure
 
@@ -27,7 +27,7 @@ Before posting either draft:
 
 1. Read the affected rqbit modules and every added test. This is the proof that
    the human owns the behavior, not a ceremonial checkbox.
-2. Edit the draft for the final upstream shape. The bracketed disclosure note
+2. Edit the draft for the final upstream shape. The bolded disclosure note
    deliberately prevents an unreviewed copy-paste.
 3. Re-run the matching verifier against the exact upstream head. A clean run
    from an older base is evidence of the design, not evidence that the current
@@ -59,7 +59,11 @@ backports upstream unless the maintainer explicitly asks for an 8.x backport.
    smaller upstream implementation is preferable if it preserves honest
    per-torrent DHT/tracker state and credential-safe failures.
 5. After both APIs ship, pin that stable release in nzbd and rerun all eleven
-   M0 gates. Only that result can authorize M2.
+   M0 gates on native macOS, Linux glibc/musl, and Windows.
+6. Run the Linux packet-capture private-mode harness and obtain reviewer
+   acceptance of the resource, package, license, and advisory dispositions.
+   A gate rerun cannot discharge those review decisions by itself.
+7. Only the complete M0 path can authorize M2.
 
 ## 4. Reproduction — verify both candidates against rqbit main
 

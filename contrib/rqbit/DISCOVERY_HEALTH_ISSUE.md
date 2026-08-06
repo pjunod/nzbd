@@ -70,13 +70,14 @@ discussion starting point. I would appreciate guidance on:
 5. whether current-run request/peer counters are useful or too implementation
    specific.
 
-I have a tested prototype against current `main` and an exact v8.1.1 backport
-used to validate the embedding requirements. I can revise it to the preferred
-shape before opening a PR.
+I have a tested prototype against rqbit `main` snapshot
+`4e5f94cbcf1d57ec500885c77cf1e24d70232d89` and an exact v8.1.1 backport
+used to validate the embedding requirements. I can rebase it onto the current
+upstream head and revise it to the preferred shape before opening a PR.
 
 ### AI assistance disclosure
 
 OpenAI Codex assisted with research, prototyping, tests, and this draft.
-**Human contributor: replace this sentence only after reviewing and editing
-the final issue and confirming you can explain the proposed contract and the
-prototype without AI assistance.**
+**Human contributor: replace this bolded note only after reviewing and
+editing the final issue and confirming you can explain the proposed contract
+and prototype without AI assistance. Keep the disclosure above.**

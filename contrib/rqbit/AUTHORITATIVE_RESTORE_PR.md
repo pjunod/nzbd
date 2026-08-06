@@ -56,6 +56,6 @@ cargo test --workspace
 ### AI assistance disclosure
 
 OpenAI Codex assisted with research, implementation, tests, and this draft.
-**Human contributor: replace this sentence only after reviewing and editing
-the final PR and confirming you can explain every changed code path and test
-without AI assistance.**
+**Human contributor: replace this bolded note only after reviewing and
+editing the final PR and confirming you can explain every changed code path
+and test without AI assistance. Keep the disclosure above.**

@@ -1,24 +1,5 @@
-From c501d6d8a0c5df605d70ef896b66dc5672ca721d Mon Sep 17 00:00:00 2001
-From: Paul Junod <donujp@gmail.com>
-Date: Thu, 6 Aug 2026 09:10:14 -0700
-Subject: [PATCH] feat: expose per-torrent discovery health
-
----
- crates/dht/src/dht.rs                      | 151 +++++++++++-
- crates/dht/src/lib.rs                      |   4 +-
- crates/librqbit/src/discovery_health.rs    | 162 +++++++++++++
- crates/librqbit/src/lib.rs                 |   5 +
- crates/librqbit/src/session.rs             | 104 ++++++--
- crates/librqbit/src/torrent_state/mod.rs   |   7 +
- crates/tracker_comms/src/lib.rs            |   4 +
- crates/tracker_comms/src/tracker_comms.rs  | 204 +++++++++++++---
- crates/tracker_comms/src/tracker_health.rs | 268 +++++++++++++++++++++
- 9 files changed, 852 insertions(+), 57 deletions(-)
- create mode 100644 crates/librqbit/src/discovery_health.rs
- create mode 100644 crates/tracker_comms/src/tracker_health.rs
-
 diff --git a/crates/dht/src/dht.rs b/crates/dht/src/dht.rs
-index c255e75..cef5740 100644
+index c255e75e5d32cb25cf4fb5a7c206a3a9eb3d48e7..cef57400b797c6c11a107227f147dc97c48cec29 100644
 --- a/crates/dht/src/dht.rs
 +++ b/crates/dht/src/dht.rs
 @@ -3,7 +3,7 @@ use std::{
@@ -266,7 +247,7 @@ index c255e75..cef5740 100644
  
      pub fn listen_addr(&self) -> SocketAddr {
 diff --git a/crates/dht/src/lib.rs b/crates/dht/src/lib.rs
-index 7096d52..7c2234f 100644
+index 7096d520e347fbece726128e1c73d89d8ddefbc8..7c2234fa80679a76f79adfa69a3ad3df56261436 100644
 --- a/crates/dht/src/lib.rs
 +++ b/crates/dht/src/lib.rs
 @@ -9,7 +9,9 @@ use std::sync::Arc;
@@ -282,7 +263,7 @@ index 7096d52..7c2234f 100644
  
 diff --git a/crates/librqbit/src/discovery_health.rs b/crates/librqbit/src/discovery_health.rs
 new file mode 100644
-index 0000000..be5e5ce
+index 0000000000000000000000000000000000000000..be5e5ce105fdc91573a332b0d5606707c1490e56
 --- /dev/null
 +++ b/crates/librqbit/src/discovery_health.rs
 @@ -0,0 +1,162 @@
@@ -449,7 +430,7 @@ index 0000000..be5e5ce
 +    }
 +}
 diff --git a/crates/librqbit/src/lib.rs b/crates/librqbit/src/lib.rs
-index ef2e96b..d93aa83 100644
+index ef2e96bf8ca215b6d254e6e27510ccf37685900a..d93aa83e0aecfdb80b46c033ab5f2f3772510cc7 100644
 --- a/crates/librqbit/src/lib.rs
 +++ b/crates/librqbit/src/lib.rs
 @@ -46,6 +46,7 @@ mod blocklist;
@@ -472,7 +453,7 @@ index ef2e96b..d93aa83 100644
  pub use session::{
      AddTorrent, AddTorrentOptions, AddTorrentResponse, ListOnlyResponse, Session, SessionOptions,
 diff --git a/crates/librqbit/src/session.rs b/crates/librqbit/src/session.rs
-index f0edb50..d85719b 100644
+index f0edb50b594c563c8283c428538583709f9b2781..d85719b034f2d2431514739c7aaa5238e224d813 100644
 --- a/crates/librqbit/src/session.rs
 +++ b/crates/librqbit/src/session.rs
 @@ -13,6 +13,7 @@ use crate::{
@@ -663,7 +644,7 @@ index f0edb50..d85719b 100644
 +    }
  }
 diff --git a/crates/librqbit/src/torrent_state/mod.rs b/crates/librqbit/src/torrent_state/mod.rs
-index 5181609..ea29530 100644
+index 51816097c9f4b1d3220efaabfbf1f9f1b002228c..ea295304499cc0bc1805e2e3decd963374e5d736 100644
 --- a/crates/librqbit/src/torrent_state/mod.rs
 +++ b/crates/librqbit/src/torrent_state/mod.rs
 @@ -38,6 +38,7 @@ use tracing::trace;
@@ -695,7 +676,7 @@ index 5181609..ea29530 100644
      pub fn stats(&self) -> TorrentStats {
          use stats::TorrentStatsState as S;
 diff --git a/crates/tracker_comms/src/lib.rs b/crates/tracker_comms/src/lib.rs
-index cdae214..06a4f1c 100644
+index cdae2140b005a3ef3b417647ec705294ec3ff292..06a4f1cd69059780d93fb07b41a7cca7b7bf2a8a 100644
 --- a/crates/tracker_comms/src/lib.rs
 +++ b/crates/tracker_comms/src/lib.rs
 @@ -1,6 +1,10 @@
@@ -710,7 +691,7 @@ index cdae214..06a4f1c 100644
 +    TrackerFailure, TrackerFailureKind, TrackerHealth, TrackerHealthSnapshot, TrackerHealthState,
 +};
 diff --git a/crates/tracker_comms/src/tracker_comms.rs b/crates/tracker_comms/src/tracker_comms.rs
-index e32a9da..3e5daea 100644
+index e32a9da1584e24be3acf88e8e10d9e45132a5867..3e5daea2a594462886b87b30afd933d55dd68e26 100644
 --- a/crates/tracker_comms/src/tracker_comms.rs
 +++ b/crates/tracker_comms/src/tracker_comms.rs
 @@ -19,6 +19,8 @@ use url::Url;
@@ -1034,10 +1015,10 @@ index e32a9da..3e5daea 100644
 +}
 diff --git a/crates/tracker_comms/src/tracker_health.rs b/crates/tracker_comms/src/tracker_health.rs
 new file mode 100644
-index 0000000..2bd80f7
+index 0000000000000000000000000000000000000000..8abbdc3c4969c1a7600cf9357cdbe2bae808e0d2
 --- /dev/null
 +++ b/crates/tracker_comms/src/tracker_health.rs
-@@ -0,0 +1,268 @@
+@@ -0,0 +1,281 @@
 +use std::collections::BTreeMap;
 +use std::fmt;
 +use std::sync::Arc;
@@ -1124,11 +1105,19 @@ index 0000000..2bd80f7
 +}
 +
 +/// Shared tracker-monitor state for one torrent.
-+#[derive(Clone, Debug, Default)]
++#[derive(Clone, Default)]
 +pub struct TrackerHealth {
-+    // Keys are full URLs so distinct announce endpoints do not overwrite each
-+    // other. Keys never leave this private, non-serializable state.
++    // Full URLs remain private lookup keys. Debug is implemented below using
++    // only the credential-safe public snapshots.
 +    inner: Arc<RwLock<BTreeMap<String, TrackerHealthEntry>>>,
++}
++
++impl fmt::Debug for TrackerHealth {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        f.debug_struct("TrackerHealth")
++            .field("trackers", &self.snapshot())
++            .finish()
++    }
 +}
 +
 +impl TrackerHealth {
@@ -1255,6 +1244,11 @@ index 0000000..2bd80f7
 +        )
 +        .unwrap();
 +        let health = TrackerHealth::new([&tracker]);
++        let debug = format!("{health:?}");
++        assert!(debug.contains("https://tracker.example:8443/<redacted>"));
++        for secret in ["user", "secret", "passkey", "token="] {
++            assert!(!debug.contains(secret), "{} leaked through Debug", secret);
++        }
 +
 +        let initial = health.snapshot();
 +        assert_eq!(initial.len(), 1);
@@ -1306,5 +1300,3 @@ index 0000000..2bd80f7
 +        );
 +    }
 +}
--- 
-2.50.1 (Apple Git-155)

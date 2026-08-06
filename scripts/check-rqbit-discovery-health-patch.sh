@@ -19,6 +19,7 @@ case "$source_head" in
   "$stable_base")
     readonly patch_file="contrib/rqbit/0003-expose-per-torrent-discovery-health.patch"
     readonly source_variant="stable"
+    readonly tracker_health_source="crates/tracker_comms/src/tracker_health.rs"
     ;;
   *)
     if ! git -C "$source_dir" cat-file -e "$main_base^{commit}" 2>/dev/null; then
@@ -31,6 +32,7 @@ case "$source_head" in
     fi
     readonly patch_file="contrib/rqbit/0004-expose-per-torrent-discovery-health-main.patch"
     readonly source_variant="main"
+    readonly tracker_health_source="crates/tracker_comms/src/tracker_comms.rs"
     ;;
 esac
 
@@ -47,6 +49,12 @@ elif [[ "$source_variant" == "main" ]]; then
   git -C "$work_dir/rqbit" apply --3way "$repository_root/$patch_file"
 else
   echo "stable v8.1.1 patch no longer applies to its pinned base" >&2
+  exit 1
+fi
+
+if grep -A 1 -E '^#\[derive\([^]]*Debug[^]]*\)\]$' "$work_dir/rqbit/$tracker_health_source" |
+  grep -q '^pub struct TrackerHealth '; then
+  echo "TrackerHealth must use its credential-safe hand-written Debug implementation" >&2
   exit 1
 fi
 
