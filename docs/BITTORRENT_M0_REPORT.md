@@ -33,7 +33,7 @@ peer listener, or production torrent admission path has been added.
 | 6. Path and delete safety | **Pass** | Traversal metainfo is rejected before an escape file exists. Delete-data removes only parsed torrent content; an unrelated sibling survives. Higher layers must still prove the persisted canonical root before requesting deletion. |
 | 7. Public observability | **Fail** | Public stats expose phase, total/progress/upload bytes, file progress, rates, ETA inputs, peer counts, completion, and error. They do not expose per-torrent tracker state, DHT state, or last tracker error. “No peers” cannot safely substitute for those facts. |
 | 8. nzbd-authoritative persistence | **Fail** | The contract test proves that `Session::new_with_opts` auto-restores the library record before returning. The persistence module and store injection point are private in 8.1.1, so nzbd cannot filter first. |
-| 9. Resource, package, and license delta | **Partial** | Measurements are recorded in §4. A blocking cargo-deny 0.20.2 policy now passes locally across all features and the locked graph. It runs on every PR, main/tag push, and a daily schedule. Gate 9 still needs the first successful Actions run and reviewer acceptance of the measurements and three exact, unreachable-path advisory exceptions. |
+| 9. Resource, package, and license delta | **Partial** | Measurements are recorded in §4. A blocking cargo-deny 0.20.2 policy passes locally across all features and the locked graph, and its [first Actions run passed](https://github.com/pjunod/nzbd/actions/runs/31064446916) on 2026-08-06 UTC. It runs on every PR, main/tag push, and a daily schedule. Gate 9 still needs reviewer acceptance of the measurements and three exact, unreachable-path advisory exceptions. |
 | 10. One explicit rustls provider | **Pass** | The process starts without a provider, explicitly installs aws-lc, and constructs librqbit’s rustls client without the mixed-provider panic. |
 | 11. v1-only boundary | **Pass** | Stable input uses v1 pieces/`btih`; v2-only and hybrid `.torrent` files and magnets return separate named errors before librqbit admission. |
 
@@ -268,10 +268,11 @@ by rustls. Three exact advisory exceptions remain:
 [`supply-chain.yml`](../.github/workflows/supply-chain.yml) pins
 `cargo-deny-action` to an immutable revision and runs separate blocking policy
 and RustSec jobs on every pull request, main or release-tag push, a daily
-schedule, and manual dispatch. Gate 9 remains **Partial** until the first
-workflow run is linked here and a reviewer accepts both the recorded delta and
-the narrow advisory dispositions. A green exception is not evidence that the
-underlying code became safe to enable.
+schedule, and manual dispatch. The
+[first blocking run](https://github.com/pjunod/nzbd/actions/runs/31064446916)
+passed both jobs on 2026-08-06 UTC. Gate 9 remains **Partial** until a reviewer
+accepts both the recorded delta and the narrow advisory dispositions. A green
+exception is not evidence that the underlying code became safe to enable.
 
 ---
 
