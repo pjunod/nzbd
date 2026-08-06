@@ -176,16 +176,22 @@ plus two non-blocking design risks. The follow-up disposition is:
    used `QueueState::from_runtime_doc`, but leader takeover used the generic
    document converter. Takeover now validates through the same production
    boundary before enabling persistence or touching local state. An
-   unsupported torrent row returns the named error, leaves `queue.json` and
-   the worker queue byte-for-byte unchanged, and keeps leader scheduling
-   disabled. The suggested journals-only fallback was not used because saving
-   that reconstructed state could erase a foreign torrent row. An end-to-end
-   engine test drives the worker-to-authority path and pins all three claims.
+   unsupported torrent row, future schema, or corrupt snapshot returns its
+   named error, leaves `queue.json` and the worker queue byte-for-byte
+   unchanged, and keeps leader scheduling disabled. The suggested
+   journals-only fallback was not used because saving that reconstructed state
+   could erase the authoritative queue. A leader whose adoption was refused
+   retries on each lease tick, so repairing the snapshot restores scheduling
+   without a daemon restart or election flap. Engine and cluster end-to-end
+   tests pin the refusal, preservation, retry, and recovery claims.
 2. **Accepted — pre-download starvation.** Fetching source, fetching magnet
    metadata, checking, and downloading now share the 60-second no-activity
    yield. `Queued` deliberately does not: a job that has not started cannot
-   generate the activity needed to reacquire a slot. M2 must stamp activity on
-   every transition into active backend work.
+   generate the activity needed to reacquire a slot. Pre-download work with no
+   activity stamp is likewise treated as fresh rather than falling back to the
+   possibly old queue time, so it gets one chance to run and produce a backend
+   fact. M2 must stamp activity once work starts so a genuinely stalled phase
+   eventually yields.
 3. **Adapted — schema-3 rollback warning.** The one-way boundary remains, but
    §1.1 now states the easily missed consequence: a pure-Usenet queue is
    rewritten as schema 3 on its first save, so rollback to a schema-2 binary

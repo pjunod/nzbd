@@ -209,6 +209,13 @@ pub fn torrent_wants_download_slot(
     if torrent.phase == TorrentPhase::Queued {
         return true;
     }
+    if torrent.last_activity_unix.is_none() && torrent.phase != TorrentPhase::Downloading {
+        // Source, metadata, and checking work with no activity stamp has not
+        // had a chance to run yet. Its queue age is not a phase-entry clock;
+        // treating an old queued timestamp as activity would make the job
+        // yield the slot before it can produce the first backend fact.
+        return true;
+    }
     let last_activity = torrent.last_activity_unix.unwrap_or(queued_at_unix);
     now_unix.saturating_sub(last_activity) < STALLED_SLOT_YIELD_SECS
 }
@@ -321,6 +328,27 @@ mod tests {
         );
         record.phase = TorrentPhase::Seeding;
         assert!(!torrent_wants_download_slot(&record, 90, 161));
+    }
+
+    #[test]
+    fn old_queued_age_cannot_starve_new_pre_download_work() {
+        for phase in [
+            TorrentPhase::FetchingSource,
+            TorrentPhase::FetchingMetadata,
+            TorrentPhase::Checking,
+        ] {
+            let record = torrent(phase, None);
+            assert!(
+                torrent_wants_download_slot(&record, 100, 10_000),
+                "{phase:?} must run once before it can be called stalled"
+            );
+        }
+
+        let record = torrent(TorrentPhase::Downloading, None);
+        assert!(
+            !torrent_wants_download_slot(&record, 100, 10_000),
+            "an already-downloading legacy row still needs a bounded fallback"
+        );
     }
 
     #[test]

@@ -132,6 +132,56 @@ async fn cluster_authority_adoption_refuses_dormant_torrent_rows_without_rewrite
     engine.shutdown().await;
 }
 
+#[tokio::test]
+async fn cluster_authority_adoption_refuses_unreadable_snapshots_without_rewrite() {
+    for (name, bytes, expected) in [
+        (
+            "future schema",
+            br#"{"schema_version":4,"jobs":[{"kind":"future_transfer"}]}"#.as_slice(),
+            "queue.json schema version 4 is newer",
+        ),
+        (
+            "corrupt JSON",
+            br#"{"schema_version":3,"jobs":["#.as_slice(),
+            "queue.json",
+        ),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let state_dir = tmp.path().join("state");
+        nzbd_state::SnapshotStore::open(&state_dir).unwrap();
+        let snapshot_path = state_dir.join("queue.json");
+        std::fs::write(&snapshot_path, bytes).unwrap();
+        let before = std::fs::read(&snapshot_path).unwrap();
+
+        let mut config = EngineConfig::single_node(
+            Vec::new(),
+            state_dir,
+            tmp.path().join("dest"),
+            test_tuning(),
+            None,
+        );
+        config.persist_queue = false;
+        config.journal_suffix = "worker".into();
+        let engine = Engine::spawn(config).await.unwrap();
+
+        let error = engine.adopt_authority().await.unwrap_err().to_string();
+        assert!(
+            error.contains(expected),
+            "{name}: unexpected error: {error}"
+        );
+        assert!(
+            engine.snapshot().jobs.is_empty(),
+            "{name}: local queue changed"
+        );
+        assert_eq!(
+            std::fs::read(&snapshot_path).unwrap(),
+            before,
+            "{name}: unreadable authority snapshot was rewritten"
+        );
+        engine.shutdown().await;
+    }
+}
+
 async fn wait_finished(
     rx: &mut broadcast::Receiver<Event>,
     job: JobId,

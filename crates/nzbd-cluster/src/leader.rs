@@ -446,9 +446,15 @@ pub fn spawn_leader_task(
             }
             let is_leader = shared.is_leader();
             if is_leader && !was_leader {
-                // Taking office: authority adoption; leases arrive via
-                // worker heartbeats (adoption) or fresh grants.
+                // Taking office: discard leases inherited from the old view.
+                // New leases arrive via worker heartbeats or fresh grants.
                 shared.leases.lock().unwrap().clear();
+            }
+            if is_leader && !authority_ready {
+                // Retry a refused adoption while this node remains leader.
+                // The engine leaves both local and shared state unchanged on
+                // refusal, so an operator can repair the snapshot in place
+                // without restarting the daemon or forcing an election flap.
                 match shared.engine.adopt_authority().await {
                     Ok(()) => {
                         authority_ready = true;

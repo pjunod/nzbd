@@ -1456,8 +1456,13 @@ impl Owner {
                 }
             }
             Ok(None) => {}
-            Err(e) => {
-                tracing::error!(error = %e, "authority snapshot unreadable; adopting journals only");
+            Err(error) => {
+                self.persist = false;
+                tracing::error!(
+                    error = %error,
+                    "authority adoption refused; unreadable shared snapshot left unchanged"
+                );
+                return Err(error);
             }
         }
 
