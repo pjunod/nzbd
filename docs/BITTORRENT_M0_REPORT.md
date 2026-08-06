@@ -339,15 +339,24 @@ exception is not evidence that the underlying code became safe to enable.
 
 Preferred path:
 
-1. review and submit the prepared authoritative-restore and discovery-health
-   patches upstream;
-2. reconcile both patches with upstream feedback without weakening nzbd's
+1. open an upstream design issue for the discovery-health contract before
+   submitting its multi-crate implementation, so rqbit maintainers can shape
+   the public surface before nzbd treats the patch as an integration plan;
+2. review and submit the prepared authoritative-restore patch and the agreed
+   discovery-health implementation upstream;
+3. reconcile both changes with upstream feedback without weakening nzbd's
    ownership, privacy, or observability contracts;
-3. pin the first stable release containing both accepted APIs;
-4. rerun all eleven M0 gates on native macOS, Linux glibc/musl, and Windows;
-5. run the packet-capture private-mode test and obtain reviewer acceptance of
+4. pin the first stable release containing both accepted APIs;
+5. rerun all eleven M0 gates on native macOS, Linux glibc/musl, and Windows;
+6. run the packet-capture private-mode test and obtain reviewer acceptance of
    the recorded resource, package, license, and advisory dispositions; and
-6. only then resume M2 daemon integration.
+7. only then resume M2 daemon integration.
+
+The two upstream changes may be designed, reviewed, and released separately,
+but they are not separate production gates. Starting M2 with authoritative
+restore alone would leave gate 7 failed and make tracker or DHT failure
+indistinguishable from an ordinary lack of peers. That degraded view is not an
+accepted shortcut around the observability contract.
 
 Two alternatives require an explicit ADR-19 amendment:
 

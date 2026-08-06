@@ -440,6 +440,13 @@ scheduled drift verifier are recorded in
 This preparation does not make gate 7 pass: the API must survive upstream
 review and ship in a stable release before nzbd can consume it.
 
+Because this contribution spans `librqbit`, `librqbit-dht`, and
+`librqbit-tracker-comms`, submit its public contract as an upstream design
+issue before asking maintainers to review the full patch. The two rqbit APIs
+may move through upstream independently, but M2 does not ship on the restore
+API alone: a degraded discovery view still fails gate 7 and cannot distinguish
+an idle swarm from a tracker or DHT failure.
+
 It does not follow that M1b must wait. A serializable transfer record, one
 owner-controlled active set, reliable structural facts, and coalesced progress
 are required whichever embedded engine wins. M1b is therefore authorized with
