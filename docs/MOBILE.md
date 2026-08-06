@@ -48,10 +48,11 @@ npm run android           # build and run an Android emulator or device
 npm run ios:device        # choose and build for a connected Apple device
 ```
 
-The first native build runs Expo prebuild and creates ignored `ios/` or
-`android/` directories. The committed source of truth remains `app.json` plus
-the TypeScript files; regenerate native folders after changing a config
-plugin.
+The `ios/` and `android/` projects are committed so they open directly in
+Xcode and Android Studio. `app.json` plus its Expo config plugins are the
+authoritative configuration inputs. After changing either, run
+`npx expo prebuild --clean`, review the regenerated native-project diff, and
+commit it with the configuration change.
 
 On the first screen, select a server under **Nearby nzbd** or enter an address
 the device itself can reach. A bare hostname or IP address gains nzbd's
@@ -97,6 +98,43 @@ resolve every screen, native module, and asset. Run `npm run ios` and
 `npm run android` before a release because a JavaScript bundle cannot prove
 Xcode signing, Android SDK setup, local-network permissions, or document
 provider behavior on a real device.
+
+## Build a signed Android release
+
+The committed development keystore signs debug builds only. Android release
+artifact tasks fail closed unless all four upload-key settings are supplied;
+the build never silently falls back to the public debug key.
+
+Generate and back up a private upload key outside the repository. For example:
+
+```bash
+keytool -genkeypair -v -storetype PKCS12 \
+  -keystore /private/path/nzbd-upload-key.p12 \
+  -alias nzbd-upload -keyalg RSA -keysize 2048 -validity 10000
+```
+
+Put the settings in `~/.gradle/gradle.properties`, which must remain outside
+version control and readable only by your account:
+
+```properties
+NZBD_ANDROID_STORE_FILE=/private/path/nzbd-upload-key.p12
+NZBD_ANDROID_STORE_PASSWORD=replace-with-the-store-password
+NZBD_ANDROID_KEY_ALIAS=nzbd-upload
+NZBD_ANDROID_KEY_PASSWORD=replace-with-the-key-password
+```
+
+Then build the Play Store bundle:
+
+```bash
+chmod 600 ~/.gradle/gradle.properties
+cd mobile/android
+./gradlew bundleRelease
+```
+
+The same four names can be supplied as environment variables in a protected
+build environment. Treat this key as the Google Play App Signing upload key:
+keep an offline backup, restrict access, and do not commit either the key or
+its passwords.
 
 ## iPad is a first-class layout
 

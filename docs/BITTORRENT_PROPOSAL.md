@@ -1628,9 +1628,10 @@ requested payload. With `[torrent].enabled=false`, it opens no peer listener.
 protocol chip · upload/ratio/peer/seed views · controls · metrics · mobile
 types/screens/document picker/magnet add · configuration editor and warnings.
 
-**Prerequisite:** land the mobile P0 release-signing and non-Latin-1 Basic-auth
-fixes from [`MOBILE_REVIEW.md`](MOBILE_REVIEW.md) before shipping a new mobile
-surface on top of those known defects.
+**Prerequisite:** the mobile P0 release-signing and non-Latin-1 Basic-auth
+fixes from [`MOBILE_REVIEW.md`](MOBILE_REVIEW.md) are implemented and guarded
+in CI. M3 remains dependent on the M2 engine decision, but no longer inherits
+those two defects.
 
 **Acceptance:** DOM and mobile unit tests cover every new state; an old mobile
 client fixture receives only existing top-level status values; an idle seed
@@ -1863,8 +1864,8 @@ The review authorized groundwork and the M0 spike, not a production torrent
 listener. That spike has now failed gates 7 and 8. The engine-neutral M1b seam
 is implemented under §4.3.2. Disk-guard F1–F3 and durable history deletion are
 now complete; M2 remains blocked until ADR-19 records an engine/API resolution
-and the complete M0 matrix passes. M3 remains blocked on the named mobile P0
-fixes.
+and the complete M0 matrix passes. The mobile P0 prerequisites are complete;
+M3 remains downstream of the M2 engine/API decision.
 
 ---
 

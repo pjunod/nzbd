@@ -12,6 +12,32 @@ env:
   NZBD_REQUIRE_TOOLS: 1
 
 jobs:
+  mobile:
+    name: mobile quality + release guard
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: mobile
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: mobile/package-lock.json
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+      - name: release signing fails closed without an upload key
+        working-directory: mobile/android
+        run: |
+          if ./gradlew :app:assembleRelease --dry-run > "$RUNNER_TEMP/release-signing.log" 2>&1; then
+            cat "$RUNNER_TEMP/release-signing.log"
+            echo "release build unexpectedly accepted missing signing credentials"
+            exit 1
+          fi
+          grep -F "Android release signing is not configured" "$RUNNER_TEMP/release-signing.log"
+
   test:
     name: unit + e2e
     runs-on: ubuntu-latest

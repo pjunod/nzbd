@@ -14,6 +14,13 @@ import {
 
 const CLIENT_NAME = 'nzbd-mobile/1.0';
 
+function utf8Base64(value: string): string {
+  const bytes = new TextEncoder().encode(value);
+  let binary = '';
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary);
+}
+
 export class ApiError extends Error {
   constructor(
     message: string,
@@ -165,7 +172,7 @@ export class NzbdClient {
     if (this.config.token) {
       headers.authorization = `Bearer ${this.config.token}`;
     } else if (this.config.password) {
-      headers.authorization = `Basic ${btoa(
+      headers.authorization = `Basic ${utf8Base64(
         `${this.config.username}:${this.config.password}`,
       )}`;
     }
