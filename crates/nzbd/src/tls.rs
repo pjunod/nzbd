@@ -9,6 +9,7 @@
 //! warning is not enough on Chrome/Android).
 
 use crate::anyhow_lite;
+use rustls::pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -73,10 +74,10 @@ pub fn server_config(
         generate_self_signed(&cert_path, &key_path, &cfg.api.tls_sans)?;
     }
 
-    let certs: Vec<rustls::pki_types::CertificateDer<'static>> = {
+    let certs: Vec<CertificateDer<'static>> = {
         let pem = std::fs::read(&cert_path)
             .map_err(|e| err(format!("read {}: {e}", cert_path.display())))?;
-        rustls_pemfile::certs(&mut pem.as_slice())
+        CertificateDer::pem_slice_iter(&pem)
             .collect::<Result<_, _>>()
             .map_err(|e| err(format!("parse {}: {e}", cert_path.display())))?
     };
@@ -89,7 +90,9 @@ pub fn server_config(
     let key = {
         let pem = std::fs::read(&key_path)
             .map_err(|e| err(format!("read {}: {e}", key_path.display())))?;
-        rustls_pemfile::private_key(&mut pem.as_slice())
+        PrivateKeyDer::pem_slice_iter(&pem)
+            .next()
+            .transpose()
             .map_err(|e| err(format!("parse {}: {e}", key_path.display())))?
             .ok_or_else(|| err(format!("{}: no private key found", key_path.display())))?
     };

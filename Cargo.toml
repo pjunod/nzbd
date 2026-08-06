@@ -33,22 +33,22 @@ license = "MIT OR Apache-2.0"
 repository = "https://example.invalid/nzbd"
 
 [workspace.dependencies]
-nzbd-types = { path = "crates/nzbd-types" }
-nzbd-nzb = { path = "crates/nzbd-nzb" }
-nzbd-yenc = { path = "crates/nzbd-yenc" }
-nzbd-par2 = { path = "crates/nzbd-par2" }
-nzbd-nntp = { path = "crates/nzbd-nntp" }
-nzbd-engine = { path = "crates/nzbd-engine" }
-nzbd-feed = { path = "crates/nzbd-feed" }
-nzbd-post = { path = "crates/nzbd-post" }
-nzbd-state = { path = "crates/nzbd-state" }
-nzbd-config = { path = "crates/nzbd-config" }
-nzbd-api = { path = "crates/nzbd-api" }
-nzbd-compat = { path = "crates/nzbd-compat" }
+nzbd-types = { version = "=0.2.0", path = "crates/nzbd-types" }
+nzbd-nzb = { version = "=0.2.0", path = "crates/nzbd-nzb" }
+nzbd-yenc = { version = "=0.2.0", path = "crates/nzbd-yenc" }
+nzbd-par2 = { version = "=0.2.0", path = "crates/nzbd-par2" }
+nzbd-nntp = { version = "=0.2.0", path = "crates/nzbd-nntp" }
+nzbd-engine = { version = "=0.2.0", path = "crates/nzbd-engine" }
+nzbd-feed = { version = "=0.2.0", path = "crates/nzbd-feed" }
+nzbd-post = { version = "=0.2.0", path = "crates/nzbd-post" }
+nzbd-state = { version = "=0.2.0", path = "crates/nzbd-state" }
+nzbd-config = { version = "=0.2.0", path = "crates/nzbd-config" }
+nzbd-api = { version = "=0.2.0", path = "crates/nzbd-api" }
+nzbd-compat = { version = "=0.2.0", path = "crates/nzbd-compat" }
 
-nzbd-nserv = { path = "crates/nzbd-nserv" }
-nzbd-cluster = { path = "crates/nzbd-cluster" }
-nzbd-torrent = { path = "crates/nzbd-torrent" }
+nzbd-nserv = { version = "=0.2.0", path = "crates/nzbd-nserv" }
+nzbd-cluster = { version = "=0.2.0", path = "crates/nzbd-cluster" }
+nzbd-torrent = { version = "=0.2.0", path = "crates/nzbd-torrent" }
 
 flate2 = "1"
 serde = { version = "1", features = ["derive"] }
@@ -68,7 +68,6 @@ hyper = "1"
 hyper-util = { version = "0.1", features = ["client", "client-legacy", "http1", "tokio", "server", "server-auto", "service"] }
 http-body-util = "0.1"
 rcgen = { version = "0.13", default-features = false, features = ["pem", "aws_lc_rs"] }
-rustls-pemfile = "2"
 sha2 = "0.10"
 quick-xml = "0.41"
 crc32fast = "1"
