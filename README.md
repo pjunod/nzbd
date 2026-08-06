@@ -2,6 +2,7 @@
 
 [![Tests](https://github.com/pjunod/nzbd/actions/workflows/ci.yml/badge.svg)](https://github.com/pjunod/nzbd/actions/workflows/ci.yml)
 [![Lint](https://github.com/pjunod/nzbd/actions/workflows/lint.yml/badge.svg)](https://github.com/pjunod/nzbd/actions/workflows/lint.yml)
+[![Supply chain](https://github.com/pjunod/nzbd/actions/workflows/supply-chain.yml/badge.svg)](https://github.com/pjunod/nzbd/actions/workflows/supply-chain.yml)
 [![Coverage](https://raw.githubusercontent.com/pjunod/nzbd/badges/coverage.svg)](https://github.com/pjunod/nzbd/actions/workflows/coverage.yml)
 [![Test count](https://raw.githubusercontent.com/pjunod/nzbd/badges/tests.svg)](https://github.com/pjunod/nzbd/actions/workflows/ci.yml)
 

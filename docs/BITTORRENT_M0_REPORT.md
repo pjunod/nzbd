@@ -33,7 +33,7 @@ peer listener, or production torrent admission path has been added.
 | 6. Path and delete safety | **Pass** | Traversal metainfo is rejected before an escape file exists. Delete-data removes only parsed torrent content; an unrelated sibling survives. Higher layers must still prove the persisted canonical root before requesting deletion. |
 | 7. Public observability | **Fail** | Public stats expose phase, total/progress/upload bytes, file progress, rates, ETA inputs, peer counts, completion, and error. They do not expose per-torrent tracker state, DHT state, or last tracker error. “No peers” cannot safely substitute for those facts. |
 | 8. nzbd-authoritative persistence | **Fail** | The contract test proves that `Session::new_with_opts` auto-restores the library record before returning. The persistence module and store injection point are private in 8.1.1, so nzbd cannot filter first. |
-| 9. Resource, package, and license delta | **Partial** | Measurements are recorded in §4. They need reviewer acceptance and a RustSec audit in release CI before this gate can pass. |
+| 9. Resource, package, and license delta | **Partial** | Measurements are recorded in §4. A blocking cargo-deny 0.20.2 policy now passes locally across all features and the locked graph. It runs on every PR, main/tag push, and a daily schedule. Gate 9 still needs the first successful Actions run and reviewer acceptance of the measurements and three exact, unreachable-path advisory exceptions. |
 | 10. One explicit rustls provider | **Pass** | The process starts without a provider, explicitly installs aws-lc, and constructs librqbit’s rustls client without the mixed-provider panic. |
 | 11. v1-only boundary | **Pass** | Stable input uses v1 pieces/`btih`; v2-only and hybrid `.torrent` files and magnets return separate named errors before librqbit admission. |
 
@@ -241,9 +241,37 @@ including `serde_with 3.14.1`, `idna_adapter 1.2.1`, and ICU4X 2.1.x. With the
 existing `time 0.3.41` MSRV pin restored, the actual Rust 1.85.1 toolchain
 passes `cargo check --workspace --all-targets` on macOS.
 
-`cargo-audit`/`cargo-deny` are not installed in this workspace, so no
-vulnerability-database result is claimed. Release CI must add or run the
-project’s chosen supply-chain check before gate 9 is accepted.
+The checked-in [`deny.toml`](../deny.toml) policy passes locally with
+cargo-deny 0.20.2 across all features and the locked graph. It fails on an
+unapproved license, registry, Git source, wildcard dependency, OpenSSL/native
+TLS dependency, vulnerable or yanked crate, or unmaintained direct workspace
+dependency. `option-ext 0.2.0` is the only license exception; its MPL-2.0
+file-level copyleft is accepted at that exact version.
+
+The first advisory run found and removed the daemon's direct
+`rustls-pemfile 2.2.0` dependency. The daemon now parses certificates and
+private keys through the maintained `rustls-pki-types` API already re-exported
+by rustls. Three exact advisory exceptions remain:
+
+- [`RUSTSEC-2026-0194`](https://rustsec.org/advisories/RUSTSEC-2026-0194)
+  and
+  [`RUSTSEC-2026-0195`](https://rustsec.org/advisories/RUSTSEC-2026-0195)
+  affect quick-xml 0.37 through librqbit 8.1.1's unconditional UPnP helper.
+  The path is reachable only when UPnP port forwarding is enabled, which M0
+  keeps off. A production gate must remove both exceptions or keep UPnP
+  unavailable.
+- [`RUSTSEC-2026-0009`](https://rustsec.org/advisories/RUSTSEC-2026-0009)
+  affects `time`'s RFC 2822 parser. rcgen compiles `time` without its parsing
+  feature, so the vulnerable parser is absent. The fixed `time 0.3.47` raises
+  its MSRV to Rust 1.88, while nzbd's verified floor is Rust 1.85.
+
+[`supply-chain.yml`](../.github/workflows/supply-chain.yml) pins
+`cargo-deny-action` to an immutable revision and runs separate blocking policy
+and RustSec jobs on every pull request, main or release-tag push, a daily
+schedule, and manual dispatch. Gate 9 remains **Partial** until the first
+workflow run is linked here and a reviewer accepts both the recorded delta and
+the narrow advisory dispositions. A green exception is not evidence that the
+underlying code became safe to enable.
 
 ---
 
@@ -255,7 +283,8 @@ Preferred path:
    public discovery-health snapshot;
 2. pin the first stable release containing those APIs;
 3. rerun all eleven M0 gates on native macOS, Linux glibc/musl, and Windows;
-4. run the packet-capture private-mode test and RustSec/license review; and
+4. run the packet-capture private-mode test and obtain reviewer acceptance of
+   the recorded resource, package, license, and advisory dispositions; and
 5. only then resume M2 daemon integration.
 
 Two alternatives require an explicit ADR-19 amendment:
@@ -280,6 +309,8 @@ The key local gates are:
 
 ```sh
 scripts/check-bittorrent-deps.sh
+cargo deny --all-features --locked check bans licenses sources
+cargo deny --all-features --locked check advisories
 cargo test -p nzbd-torrent -- --nocapture
 cargo test -p nzbd-state snapshot
 cargo check -p nzbd-torrent

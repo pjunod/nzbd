@@ -1338,13 +1338,24 @@ whose prefix merely resembles the configured root. The existing job
 
 ### 11.6 Supply-chain boundary
 
-- Pin the accepted `librqbit` version and review its feature graph.
-- Keep default features off; use Rust TLS and do not embed its HTTP API/Web UI.
-- Run license and vulnerability checks in CI.
-- Subscribe to upstream releases/security notices and test upgrades against
-  the local swarm harness before changing the pin.
-- Fuzz the adapter’s preflight parsing/path validation even if upstream also
-  fuzzes bencode.
+- Pin the accepted `librqbit` version and review its feature graph. Keep
+  default features off, use Rust TLS, and do not embed its HTTP API or Web UI.
+- Run [`deny.toml`](../deny.toml) with cargo-deny 0.20.2 across all features
+  and the locked graph. The policy allow-lists licenses and crates.io, denies
+  wildcard and unknown-source dependencies, and forbids native-tls/OpenSSL.
+- Run separate blocking license/bans/source and RustSec jobs on every pull
+  request, main or release-tag push, and a daily schedule. Pin the
+  cargo-deny action by immutable commit so the gate cannot change underneath
+  an otherwise identical revision.
+- Treat advisory exceptions as production capability restrictions, not
+  waivers. The quick-xml exceptions inherited through librqbit 8.1.1 mean UPnP
+  remains unavailable until the dependency is patched or replaced. The
+  `time` exception is acceptable only while its vulnerable parsing feature is
+  absent and Rust 1.85 remains the verified MSRV.
+- Subscribe to upstream releases and security notices, then test upgrades
+  against the local swarm harness before changing the pin.
+- Fuzz the adapter's preflight parsing and path validation even if upstream
+  also fuzzes bencode.
 
 ---
 
