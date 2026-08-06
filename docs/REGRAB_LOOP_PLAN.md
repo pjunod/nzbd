@@ -1,9 +1,10 @@
 # The re-grab loop — diagnosis and fix plan
 
-**Status:** ready to build · **Diagnosed:** live on nuc3 2026-07-31 against
-build `0.2.0+unknown` (built 2026-07-29 18:49 UTC, includes `2453665`) ·
-**Written:** 2026-07-31 · **Spans:** nzbd (§6) · monarr (§7) · the nuc3
-deploy (§8)
+**Status:** nzbd F1–F3 complete; monarr and operator work remains ·
+**Diagnosed:** live on nuc3 2026-07-31 against build `0.2.0+unknown`
+(built 2026-07-29 18:49 UTC, includes `2453665`) · **Written:** 2026-07-31 ·
+**Updated:** 2026-08-05 · **Spans:** nzbd (§6) · monarr (§7) · the nuc3 deploy
+(§8)
 
 Companion to [ARCHITECTURE.md](ARCHITECTURE.md) (how post-processing and the
 owner loop are built) and sibling of
@@ -288,9 +289,10 @@ for them already exists (`picked_up_by`, `history delete` with
   monarr's call (M2) — nzbd deleting content an importer may still be
   copying is how you corrupt an import. A retention feature for
   picked-up-and-aged entries is a separate future decision.
-- **Do not "fix" the history-delete defect in passing** — it has its own
-  doc and an undecided semantics question
-  ([DEFECT_HISTORY_DELETE.md](DEFECT_HISTORY_DELETE.md) §5).
+- **Do not weaken the resolved history-delete semantics in passing.**
+  [DEFECT_HISTORY_DELETE.md](DEFECT_HISTORY_DELETE.md) records the decision:
+  forget means everywhere, and portable tombstones must continue to beat
+  stale peer entries and compaction.
 - **Do not sweep pre-existing debris from boot repair.** The software
   prevents recurrence (F2); the one-time cleanup is an operator step (R2)
   because only the operator knows which corpses are still wanted for

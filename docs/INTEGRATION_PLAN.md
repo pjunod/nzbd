@@ -36,15 +36,13 @@
 > nothing; the plain monotone `seq` still rides in the body. Consumers
 > should treat the id as opaque and echo it back verbatim.
 >
-> **Known wart, flagged not fixed —
-> [DEFECT_HISTORY_DELETE.md](DEFECT_HISTORY_DELETE.md).** `?since_seq=` can
-> hand a consumer the same history entry twice: `HistoryDb::delete` removes
-> the index row but not the authoritative JSONL line, so the next refresh
-> re-imports it with a fresh, higher rowid. The duplicate is
-> byte-identical — **consumers dedupe on `(job, completed_at)`**, the key
-> the index is already unique on. That file has the reproduction, the
-> operator-facing half of the same bug ("forget" doesn't forget), and the
-> two fix options with the semantic decision they turn on.
+> **Resolved 2026-08-05 —
+> [DEFECT_HISTORY_DELETE.md](DEFECT_HISTORY_DELETE.md).** `HistoryDb::delete`
+> now appends a portable tombstone for `(job, completed_at)` before removing
+> the derived index row. Refresh, a rebuilt index, and a peer's stale entry
+> cannot publish the completion again under a fresh `?since_seq=` cursor.
+> Consumers should still treat `(job, completed_at)` as the stable identity
+> of a completion, but no longer need that key to mask delete resurrection.
 >
 > Not done, and deliberately: cluster-mode PP stage timings are not wired
 > to a node's `/metrics`. Leases run wherever the scheduler puts them, so

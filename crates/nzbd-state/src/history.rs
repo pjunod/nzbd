@@ -22,6 +22,38 @@ const COLUMNS: &str = "job_id, name, category, final_dir, status, size, health, 
                        dupe_key, dupe_score, completed_at, hidden, first_seen, last_seen,
                        seen_count, removed_at, picked_up_by, id, stages, record";
 
+type HistoryKey = (u32, i64);
+
+/// Portable mutations beside legacy bare [`HistoryEntry`] lines.
+///
+/// The tagged shape is intentionally not a `HistoryEntry`: older binaries
+/// skip it as an unknown JSONL line instead of mistaking it for history. New
+/// binaries read both shapes, so the existing log needs no rewrite.
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(tag = "op", rename_all = "snake_case")]
+enum HistoryMutation {
+    Tombstone {
+        job: crate::JobId,
+        completed_at_unix: i64,
+    },
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(untagged)]
+enum HistoryLogLine {
+    Mutation(HistoryMutation),
+    Entry(Box<HistoryEntry>),
+}
+
+/// Cheap first-pass discriminator for portable mutations. Entry lines can
+/// contain a large embedded `JobRecord`; borrowing only the optional tag lets
+/// the tombstone pass skip that payload without allocating or materialising it.
+#[derive(Debug, serde::Deserialize)]
+struct HistoryMutationProbe<'a> {
+    #[serde(borrow)]
+    op: Option<&'a str>,
+}
+
 /// How much history to keep. `0` disables that bound; whichever bound
 /// bites first wins. See [`nzbd_config::HistorySection`] for why there are
 /// two of them.
@@ -153,6 +185,17 @@ impl HistoryDb {
             "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value INTEGER NOT NULL);",
         )
         .map_err(|e| StateError::Corrupt(format!("sqlite meta schema: {e}")))?;
+        // Derived from portable JSONL tombstones. Keeping the set in SQLite
+        // makes the delete win even if a refresh races an insert of the old
+        // entry; a wiped index reconstructs it from the log.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS history_tombstones (
+                 job_id INTEGER NOT NULL,
+                 completed_at INTEGER NOT NULL,
+                 PRIMARY KEY(job_id, completed_at)
+             );",
+        )
+        .map_err(|e| StateError::Corrupt(format!("sqlite tombstone schema: {e}")))?;
 
         let jsonl = jsonl_dir.map(|d| {
             let file = match tag {
@@ -248,25 +291,54 @@ impl HistoryDb {
         };
         files.sort();
         let floor = self.ingest_floor()?;
-        let before = self.row_count()?;
-        let mut dropped = 0usize;
-        for path in files {
-            let Ok(file) = fsx::open(&path) else {
+        let mut tombstones = std::collections::HashSet::new();
+        for path in &files {
+            let Ok(file) = fsx::open(path) else {
                 continue;
             };
             for line in BufReader::new(file).split(b'\n') {
-                let line = fsx::ctx(line, "read", &path)?;
+                let line = fsx::ctx(line, "read", path)?;
+                if line.is_empty() {
+                    continue;
+                }
+                let Ok(probe) = serde_json::from_slice::<HistoryMutationProbe<'_>>(&line) else {
+                    continue;
+                };
+                if probe.op == Some("tombstone") {
+                    if let Ok(HistoryMutation::Tombstone {
+                        job,
+                        completed_at_unix,
+                    }) = serde_json::from_slice::<HistoryMutation>(&line)
+                    {
+                        tombstones.insert((job.0, completed_at_unix));
+                    }
+                }
+            }
+        }
+
+        // Apply every delete before replaying entries. File-name ordering is
+        // not a cross-node clock, so a tombstone is monotone: it wins over
+        // every copy of this immutable completion key on every node.
+        let removed = self.apply_tombstones(&tombstones)?;
+        let before = self.row_count()?;
+        let mut dropped = 0usize;
+        for path in &files {
+            let Ok(file) = fsx::open(path) else {
+                continue;
+            };
+            for line in BufReader::new(file).split(b'\n') {
+                let line = fsx::ctx(line, "read", path)?;
                 if line.is_empty() {
                     continue;
                 }
                 let Ok(entry) = serde_json::from_slice::<HistoryEntry>(&line) else {
-                    continue; // torn tail / old format
+                    continue; // tombstone / torn tail / unknown old format
                 };
                 if entry.completed_at_unix < floor {
                     dropped += 1;
-                    continue; // outside retention — a prune already dropped it
+                } else if !tombstones.contains(&(entry.job.0, entry.completed_at_unix)) {
+                    self.insert(&entry, false)?;
                 }
-                self.insert(&entry, false)?;
             }
         }
         let imported = self.row_count()?.saturating_sub(before);
@@ -280,7 +352,62 @@ impl HistoryDb {
         if dropped > 0 {
             tracing::debug!(dropped, floor, "history ingest skipped pre-retention rows");
         }
+        if removed > 0 {
+            tracing::debug!(removed, "history ingest applied durable tombstones");
+        }
         Ok(())
+    }
+
+    /// Merge previously unseen portable tombstones into the derived index,
+    /// then remove the rows they cover in one transaction. The portable set
+    /// is monotone, so diffing it against SQLite avoids two no-op writes per
+    /// historical tombstone on every five-second refresh.
+    fn apply_tombstones(
+        &self,
+        tombstones: &std::collections::HashSet<HistoryKey>,
+    ) -> Result<usize, StateError> {
+        if tombstones.is_empty() {
+            return Ok(0);
+        }
+        let mut conn = self.conn.lock().unwrap();
+        let existing = {
+            let mut statement = conn
+                .prepare("SELECT job_id, completed_at FROM history_tombstones")
+                .map_err(|e| StateError::Corrupt(format!("sqlite tombstone select: {e}")))?;
+            let rows = statement
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .map_err(|e| StateError::Corrupt(format!("sqlite tombstone query: {e}")))?;
+            rows.collect::<Result<std::collections::HashSet<HistoryKey>, _>>()
+                .map_err(|e| StateError::Corrupt(format!("sqlite tombstone read: {e}")))?
+        };
+        let pending = tombstones
+            .difference(&existing)
+            .copied()
+            .collect::<Vec<_>>();
+        if pending.is_empty() {
+            return Ok(0);
+        }
+        let tx = conn
+            .transaction()
+            .map_err(|e| StateError::Corrupt(format!("sqlite tombstone transaction: {e}")))?;
+        let mut removed = 0usize;
+        for (job, completed_at) in pending {
+            tx.execute(
+                "INSERT OR IGNORE INTO history_tombstones (job_id, completed_at)
+                 VALUES (?1, ?2)",
+                rusqlite::params![job, completed_at],
+            )
+            .map_err(|e| StateError::Corrupt(format!("sqlite tombstone insert: {e}")))?;
+            removed += tx
+                .execute(
+                    "DELETE FROM history WHERE job_id = ?1 AND completed_at = ?2",
+                    rusqlite::params![job, completed_at],
+                )
+                .map_err(|e| StateError::Corrupt(format!("sqlite tombstone delete: {e}")))?;
+        }
+        tx.commit()
+            .map_err(|e| StateError::Corrupt(format!("sqlite tombstone commit: {e}")))?;
+        Ok(removed)
     }
 
     /// The oldest `completed_at` ingest will accept: the higher of the
@@ -363,8 +490,9 @@ impl HistoryDb {
     /// single-node), never a peer's; the swap is tmp+rename, so a concurrent
     /// reader on another node sees the whole old file or the whole new one;
     /// and `jsonl_write` serializes it against this process's own appends.
-    /// The semantic question that defect is blocked on — does "forget" mean
-    /// here or everywhere — is not answered here and not touched.
+    /// Explicit forget is a separate mutation: it means everywhere and its
+    /// tombstone survives this compaction even after the covered entry does
+    /// not.
     pub fn prune(&self, now: i64) -> Result<usize, StateError> {
         let r = self.retention();
         if r.is_unlimited() {
@@ -499,14 +627,21 @@ impl HistoryDb {
             if line.is_empty() {
                 continue;
             }
-            match serde_json::from_slice::<HistoryEntry>(&line) {
-                Ok(e) if live.contains(&(e.job.0, e.completed_at_unix)) => {
+            match serde_json::from_slice::<HistoryLogLine>(&line) {
+                Ok(HistoryLogLine::Entry(e)) if live.contains(&(e.job.0, e.completed_at_unix)) => {
                     kept.extend_from_slice(&line);
                     kept.push(b'\n');
                 }
-                Ok(_) => dropped += 1,
-                // A torn tail is not evidence to delete by. Keep it: the
-                // reader already skips what it cannot parse.
+                Ok(HistoryLogLine::Entry(_)) => dropped += 1,
+                // Tombstones are the only durable proof that a peer's old
+                // entry must stay forgotten. They are monotone and remain
+                // forever; dropping one would make compaction resurrect data.
+                Ok(HistoryLogLine::Mutation(HistoryMutation::Tombstone { .. })) => {
+                    kept.extend_from_slice(&line);
+                    kept.push(b'\n');
+                }
+                // A torn tail or unknown old line is not evidence to delete
+                // by. Keep it: the reader already skips what it cannot parse.
                 Err(_) => {
                     kept.extend_from_slice(&line);
                     kept.push(b'\n');
@@ -544,7 +679,11 @@ impl HistoryDb {
                  (job_id, name, category, final_dir, status, size, health, params,
                   dupe_key, dupe_score, completed_at, hidden, removed_at, picked_up_by,
                   stages, record)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
+                 SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16
+                 WHERE NOT EXISTS (
+                   SELECT 1 FROM history_tombstones
+                   WHERE job_id = ?1 AND completed_at = ?11
+                 )
                  ON CONFLICT(job_id, completed_at) DO UPDATE SET
                    hidden = excluded.hidden,
                    removed_at = COALESCE(excluded.removed_at, history.removed_at),
@@ -663,15 +802,10 @@ impl HistoryDb {
     /// the path that makes SSE loss harmless: the stream can drop
     /// anything, and `since_seq` still reconstructs it.
     ///
-    /// **Known defect — `docs/DEFECT_HISTORY_DELETE.md`.** `delete` removes
-    /// the index row but not the authoritative JSONL line, so the next
-    /// `refresh` re-imports it with a *new, higher* rowid and a consumer
-    /// paging forward is handed the same entry a second time under a later
-    /// cursor. The duplicate is byte-identical, so **dedupe on
-    /// `(job, completed_at)`** — the key this index is already unique on.
-    /// Pinned by `delete_resurrects_the_entry_with_a_new_cursor`, which
-    /// documents the wrong behavior on purpose; that doc has the two fix
-    /// options and the semantic decision they wait on.
+    /// Durable JSONL tombstones prevent a forgotten entry from returning
+    /// under a new rowid. A consumer that advances to cursor N before a
+    /// delete will therefore never receive that completion again at a
+    /// cursor greater than N, including after a peer-log refresh or rebuild.
     pub fn list_since(
         &self,
         since_seq: i64,
@@ -831,26 +965,63 @@ impl HistoryDb {
         Ok(())
     }
 
-    /// Forget an entry.
-    ///
-    /// **Known defect — `docs/DEFECT_HISTORY_DELETE.md`.** This removes the
-    /// index row only. The JSONL line survives, and the next `refresh`
-    /// puts the entry back with a fresh rowid, so the delete does not
-    /// stick — the UI's "forget" is undone within one history poll and
-    /// `list_since` reports the entry twice. `hide` re-appends its change
-    /// to the log for exactly this reason; `delete` has no equivalent, and
-    /// giving it one is a cross-node semantic decision rather than a
-    /// mechanical fix. Read that doc before changing this function.
-    pub fn delete(&self, job: crate::JobId) -> Result<bool, StateError> {
-        let n = {
-            let conn = self.conn.lock().unwrap();
-            conn.execute("DELETE FROM history WHERE job_id = ?1", [job.0])
-                .map_err(|e| StateError::Corrupt(e.to_string()))?
+    /// Append all tombstones for one delete under one lock and one fsync.
+    /// The log lands before the derived-index delete: if SQLite then fails,
+    /// the next refresh still converges on the durable operator intent.
+    fn append_tombstones(&self, job: crate::JobId, completed_at: &[i64]) -> Result<(), StateError> {
+        let Some(path) = &self.jsonl else {
+            return Ok(());
         };
+        if completed_at.is_empty() {
+            return Ok(());
+        }
+        if let Some(parent) = path.parent() {
+            fsx::create_dir_all(parent)?;
+        }
+        let _guard = self.jsonl_write.lock().unwrap();
+        let mut f = fsx::open_append(path)?;
+        let mut buf = Vec::new();
+        for completed_at_unix in completed_at {
+            let mutation = HistoryMutation::Tombstone {
+                job,
+                completed_at_unix: *completed_at_unix,
+            };
+            serde_json::to_writer(&mut buf, &mutation)?;
+            buf.push(b'\n');
+        }
+        fsx::write_all(&mut f, &buf, path)?;
+        fsx::sync_data(&f, path)?;
+        Ok(())
+    }
+
+    /// Forget an entry everywhere that reads the shared portable log.
+    ///
+    /// Each matching completion key gets a durable tombstone before the
+    /// derived SQLite row is removed. A peer or rebuilt index can still hold
+    /// the old entry line; the tombstone wins, so neither UI history nor the
+    /// forward cursor can resurrect it under a new rowid.
+    pub fn delete(&self, job: crate::JobId) -> Result<bool, StateError> {
+        let completed_at = {
+            let conn = self.conn.lock().unwrap();
+            let mut stmt = conn
+                .prepare("SELECT completed_at FROM history WHERE job_id = ?1")
+                .map_err(|e| StateError::Corrupt(format!("sqlite delete lookup: {e}")))?;
+            let rows = stmt
+                .query_map([job.0], |row| row.get::<_, i64>(0))
+                .map_err(|e| StateError::Corrupt(format!("sqlite delete lookup: {e}")))?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|e| StateError::Corrupt(format!("sqlite delete lookup: {e}")))?
+        };
+        self.append_tombstones(job, &completed_at)?;
+        let tombstones = completed_at
+            .iter()
+            .map(|at| (job.0, *at))
+            .collect::<std::collections::HashSet<_>>();
+        self.apply_tombstones(&tombstones)?;
         // The record and its spooled NZB live and die together: an entry
         // nobody can see must not leave a file behind.
         self.drop_spool(job);
-        Ok(n > 0)
+        Ok(!completed_at.is_empty())
     }
 
     // -----------------------------------------------------------------
@@ -1153,7 +1324,7 @@ mod tests {
     }
 
     #[test]
-    fn record_list_delete_and_jsonl_rebuild() {
+    fn durable_delete_converges_on_a_fresh_index() {
         let tmp = tempfile::tempdir().unwrap();
         let db_path = tmp.path().join("local/history.sqlite");
         let shared = tmp.path().join("shared");
@@ -1168,14 +1339,12 @@ mod tests {
         assert!(db.delete(crate::JobId(1)).unwrap());
         drop(db);
 
-        // New authority, fresh local index: rebuilt from the shared JSONL.
+        // New node, fresh local index: the portable tombstone beats the old
+        // entry line in the shared JSONL.
         let db2 = HistoryDb::open(&tmp.path().join("other/history.sqlite"), Some(&shared)).unwrap();
         let list = db2.list(10).unwrap();
-        assert_eq!(
-            list.len(),
-            2,
-            "rebuilt from JSONL (incl. deleted-locally row)"
-        );
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].job.0, 2, "the unrelated completion survives");
     }
 
     /// The cursor a consumer walks forward on. Two properties matter and
@@ -1274,15 +1443,8 @@ mod tests {
         assert!(db2.list_since(0, 10).unwrap()[0].seq > 0);
     }
 
-    /// **Pins a known defect on purpose** (`docs/DEFECT_HISTORY_DELETE.md`).
-    ///
-    /// A deleted entry comes back on the next refresh with a new rowid, so
-    /// "forget" does not stick and a cursor consumer sees the entry twice.
-    /// This test asserts the WRONG behavior so that a fix cannot land
-    /// silently: when someone implements tombstones, this test fails, and
-    /// its replacement is item 1 and item 3 of that doc's acceptance list.
     #[test]
-    fn delete_resurrects_the_entry_with_a_new_cursor() {
+    fn delete_survives_refresh_and_never_replays_on_the_cursor() {
         let tmp = tempfile::tempdir().unwrap();
         let shared = tmp.path().join("shared");
         let db = HistoryDb::open(&tmp.path().join("local/history.sqlite"), Some(&shared)).unwrap();
@@ -1291,7 +1453,6 @@ mod tests {
         }
         let before = db.list_since(0, 50).unwrap();
         let cursor = before.last().unwrap().seq;
-        let gone_at = before.iter().find(|e| e.job.0 == 2).unwrap().seq;
 
         assert!(db.delete(crate::JobId(2)).unwrap());
         assert!(
@@ -1299,29 +1460,62 @@ mod tests {
             "the delete does take effect in the index"
         );
 
-        // …until the first read rebuilds the index from the log, which is
-        // every history poll. `open` seeds without arming the throttle, so
-        // this first `refresh` is not skipped.
-        db.refresh().unwrap();
-        let back = db
-            .list_since(0, 50)
+        // Three complete replay cycles, bypassing the five-second public
+        // refresh throttle. Neither the full view nor a consumer already at
+        // `cursor` may receive this completion again under a new rowid.
+        for _ in 0..3 {
+            db.rebuild_from_jsonl(true).unwrap();
+            assert!(!db.list_since(0, 50).unwrap().iter().any(|e| e.job.0 == 2));
+            assert!(db.list_since(cursor, 50).unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn tombstone_beats_hidden_and_peer_copies_regardless_of_file_order() {
+        let tmp = tempfile::tempdir().unwrap();
+        let shared = tmp.path().join("shared");
+        let own = shared.join("history.jsonl");
+        let db = HistoryDb::open(&tmp.path().join("local/history.sqlite"), Some(&shared)).unwrap();
+        db.record(&entry(2, 200)).unwrap();
+        assert!(db.hide(crate::JobId(2), Some("sonarr"), 999).unwrap());
+        let old_lines = std::fs::read_to_string(&own).unwrap();
+        assert!(db.delete(crate::JobId(2)).unwrap());
+
+        // A peer still has both the original and later hidden re-append. Its
+        // file sorts after this node's file, but ordering cannot override a
+        // monotone tombstone for the immutable completion key.
+        std::fs::write(shared.join("history.peer.jsonl"), old_lines).unwrap();
+        let peer = HistoryDb::open(&tmp.path().join("peer/history.sqlite"), Some(&shared)).unwrap();
+        assert!(peer.list_filtered(10, true).unwrap().is_empty());
+
+        let lines: Vec<_> = std::fs::read_to_string(&own)
             .unwrap()
-            .into_iter()
-            .find(|e| e.job.0 == 2)
-            .expect("DEFECT: the deleted entry is back");
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        let tombstone = lines.last().unwrap();
         assert!(
-            back.seq > gone_at,
-            "and it is back as a NEW row (seq {} > {gone_at}), which is why \
-             a consumer past cursor {cursor} is handed it a second time",
-            back.seq
+            serde_json::from_str::<HistoryEntry>(tombstone).is_err(),
+            "an older binary must skip, never misread, the new mutation"
         );
-        assert!(
-            db.list_since(cursor, 50)
-                .unwrap()
-                .iter()
-                .any(|e| e.job.0 == 2),
-            "DEFECT: duplicate delivery on the cursor"
-        );
+    }
+
+    #[test]
+    fn failed_tombstone_append_does_not_delete_the_index_row() {
+        let tmp = tempfile::tempdir().unwrap();
+        let shared = tmp.path().join("shared");
+        let db = HistoryDb::open(&tmp.path().join("local/history.sqlite"), Some(&shared)).unwrap();
+        db.record(&entry(2, 200)).unwrap();
+        db.spool_nzb(crate::JobId(2), b"<nzb/>").unwrap();
+
+        // Replace the JSONL directory with a plain file. The durable write
+        // must fail before SQLite changes; reporting success here would make
+        // a forget disappear again on the next healthy rebuild.
+        std::fs::rename(&shared, tmp.path().join("shared.saved")).unwrap();
+        std::fs::write(&shared, b"not a directory").unwrap();
+        assert!(db.delete(crate::JobId(2)).is_err());
+        assert_eq!(db.list_filtered(10, true).unwrap()[0].job.0, 2);
+        assert!(db.has_spool(crate::JobId(2)), "Undo source also remains");
     }
 
     #[test]
@@ -1532,6 +1726,55 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert!(rows[0].hidden);
         assert_eq!(rows[0].picked_up_by.as_deref(), Some("sonarr"));
+    }
+
+    #[test]
+    fn compaction_keeps_tombstones_that_guard_against_peer_resurrection() {
+        let tmp = tempfile::tempdir().unwrap();
+        let jsonl_dir = tmp.path().join("h");
+        let db = HistoryDb::open(&tmp.path().join("history.sqlite"), Some(&jsonl_dir)).unwrap();
+        db.record(&entry(1, 100)).unwrap();
+        db.record(&entry(2, 200)).unwrap();
+        assert!(db.delete(crate::JobId(1)).unwrap());
+        db.record(&entry(3, 300)).unwrap();
+
+        // Removing job 2 by retention forces a compaction. Job 1's obsolete
+        // entry line may go, but its tombstone must remain beside live job 3.
+        db.set_retention(Retention {
+            keep_max: 1,
+            keep_days: 0,
+        })
+        .unwrap();
+        let own = jsonl_dir.join("history.jsonl");
+        let text = std::fs::read_to_string(&own).unwrap();
+        assert_eq!(text.lines().count(), 2, "one entry plus one tombstone");
+        assert!(text.lines().any(|line| {
+            matches!(
+                serde_json::from_str::<HistoryLogLine>(line),
+                Ok(HistoryLogLine::Mutation(HistoryMutation::Tombstone {
+                    job: crate::JobId(1),
+                    completed_at_unix: 100
+                }))
+            )
+        }));
+
+        // A peer can retain job 1 forever; the compacted tombstone still
+        // prevents a fresh index from accepting it.
+        std::fs::write(
+            jsonl_dir.join("history.peer.jsonl"),
+            format!("{}\n", serde_json::to_string(&entry(1, 100)).unwrap()),
+        )
+        .unwrap();
+        let fresh = HistoryDb::open(&tmp.path().join("fresh.sqlite"), Some(&jsonl_dir)).unwrap();
+        assert_eq!(
+            fresh
+                .list_filtered(10, true)
+                .unwrap()
+                .into_iter()
+                .map(|e| e.job.0)
+                .collect::<Vec<_>>(),
+            vec![3]
+        );
     }
 
     /// Retention off is retention off: an install that never sets bounds

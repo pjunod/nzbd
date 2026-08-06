@@ -1,7 +1,7 @@
 # BitTorrent M1b report — one queue contract, still no peer session
 
-**Status:** implemented; pending review · **Date:** 2026-08-05 ·
-**Branch:** `codex/bittorrent-engine-unblock` ·
+**Status:** implemented; merged in PR #9 · **Date:** 2026-08-05 ·
+**Historical branch:** `codex/bittorrent-engine-unblock` ·
 **Decision owner:** ADR-19 in [BITTORRENT_PROPOSAL.md](BITTORRENT_PROPOSAL.md)
 
 M1b adds the protocol-neutral state and message boundary needed by any future
@@ -133,11 +133,13 @@ M1b does not soften any M0 stop condition. Before M2:
 1. rqbit must expose authoritative restore and honest discovery health in a
    stable release, or ADR-19 must select and prove another engine;
 2. all eleven M0 gates must pass on native macOS, Linux glibc/musl, and
-   Windows, including private-mode capture and dependency review;
-3. [`REGRAB_LOOP_PLAN.md`](REGRAB_LOOP_PLAN.md) F1–F3 must enforce the second
-   payload root; and
-4. [`DEFECT_HISTORY_DELETE.md`](DEFECT_HISTORY_DELETE.md) must land its durable
-   history deletion fix.
+   Windows, including private-mode capture and dependency review.
+
+The two repository prerequisites named in the original report are complete:
+[`REGRAB_LOOP_PLAN.md`](REGRAB_LOOP_PLAN.md) F1–F3 landed on 2026-07-31, and
+[`DEFECT_HISTORY_DELETE.md`](DEFECT_HISTORY_DELETE.md) now makes forget durable
+across the shared JSONL. They no longer block M2; the engine decision still
+does.
 
 No production BitTorrent networking should appear in review of this milestone.
 If it does, that is a scope and safety defect, not an optional follow-up.

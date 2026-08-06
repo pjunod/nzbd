@@ -126,7 +126,7 @@ NZBGet configuration and prints a mapping report.
 | [docs/BITTORRENT_M1B_REPORT.md](docs/BITTORRENT_M1B_REPORT.md) | Dormant protocol-neutral queue/backend seam: schema 3, shared scheduling, coalesced progress, and the production-networking guard |
 | [docs/INTEGRATION.md](docs/INTEGRATION.md) | Every seam with monarr and plurx: what each does, where you watch it, and the command that proves it |
 | [docs/INTEGRATION_PLAN.md](docs/INTEGRATION_PLAN.md) | The event/cursor contract consumers build against, and how it was built |
-| [docs/DEFECT_HISTORY_DELETE.md](docs/DEFECT_HISTORY_DELETE.md) | Open defect: why forgetting a history entry doesn't stick, and the two ways to fix it |
+| [docs/DEFECT_HISTORY_DELETE.md](docs/DEFECT_HISTORY_DELETE.md) | Resolved defect: why history rows resurrected, why forget now means everywhere, and how portable tombstones converge |
 | [docs/CLUSTERING.md](docs/CLUSTERING.md) | Cluster design (ADR-13…16), failure matrix, operations |
 | [STATUS.md](STATUS.md) | What's done, what's next, with commit evidence |
 
