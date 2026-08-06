@@ -11,7 +11,7 @@ index f0edb50..e8092e3 100644
 +    ///
 +    /// When this is true, callers remain responsible for explicitly re-adding
 +    /// the torrents they consider authoritative. `AddTorrentOptions::preferred_id`
-+    /// can reuse the persisted torrent ID and its fast-resume data.
++    /// can select the persisted torrent ID during explicit admission.
 +    pub disable_auto_restore: bool,
 +
      /// The peer ID to use. If not specified, a random one will be generated.

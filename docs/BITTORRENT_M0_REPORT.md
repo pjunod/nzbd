@@ -229,11 +229,17 @@ starts empty, explicitly restores only the authoritative torrent with its
 persisted `preferred_id`, and finally proves that a legacy session still
 restores both records. That verifies the ownership seam without exposing the
 private persistence schema or deleting library state before startup.
+It does not independently prove restoration of non-empty piece progress, so
+the patch comment is deliberately limited to the persistence identity the
+test demonstrates.
 
 [`scripts/check-rqbit-authoritative-restore-patch.sh`](../scripts/check-rqbit-authoritative-restore-patch.sh)
-clones a supplied clean v8.1.1 or rqbit-main tree locally, checks its exact
-base commit, applies the matching patch, verifies formatting, and runs the
-isolated Rust-TLS test. Both variants passed on 2026-08-06. This is
+clones a supplied clean v8.1.1 or rqbit-main tree locally, requires the exact
+stable tag or a descendant of the documented main base, reports the verified
+SHA, applies the matching patch directly or by three-way fallback on main,
+verifies formatting, and runs the isolated Rust-TLS test. The dedicated
+`rqbit contribution patches` workflow checks both variants on relevant changes
+and weekly for upstream-main drift. Both variants passed locally on 2026-08-06. This is
 contribution evidence, not a production dependency: nzbd still pins
 unmodified stable 8.1.1, gate 8 remains failed, and no daemon session consumes
 the new option.

@@ -18,21 +18,37 @@ readonly source_head
 case "$source_head" in
   "$stable_base")
     readonly patch_file="contrib/rqbit/0001-allow-persistence-without-auto-restore.patch"
-    ;;
-  "$main_base")
-    readonly patch_file="contrib/rqbit/0002-allow-persistence-without-auto-restore-main.patch"
+    readonly source_variant="stable"
     ;;
   *)
-    echo "expected rqbit v8.1.1 at $stable_base or main at $main_base; found $source_head" >&2
-    exit 1
+    if ! git -C "$source_dir" cat-file -e "$main_base^{commit}" 2>/dev/null; then
+      echo "rqbit main base $main_base is missing; use a full main checkout" >&2
+      exit 1
+    fi
+    if ! git -C "$source_dir" merge-base --is-ancestor "$main_base" "$source_head"; then
+      echo "expected rqbit v8.1.1 at $stable_base or a descendant of main base $main_base; found $source_head" >&2
+      exit 1
+    fi
+    readonly patch_file="contrib/rqbit/0002-allow-persistence-without-auto-restore-main.patch"
+    readonly source_variant="main"
     ;;
 esac
+
+echo "verifying rqbit $source_variant patch against $source_head"
 
 readonly work_dir="$(mktemp -d "${TMPDIR:-/tmp}/nzbd-rqbit-patch.XXXXXX")"
 trap 'rm -rf -- "$work_dir"' EXIT
 
 git clone --quiet --no-hardlinks "$source_dir" "$work_dir/rqbit"
-git -C "$work_dir/rqbit" apply "$repository_root/$patch_file"
+if git -C "$work_dir/rqbit" apply --check "$repository_root/$patch_file"; then
+  git -C "$work_dir/rqbit" apply "$repository_root/$patch_file"
+elif [[ "$source_variant" == "main" ]]; then
+  echo "direct apply drifted; attempting a three-way apply against $source_head" >&2
+  git -C "$work_dir/rqbit" apply --3way "$repository_root/$patch_file"
+else
+  echo "stable v8.1.1 patch no longer applies to its pinned base" >&2
+  exit 1
+fi
 
 (
   cd "$work_dir/rqbit"
