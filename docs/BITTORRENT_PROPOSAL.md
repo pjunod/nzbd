@@ -428,6 +428,18 @@ scheduled drift check, and full result are recorded in
 This preparation does not make gate 8 pass: the API must survive upstream
 review and ship in a stable release before nzbd can consume it.
 
+The second API is now concrete as well. The tested
+[`discovery_health` patch](../contrib/rqbit/0003-expose-per-torrent-discovery-health.patch)
+adds a public, per-torrent snapshot with explicit DHT states, current-run DHT
+counters, tracker states, next-announcement delays, and bounded last-failure
+categories. Tracker paths, queries, user information, response bodies, and
+credentials are excluded; only scheme, host, and port reach the public
+endpoint label. Exact-stable and rqbit-main variants, focused tests, and the
+scheduled drift verifier are recorded in
+[BITTORRENT_M0_REPORT.md](BITTORRENT_M0_REPORT.md#34-the-discovery-health-patch-is-ready-not-released).
+This preparation does not make gate 7 pass: the API must survive upstream
+review and ship in a stable release before nzbd can consume it.
+
 It does not follow that M1b must wait. A serializable transfer record, one
 owner-controlled active set, reliable structural facts, and coalesced progress
 are required whichever embedded engine wins. M1b is therefore authorized with

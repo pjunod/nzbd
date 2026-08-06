@@ -31,7 +31,7 @@ peer listener, or production torrent admission path has been added.
 | 4. Kill/restart never trusts partial data | **Blocked** | The accepted fast-resume design cannot be constructed without failing gate 8. A persistence-disabled full hash recheck is a possible safe but slower product decision, not an equivalent test of the accepted design. |
 | 5. Private-torrent discovery | **Partial** | A one-tracker private torrent downloads through a loopback HTTP tracker. Stable source disables DHT and ignores/suppresses PEX for private torrents. Because the downloader test disables DHT globally, it does not independently prove private-flag DHT suppression. Tracker order is also lost through a hash set before truncation, so the adapter rejects private metainfo unless it has exactly one unique tracker. A packet-capture leak test still belongs in the native platform matrix. |
 | 6. Path and delete safety | **Pass** | Traversal metainfo is rejected before an escape file exists. Delete-data removes only parsed torrent content; an unrelated sibling survives. Higher layers must still prove the persisted canonical root before requesting deletion. |
-| 7. Public observability | **Fail** | Public stats expose phase, total/progress/upload bytes, file progress, rates, ETA inputs, peer counts, completion, and error. They do not expose per-torrent tracker state, DHT state, or last tracker error. “No peers” cannot safely substitute for those facts. |
+| 7. Public observability | **Fail** | Public stats expose phase, total/progress/upload bytes, file progress, rates, ETA inputs, peer counts, completion, and error. Stable 8.1.1 does not expose per-torrent tracker state, DHT state, or last tracker error. A tested upstream patch now supplies that snapshot, but this gate remains failed until an accepted stable release contains it. “No peers” cannot safely substitute for those facts. |
 | 8. nzbd-authoritative persistence | **Fail** | The contract test proves that `Session::new_with_opts` auto-restores the library record before returning. The persistence module and store injection point are private in 8.1.1, so nzbd cannot filter first. A tested upstream patch now supplies the missing opt-out, but this gate remains failed until an accepted stable release contains it. |
 | 9. Resource, package, and license delta | **Partial** | Measurements are recorded in §4. A blocking cargo-deny 0.20.2 policy passes locally across all features and the locked graph, and its [first Actions run passed](https://github.com/pjunod/nzbd/actions/runs/31064446916) on 2026-08-06 UTC. It runs on every PR, main/tag push, and a daily schedule. Gate 9 still needs reviewer acceptance of the measurements and three exact, unreachable-path advisory exceptions. |
 | 10. One explicit rustls provider | **Pass** | The process starts without a provider, explicitly installs aws-lc, and constructs librqbit’s rustls client without the mixed-provider panic. |
@@ -244,6 +244,34 @@ contribution evidence, not a production dependency: nzbd still pins
 unmodified stable 8.1.1, gate 8 remains failed, and no daemon session consumes
 the new option.
 
+### 3.4 The discovery-health patch is ready, not released
+
+[`contrib/rqbit/0003-expose-per-torrent-discovery-health.patch`](../contrib/rqbit/0003-expose-per-torrent-discovery-health.patch)
+targets the exact v8.1.1 commit. Its public `ManagedTorrent::discovery_health`
+snapshot distinguishes disabled, private-suppressed, inactive, searching,
+working, and degraded DHT states, with current-run request and peer counters.
+Each tracker reports a stable state, next-announcement delay, and bounded last
+failure category. Public endpoints retain only scheme, host, and port; path,
+query, user information, response body, and credentials never enter the
+snapshot.
+
+The corresponding rqbit-main patch starts at the same documented main base as
+the authoritative-restore contribution. Tests prove endpoint and serialized
+snapshot redaction, private-torrent DHT suppression, DHT success/failure
+transitions, HTTP failure classification, tracker backoff, and rejected
+tracker retention. The focused stable suites pass 37 tests with three
+pre-existing network tests ignored; the focused main suites pass 69 tests
+with six upstream integration tests ignored.
+
+[`scripts/check-rqbit-discovery-health-patch.sh`](../scripts/check-rqbit-discovery-health-patch.sh)
+uses the same exact-stable and descendant-of-main rules as the restore
+verifier, reports the tested SHA, allows a three-way fallback only for main,
+checks formatting, and runs all three affected crate suites. The dedicated
+workflow tests both contributions against stable and main on relevant changes
+and weekly for upstream drift. This is contribution evidence only: nzbd still
+pins unmodified stable 8.1.1, gate 7 remains failed, and production wiring
+remains prohibited.
+
 ---
 
 ## 4. Measurements and dependency review
@@ -311,8 +339,10 @@ exception is not evidence that the underlying code became safe to enable.
 
 Preferred path:
 
-1. review and submit the prepared authoritative-restore patch upstream;
-2. design and prove the separate public discovery-health snapshot;
+1. review and submit the prepared authoritative-restore and discovery-health
+   patches upstream;
+2. reconcile both patches with upstream feedback without weakening nzbd's
+   ownership, privacy, or observability contracts;
 3. pin the first stable release containing both accepted APIs;
 4. rerun all eleven M0 gates on native macOS, Linux glibc/musl, and Windows;
 5. run the packet-capture private-mode test and obtain reviewer acceptance of
