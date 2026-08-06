@@ -16,10 +16,11 @@ done
 probe_port=45123
 runner_uid="$(id -u)"
 runner_user="$(id -un)"
-capture_file="$(mktemp)"
-capture_log="$(mktemp)"
-test_log="$(mktemp)"
-capture_hex_file="$(mktemp)"
+work_dir="$(mktemp -d "${TMPDIR:-/tmp}/nzbd-private-discovery.XXXXXX")"
+capture_file="$work_dir/capture.pcap"
+capture_log="$work_dir/tcpdump.log"
+test_log="$work_dir/test.log"
+capture_hex_file="$work_dir/capture.hex"
 tcpdump_pid=""
 capture_stopped=0
 rules_installed=0
@@ -37,6 +38,7 @@ cleanup() {
     done
   fi
   rm -f "$capture_file" "$capture_log" "$test_log" "$capture_hex_file"
+  rmdir "$work_dir" >/dev/null 2>&1
 }
 trap cleanup EXIT
 
@@ -47,8 +49,13 @@ trap cleanup EXIT
 getent ahostsv4 dht.transmissionbt.com >/dev/null
 getent ahostsv4 dht.libtorrent.org >/dev/null
 
-# Keep tcpdump's capture process under the runner account so it can open the
-# runner-owned mktemp file after dropping root privileges.
+# tcpdump opens its output after dropping privileges on Ubuntu's hosted
+# runners. Give it a runner-owned directory and a path that does not exist yet;
+# a pre-created mktemp file is rejected with EACCES before capture begins.
+if [[ -e "$capture_file" ]]; then
+  echo "capture output must not exist before tcpdump starts" >&2
+  exit 1
+fi
 sudo tcpdump -Z "$runner_user" -i any -U -s 0 -w "$capture_file" udp >"$capture_log" 2>&1 &
 tcpdump_pid=$!
 for _ in {1..50}; do
