@@ -1296,6 +1296,7 @@ The exact constants should be centralized and tested:
 | Raw/fetched metainfo | 10 MiB default, 1–100 MiB config range | `422 metainfo_too_large` |
 | Redirects | 5 | `422 too_many_redirects` |
 | Files per torrent | 100,000 | `422 too_many_files` |
+| One path component | 255 encoded bytes | `422 path_component_too_long` |
 | One relative path | 4 KiB encoded | `422 path_too_long` |
 | All path bytes | 16 MiB | `422 metadata_too_large` |
 | Magnet URI | 16 KiB | `422 magnet_too_long` |
@@ -1306,15 +1307,15 @@ raise the bound with a regression fixture and measured memory impact.
 
 The dormant adapter centralizes and enforces the limits it can own before
 daemon integration: 10 MiB raw metainfo, 16 KiB magnet URIs, 100,000 files,
-4 KiB per projected relative payload path, 16 MiB across projected paths, and
-2 KiB for every rqbit operation or live-stat error that crosses the adapter.
-Projected paths include the multi-file root and platform separator bytes, so
-the accounting bounds the paths later passed to storage rather than only the
-raw bencode component payloads. Exact-limit tests pass and the first excess
-byte or file returns a stable named error. Error truncation is UTF-8 safe and
-ends with an explicit marker. The 1–100 MiB metainfo configuration range,
-redirects, and fetched-body streaming remain API/source-fetch work; no
-production input is wired by these constants.
+255 encoded bytes per component, 4 KiB per projected relative payload path,
+16 MiB across projected paths, and 2 KiB for every rqbit operation or live-stat
+error that crosses the adapter. Projected paths include the multi-file root and
+platform separator bytes, so the accounting bounds the paths later passed to
+storage rather than only the raw bencode component payloads. Exact-limit tests
+pass and the first excess byte or file returns a stable named error. Error
+truncation is UTF-8 safe and ends with an explicit marker. The 1–100 MiB
+metainfo configuration range, redirects, and fetched-body streaming remain
+API/source-fetch work; no production input is wired by these constants.
 
 ---
 

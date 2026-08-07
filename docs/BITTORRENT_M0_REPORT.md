@@ -112,8 +112,8 @@ The isolated suite covers:
 - parsed BEP 47 padding metainfo whose padding entry stays out of the
   importer-safe content inventory without shifting later file progress;
 - centralized proposal limits for raw metainfo, magnet length, file count, one
-  projected relative path, and aggregate projected path bytes, with exact
-  boundary and first-excess tests;
+  path component, one projected relative path, and aggregate projected path
+  bytes, with exact boundary and first-excess tests;
 - deterministic, socket-free preflight mutations covering every truncation and
   bounded single-byte replacement, deletion, and insertion around valid v1,
   v2-only, and hybrid seeds, plus nesting, length-overflow, duplicate-info,

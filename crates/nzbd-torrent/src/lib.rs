@@ -29,6 +29,8 @@ pub const MAX_MAGNET_URI_BYTES: usize = 16 * 1024;
 pub const MAX_TORRENT_FILES: usize = 100_000;
 /// Maximum encoded length of one projected relative payload path.
 pub const MAX_TORRENT_RELATIVE_PATH_BYTES: usize = 4 * 1024;
+/// Portable maximum encoded length of one payload path component.
+pub const MAX_TORRENT_PATH_COMPONENT_BYTES: usize = 255;
 /// Maximum aggregate encoded length of all projected relative payload paths.
 pub const MAX_TORRENT_PATH_BYTES: usize = 16 * 1024 * 1024;
 /// Maximum display-safe engine error length from proposal §10.3.
@@ -90,6 +92,8 @@ pub enum TorrentError {
     TooManyFiles { count: usize, limit: usize },
     #[error("torrent relative path is too long ({size} bytes; maximum {limit})")]
     PathTooLong { size: usize, limit: usize },
+    #[error("torrent path component is too long ({size} bytes; maximum {limit})")]
+    PathComponentTooLong { size: usize, limit: usize },
     #[error("torrent path metadata is too large ({size} bytes; maximum {limit})")]
     PathMetadataTooLarge { size: usize, limit: usize },
     #[error("torrent contains payload paths that collide under portable case comparison")]
@@ -750,6 +754,12 @@ fn validate_path_component(component: &[u8]) -> Result<(), TorrentError> {
         return Err(TorrentError::UnsafeMetainfoPath(
             "path components cannot be empty",
         ));
+    }
+    if component.len() > MAX_TORRENT_PATH_COMPONENT_BYTES {
+        return Err(TorrentError::PathComponentTooLong {
+            size: component.len(),
+            limit: MAX_TORRENT_PATH_COMPONENT_BYTES,
+        });
     }
     if component.contains(&0) {
         return Err(TorrentError::UnsafeMetainfoPath(

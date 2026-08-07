@@ -346,6 +346,7 @@ fn proposal_admission_constants_and_input_boundaries_are_pinned() {
     assert_eq!(MAX_MAGNET_URI_BYTES, 16 * 1024);
     assert_eq!(MAX_TORRENT_FILES, 100_000);
     assert_eq!(MAX_TORRENT_RELATIVE_PATH_BYTES, 4 * 1024);
+    assert_eq!(MAX_TORRENT_PATH_COMPONENT_BYTES, 255);
     assert_eq!(MAX_TORRENT_PATH_BYTES, 16 * 1024 * 1024);
 
     assert!(validate_metainfo_size(DEFAULT_MAX_METAINFO_BYTES).is_ok());
@@ -357,6 +358,17 @@ fn proposal_admission_constants_and_input_boundaries_are_pinned() {
     assert!(matches!(
         validate_magnet_size(MAX_MAGNET_URI_BYTES + 1),
         Err(TorrentError::MagnetTooLong { .. })
+    ));
+
+    let component_at_limit = vec![b'a'; MAX_TORRENT_PATH_COMPONENT_BYTES];
+    assert!(validate_metainfo_contract(&v1_metainfo(&component_at_limit), false).is_ok());
+    let component_over_limit = vec![b'a'; MAX_TORRENT_PATH_COMPONENT_BYTES + 1];
+    assert!(matches!(
+        validate_metainfo_contract(&v1_metainfo(&component_over_limit), false),
+        Err(TorrentError::PathComponentTooLong {
+            size: 256,
+            limit: 255
+        })
     ));
 }
 
