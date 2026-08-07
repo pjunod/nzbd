@@ -9,6 +9,9 @@ repository.workspace = true
 publish = false
 
 [dependencies]
+bytes = { workspace = true }
+icu_normalizer = { workspace = true }
+icu_casemap = { workspace = true }
 librqbit = { workspace = true }
 rustls = { workspace = true }
 thiserror = { workspace = true }

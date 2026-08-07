@@ -23,6 +23,30 @@ fn single_file_info(name: &[u8]) -> Vec<u8> {
     info
 }
 
+#[cfg(unix)]
+fn multi_file_info(root: &[u8], path: &[u8]) -> Vec<u8> {
+    let mut info = vec![b'd'];
+    bencode_bytes(&mut info, b"files");
+    info.push(b'l');
+    info.push(b'd');
+    bencode_bytes(&mut info, b"length");
+    info.extend_from_slice(b"i1e");
+    bencode_bytes(&mut info, b"path");
+    info.push(b'l');
+    bencode_bytes(&mut info, path);
+    info.push(b'e');
+    info.push(b'e');
+    info.push(b'e');
+    bencode_bytes(&mut info, b"name");
+    bencode_bytes(&mut info, root);
+    bencode_bytes(&mut info, b"piece length");
+    info.extend_from_slice(b"i16384e");
+    bencode_bytes(&mut info, b"pieces");
+    bencode_bytes(&mut info, &[0; 20]);
+    info.push(b'e');
+    info
+}
+
 fn metainfo(info: &[u8], announce: Option<&str>) -> Vec<u8> {
     let mut torrent = vec![b'd'];
     if let Some(announce) = announce {
@@ -153,30 +177,68 @@ async fn proxy_rejects_dht_and_udp_tracker_leak_paths() {
 }
 
 #[tokio::test]
-async fn traversal_name_is_rejected_before_any_escape_file_exists() {
+async fn unsafe_names_are_rejected_before_any_escape_file_exists() {
     let parent = tempfile::tempdir().unwrap();
     let root = parent.path().join("payload");
     std::fs::create_dir(&root).unwrap();
     let session = TorrentSession::start(root.clone(), TorrentSessionConfig::default())
         .await
         .unwrap();
+    for name in [
+        &b"../escape"[..],
+        &b"sub/../../escape"[..],
+        &b"sub\\..\\..\\escape"[..],
+        &b"/absolute"[..],
+        &b"\\\\server\\share"[..],
+    ] {
+        let result = session
+            .add_metainfo(
+                single_file_metainfo(name),
+                TorrentAddConfig {
+                    overwrite: true,
+                    ..Default::default()
+                },
+            )
+            .await;
+        let error = match result {
+            Ok(_) => panic!("unsafe metainfo name was accepted: {name:?}"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(error, TorrentError::UnsafeMetainfoPath(_)),
+            "unexpected error for {name:?}: {error}"
+        );
+    }
+    assert!(!parent.path().join("escape").exists());
+    session.stop().await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn existing_symlink_is_rejected_before_storage_can_follow_it() {
+    use std::os::unix::fs::symlink;
+
+    let parent = tempfile::tempdir().unwrap();
+    let root = parent.path().join("payload");
+    let outside = parent.path().join("outside");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::create_dir(&outside).unwrap();
+    let session = TorrentSession::start(root.clone(), TorrentSessionConfig::default())
+        .await
+        .unwrap();
+    symlink(&outside, root.join("release")).unwrap();
+
     let result = session
         .add_metainfo(
-            single_file_metainfo(b"../escape"),
+            metainfo(&multi_file_info(b"release", b"payload.bin"), None),
             TorrentAddConfig {
                 overwrite: true,
                 ..Default::default()
             },
         )
         .await;
-    let error = match result {
-        Ok(_) => panic!("traversal metainfo was accepted"),
-        Err(error) => error.to_string(),
-    };
-    assert!(
-        error.contains("path traversal") || error.contains("separator"),
-        "unexpected error: {error}"
-    );
-    assert!(!parent.path().join("escape").exists());
+    assert!(matches!(result, Err(TorrentError::ExistingPathSymlink)));
+    assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
+
     session.stop().await;
 }

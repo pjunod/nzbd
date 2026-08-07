@@ -8,17 +8,54 @@
 
 use librqbit::api::TorrentIdOrHash;
 use librqbit::{
-    AddTorrent, AddTorrentOptions, ManagedTorrent, Session, SessionOptions, TorrentStatsState,
+    AddTorrent, AddTorrentOptions, AddTorrentResponse, ManagedTorrent, PeerConnectionOptions,
+    Session, SessionOptions, TorrentStatsState,
 };
+use std::borrow::Cow;
 use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::num::NonZeroU32;
 use std::ops::Range;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 /// The exact engine release the M0 contract and interop tests describe.
 pub const ENGINE_VERSION: &str = "8.1.1";
+/// Default raw or fetched `.torrent` admission limit from proposal §10.3.
+pub const DEFAULT_MAX_METAINFO_BYTES: usize = 10 * 1024 * 1024;
+/// Maximum magnet URI length from proposal §10.3.
+pub const MAX_MAGNET_URI_BYTES: usize = 16 * 1024;
+/// Maximum number of payload files described by one torrent.
+pub const MAX_TORRENT_FILES: usize = 100_000;
+/// Maximum encoded length of one projected relative payload path.
+pub const MAX_TORRENT_RELATIVE_PATH_BYTES: usize = 4 * 1024;
+/// Portable maximum encoded length of one payload path component.
+pub const MAX_TORRENT_PATH_COMPONENT_BYTES: usize = 255;
+/// Maximum aggregate encoded length of all projected relative payload paths.
+pub const MAX_TORRENT_PATH_BYTES: usize = 16 * 1024 * 1024;
+/// Maximum unique explicit bootstrap peers accepted for one torrent.
+pub const MAX_INITIAL_PEERS: usize = 80;
+/// Maximum unique non-empty trackers accepted from one torrent source.
+pub const MAX_TRACKERS_PER_TORRENT: usize = 64;
+/// Maximum decoded byte length of one tracker URL.
+pub const MAX_TRACKER_URL_BYTES: usize = 2 * 1024;
+/// Maximum concurrent engine integrity checks during torrent initialization.
+pub const MAX_CONCURRENT_TORRENT_INITIALIZATIONS: usize = 1;
+/// Timeout for establishing an outgoing peer connection.
+pub const PEER_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Timeout for one peer-protocol read or write operation.
+pub const PEER_READ_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Interval between idle peer keepalive messages.
+pub const PEER_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(120);
+/// Maximum display-safe engine error length from proposal §10.3.
+pub const DISPLAY_SAFE_ERROR_MAX_BYTES: usize = 2 * 1024;
+
+// librqbit-core 5.0.0 divides pieces into 16 KiB chunks and stores absolute
+// chunk indices in u32. Keep this version-pinned representation check at the
+// adapter boundary until the engine makes its arithmetic checked.
+const RQBIT_CHUNK_BYTES: u64 = 16 * 1024;
+const ERROR_TRUNCATION_MARKER: &str = "... [truncated]";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CryptoProviderInstall {
@@ -34,20 +71,36 @@ pub enum TorrentError {
     Engine(String),
     #[error("torrent engine returned no managed handle")]
     MissingHandle,
+    #[error("torrent engine did not return resolved magnet metadata")]
+    MissingResolvedMagnet,
     #[error("BitTorrent v2-only magnets are not supported by librqbit 8.1.1")]
     UnsupportedV2Magnet,
     #[error("hybrid BitTorrent v1/v2 magnets are not supported in the first release")]
     UnsupportedHybridMagnet,
+    #[error("invalid BitTorrent magnet URI: {0}")]
+    InvalidMagnet(&'static str),
     #[error("BitTorrent v2-only metainfo is not supported by librqbit 8.1.1")]
     UnsupportedV2Metainfo,
     #[error("hybrid BitTorrent v1/v2 metainfo is not supported in the first release")]
     UnsupportedHybridMetainfo,
     #[error("invalid SOCKS proxy configuration: {0}")]
     InvalidProxy(&'static str),
+    #[error("invalid TCP listen range: expected exactly one non-zero port")]
+    InvalidListenPortRange,
+    #[error("invalid initial BitTorrent peer: {0}")]
+    InvalidInitialPeer(&'static str),
+    #[error("too many unique initial BitTorrent peers ({count}; maximum {limit})")]
+    TooManyInitialPeers { count: usize, limit: usize },
     #[error(
         "SOCKS proxy cannot be combined with DHT because librqbit 8.1.1 sends DHT traffic outside the proxy"
     )]
     ProxyWithDht,
+    #[error(
+        "magnet metadata cannot be resolved while DHT is enabled because torrent privacy is unknown until the metadata arrives"
+    )]
+    MagnetWithDht,
+    #[error("private torrent metainfo cannot be admitted while DHT is enabled")]
+    PrivateMetainfoWithDht,
     #[error(
         "SOCKS proxy cannot be used with UDP trackers because librqbit 8.1.1 sends UDP announces outside the proxy"
     )]
@@ -56,10 +109,340 @@ pub enum TorrentError {
         "private torrents must declare exactly one unique tracker in the first release (found {0})"
     )]
     PrivateTrackerCount(usize),
+    #[error("invalid BitTorrent tracker URL: {0}")]
+    InvalidTracker(&'static str),
+    #[error("BitTorrent tracker URL is too long ({size} bytes; maximum {limit})")]
+    TrackerUrlTooLong { size: usize, limit: usize },
+    #[error("too many unique BitTorrent trackers ({count}; maximum {limit})")]
+    TooManyTrackers { count: usize, limit: usize },
+    #[error("unsafe torrent metainfo path: {0}")]
+    UnsafeMetainfoPath(&'static str),
+    #[error("torrent metainfo is too large ({size} bytes; maximum {limit})")]
+    MetainfoTooLarge { size: usize, limit: usize },
+    #[error("magnet URI is too long ({size} bytes; maximum {limit})")]
+    MagnetTooLong { size: usize, limit: usize },
+    #[error("torrent contains too many files ({count}; maximum {limit})")]
+    TooManyFiles { count: usize, limit: usize },
+    #[error("torrent relative path is too long ({size} bytes; maximum {limit})")]
+    PathTooLong { size: usize, limit: usize },
+    #[error("torrent path component is too long ({size} bytes; maximum {limit})")]
+    PathComponentTooLong { size: usize, limit: usize },
+    #[error("torrent path metadata is too large ({size} bytes; maximum {limit})")]
+    PathMetadataTooLarge { size: usize, limit: usize },
+    #[error("torrent contains payload paths that collide or overlap under portable comparison")]
+    PathCollision,
+    #[error("unsafe existing torrent path: a payload component is a symbolic link")]
+    ExistingPathSymlink,
+    #[error("unsafe existing torrent path: {0}")]
+    ExistingPathType(&'static str),
+    #[error("invalid torrent piece geometry: {0}")]
+    InvalidMetainfoGeometry(&'static str),
 }
 
 fn engine_error(error: impl std::fmt::Display) -> TorrentError {
-    TorrentError::Engine(error.to_string())
+    TorrentError::Engine(display_safe_error(&error.to_string()))
+}
+
+fn display_safe_error(message: &str) -> String {
+    let mut output = String::new();
+    let mut redact_next_secret_value = false;
+    for raw_token in message.split_whitespace() {
+        let normalized = if raw_token.chars().any(char::is_control) {
+            Cow::Owned(
+                raw_token
+                    .chars()
+                    .filter(|character| !character.is_control())
+                    .collect::<String>(),
+            )
+        } else {
+            Cow::Borrowed(raw_token)
+        };
+        if normalized.is_empty() {
+            continue;
+        }
+        let redacted = if redact_next_secret_value {
+            if is_secret_assignment_separator(&normalized) {
+                Cow::Borrowed(normalized.as_ref())
+            } else {
+                redact_next_secret_value = secret_value_may_continue(&normalized);
+                Cow::Borrowed("<redacted>")
+            }
+        } else {
+            redact_next_secret_value = secret_value_follows(&normalized);
+            redact_error_token(&normalized)
+        };
+        let separator = usize::from(!output.is_empty());
+        if output
+            .len()
+            .saturating_add(separator)
+            .saturating_add(redacted.len())
+            > DISPLAY_SAFE_ERROR_MAX_BYTES
+        {
+            if separator != 0 && output.len() < DISPLAY_SAFE_ERROR_MAX_BYTES {
+                output.push(' ');
+            }
+            let remaining = DISPLAY_SAFE_ERROR_MAX_BYTES.saturating_sub(output.len());
+            let mut boundary = remaining.min(redacted.len());
+            while !redacted.is_char_boundary(boundary) {
+                boundary -= 1;
+            }
+            output.push_str(&redacted[..boundary]);
+            return mark_display_truncated(output);
+        }
+        if separator != 0 {
+            output.push(' ');
+        }
+        output.push_str(&redacted);
+    }
+    output
+}
+
+fn redact_error_token(token: &str) -> Cow<'_, str> {
+    if let Some(assignments) = redact_secret_assignments(token) {
+        return Cow::Owned(redact_error_token_values(&assignments).into_owned());
+    }
+    redact_error_token_values(token)
+}
+
+fn redact_error_token_values(token: &str) -> Cow<'_, str> {
+    let whole = redact_error_value(token);
+    if whole.as_ref() != token {
+        return whole;
+    }
+    for separator in ['=', ':'] {
+        if let Some((key, value)) = token.split_once(separator) {
+            let redacted = redact_error_value(value);
+            if redacted.as_ref() != value {
+                return Cow::Owned(format!("{key}{separator}{redacted}"));
+            }
+        }
+    }
+    whole
+}
+
+fn redact_secret_assignments(token: &str) -> Option<String> {
+    let bytes = token.as_bytes();
+    let mut ranges = Vec::new();
+    let mut index = 0usize;
+    while index < bytes.len() {
+        if !matches!(bytes[index], b'=' | b':') {
+            index += 1;
+            continue;
+        }
+
+        let mut key_end = index;
+        while key_end > 0 && matches!(bytes[key_end - 1], b'"' | b'\'') {
+            key_end -= 1;
+        }
+        let mut key_start = key_end;
+        while key_start > 0
+            && (bytes[key_start - 1].is_ascii_alphanumeric()
+                || matches!(bytes[key_start - 1], b'_' | b'-' | b'.'))
+        {
+            key_start -= 1;
+        }
+        if key_start == key_end || !is_secret_key(&token[key_start..key_end]) {
+            index += 1;
+            continue;
+        }
+
+        let mut value_start = index + 1;
+        while value_start < bytes.len() && matches!(bytes[value_start], b'"' | b'\'' | b'=' | b'>')
+        {
+            value_start += 1;
+        }
+        let mut value_end = value_start;
+        while value_end < bytes.len()
+            && !matches!(
+                bytes[value_end],
+                b'&' | b',' | b';' | b'}' | b']' | b')' | b'"' | b'\''
+            )
+        {
+            value_end += 1;
+        }
+        if value_start != value_end {
+            ranges.push(value_start..value_end);
+            index = value_end;
+        } else {
+            index += 1;
+        }
+    }
+
+    if ranges.is_empty() {
+        return None;
+    }
+    let redacted_bytes = ranges
+        .iter()
+        .map(|range| range.end.saturating_sub(range.start))
+        .sum::<usize>();
+    let mut output = String::with_capacity(
+        token
+            .len()
+            .saturating_sub(redacted_bytes)
+            .saturating_add(ranges.len() * "<redacted>".len()),
+    );
+    let mut copied = 0usize;
+    for range in ranges {
+        output.push_str(&token[copied..range.start]);
+        output.push_str("<redacted>");
+        copied = range.end;
+    }
+    output.push_str(&token[copied..]);
+    Some(output)
+}
+
+fn secret_value_follows(token: &str) -> bool {
+    let wrapper = |character: char| {
+        matches!(
+            character,
+            ',' | ';' | '(' | ')' | '[' | ']' | '{' | '}' | '"' | '\''
+        )
+    };
+    let token = token.trim_matches(wrapper);
+    let (key, inline_value) =
+        if let Some(key) = token.strip_suffix('=').or_else(|| token.strip_suffix(':')) {
+            (key, None)
+        } else if let Some((key, value)) = token.split_once(['=', ':']) {
+            (key, Some(value))
+        } else {
+            (token, None)
+        };
+    let key = key.trim_matches(wrapper);
+    if key.is_empty() || !is_secret_key(key) {
+        return false;
+    }
+    inline_value.is_none_or(|value| {
+        let value = value.trim_matches(wrapper);
+        value.is_empty() || is_authorization_scheme(value) || value.ends_with([',', ';'])
+    })
+}
+
+fn is_secret_assignment_separator(token: &str) -> bool {
+    matches!(token, "=" | ":" | "=>" | ":=" | "->")
+}
+
+fn secret_value_may_continue(token: &str) -> bool {
+    let token = token.trim_matches(|character: char| {
+        matches!(character, '(' | ')' | '[' | ']' | '{' | '}' | '"' | '\'')
+    });
+    is_authorization_scheme(token.trim_end_matches([',', ';'])) || token.ends_with([',', ';'])
+}
+
+fn is_authorization_scheme(value: &str) -> bool {
+    [
+        "basic",
+        "bearer",
+        "digest",
+        "negotiate",
+        "token",
+        "aws4-hmac-sha256",
+    ]
+    .iter()
+    .any(|scheme| value.eq_ignore_ascii_case(scheme))
+}
+
+fn redact_error_value(value: &str) -> Cow<'_, str> {
+    if value
+        .as_bytes()
+        .windows(b"magnet:?".len())
+        .any(|window| window.eq_ignore_ascii_case(b"magnet:?"))
+    {
+        return Cow::Borrowed("<redacted-magnet>");
+    }
+    if let Some(scheme_end) = value.find("://") {
+        if value.len() > DISPLAY_SAFE_ERROR_MAX_BYTES * 2 {
+            return Cow::Borrowed("<redacted-url>");
+        }
+        let scheme_start = value[..scheme_end]
+            .rfind(|character: char| {
+                !character.is_ascii_alphanumeric() && !matches!(character, '+' | '-' | '.')
+            })
+            .map_or(0, |index| index + 1);
+        let prefix = &value[..scheme_start];
+        let candidate = value[scheme_start..].trim_end_matches(|character: char| {
+            matches!(character, ',' | ';' | ')' | ']' | '}' | '"' | '\'')
+        });
+        let safe = url::Url::parse(candidate)
+            .ok()
+            .and_then(|url| {
+                let host = url.host_str()?;
+                let host = if host.contains(':') {
+                    format!("[{host}]")
+                } else {
+                    host.to_owned()
+                };
+                let port = url
+                    .port()
+                    .map(|port| format!(":{port}"))
+                    .unwrap_or_default();
+                Some(format!("{}://{host}{port}/<redacted>", url.scheme()))
+            })
+            .unwrap_or_else(|| "<redacted-url>".into());
+        return Cow::Owned(format!("{prefix}{safe}"));
+    }
+    if value
+        .find('?')
+        .is_some_and(|query| value[query + 1..].contains(['=', '&']))
+    {
+        return Cow::Borrowed("<redacted-query>");
+    }
+
+    let trimmed = value.trim_matches(|character: char| {
+        matches!(character, ',' | ';' | '(' | ')' | '{' | '}' | '"' | '\'')
+    });
+    let address = trimmed.parse::<SocketAddr>().is_ok()
+        || trimmed.parse::<std::net::IpAddr>().is_ok()
+        || trimmed
+            .trim_matches(['[', ']'])
+            .parse::<SocketAddr>()
+            .is_ok();
+    if address {
+        return Cow::Borrowed("<redacted-peer>");
+    }
+    let bytes = trimmed.as_bytes();
+    let windows_absolute = bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && matches!(bytes[2], b'/' | b'\\');
+    if trimmed.starts_with('/') || trimmed.starts_with("\\\\") || windows_absolute {
+        return Cow::Borrowed("<redacted-path>");
+    }
+    Cow::Borrowed(value)
+}
+
+fn is_secret_key(key: &str) -> bool {
+    let key = key
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .flat_map(char::to_lowercase)
+        .collect::<String>();
+    // Match conservative substrings intentionally: engine error fields are
+    // untrusted, and over-redacting an innocent key such as `design` is safer
+    // than leaking tracker passkeys through a novel compound field name.
+    // Do not narrow this to exact names without equivalent leak coverage.
+    [
+        "auth",
+        "cookie",
+        "credential",
+        "key",
+        "pass",
+        "secret",
+        "session",
+        "sig",
+        "token",
+    ]
+    .iter()
+    .any(|secret| key.contains(secret))
+}
+
+fn mark_display_truncated(mut message: String) -> String {
+    let mut boundary = DISPLAY_SAFE_ERROR_MAX_BYTES - ERROR_TRUNCATION_MARKER.len();
+    while !message.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    message.truncate(boundary);
+    message.push_str(ERROR_TRUNCATION_MARKER);
+    message
 }
 
 /// Install nzbd's aws-lc provider before librqbit constructs its reqwest
@@ -102,7 +485,7 @@ impl std::fmt::Debug for TorrentProxyConfig {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("TorrentProxyConfig")
-            .field("url", &self.url)
+            .field("url", &"<redacted>")
             .field("username", &self.username)
             .field("password", &self.password.as_ref().map(|_| "***"))
             .finish()
@@ -126,6 +509,15 @@ impl TorrentProxyConfig {
                 "put credentials in the separate username and password fields",
             ));
         }
+        if !matches!(url.path(), "" | "/") || url.query().is_some() || url.fragment().is_some() {
+            return Err(TorrentError::InvalidProxy(
+                "URL must not contain a path, query, or fragment",
+            ));
+        }
+        // Treat a trailing slash as the same origin, but never pass alternate
+        // URL syntax to rqbit's peer and HTTP tracker clients. Stable rqbit
+        // parses these two paths differently.
+        url.set_path("");
         match (&self.username, &self.password) {
             (None, None) => {}
             (Some(username), Some(password)) if !username.is_empty() => {
@@ -165,6 +557,8 @@ pub struct TorrentAddConfig {
 #[derive(Clone)]
 pub struct TorrentSession {
     inner: Arc<Session>,
+    dht_enabled: bool,
+    output_root: PathBuf,
     proxy_enabled: bool,
 }
 
@@ -173,6 +567,7 @@ impl TorrentSession {
         output_root: PathBuf,
         config: TorrentSessionConfig,
     ) -> Result<Self, TorrentError> {
+        validate_listen_port_range(config.listen_port_range.as_ref())?;
         install_process_crypto_provider()?;
         let proxy_enabled = config.proxy.is_some();
         if proxy_enabled && config.dht {
@@ -183,12 +578,16 @@ impl TorrentSession {
             .as_ref()
             .map(TorrentProxyConfig::engine_url)
             .transpose()?;
+        std::fs::create_dir_all(&output_root).map_err(engine_error)?;
+        let output_root = std::fs::canonicalize(output_root).map_err(engine_error)?;
         let options = session_options(config.dht, config.listen_port_range, socks_proxy_url);
-        let inner = Session::new_with_opts(output_root, options)
+        let inner = Session::new_with_opts(output_root.clone(), options)
             .await
             .map_err(engine_error)?;
         Ok(Self {
             inner,
+            dht_enabled: config.dht,
+            output_root,
             proxy_enabled,
         })
     }
@@ -208,43 +607,64 @@ impl TorrentSession {
     pub async fn add_metainfo(
         &self,
         bytes: Vec<u8>,
-        config: TorrentAddConfig,
+        mut config: TorrentAddConfig,
     ) -> Result<TorrentHandle, TorrentError> {
-        validate_metainfo_contract(&bytes, self.proxy_enabled)?;
-        self.add(AddTorrent::from_bytes(bytes), config).await
+        normalize_initial_peers(&mut config.initial_peers)?;
+        validate_metainfo_admission(&bytes, self.proxy_enabled, self.dht_enabled)?;
+        validate_existing_filesystem_paths(&bytes, &self.output_root)?;
+        self.add_validated_metainfo(bytes.into(), config).await
     }
 
     pub async fn add_magnet(
         &self,
         magnet: String,
-        config: TorrentAddConfig,
+        mut config: TorrentAddConfig,
     ) -> Result<TorrentHandle, TorrentError> {
-        let lower = magnet.to_ascii_lowercase();
-        let has_v1 = lower.contains("urn:btih:");
-        let has_v2 = lower.contains("urn:btmh:");
-        match (has_v1, has_v2) {
-            (true, true) => return Err(TorrentError::UnsupportedHybridMagnet),
-            (false, true) => return Err(TorrentError::UnsupportedV2Magnet),
-            _ => {}
+        normalize_initial_peers(&mut config.initial_peers)?;
+        let magnet = validate_magnet_contract(&magnet, self.proxy_enabled)?;
+        // A magnet does not reveal the private bit until BEP 9 metadata has
+        // already been fetched. Stable rqbit has no per-add DHT suppression,
+        // so a DHT-enabled session would query for the hash before nzbd could
+        // learn that the torrent is private. Fail closed before calling the
+        // engine; tracker/explicit-peer resolution remains available in a
+        // DHT-disabled session.
+        if self.dht_enabled {
+            return Err(TorrentError::MagnetWithDht);
         }
-        validate_magnet_proxy_contract(&magnet, self.proxy_enabled)?;
-        self.add(AddTorrent::from_url(magnet), config).await
+        let resolved = self
+            .inner
+            .add_torrent(
+                AddTorrent::from_url(magnet),
+                Some(magnet_resolution_options(config.initial_peers.clone())),
+            )
+            .await
+            .map_err(engine_error)?;
+        let AddTorrentResponse::ListOnly(resolved) = resolved else {
+            return Err(TorrentError::MissingResolvedMagnet);
+        };
+
+        // rqbit's list-only path resolves BEP 9 metadata but returns before it
+        // constructs storage or manages the torrent. Re-run every nzbd-owned
+        // metainfo invariant here, then admit only the validated bytes.
+        validate_metainfo_contract(resolved.torrent_bytes.as_ref(), self.proxy_enabled)?;
+        validate_existing_filesystem_paths(resolved.torrent_bytes.as_ref(), &self.output_root)?;
+        extend_with_resolved_peers(&mut config.initial_peers, resolved.seen_peers);
+        self.add_validated_metainfo(resolved.torrent_bytes, config)
+            .await
     }
 
-    async fn add(
+    async fn add_validated_metainfo(
         &self,
-        source: AddTorrent<'_>,
+        bytes: bytes::Bytes,
         config: TorrentAddConfig,
     ) -> Result<TorrentHandle, TorrentError> {
-        let options = AddTorrentOptions {
-            paused: config.paused,
-            overwrite: config.overwrite,
-            initial_peers: Some(config.initial_peers),
-            ..Default::default()
-        };
+        let options = managed_add_options(config);
         let handle = self
             .inner
-            .add_torrent(source, Some(options))
+            // Keep rqbit's URL variant outside managed admission. Its stable
+            // HTTP client buffers the response before nzbd can enforce the
+            // metainfo limit and does not expose the proposal's fetch policy.
+            .add_torrent(AddTorrent::from_bytes(bytes), Some(options))
             .await
             .map_err(engine_error)?
             .into_handle()
@@ -286,6 +706,43 @@ impl TorrentSession {
     }
 }
 
+fn magnet_resolution_options(initial_peers: Vec<SocketAddr>) -> AddTorrentOptions {
+    exact_add_options(false, false, true, initial_peers)
+}
+
+fn managed_add_options(config: TorrentAddConfig) -> AddTorrentOptions {
+    exact_add_options(config.paused, config.overwrite, false, config.initial_peers)
+}
+
+fn exact_add_options(
+    paused: bool,
+    overwrite: bool,
+    list_only: bool,
+    initial_peers: Vec<SocketAddr>,
+) -> AddTorrentOptions {
+    // Keep every stable 8.1.1 field explicit. In particular, the adapter does
+    // not allow selection, alternate output roots, injected trackers, custom
+    // storage, or deferred writes to appear through an upstream default.
+    AddTorrentOptions {
+        paused,
+        only_files_regex: None,
+        only_files: None,
+        overwrite,
+        list_only,
+        output_folder: None,
+        sub_folder: None,
+        peer_opts: None,
+        force_tracker_interval: None,
+        disable_trackers: false,
+        ratelimits: Default::default(),
+        initial_peers: Some(initial_peers),
+        preferred_id: None,
+        storage_factory: None,
+        defer_writes: None,
+        trackers: None,
+    }
+}
+
 fn session_options(
     dht: bool,
     listen_port_range: Option<Range<u16>>,
@@ -303,32 +760,531 @@ fn session_options(
         // no input that can turn this runtime path on.
         enable_upnp_port_forwarding: false,
         socks_proxy_url,
-        ..Default::default()
+        // Spell out every stable 8.1.1 option instead of inheriting upstream
+        // defaults. A newly added engine capability must become a compile-time
+        // review event before it can affect nzbd's network or storage boundary.
+        dht_config: None,
+        fastresume: false,
+        persistence: None,
+        peer_id: None,
+        peer_opts: Some(explicit_peer_connection_options()),
+        defer_writes_up_to: None,
+        default_storage_factory: None,
+        cancellation_token: None,
+        // An initialization can scan and hash the payload before a torrent
+        // becomes live. Keep that disk-heavy work serial even though stable
+        // rqbit's unset default permits three concurrent initializations.
+        concurrent_init_limit: Some(MAX_CONCURRENT_TORRENT_INITIALIZATIONS),
+        root_span: None,
+        ratelimits: Default::default(),
+        blocklist_url: None,
+        trackers: HashSet::new(),
     }
 }
 
-fn validate_metainfo_contract(bytes: &[u8], proxy_enabled: bool) -> Result<(), TorrentError> {
+fn explicit_peer_connection_options() -> PeerConnectionOptions {
+    // Pin stable 8.1.1's effective fallbacks so a future engine default cannot
+    // silently lengthen connection or I/O lifetime at nzbd's network boundary.
+    PeerConnectionOptions {
+        connect_timeout: Some(PEER_CONNECT_TIMEOUT),
+        read_write_timeout: Some(PEER_READ_WRITE_TIMEOUT),
+        keep_alive_interval: Some(PEER_KEEP_ALIVE_INTERVAL),
+    }
+}
+
+fn validate_listen_port_range(range: Option<&Range<u16>>) -> Result<(), TorrentError> {
+    let Some(range) = range else {
+        return Ok(());
+    };
+    if range.start == 0 || range.start.checked_add(1) != Some(range.end) {
+        return Err(TorrentError::InvalidListenPortRange);
+    }
+    Ok(())
+}
+
+fn normalize_initial_peers(peers: &mut Vec<SocketAddr>) -> Result<(), TorrentError> {
+    let mut unique = HashSet::with_capacity(peers.len().min(MAX_INITIAL_PEERS));
+    let mut normalized = Vec::with_capacity(peers.len().min(MAX_INITIAL_PEERS));
+    for peer in peers.iter().copied() {
+        if !valid_initial_peer(peer) {
+            return Err(TorrentError::InvalidInitialPeer(
+                "peers must be unicast IPv4 endpoints with non-zero ports",
+            ));
+        }
+        if unique.insert(peer) {
+            if normalized.len() == MAX_INITIAL_PEERS {
+                return Err(TorrentError::TooManyInitialPeers {
+                    count: normalized.len() + 1,
+                    limit: MAX_INITIAL_PEERS,
+                });
+            }
+            normalized.push(peer);
+        }
+    }
+    *peers = normalized;
+    Ok(())
+}
+
+fn extend_with_resolved_peers(
+    peers: &mut Vec<SocketAddr>,
+    resolved: impl IntoIterator<Item = SocketAddr>,
+) {
+    let mut unique = peers.iter().copied().collect::<HashSet<_>>();
+    for peer in resolved {
+        if peers.len() == MAX_INITIAL_PEERS {
+            break;
+        }
+        if valid_initial_peer(peer) && unique.insert(peer) {
+            peers.push(peer);
+        }
+    }
+}
+
+fn valid_initial_peer(peer: SocketAddr) -> bool {
+    let SocketAddr::V4(peer) = peer else {
+        return false;
+    };
+    let address = peer.ip();
+    peer.port() != 0
+        && !address.is_unspecified()
+        && !address.is_multicast()
+        && *address != std::net::Ipv4Addr::BROADCAST
+}
+
+fn validate_metainfo_contract(bytes: &[u8], proxy_enabled: bool) -> Result<bool, TorrentError> {
+    validate_metainfo_size(bytes.len())?;
     validate_metainfo_version(bytes)?;
     let metainfo =
         librqbit::torrent_from_bytes::<librqbit::ByteBuf<'_>>(bytes).map_err(engine_error)?;
-    if proxy_enabled
-        && metainfo
-            .iter_announce()
-            .any(|tracker| tracker_uses_udp(AsRef::<[u8]>::as_ref(tracker)))
-    {
-        return Err(TorrentError::ProxyWithUdpTracker);
+    validate_metainfo_geometry(&metainfo.info)?;
+    validate_metainfo_paths(&metainfo.info)?;
+    let mut trackers = HashSet::new();
+    for tracker in metainfo.iter_announce() {
+        let tracker = AsRef::<[u8]>::as_ref(tracker);
+        if validate_tracker_url(tracker)? && proxy_enabled {
+            return Err(TorrentError::ProxyWithUdpTracker);
+        }
+        if !tracker.is_empty()
+            && trackers.insert(tracker.to_vec())
+            && trackers.len() > MAX_TRACKERS_PER_TORRENT
+        {
+            return Err(TorrentError::TooManyTrackers {
+                count: trackers.len(),
+                limit: MAX_TRACKERS_PER_TORRENT,
+            });
+        }
     }
     if !metainfo.info.private {
-        return Ok(());
+        return Ok(false);
     }
-    let trackers = metainfo
-        .iter_announce()
-        .map(AsRef::<[u8]>::as_ref)
-        .collect::<HashSet<_>>();
     if trackers.len() != 1 {
         return Err(TorrentError::PrivateTrackerCount(trackers.len()));
     }
+    Ok(true)
+}
+
+fn validate_metainfo_admission(
+    bytes: &[u8],
+    proxy_enabled: bool,
+    dht_enabled: bool,
+) -> Result<(), TorrentError> {
+    let private = validate_metainfo_contract(bytes, proxy_enabled)?;
+    validate_private_discovery(private, dht_enabled)
+}
+
+fn validate_private_discovery(private: bool, dht_enabled: bool) -> Result<(), TorrentError> {
+    if private && dht_enabled {
+        return Err(TorrentError::PrivateMetainfoWithDht);
+    }
     Ok(())
+}
+
+fn validate_metainfo_geometry<BufType: AsRef<[u8]>>(
+    info: &librqbit::TorrentMetaV1Info<BufType>,
+) -> Result<(), TorrentError> {
+    if info.piece_length == 0 {
+        return Err(TorrentError::InvalidMetainfoGeometry(
+            "piece length must be greater than zero",
+        ));
+    }
+
+    let mut total_length = 0_u64;
+    for length in info.iter_file_lengths().map_err(engine_error)? {
+        total_length =
+            total_length
+                .checked_add(length)
+                .ok_or(TorrentError::InvalidMetainfoGeometry(
+                    "aggregate payload length overflows u64",
+                ))?;
+    }
+    if total_length == 0 {
+        return Err(TorrentError::InvalidMetainfoGeometry(
+            "aggregate payload length must be greater than zero",
+        ));
+    }
+
+    let piece_hash_bytes = info.pieces.as_ref().len();
+    if piece_hash_bytes % 20 != 0 {
+        return Err(TorrentError::InvalidMetainfoGeometry(
+            "v1 piece hashes must be a whole number of 20-byte SHA-1 values",
+        ));
+    }
+    let actual_piece_count = piece_hash_bytes / 20;
+    let expected_piece_count = total_length.div_ceil(u64::from(info.piece_length));
+    if u64::try_from(actual_piece_count).ok() != Some(expected_piece_count) {
+        return Err(TorrentError::InvalidMetainfoGeometry(
+            "piece hash count does not match payload length and piece length",
+        ));
+    }
+
+    let piece_length = u64::from(info.piece_length);
+    let normal_chunks = piece_length.div_ceil(RQBIT_CHUNK_BYTES);
+    let last_piece_length = match total_length % piece_length {
+        0 => piece_length,
+        remainder => remainder,
+    };
+    let total_chunks = expected_piece_count
+        .checked_sub(1)
+        .and_then(|normal_pieces| normal_pieces.checked_mul(normal_chunks))
+        .and_then(|chunks| chunks.checked_add(last_piece_length.div_ceil(RQBIT_CHUNK_BYTES)))
+        .ok_or(TorrentError::InvalidMetainfoGeometry(
+            "aggregate chunk count overflows the adapter representation",
+        ))?;
+    if total_chunks > u64::from(u32::MAX) {
+        return Err(TorrentError::InvalidMetainfoGeometry(
+            "aggregate chunk count exceeds rqbit's u32 representation",
+        ));
+    }
+
+    Ok(())
+}
+
+fn validate_existing_filesystem_paths(
+    bytes: &[u8],
+    output_root: &Path,
+) -> Result<(), TorrentError> {
+    let metainfo =
+        librqbit::torrent_from_bytes::<librqbit::ByteBuf<'_>>(bytes).map_err(engine_error)?;
+    let multi_file_root = metainfo
+        .info
+        .files
+        .as_ref()
+        .and(metainfo.info.name.as_ref())
+        .map(|name| {
+            std::str::from_utf8(name.as_ref()).map_err(|_| {
+                TorrentError::UnsafeMetainfoPath("path components must contain valid UTF-8")
+            })
+        })
+        .transpose()?;
+
+    for file in metainfo.info.iter_file_details().map_err(engine_error)? {
+        let mut candidate = output_root.to_path_buf();
+        if let Some(root) = multi_file_root {
+            candidate.push(root);
+            if validate_existing_path(&candidate, ExistingPathKind::Directory)? {
+                continue;
+            }
+        }
+        let mut components = file.filename.iter_components().peekable();
+        while let Some(component) = components.next() {
+            let component = component.map_err(|_| {
+                TorrentError::UnsafeMetainfoPath(
+                    "components must be portable UTF-8 names without traversal or separators",
+                )
+            })?;
+            candidate.push(component);
+            let expected = if components.peek().is_some() {
+                ExistingPathKind::Directory
+            } else {
+                ExistingPathKind::File
+            };
+            if validate_existing_path(&candidate, expected)? {
+                break;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Returns true once a missing prefix proves that no deeper existing symlink
+/// can currently exist. Production writes still require a descriptor-relative
+/// containment design to close the check/write race.
+#[derive(Clone, Copy)]
+enum ExistingPathKind {
+    Directory,
+    File,
+}
+
+fn validate_existing_path(path: &Path, expected: ExistingPathKind) -> Result<bool, TorrentError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(TorrentError::ExistingPathSymlink),
+        Ok(metadata) if matches!(expected, ExistingPathKind::Directory) && !metadata.is_dir() => {
+            Err(TorrentError::ExistingPathType(
+                "a payload prefix is not a directory",
+            ))
+        }
+        Ok(metadata) if matches!(expected, ExistingPathKind::File) && !metadata.is_file() => Err(
+            TorrentError::ExistingPathType("a payload leaf is not a regular file"),
+        ),
+        Ok(_) => Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
+        Err(error) => Err(engine_error(error)),
+    }
+}
+
+fn validate_metainfo_paths<BufType: AsRef<[u8]>>(
+    info: &librqbit::TorrentMetaV1Info<BufType>,
+) -> Result<(), TorrentError> {
+    validate_metainfo_paths_with_limits(info, MetainfoPathLimits::PROPOSAL)
+}
+
+#[derive(Clone, Copy)]
+struct MetainfoPathLimits {
+    files: usize,
+    relative_path_bytes: usize,
+    all_path_bytes: usize,
+}
+
+impl MetainfoPathLimits {
+    const PROPOSAL: Self = Self {
+        files: MAX_TORRENT_FILES,
+        relative_path_bytes: MAX_TORRENT_RELATIVE_PATH_BYTES,
+        all_path_bytes: MAX_TORRENT_PATH_BYTES,
+    };
+}
+
+fn validate_metainfo_paths_with_limits<BufType: AsRef<[u8]>>(
+    info: &librqbit::TorrentMetaV1Info<BufType>,
+    limits: MetainfoPathLimits,
+) -> Result<(), TorrentError> {
+    let declared_name = info.name.as_ref().ok_or(TorrentError::UnsafeMetainfoPath(
+        "torrent metainfo must declare an explicit payload name",
+    ))?;
+    let (root_path_bytes, root_collision_key) = if info.files.is_some() {
+        validate_path_component(declared_name.as_ref())?;
+        let root = std::str::from_utf8(declared_name.as_ref()).map_err(|_| {
+            TorrentError::UnsafeMetainfoPath("path components must contain valid UTF-8")
+        })?;
+        (root.len(), portable_collision_key(root))
+    } else {
+        (0, String::new())
+    };
+
+    let files = info.iter_file_details().map_err(engine_error)?;
+    let mut file_count = 0usize;
+    let mut all_path_bytes = 0usize;
+    let mut file_path_collision_keys = HashSet::new();
+    let mut directory_path_collision_keys = HashSet::new();
+    for file in files {
+        file_count = file_count.saturating_add(1);
+        if file_count > limits.files {
+            return Err(TorrentError::TooManyFiles {
+                count: file_count,
+                limit: limits.files,
+            });
+        }
+        if file.attrs().symlink || file.symlink_path.is_some() {
+            return Err(TorrentError::UnsafeMetainfoPath(
+                "metainfo-declared symlinks are not supported",
+            ));
+        }
+
+        let mut component_count = 0usize;
+        let mut relative_path_bytes = root_path_bytes;
+        let mut collision_key = root_collision_key.clone();
+        let mut components = file.filename.iter_components().peekable();
+        while let Some(component) = components.next() {
+            component_count += 1;
+            let component = component.map_err(|_| {
+                TorrentError::UnsafeMetainfoPath(
+                    "components must be portable UTF-8 names without traversal or separators",
+                )
+            })?;
+            validate_path_component(component.as_bytes())?;
+            if !collision_key.is_empty() {
+                collision_key.push('/');
+            }
+            collision_key.push_str(&portable_collision_key(component));
+            if relative_path_bytes != 0 {
+                relative_path_bytes = relative_path_bytes.saturating_add(1);
+            }
+            relative_path_bytes = relative_path_bytes.saturating_add(component.len());
+            if relative_path_bytes > limits.relative_path_bytes {
+                return Err(TorrentError::PathTooLong {
+                    size: relative_path_bytes,
+                    limit: limits.relative_path_bytes,
+                });
+            }
+            if components.peek().is_some() {
+                if file_path_collision_keys.contains(&collision_key) {
+                    return Err(TorrentError::PathCollision);
+                }
+                directory_path_collision_keys.insert(collision_key.clone());
+            }
+        }
+        if component_count == 0 {
+            return Err(TorrentError::UnsafeMetainfoPath(
+                "file paths must contain at least one component",
+            ));
+        }
+        if directory_path_collision_keys.contains(&collision_key)
+            || !file_path_collision_keys.insert(collision_key)
+        {
+            return Err(TorrentError::PathCollision);
+        }
+        all_path_bytes = all_path_bytes.saturating_add(relative_path_bytes);
+        if all_path_bytes > limits.all_path_bytes {
+            return Err(TorrentError::PathMetadataTooLarge {
+                size: all_path_bytes,
+                limit: limits.all_path_bytes,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn portable_collision_key(component: &str) -> String {
+    let case_mapper = icu_casemap::CaseMapper::new();
+    // Windows' invariant path comparison also aliases dotless i with ASCII I.
+    // Simple case folding deliberately preserves dotless i, so keep this one
+    // additional conservative portability mapping explicit. Simple folding
+    // also avoids collapsing compatibility-only ligatures and width variants.
+    let windows_folded = component
+        .chars()
+        .map(|character| match character {
+            '\u{0131}' => 'i',
+            _ => {
+                let folded = case_mapper.simple_fold(character);
+                if folded == '\u{0131}' {
+                    'i'
+                } else {
+                    folded
+                }
+            }
+        })
+        .collect::<String>();
+    icu_normalizer::ComposingNormalizer::new_nfc()
+        .normalize(&windows_folded)
+        .into_owned()
+}
+
+fn validate_metainfo_size(size: usize) -> Result<(), TorrentError> {
+    if size > DEFAULT_MAX_METAINFO_BYTES {
+        return Err(TorrentError::MetainfoTooLarge {
+            size,
+            limit: DEFAULT_MAX_METAINFO_BYTES,
+        });
+    }
+    Ok(())
+}
+
+fn validate_magnet_size(size: usize) -> Result<(), TorrentError> {
+    if size > MAX_MAGNET_URI_BYTES {
+        return Err(TorrentError::MagnetTooLong {
+            size,
+            limit: MAX_MAGNET_URI_BYTES,
+        });
+    }
+    Ok(())
+}
+
+fn validate_path_component(component: &[u8]) -> Result<(), TorrentError> {
+    if component.is_empty() {
+        return Err(TorrentError::UnsafeMetainfoPath(
+            "path components cannot be empty",
+        ));
+    }
+    if component.len() > MAX_TORRENT_PATH_COMPONENT_BYTES {
+        return Err(TorrentError::PathComponentTooLong {
+            size: component.len(),
+            limit: MAX_TORRENT_PATH_COMPONENT_BYTES,
+        });
+    }
+    if component.contains(&0) {
+        return Err(TorrentError::UnsafeMetainfoPath(
+            "path components cannot contain NUL",
+        ));
+    }
+    if component.contains(&b'/') || component.contains(&b'\\') {
+        return Err(TorrentError::UnsafeMetainfoPath(
+            "path components cannot contain platform separators",
+        ));
+    }
+    if matches!(component, b"." | b"..") {
+        return Err(TorrentError::UnsafeMetainfoPath(
+            "dot path components are not allowed",
+        ));
+    }
+    if component.len() >= 2 && component[0].is_ascii_alphabetic() && component[1] == b':' {
+        return Err(TorrentError::UnsafeMetainfoPath(
+            "Windows drive prefixes are not allowed",
+        ));
+    }
+    if component
+        .iter()
+        .any(|byte| *byte < b' ' || b"<>:\"|?*".contains(byte))
+    {
+        return Err(TorrentError::UnsafeMetainfoPath(
+            "Windows-reserved characters are not allowed",
+        ));
+    }
+    if matches!(component.last(), Some(b'.' | b' ')) {
+        return Err(TorrentError::UnsafeMetainfoPath(
+            "path components cannot end with a dot or space",
+        ));
+    }
+    let component = std::str::from_utf8(component).map_err(|_| {
+        TorrentError::UnsafeMetainfoPath("path components must contain valid UTF-8")
+    })?;
+    if is_windows_reserved_component(component) {
+        return Err(TorrentError::UnsafeMetainfoPath(
+            "Windows device names are not allowed",
+        ));
+    }
+    Ok(())
+}
+
+fn is_windows_reserved_component(component: &str) -> bool {
+    let basename = component
+        .split('.')
+        .next()
+        .unwrap_or(component)
+        .trim_end_matches(' ')
+        .to_ascii_uppercase();
+    matches!(
+        basename.as_str(),
+        "CON"
+            | "PRN"
+            | "AUX"
+            | "NUL"
+            | "CLOCK$"
+            | "CONIN$"
+            | "CONOUT$"
+            | "COM1"
+            | "COM2"
+            | "COM3"
+            | "COM4"
+            | "COM5"
+            | "COM6"
+            | "COM7"
+            | "COM8"
+            | "COM9"
+            | "COM¹"
+            | "COM²"
+            | "COM³"
+            | "LPT1"
+            | "LPT2"
+            | "LPT3"
+            | "LPT4"
+            | "LPT5"
+            | "LPT6"
+            | "LPT7"
+            | "LPT8"
+            | "LPT9"
+            | "LPT¹"
+            | "LPT²"
+            | "LPT³"
+    )
 }
 
 fn validate_metainfo_version(bytes: &[u8]) -> Result<(), TorrentError> {
@@ -485,24 +1441,164 @@ impl<'a> MetainfoVersionScanner<'a> {
     }
 }
 
-fn validate_magnet_proxy_contract(magnet: &str, proxy_enabled: bool) -> Result<(), TorrentError> {
-    if !proxy_enabled {
-        return Ok(());
+fn validate_magnet_contract(magnet: &str, proxy_enabled: bool) -> Result<String, TorrentError> {
+    validate_magnet_size(magnet.len())?;
+    let url = url::Url::parse(magnet)
+        .map_err(|_| TorrentError::InvalidMagnet("URI syntax is not valid"))?;
+    if !url.scheme().eq_ignore_ascii_case("magnet") || url.has_host() || !url.path().is_empty() {
+        return Err(TorrentError::InvalidMagnet(
+            "expected a magnet URI without an authority or path",
+        ));
     }
-    let url = url::Url::parse(magnet).map_err(engine_error)?;
-    if url.query_pairs().any(|(key, tracker)| {
-        key.eq_ignore_ascii_case("tr") && tracker_uses_udp(tracker.as_bytes())
-    }) {
-        return Err(TorrentError::ProxyWithUdpTracker);
+
+    let mut v1_topics = 0usize;
+    let mut has_v2 = false;
+    let mut normalize_base32 = false;
+    for (key, topic) in url.query_pairs() {
+        match key.as_ref() {
+            "xt" => {
+                if let Some(hash) = topic.strip_prefix("urn:btih:") {
+                    if !valid_btih(hash.as_bytes()) {
+                        return Err(TorrentError::InvalidMagnet(
+                            "btih must be 40 hexadecimal or 32 base32 characters",
+                        ));
+                    }
+                    normalize_base32 |=
+                        hash.len() == 32 && hash.as_bytes().iter().any(u8::is_ascii_lowercase);
+                    v1_topics = v1_topics.saturating_add(1);
+                } else if let Some(hash) = topic.strip_prefix("urn:btmh:") {
+                    if !valid_btmh(hash.as_bytes()) {
+                        return Err(TorrentError::InvalidMagnet(
+                            "btmh must contain the 1220 multihash prefix and a 32-byte hexadecimal digest",
+                        ));
+                    }
+                    has_v2 = true;
+                } else {
+                    return Err(TorrentError::InvalidMagnet(
+                        "only v1 btih and v2 btmh exact topics are supported",
+                    ));
+                }
+            }
+            // rqbit 8.1.1 eagerly expands every selected range into a Vec
+            // while parsing the URI. The dormant adapter does not expose
+            // selective-file admission, so reject the parameter before an
+            // attacker-controlled range can allocate without a useful bound.
+            "so" => {
+                return Err(TorrentError::InvalidMagnet(
+                    "select-only parameters are not supported",
+                ));
+            }
+            _ => {}
+        }
     }
-    Ok(())
+
+    if v1_topics > 0 && has_v2 {
+        return Err(TorrentError::UnsupportedHybridMagnet);
+    }
+    if v1_topics == 0 && has_v2 {
+        return Err(TorrentError::UnsupportedV2Magnet);
+    }
+    if v1_topics == 0 {
+        return Err(TorrentError::InvalidMagnet(
+            "a v1 xt=urn:btih topic is required",
+        ));
+    }
+    if v1_topics > 1 {
+        return Err(TorrentError::InvalidMagnet(
+            "multiple v1 exact-topic values are ambiguous",
+        ));
+    }
+
+    let mut trackers = HashSet::new();
+    for (key, tracker) in url.query_pairs() {
+        if key == "tr" {
+            if validate_tracker_url(tracker.as_bytes())? && proxy_enabled {
+                return Err(TorrentError::ProxyWithUdpTracker);
+            }
+            if !tracker.is_empty()
+                && trackers.insert(tracker.into_owned())
+                && trackers.len() > MAX_TRACKERS_PER_TORRENT
+            {
+                return Err(TorrentError::TooManyTrackers {
+                    count: trackers.len(),
+                    limit: MAX_TRACKERS_PER_TORRENT,
+                });
+            }
+        }
+    }
+    if !normalize_base32 {
+        return Ok(magnet.to_owned());
+    }
+
+    let normalized_pairs = url
+        .query_pairs()
+        .map(|(key, value)| {
+            let value = if key == "xt" {
+                value
+                    .strip_prefix("urn:btih:")
+                    .filter(|hash| hash.len() == 32)
+                    .map(|hash| format!("urn:btih:{}", hash.to_ascii_uppercase()))
+                    .unwrap_or_else(|| value.into_owned())
+            } else {
+                value.into_owned()
+            };
+            (key.into_owned(), value)
+        })
+        .collect::<Vec<_>>();
+    let mut normalized = url;
+    normalized
+        .query_pairs_mut()
+        .clear()
+        .extend_pairs(normalized_pairs);
+    Ok(normalized.into())
 }
 
-fn tracker_uses_udp(tracker: &[u8]) -> bool {
-    std::str::from_utf8(tracker)
-        .ok()
-        .and_then(|tracker| url::Url::parse(tracker).ok())
-        .is_some_and(|tracker| tracker.scheme().eq_ignore_ascii_case("udp"))
+fn valid_btih(hash: &[u8]) -> bool {
+    (hash.len() == 40 && hash.iter().all(u8::is_ascii_hexdigit))
+        || (hash.len() == 32
+            && hash
+                .iter()
+                .all(|byte| byte.is_ascii_alphabetic() || matches!(byte, b'2'..=b'7')))
+}
+
+fn valid_btmh(hash: &[u8]) -> bool {
+    hash.len() == 68 && hash.starts_with(b"1220") && hash[4..].iter().all(u8::is_ascii_hexdigit)
+}
+
+fn validate_tracker_url(tracker: &[u8]) -> Result<bool, TorrentError> {
+    if tracker.is_empty() {
+        return Ok(false);
+    }
+    if tracker.len() > MAX_TRACKER_URL_BYTES {
+        return Err(TorrentError::TrackerUrlTooLong {
+            size: tracker.len(),
+            limit: MAX_TRACKER_URL_BYTES,
+        });
+    }
+    let tracker = std::str::from_utf8(tracker)
+        .map_err(|_| TorrentError::InvalidTracker("tracker URLs must contain valid UTF-8"))?;
+    let tracker = url::Url::parse(tracker)
+        .map_err(|_| TorrentError::InvalidTracker("tracker URL syntax is not valid"))?;
+    if tracker.host_str().is_none() {
+        return Err(TorrentError::InvalidTracker(
+            "tracker URLs must include a host",
+        ));
+    }
+    if tracker.port() == Some(0) {
+        return Err(TorrentError::InvalidTracker(
+            "tracker URLs must not use port zero",
+        ));
+    }
+    match tracker.scheme() {
+        "http" | "https" => Ok(false),
+        "udp" if tracker.port().is_some() => Ok(true),
+        "udp" => Err(TorrentError::InvalidTracker(
+            "UDP tracker URLs must include an explicit port",
+        )),
+        _ => Err(TorrentError::InvalidTracker(
+            "only HTTP, HTTPS, and UDP trackers are supported",
+        )),
+    }
 }
 
 #[derive(Clone)]
@@ -553,6 +1649,12 @@ impl TorrentHandle {
                 )
             })
             .unwrap_or_default();
+        let content_files = self
+            .inner
+            .with_metadata(|metadata| {
+                project_content_files(&metadata.file_infos, &stats.file_progress)
+            })
+            .unwrap_or_default();
         let eta_seconds = (download_bps > 0 && stats.progress_bytes < stats.total_bytes)
             .then(|| (stats.total_bytes - stats.progress_bytes).div_ceil(download_bps));
         TorrentStats {
@@ -561,12 +1663,13 @@ impl TorrentHandle {
             uploaded_bytes: stats.uploaded_bytes,
             total_bytes: stats.total_bytes,
             file_progress_bytes: stats.file_progress,
+            content_files,
             download_bps,
             upload_bps,
             eta_seconds,
             peers,
             finished: stats.finished,
-            error: stats.error,
+            error: stats.error.map(|error| display_safe_error(&error)),
         }
     }
 
@@ -583,6 +1686,22 @@ impl TorrentHandle {
             .await
             .map_err(engine_error)
     }
+}
+
+fn project_content_files(
+    file_infos: &[librqbit::file_info::FileInfo],
+    file_progress: &[u64],
+) -> Vec<TorrentContentFile> {
+    file_infos
+        .iter()
+        .enumerate()
+        .filter(|(_, file)| !file.attrs.padding)
+        .map(|(index, file)| TorrentContentFile {
+            relative_path: file.relative_filename.clone(),
+            size_bytes: file.len,
+            progress_bytes: file_progress.get(index).copied().unwrap_or(0),
+        })
+        .collect()
 }
 
 fn mib_per_second_to_bps(mib_per_second: f64) -> u64 {
@@ -617,25 +1736,207 @@ pub struct TorrentStats {
     pub progress_bytes: u64,
     pub uploaded_bytes: u64,
     pub total_bytes: u64,
+    /// Engine-indexed progress retained for low-level diagnostics.
     pub file_progress_bytes: Vec<u64>,
+    /// Importer-safe file inventory. BEP 47 padding entries are omitted.
+    pub content_files: Vec<TorrentContentFile>,
     pub download_bps: u64,
     pub upload_bps: u64,
     pub eta_seconds: Option<u64>,
     pub peers: TorrentPeerStats,
     pub finished: bool,
+    /// Redacted, control-character-free, and bounded to 2 KiB.
     pub error: Option<String>,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TorrentContentFile {
+    pub relative_path: PathBuf,
+    pub size_bytes: u64,
+    pub progress_bytes: u64,
+}
+
+#[cfg(test)]
+mod preflight_tests;
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn file_info(path: &str, len: u64, padding: bool) -> librqbit::file_info::FileInfo {
+        let mut file = librqbit::file_info::FileInfo {
+            relative_filename: PathBuf::from(path),
+            offset_in_torrent: 0,
+            piece_range: 0..1,
+            attrs: Default::default(),
+            len,
+        };
+        file.attrs.padding = padding;
+        file
+    }
+
     #[test]
-    fn session_options_cannot_enable_upnp() {
+    fn content_file_projection_hides_padding_and_keeps_engine_progress_alignment() {
+        let files = vec![
+            file_info("release/video.mkv", 100, false),
+            file_info("release/.pad/64", 64, true),
+            file_info("release/readme.txt", 10, false),
+        ];
+
+        assert_eq!(
+            project_content_files(&files, &[75, 64, 3]),
+            vec![
+                TorrentContentFile {
+                    relative_path: PathBuf::from("release/video.mkv"),
+                    size_bytes: 100,
+                    progress_bytes: 75,
+                },
+                TorrentContentFile {
+                    relative_path: PathBuf::from("release/readme.txt"),
+                    size_bytes: 10,
+                    progress_bytes: 3,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn session_options_are_an_explicit_dormant_boundary() {
         // This pins the helper used by TorrentSession::start. If start stops
         // delegating here, move the assertion to the replacement call path.
         let options = session_options(false, None, None);
+        assert!(options.disable_dht);
+        assert!(options.disable_dht_persistence);
+        assert!(options.dht_config.is_none());
+        assert!(!options.fastresume);
+        assert!(options.persistence.is_none());
+        assert!(options.peer_id.is_none());
+        let peer_options = options.peer_opts.expect("peer policy must be explicit");
+        assert_eq!(peer_options.connect_timeout, Some(PEER_CONNECT_TIMEOUT));
+        assert_eq!(
+            peer_options.read_write_timeout,
+            Some(PEER_READ_WRITE_TIMEOUT)
+        );
+        assert_eq!(
+            peer_options.keep_alive_interval,
+            Some(PEER_KEEP_ALIVE_INTERVAL)
+        );
+        assert!(options.listen_port_range.is_none());
         assert!(!options.enable_upnp_port_forwarding);
+        assert!(options.defer_writes_up_to.is_none());
+        assert!(options.default_storage_factory.is_none());
+        assert!(options.socks_proxy_url.is_none());
+        assert!(options.cancellation_token.is_none());
+        assert_eq!(
+            options.concurrent_init_limit,
+            Some(MAX_CONCURRENT_TORRENT_INITIALIZATIONS)
+        );
+        assert!(options.root_span.is_none());
+        assert_eq!(options.ratelimits, Default::default());
+        assert!(options.blocklist_url.is_none());
+        assert!(options.trackers.is_empty());
+    }
+
+    #[test]
+    fn per_torrent_options_are_an_explicit_admission_boundary() {
+        let peer = "127.0.0.1:6881".parse().unwrap();
+        let resolving = magnet_resolution_options(vec![peer]);
+        assert!(!resolving.paused);
+        assert!(!resolving.overwrite);
+        assert!(resolving.list_only);
+        assert_eq!(resolving.initial_peers, Some(vec![peer]));
+        assert_add_options_cannot_redirect_or_expand_scope(&resolving);
+
+        let managed = managed_add_options(TorrentAddConfig {
+            paused: true,
+            overwrite: true,
+            initial_peers: vec![peer],
+        });
+        assert!(managed.paused);
+        assert!(managed.overwrite);
+        assert!(!managed.list_only);
+        assert_eq!(managed.initial_peers, Some(vec![peer]));
+        assert_add_options_cannot_redirect_or_expand_scope(&managed);
+    }
+
+    fn assert_add_options_cannot_redirect_or_expand_scope(options: &AddTorrentOptions) {
+        assert!(options.only_files_regex.is_none());
+        assert!(options.only_files.is_none());
+        assert!(options.output_folder.is_none());
+        assert!(options.sub_folder.is_none());
+        assert!(options.peer_opts.is_none());
+        assert!(options.force_tracker_interval.is_none());
+        assert!(!options.disable_trackers);
+        assert_eq!(options.ratelimits, Default::default());
+        assert!(options.preferred_id.is_none());
+        assert!(options.storage_factory.is_none());
+        assert!(options.defer_writes.is_none());
+        assert!(options.trackers.is_none());
+    }
+
+    #[test]
+    fn listen_range_is_exactly_one_explicit_port() {
+        assert!(validate_listen_port_range(None).is_ok());
+        assert!(validate_listen_port_range(Some(&(6881..6882))).is_ok());
+
+        for range in [0..1, 6881..6881, 6881..6883, u16::MAX..u16::MAX] {
+            assert!(matches!(
+                validate_listen_port_range(Some(&range)),
+                Err(TorrentError::InvalidListenPortRange)
+            ));
+        }
+    }
+
+    #[test]
+    fn initial_peers_are_validated_deduplicated_and_bounded() {
+        let peer = SocketAddr::from(([127, 0, 0, 1], 6881));
+        let mut duplicates = vec![peer; MAX_INITIAL_PEERS + 1];
+        normalize_initial_peers(&mut duplicates).unwrap();
+        assert_eq!(duplicates, vec![peer]);
+
+        for peer in [
+            SocketAddr::from(([127, 0, 0, 1], 0)),
+            SocketAddr::from(([0, 0, 0, 0], 6881)),
+            SocketAddr::from(([224, 0, 0, 1], 6881)),
+            SocketAddr::from(([255, 255, 255, 255], 6881)),
+            SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 1], 6881)),
+        ] {
+            assert!(matches!(
+                normalize_initial_peers(&mut vec![peer]),
+                Err(TorrentError::InvalidInitialPeer(_))
+            ));
+        }
+
+        let mut too_many = (1..=MAX_INITIAL_PEERS + 1)
+            .map(|last| SocketAddr::from(([192, 0, 2, last as u8], 6881)))
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            normalize_initial_peers(&mut too_many),
+            Err(TorrentError::TooManyInitialPeers {
+                count,
+                limit: MAX_INITIAL_PEERS
+            }) if count == MAX_INITIAL_PEERS + 1
+        ));
+    }
+
+    #[test]
+    fn resolved_peers_keep_explicit_order_and_stop_at_the_limit() {
+        let first = SocketAddr::from(([192, 0, 2, 1], 6881));
+        let second = SocketAddr::from(([192, 0, 2, 2], 6881));
+        let mut peers = vec![first];
+        extend_with_resolved_peers(
+            &mut peers,
+            [first, SocketAddr::from(([192, 0, 2, 3], 0)), second],
+        );
+        assert_eq!(peers, vec![first, second]);
+
+        let mut full = (1..=MAX_INITIAL_PEERS)
+            .map(|last| SocketAddr::from(([198, 51, 100, last as u8], 6881)))
+            .collect::<Vec<_>>();
+        let overflow = SocketAddr::from(([203, 0, 113, 1], 6881));
+        extend_with_resolved_peers(&mut full, [overflow]);
+        assert_eq!(full.len(), MAX_INITIAL_PEERS);
+        assert!(!full.contains(&overflow));
     }
 
     #[test]
@@ -660,6 +1961,9 @@ mod tests {
             url: "socks5://alice:secret@127.0.0.1:1080".into(),
             ..Default::default()
         };
+        let shown = format!("{embedded:?}");
+        assert!(!shown.contains("alice"));
+        assert!(!shown.contains("secret"));
         assert!(matches!(
             embedded.engine_url(),
             Err(TorrentError::InvalidProxy(_))
@@ -674,5 +1978,139 @@ mod tests {
             partial.engine_url(),
             Err(TorrentError::InvalidProxy(_))
         ));
+    }
+
+    #[test]
+    fn proxy_accepts_only_an_origin_url() {
+        let trailing_slash = TorrentProxyConfig {
+            url: "socks5://127.0.0.1:1080/".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            trailing_slash.engine_url().unwrap(),
+            "socks5://127.0.0.1:1080"
+        );
+
+        for url in [
+            "socks5://127.0.0.1:1080/private",
+            "socks5://127.0.0.1:1080/?token=secret",
+            "socks5://127.0.0.1:1080/#fragment",
+        ] {
+            let proxy = TorrentProxyConfig {
+                url: url.into(),
+                ..Default::default()
+            };
+            assert!(matches!(
+                proxy.engine_url(),
+                Err(TorrentError::InvalidProxy(
+                    "URL must not contain a path, query, or fragment"
+                ))
+            ));
+        }
+    }
+
+    #[test]
+    fn engine_errors_are_redacted_and_display_safe() {
+        let message = concat!(
+            "fetch magnet:?xt=urn:btih:0123456789012345678901234567890123456789&dn=secret-name ",
+            "tracker=https://alice:secret@tracker.example/passkey?auth=secret ",
+            "proxy=socks5://bob:hunter2@127.0.0.1:1080 ",
+            "socks_proxy_password=plain-secret ",
+            "password: spaced-secret api_token = equals-secret ",
+            "\"authorization\":\"json-secret\" cookie : cookie-secret ",
+            "authorization: Bearer bearer-secret visible-context ",
+            "proxy_authorization=Basic basic-secret visible-context ",
+            "password => arrow-secret visible-context ",
+            "secret := walrus-secret token -> pointer-secret visible-context ",
+            "authorization: Digest username=digest-user, response=digest-secret visible-context ",
+            "cookie: first-cookie=one; second-cookie=two visible-context ",
+            "query=tracker.example/private-passkey?auth=query-secret ",
+            "peers=[203.0.113.7:6881, /Users/alice/private/file]\nforbidden"
+        );
+        let shown = engine_error(message).to_string();
+
+        for secret in [
+            "secret-name",
+            "alice",
+            "hunter2",
+            "plain-secret",
+            "spaced-secret",
+            "equals-secret",
+            "json-secret",
+            "cookie-secret",
+            "bearer-secret",
+            "basic-secret",
+            "arrow-secret",
+            "walrus-secret",
+            "pointer-secret",
+            "digest-user",
+            "digest-secret",
+            "first-cookie",
+            "second-cookie",
+            "private-passkey",
+            "query-secret",
+            "203.0.113.7",
+            "/Users/alice",
+        ] {
+            assert!(!shown.contains(secret), "leaked {secret:?}: {shown}");
+        }
+        assert!(shown.contains("tracker.example"));
+        assert!(shown.contains("visible-context"));
+        assert!(!shown.contains('\n'));
+    }
+
+    #[test]
+    fn engine_errors_redact_embedded_and_tracker_specific_credentials() {
+        let message = concat!(
+            "user=public&password=hunter2 ",
+            "{\"user\":\"public\",\"password\":\"p@ss\"} ",
+            "password=before-url,https://tracker.example/announce ",
+            "torrent_pass=gazelle authkey=tracker-auth apikey=api-one ",
+            "api_key=api-two sig=signed signature=signature-value ",
+            "sessionid=session-value"
+        );
+        let shown = engine_error(message).to_string();
+
+        for secret in [
+            "hunter2",
+            "p@ss",
+            "before-url",
+            "gazelle",
+            "tracker-auth",
+            "api-one",
+            "api-two",
+            "signed",
+            "signature-value",
+            "session-value",
+        ] {
+            assert!(!shown.contains(secret), "leaked {secret:?}: {shown}");
+        }
+        assert!(shown.contains("user=public"));
+        assert!(shown.contains("tracker.example"));
+    }
+
+    #[test]
+    fn display_safe_errors_are_utf8_safe_bounded_and_marked() {
+        let exact = display_safe_error(&"x".repeat(DISPLAY_SAFE_ERROR_MAX_BYTES));
+        assert_eq!(exact.len(), DISPLAY_SAFE_ERROR_MAX_BYTES);
+        assert!(!exact.ends_with(ERROR_TRUNCATION_MARKER));
+
+        let first_excess = display_safe_error(&format!(
+            "{}é",
+            "x".repeat(DISPLAY_SAFE_ERROR_MAX_BYTES - 1)
+        ));
+        assert_eq!(first_excess.len(), DISPLAY_SAFE_ERROR_MAX_BYTES);
+        assert!(first_excess.ends_with(ERROR_TRUNCATION_MARKER));
+
+        let unicode = display_safe_error(&"é".repeat(DISPLAY_SAFE_ERROR_MAX_BYTES));
+        assert!(unicode.len() <= DISPLAY_SAFE_ERROR_MAX_BYTES);
+        assert!(unicode.ends_with(ERROR_TRUNCATION_MARKER));
+        assert!(std::str::from_utf8(unicode.as_bytes()).is_ok());
+
+        let huge_url = display_safe_error(&format!(
+            "https://tracker.example/{}?passkey=secret",
+            "x".repeat(DISPLAY_SAFE_ERROR_MAX_BYTES * 4)
+        ));
+        assert_eq!(huge_url, "<redacted-url>");
     }
 }

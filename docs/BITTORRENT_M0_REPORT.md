@@ -26,16 +26,16 @@ peer listener, or production torrent admission path has been added.
 | Gate | Result | Evidence and consequence |
 |---:|---|---|
 | 1. Rust 1.85 and platform packaging | **Pass** | A real Rust 1.85.1 macOS build passes, and the release harness links only macOS system libraries, not OpenSSL. The first checked-in `BitTorrent M0` run caught Tokio 1.53.0 using Rust 1.86's `OnceLock::wait` on Windows. After the workspace pinned Tokio 1.52.4, the [corrected run completed successfully](https://github.com/pjunod/nzbd/actions/runs/31060326800) on 2026-08-06 UTC: the isolated adapter suite passed on Linux glibc, macOS arm64, Windows MSVC, and x86-64/aarch64 musl under Rust 1.85, and the exact-engine/Rust-TLS dependency policy also passed. |
-| 2. v1 `.torrent`, magnet, TCP/IPv4, then seed | **Pass** | Deterministic generated payloads download through both admission paths; a local seeder accounts for both uploads and exact bytes match. |
+| 2. v1 `.torrent`, magnet, TCP/IPv4, then seed | **Pass** | Deterministic generated payloads download through both admission paths; a local seeder accounts for both uploads and exact bytes match. The adapter checks nonzero piece length and total payload, checked aggregate length, whole SHA-1 hash width, exact hash count, and rqbit's `u32` absolute chunk-index boundary before the engine constructs its length table. |
 | 3. Controls and live limits | **Pass** | Pause/resume is exercised before completion, the live download limit is removed during transfer, and idempotent keep-data delete, idempotent delete-data, and unrelated-sibling retention pass. |
 | 4. Kill/restart never trusts partial data | **Blocked** | The accepted fast-resume design cannot be constructed without failing gate 8. A persistence-disabled full hash recheck is a possible safe but slower product decision, not an equivalent test of the accepted design. |
-| 5. Private-torrent discovery | **Pass** | A one-tracker private torrent downloads through a loopback HTTP tracker, and a deterministic peer-wire control proves public torrents consume an injected PEX peer while private torrents ignore it. A Linux capture harness starts live DHT, redirects both stable-8.1.1 bootstrap ports to a local KRPC probe, and observes separate public control hashes before and during a 15-second private canary window. It scans all captured UDP—not just redirected DHT—for the private hash in binary or LSD-style text form. The [first successful capture run](https://github.com/pjunod/nzbd/actions/runs/31128106994) passed on 2026-08-06 UTC: both DHT controls were observed and no private DHT/LSD hash appeared. Tracker order is still lost through a hash set before truncation, so the adapter rejects private metainfo unless it has exactly one unique tracker. |
-| 6. Path and delete safety | **Pass** | Traversal metainfo is rejected before an escape file exists. Delete-data removes only parsed torrent content; an unrelated sibling survives. Higher layers must still prove the persisted canonical root before requesting deletion. |
+| 5. Private-torrent discovery | **Pass** | A one-tracker private torrent downloads through a loopback HTTP tracker, and a deterministic peer-wire control proves public torrents consume an injected PEX peer while private torrents ignore it. A Linux capture harness starts live DHT, redirects both stable-8.1.1 bootstrap ports to a local KRPC probe, and observes separate public control hashes before and during a 15-second private canary window. It scans all captured UDP—not just redirected DHT—for the private hash in binary or LSD-style text form. The [first successful capture run](https://github.com/pjunod/nzbd/actions/runs/31128106994) passed on 2026-08-06 UTC: both DHT controls were observed and no private DHT/LSD hash appeared. Tracker order is still lost through a hash set before truncation, so the adapter rejects private metainfo unless it has exactly one unique tracker. Empty tracker slots are treated as absent; every non-empty tracker URL now fails closed before rqbit can silently discard malformed/non-UTF-8 input, unsupported schemes, missing hosts, or UDP without a port. A magnet does not expose the private bit before resolution; because stable rqbit has no per-add DHT suppression, the adapter rejects every magnet in a DHT-enabled session before calling the engine. A known-private `.torrent` is likewise rejected before engine admission when session DHT is live. Loopback and policy tests prove both guards fail before contact while DHT-disabled private admission remains available. |
+| 6. Path and delete safety | **Pass** | The adapter now repeats the portable lexical path invariant before rqbit admission: unnamed payloads, empty/dot/parent components, slash or backslash, absolute/UNC forms, Windows drive prefixes and device aliases, alternate-data-stream and other reserved characters, trailing dot/space aliases, malformed UTF-8, empty multi-file paths, missing/unsafe multi-file roots, metainfo-declared symlinks, exact duplicate paths, file-versus-directory-prefix overlaps, and portable Unicode NFC/simple-case-fold collisions fail with safe nzbd-owned errors. Greek sigma, long-s, and Windows dotless-i aliases are covered without collapsing compatibility-only ligature or width pairs. rqbit's shared `torrent-content` fallback is therefore never used for an unnamed single-file torrent. Magnet input first resolves through rqbit's list-only path, which returns before storage construction; nzbd then applies the same metainfo contract and admits only the validated bytes. A fake BEP 9 peer proves an unsafe resolved path leaves the destination empty, and the real-admission corpus still proves rejection before an escape file exists. The session canonicalizes its output root and preflights every existing payload prefix with no-follow metadata: symlinks fail, prefixes must be directories, and leaves must be regular files while an existing regular leaf remains valid resume input. A Unix test proves a symlink is rejected before storage and its external target remains empty. This is defense in depth, not a claim to close the check/write race. The importer-safe content inventory omits BEP 47 padding entries while raw engine-indexed progress remains available only as diagnostics. Delete-data removes only parsed torrent content; an unrelated sibling survives. Higher layers must still prove persisted delete-root authority, descriptor-relative containment across writes, and empirical filesystem-specific case/normalization behavior in M5/M2. |
 | 7. Public observability | **Fail** | Public stats expose phase, total/progress/upload bytes, file progress, rates, ETA inputs, peer counts, completion, and error. Stable 8.1.1 does not expose per-torrent tracker state, DHT state, or last tracker error. A tested upstream patch now supplies that snapshot, but this gate remains failed until an accepted stable release contains it. “No peers” cannot safely substitute for those facts. |
 | 8. nzbd-authoritative persistence | **Fail** | The contract test proves that `Session::new_with_opts` auto-restores the library record before returning. The persistence module and store injection point are private in 8.1.1, so nzbd cannot filter first. A tested upstream patch now supplies the missing opt-out, but this gate remains failed until an accepted stable release contains it. |
-| 9. Resource, package, and license delta | **Partial** | Measurements are recorded in §4. A blocking cargo-deny 0.20.2 policy passes locally across all features and the locked graph, and its [first Actions run passed](https://github.com/pjunod/nzbd/actions/runs/31064446916) on 2026-08-06 UTC. The repository-wide Supply chain check also freezes the reviewed advisory package/feature sets and sole MPL-2.0 package path without pinning nzbd's own version. The [gate 9 review brief](BITTORRENT_GATE9_REVIEW.md) isolates the remaining human acceptance decision. |
+| 9. Resource, package, and license delta | **Partial** | Measurements are recorded in §4. A blocking cargo-deny 0.20.2 policy passes locally across all features and the locked graph, and its [first Actions run passed](https://github.com/pjunod/nzbd/actions/runs/31064446916) on 2026-08-06 UTC. The repository-wide Supply chain check also freezes the reviewed advisory package/feature sets and sole MPL-2.0 package path without pinning nzbd's own version. Stable 8.1.1 also hard-codes 128 live peers per torrent and exposes no session-wide cap, so the proposed 80/400 runtime budgets are not yet enforceable; the 80-peer adapter guard applies only to explicit bootstrap input. The [gate 9 review brief](BITTORRENT_GATE9_REVIEW.md) isolates the remaining human acceptance and resource-control decisions. |
 | 10. One explicit rustls provider | **Pass** | The process starts without a provider, explicitly installs aws-lc, and constructs librqbit’s rustls client without the mixed-provider panic. |
-| 11. v1-only boundary | **Pass** | Stable input uses v1 pieces/`btih`; v2-only and hybrid `.torrent` files and magnets return separate named errors before librqbit admission. |
+| 11. v1-only boundary | **Pass** | Stable input uses v1 pieces/`btih`; v2-only and hybrid `.torrent` files and magnets return separate named errors before managed-torrent admission. Magnet classification reads decoded `xt` query parameters rather than searching the whole URI, so version-looking text in a display name or tracker URL cannot create a false v2/hybrid result. The adapter accepts one valid 40-hex or 32-base32 `btih`, rejects missing, malformed, or duplicate v1 topics by name, and rechecks the resolved info dictionary before storage exists. |
 
 Gates 7 and 8 are stop conditions in §4.3 of the proposal. This is an M0
 **no-go**, even though the data-path tests are healthy.
@@ -51,15 +51,48 @@ code. The daemon does not depend on it. The boundary currently provides:
 
 - explicit process-wide aws-lc provider installation;
 - session construction with DHT off by default, UPnP unavailable, DHT
-  persistence disabled unconditionally, and proxy+DHT rejected because DHT
-  bypasses the engine's SOCKS path;
-- raw v1 metainfo and v1 magnet admission;
+  persistence disabled unconditionally, no library fast-resume/session
+  persistence, global trackers, remote blocklist, or deferred-write buffer,
+  and proxy+DHT rejected because DHT bypasses the engine's SOCKS path. Every
+  stable 8.1.1 session option is assigned explicitly so a new upstream option
+  becomes a compile-time review event instead of silently inheriting a default;
+- per-torrent admission options assigned explicitly for metadata resolution
+  and managed torrents, with selective files, alternate output roots, custom
+  trackers/storage, and deferred writes unavailable. Newly added upstream add
+  options likewise require an explicit adapter review;
+- raw v1 metainfo and two-stage v1 magnet admission, with an engine-compatible
+  exact-topic grammar, eager `so=` expansion rejected before rqbit parsing,
+  and resolved metadata returned by list-only mode and revalidated before
+  storage construction;
+- bounded bootstrap peers: caller order is retained, duplicates are removed,
+  non-unicast/port-zero/IPv6 endpoints fail by name, and resolved magnet peers
+  cannot grow the handoff beyond 80. This bounds admission input only; it does
+  not cap peers later discovered from trackers, PEX, or DHT;
+- one concurrent torrent initialization: stable rqbit's unset default permits
+  three payload integrity scans at once, while the dormant session explicitly
+  serializes that disk-heavy work. This is an initialization-I/O guard, not the
+  future shared active-download scheduler or a runtime peer cap;
+- explicit peer lifetimes: the dormant session pins stable 8.1.1's effective
+  10-second connect and read/write timeouts and 120-second keepalive interval;
+  per-add options inherit this reviewed session policy instead of introducing
+  another override;
+- bytes-only managed admission: the private engine handoff accepts only
+  metainfo bytes that already passed nzbd preflight. Stable rqbit's URL variant
+  cannot bypass nzbd's future source-fetch size, redirect, timeout, or
+  redaction policy through this helper;
 - named v2-only and hybrid rejection for both metainfo and magnets;
-- exact-one-tracker validation for private metainfo;
+- fail-closed HTTP/HTTPS/UDP tracker URL validation for metainfo and magnets,
+  with at most 64 unique non-empty trackers and 2 KiB per decoded URL, plus
+  exact-one-tracker validation for private metainfo;
 - pause, resume, idempotent forget, and bounded delete-data delegation;
 - live session upload/download rate changes;
 - info hash, phase, progress, upload, per-file progress, rates, derived ETA,
-  peer aggregates, completion, and error facts;
+  peer aggregates, completion, display-safe error facts, and an importer-safe
+  content-file inventory that omits BEP 47 padding entries;
+- a 2 KiB display-safe boundary for rqbit operation/stat errors that removes
+  magnet URIs, URL credentials/queries, inline, colon-delimited, JSON-style,
+  and whitespace-separated secret assignments, peer addresses, absolute
+  paths, and control characters before returning adapter values;
 - split SOCKS URL/username/password input with password redaction, a strict
   credential form, named rejection of UDP trackers, and a recording relay
   proving the peer path did not also connect directly; and
@@ -80,20 +113,64 @@ daemon behavior changed by the spike.
 The isolated suite covers:
 
 - `.torrent` and magnet download from one local TCP seeder;
+- a fake BEP 9 metadata peer proving unsafe magnet-resolved paths fail while
+  the destination directory remains empty;
 - exact-byte verification and upload accounting;
 - a live 16 KiB/s limit followed by an unlimited transfer;
 - pause and resume before download completion;
 - keep-data and delete-data behavior, including idempotence;
+- named rejection of zero, empty, and multi-port TCP listen ranges so the
+  adapter cannot silently request an ephemeral port or probe a range;
+- deterministic deduplication and an 80-peer bound for explicit bootstrap
+  peers, with rejection of port-zero, non-unicast, and IPv6 endpoints before
+  the IPv4-only v1 engine path sees them;
 - authenticated SOCKS5 peer routing through a loopback proxy, with a
   recording relay proving no parallel direct connection;
+- origin-only SOCKS proxy validation, including rejection of paths, queries,
+  and fragments before rqbit's peer and tracker clients can interpret the
+  same setting differently;
 - named rejection of proxy+DHT and proxy+UDP-tracker leak paths;
-- password redaction and invalid proxy combinations;
+- named rejection of tracker port zero rather than deferring an invalid
+  endpoint to rqbit's retry/error path;
+- named rejection of privacy-unknown magnets and known-private metainfo in a
+  DHT-enabled session before rqbit can contact even an explicitly supplied
+  peer;
+- password redaction and invalid proxy combinations, including embedded proxy
+  credentials before validation, multi-token authorization/cookie values,
+  embedded JSON/query assignments, private-tracker credential names, and
+  alternate assignment separators;
+- engine/stat error redaction and UTF-8-safe 2 KiB truncation with an explicit
+  marker;
 - one-tracker private-torrent discovery and multi-tracker rejection;
 - a positive-control PEX peer that public torrents contact and private torrents
   ignore; the canary address is available only through the peer-wire message;
 - traversal rejection before filesystem escape;
+- canonical-root and existing-symlink preflight whose external target remains
+  untouched, with the remaining check/write race called out explicitly;
+- adapter-owned portable path preflight for single- and multi-file torrents,
+  including safe named errors, Windows device/character/alias rejection,
+  metainfo-declared symlink rejection, and exact or portable simple-case-fold
+  duplicate path rejection;
+- parsed BEP 47 padding metainfo whose padding entry stays out of the
+  importer-safe content inventory without shifting later file progress;
+- centralized proposal limits for raw metainfo, magnet length, file count, one
+  path component, one projected relative path, and aggregate projected path
+  bytes, with exact boundary and first-excess tests;
+- deterministic, socket-free preflight mutations covering every truncation and
+  bounded single-byte replacement, deletion, and insertion around valid v1,
+  v2-only, and hybrid seeds, with exact accepted/rejected outcome counts plus
+  nesting, length-overflow, duplicate-info, trailing-byte, and framed-marker
+  invariants;
+- checked v1 payload/piece/hash geometry, including zero values, aggregate
+  length overflow, malformed hash width, mismatched hash count, and valid
+  zero-length sidecars;
 - the explicit aws-lc provider invariant;
-- v2-only and hybrid named rejection for metainfo and magnets; and
+- v2-only and hybrid named rejection for metainfo and magnets;
+- query-aware magnet validation for hex/base32 `btih` with lowercase base32
+  normalized to rqbit's accepted spelling, valid `btmh`,
+  duplicate/missing/unknown exact topics, engine-incompatible casing, false
+  version markers outside `xt`, and pre-engine rejection of unbounded `so=`
+  file-range expansion; and
 - the persistence auto-restore behavior that fails gate 8.
 
 All peers, trackers, proxies, and DHT responders in the suite are local and
@@ -105,6 +182,28 @@ point. Separate public lookups prove the probe is live before and throughout a
 15-second private canary window. The harness scans every captured UDP packet,
 not only redirected DHT traffic, for the private binary hash and the ASCII hash
 used by LSD.
+
+The bounded mutation corpus is a fast CI regression layer, not a claim of
+coverage-guided fuzzing completeness. It exercises the adapter-owned scanner
+without sockets and leaves a persistent fuzz target plus symlink and
+case-collision filesystem probes for M5.
+
+The two-stage magnet guard closes the storage-ordering gap, not the allocation
+gap inside stable rqbit: its metadata reader may allocate up to 32 MiB before
+returning list-only bytes, after which nzbd applies the 10 MiB contract. A
+production magnet path still needs a reviewed pre-allocation answer; gates 7
+and 8 already keep that path disabled.
+
+Stable 8.1.1 also creates a private 128-permit live-peer semaphore for every
+torrent. Its public session/add options cannot apply the proposal's default of
+80 live peers per torrent, and there is no shared session semaphore for the
+proposed 400-peer total. The adapter's 80-peer guard bounds only the explicit
+and resolved bootstrap vector handed to rqbit; tracker, PEX, and DHT discovery
+can still fill the engine's 128 live slots. The pinned rqbit-main snapshot
+`4e5f94cbcf1d57ec500885c77cf1e24d70232d89` exposes a per-torrent
+`peer_limit`, but still no session-total limit. Production integration must use
+an accepted stable per-torrent API and add an nzbd-owned shared-session budget
+before advertising the 80/400 configuration contract.
 
 ### 2.3 Queue schema version fallback
 
@@ -292,11 +391,16 @@ intentionally does not link the blocked adapter.
 
 | Measurement | Result |
 |---|---:|
-| Unstripped optimized harness | 10,074,960 bytes (9.61 MiB) |
-| Maximum resident set while starting/stopping one idle session | 8,798,208 bytes (8.39 MiB) |
-| Normal dependency closure of `nzbd-torrent` | 220 unique package/version identities |
-| New package/version identities in the workspace lockfile | 176 |
+| Unstripped optimized harness | 10,111,360 bytes (9.64 MiB) |
+| Maximum resident set while starting/stopping one idle session | 8,814,592 bytes (8.41 MiB) |
+| Normal dependency closure of `nzbd-torrent` | 222 unique package/version identities |
+| New package/version identities in the workspace lockfile | 178 |
 | OpenSSL dynamic link | none; only CoreFoundation, libiconv, and libSystem were listed on this host |
+
+The 2026-08-07 review remediation refreshed these measurements after adding
+`icu_casemap 2.1.1` and `icu_casemap_data 2.1.1` for Unicode simple case
+folding. The change added two package identities, 36,400 binary bytes, and
+16,384 bytes to the one-sample idle RSS measurement.
 
 The normal closure reports permissive licenses: MIT, Apache-2.0, BSD, ISC,
 Unicode-3.0, Zlib, Unlicense, CDLA-Permissive-2.0, and related compatible

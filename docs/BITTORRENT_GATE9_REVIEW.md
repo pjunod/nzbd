@@ -11,27 +11,37 @@ Companion to
 and advisory decision. Review the table and §4; do not mark the gate Pass
 merely because CI is green. The remaining decision is whether the recorded
 cost and three constrained exceptions are acceptable for the eventual first
-release.
+release, and whether the missing live-peer resource controls must be resolved
+before this gate can pass.
 
 No production BitTorrent path is enabled by this review. Gates 7 and 8 still
 fail until accepted stable rqbit APIs provide authoritative restore and honest
 per-torrent discovery health.
 
-## 1. Decision requested — four costs and three exact exceptions
+## 1. Decision requested — measured costs, exact exceptions, and one resource gap
 
 The isolated M0 adapter measured the following in one macOS 26.6 arm64 run:
 
 | Measurement | Recorded result | Reviewer question |
 |---|---:|---|
-| Unstripped optimized `m0_idle` harness | 10,074,960 bytes (9.61 MiB) | Is this binary delta acceptable for the single-binary release? |
-| Maximum resident set for one idle session | 8,798,208 bytes (8.39 MiB) | Is this idle memory cost acceptable before real swarm load? |
-| Normal `nzbd-torrent` dependency closure | 220 package/version identities | Is the maintenance and audit surface acceptable? |
-| New workspace lockfile identities | 176 package/version identities | Is the dependency expansion proportionate to not implementing BitTorrent ourselves? |
+| Unstripped optimized `m0_idle` harness | 10,111,360 bytes (9.64 MiB) | Is this binary delta acceptable for the single-binary release? |
+| Maximum resident set for one idle session | 8,814,592 bytes (8.41 MiB) | Is this idle memory cost acceptable before real swarm load? |
+| Normal `nzbd-torrent` dependency closure | 222 package/version identities | Is the maintenance and audit surface acceptable? |
+| New workspace lockfile identities | 178 package/version identities | Is the dependency expansion proportionate to not implementing BitTorrent ourselves? |
 
 These are spike measurements, not permanent limits. The complete M0 rerun
 must measure the final daemon after an accepted rqbit release is linked. A
 reviewer can accept this preliminary cost without claiming the eventual daemon
 has the same size or resident set.
+
+The proposed `max_peers_per_torrent = 80` and `max_peers_total = 400` are not
+implemented by stable 8.1.1. Stable hard-codes 128 live peer permits per
+torrent and exposes no shared session cap. The adapter's 80-entry guard applies
+only to explicit/resolved bootstrap peers; later tracker, PEX, or DHT discovery
+can fill all 128 engine slots. The pinned rqbit-main snapshot exposes a
+per-torrent `peer_limit`, but still no session-total budget. Preliminary
+binary/dependency acceptance therefore cannot authorize the advertised 80/400
+runtime contract.
 
 The normal closure is permissively licensed except for exact
 `option-ext 0.2.0`, which is MPL-2.0 file-level copyleft. The checked-in
@@ -106,10 +116,10 @@ byte-for-byte acceptance comparisons.
 
 Gate 9 may move from Partial to Pass only if a reviewer accepts all of these:
 
-1. **Binary and idle-memory cost.** The one-sample 9.61 MiB harness and
-   8.39 MiB idle RSS are acceptable preliminary costs, subject to
+1. **Binary and idle-memory cost.** The one-sample 9.64 MiB harness and
+   8.41 MiB idle RSS are acceptable preliminary costs, subject to
    final-daemon remeasurement.
-2. **Dependency and license cost.** The 220-package closure, 176 new lockfile
+2. **Dependency and license cost.** The 222-package closure, 178 new lockfile
    identities, and exact MPL-2.0 exception are acceptable.
 3. **UPnP restriction.** Compiling the affected `quick-xml` is acceptable only
    because the first release cannot enable UPnP and CI guards that boundary.
@@ -117,6 +127,10 @@ Gate 9 may move from Partial to Pass only if a reviewer accepts all of these:
    only while its vulnerable parsing feature remains absent.
 5. **Renewal rule.** Any engine, feature, advisory, dependency-path, or MSRV
    change reopens this decision; a previous green run is not a waiver.
+6. **Runtime peer budgets.** Gate 9 cannot pass on the claim that the proposed
+   80/400 peer budgets are enforced. An accepted stable per-torrent limit and
+   an nzbd-owned shared-session cap must exist first, or the proposal must be
+   explicitly amended with new measured and reviewed limits.
 
 If any item is rejected, gate 9 remains Partial and the remedy must be named:
 upgrade or patch the dependency, remove the capability, change engines, or set
@@ -130,6 +144,8 @@ an accepted resource budget. Silence is not acceptance.
   stable discovery-health API.
 - It does not add torrent configuration, admission, listeners, trackers, DHT,
   payload I/O, qBittorrent compatibility, or UI.
+- It does not treat the 80-entry bootstrap-input guard as a live-peer resource
+  cap or accept stable 8.1.1's hard-coded 128-per-torrent behavior.
 - It does not submit either prepared patch upstream.
 
 Gate 9 is one required decision among eleven, not permission to skip the two
