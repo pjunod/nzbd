@@ -494,6 +494,7 @@ fn proposal_admission_constants_and_input_boundaries_are_pinned() {
     assert_eq!(MAX_TORRENT_RELATIVE_PATH_BYTES, 4 * 1024);
     assert_eq!(MAX_TORRENT_PATH_COMPONENT_BYTES, 255);
     assert_eq!(MAX_TORRENT_PATH_BYTES, 16 * 1024 * 1024);
+    assert_eq!(MAX_INITIAL_PEERS, 80);
 
     assert!(validate_metainfo_size(DEFAULT_MAX_METAINFO_BYTES).is_ok());
     assert!(matches!(
@@ -642,6 +643,8 @@ fn tracker_preflight_rejects_inputs_the_engine_would_silently_drop() {
         &b"not-a-url"[..],
         &b"wss://tracker.example/announce"[..],
         &b"udp://tracker.example/announce"[..],
+        &b"http://tracker.example:0/announce"[..],
+        &b"udp://tracker.example:0/announce"[..],
         &b"udp:/announce"[..],
         &b"https://\xff/announce"[..],
     ] {
@@ -661,6 +664,8 @@ fn tracker_preflight_rejects_inputs_the_engine_would_silently_drop() {
         "not-a-url",
         "wss%3A%2F%2Ftracker.example%2Fannounce",
         "udp%3A%2F%2Ftracker.example%2Fannounce",
+        "https%3A%2F%2Ftracker.example%3A0%2Fannounce",
+        "udp%3A%2F%2Ftracker.example%3A0%2Fannounce",
     ] {
         assert!(matches!(
             validate_magnet_contract(&format!("magnet:?xt=urn:btih:{hex}&tr={tracker}"), false),

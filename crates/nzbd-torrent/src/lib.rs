@@ -33,6 +33,8 @@ pub const MAX_TORRENT_RELATIVE_PATH_BYTES: usize = 4 * 1024;
 pub const MAX_TORRENT_PATH_COMPONENT_BYTES: usize = 255;
 /// Maximum aggregate encoded length of all projected relative payload paths.
 pub const MAX_TORRENT_PATH_BYTES: usize = 16 * 1024 * 1024;
+/// Maximum unique explicit bootstrap peers accepted for one torrent.
+pub const MAX_INITIAL_PEERS: usize = 80;
 /// Maximum display-safe engine error length from proposal §10.3.
 pub const DISPLAY_SAFE_ERROR_MAX_BYTES: usize = 2 * 1024;
 
@@ -72,6 +74,10 @@ pub enum TorrentError {
     InvalidProxy(&'static str),
     #[error("invalid TCP listen range: expected exactly one non-zero port")]
     InvalidListenPortRange,
+    #[error("invalid initial BitTorrent peer: {0}")]
+    InvalidInitialPeer(&'static str),
+    #[error("too many unique initial BitTorrent peers ({count}; maximum {limit})")]
+    TooManyInitialPeers { count: usize, limit: usize },
     #[error(
         "SOCKS proxy cannot be combined with DHT because librqbit 8.1.1 sends DHT traffic outside the proxy"
     )]
@@ -471,8 +477,9 @@ impl TorrentSession {
     pub async fn add_metainfo(
         &self,
         bytes: Vec<u8>,
-        config: TorrentAddConfig,
+        mut config: TorrentAddConfig,
     ) -> Result<TorrentHandle, TorrentError> {
+        normalize_initial_peers(&mut config.initial_peers)?;
         validate_metainfo_contract(&bytes, self.proxy_enabled)?;
         validate_existing_filesystem_paths(&bytes, &self.output_root)?;
         self.add(AddTorrent::from_bytes(bytes), config).await
@@ -483,6 +490,7 @@ impl TorrentSession {
         magnet: String,
         mut config: TorrentAddConfig,
     ) -> Result<TorrentHandle, TorrentError> {
+        normalize_initial_peers(&mut config.initial_peers)?;
         validate_magnet_contract(&magnet, self.proxy_enabled)?;
         // A magnet does not reveal the private bit until BEP 9 metadata has
         // already been fetched. Stable rqbit has no per-add DHT suppression,
@@ -514,11 +522,7 @@ impl TorrentSession {
         // metainfo invariant here, then admit only the validated bytes.
         validate_metainfo_contract(resolved.torrent_bytes.as_ref(), self.proxy_enabled)?;
         validate_existing_filesystem_paths(resolved.torrent_bytes.as_ref(), &self.output_root)?;
-        for peer in resolved.seen_peers {
-            if !config.initial_peers.contains(&peer) {
-                config.initial_peers.push(peer);
-            }
-        }
+        extend_with_resolved_peers(&mut config.initial_peers, resolved.seen_peers);
         self.add(AddTorrent::from_bytes(resolved.torrent_bytes), config)
             .await
     }
@@ -607,6 +611,55 @@ fn validate_listen_port_range(range: Option<&Range<u16>>) -> Result<(), TorrentE
         return Err(TorrentError::InvalidListenPortRange);
     }
     Ok(())
+}
+
+fn normalize_initial_peers(peers: &mut Vec<SocketAddr>) -> Result<(), TorrentError> {
+    let mut unique = HashSet::with_capacity(peers.len().min(MAX_INITIAL_PEERS));
+    let mut normalized = Vec::with_capacity(peers.len().min(MAX_INITIAL_PEERS));
+    for peer in peers.iter().copied() {
+        if !valid_initial_peer(peer) {
+            return Err(TorrentError::InvalidInitialPeer(
+                "peers must be unicast IPv4 endpoints with non-zero ports",
+            ));
+        }
+        if unique.insert(peer) {
+            if normalized.len() == MAX_INITIAL_PEERS {
+                return Err(TorrentError::TooManyInitialPeers {
+                    count: normalized.len() + 1,
+                    limit: MAX_INITIAL_PEERS,
+                });
+            }
+            normalized.push(peer);
+        }
+    }
+    *peers = normalized;
+    Ok(())
+}
+
+fn extend_with_resolved_peers(
+    peers: &mut Vec<SocketAddr>,
+    resolved: impl IntoIterator<Item = SocketAddr>,
+) {
+    let mut unique = peers.iter().copied().collect::<HashSet<_>>();
+    for peer in resolved {
+        if peers.len() == MAX_INITIAL_PEERS {
+            break;
+        }
+        if valid_initial_peer(peer) && unique.insert(peer) {
+            peers.push(peer);
+        }
+    }
+}
+
+fn valid_initial_peer(peer: SocketAddr) -> bool {
+    let SocketAddr::V4(peer) = peer else {
+        return false;
+    };
+    let address = peer.ip();
+    peer.port() != 0
+        && !address.is_unspecified()
+        && !address.is_multicast()
+        && *address != std::net::Ipv4Addr::BROADCAST
 }
 
 fn validate_metainfo_contract(bytes: &[u8], proxy_enabled: bool) -> Result<(), TorrentError> {
@@ -1260,6 +1313,11 @@ fn validate_tracker_url(tracker: &[u8]) -> Result<bool, TorrentError> {
             "tracker URLs must include a host",
         ));
     }
+    if tracker.port() == Some(0) {
+        return Err(TorrentError::InvalidTracker(
+            "tracker URLs must not use port zero",
+        ));
+    }
     match tracker.scheme() {
         "http" | "https" => Ok(false),
         "udp" if tracker.port().is_some() => Ok(true),
@@ -1490,6 +1548,58 @@ mod tests {
                 Err(TorrentError::InvalidListenPortRange)
             ));
         }
+    }
+
+    #[test]
+    fn initial_peers_are_validated_deduplicated_and_bounded() {
+        let peer = SocketAddr::from(([127, 0, 0, 1], 6881));
+        let mut duplicates = vec![peer; MAX_INITIAL_PEERS + 1];
+        normalize_initial_peers(&mut duplicates).unwrap();
+        assert_eq!(duplicates, vec![peer]);
+
+        for peer in [
+            SocketAddr::from(([127, 0, 0, 1], 0)),
+            SocketAddr::from(([0, 0, 0, 0], 6881)),
+            SocketAddr::from(([224, 0, 0, 1], 6881)),
+            SocketAddr::from(([255, 255, 255, 255], 6881)),
+            SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 1], 6881)),
+        ] {
+            assert!(matches!(
+                normalize_initial_peers(&mut vec![peer]),
+                Err(TorrentError::InvalidInitialPeer(_))
+            ));
+        }
+
+        let mut too_many = (1..=MAX_INITIAL_PEERS + 1)
+            .map(|last| SocketAddr::from(([192, 0, 2, last as u8], 6881)))
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            normalize_initial_peers(&mut too_many),
+            Err(TorrentError::TooManyInitialPeers {
+                count,
+                limit: MAX_INITIAL_PEERS
+            }) if count == MAX_INITIAL_PEERS + 1
+        ));
+    }
+
+    #[test]
+    fn resolved_peers_keep_explicit_order_and_stop_at_the_limit() {
+        let first = SocketAddr::from(([192, 0, 2, 1], 6881));
+        let second = SocketAddr::from(([192, 0, 2, 2], 6881));
+        let mut peers = vec![first];
+        extend_with_resolved_peers(
+            &mut peers,
+            [first, SocketAddr::from(([192, 0, 2, 3], 0)), second],
+        );
+        assert_eq!(peers, vec![first, second]);
+
+        let mut full = (1..=MAX_INITIAL_PEERS)
+            .map(|last| SocketAddr::from(([198, 51, 100, last as u8], 6881)))
+            .collect::<Vec<_>>();
+        let overflow = SocketAddr::from(([203, 0, 113, 1], 6881));
+        extend_with_resolved_peers(&mut full, [overflow]);
+        assert_eq!(full.len(), MAX_INITIAL_PEERS);
+        assert!(!full.contains(&overflow));
     }
 
     #[test]

@@ -97,12 +97,17 @@ The isolated suite covers:
 - keep-data and delete-data behavior, including idempotence;
 - named rejection of zero, empty, and multi-port TCP listen ranges so the
   adapter cannot silently request an ephemeral port or probe a range;
+- deterministic deduplication and an 80-peer bound for explicit bootstrap
+  peers, with rejection of port-zero, non-unicast, and IPv6 endpoints before
+  the IPv4-only v1 engine path sees them;
 - authenticated SOCKS5 peer routing through a loopback proxy, with a
   recording relay proving no parallel direct connection;
 - origin-only SOCKS proxy validation, including rejection of paths, queries,
   and fragments before rqbit's peer and tracker clients can interpret the
   same setting differently;
 - named rejection of proxy+DHT and proxy+UDP-tracker leak paths;
+- named rejection of tracker port zero rather than deferring an invalid
+  endpoint to rqbit's retry/error path;
 - named rejection of privacy-unknown magnets in a DHT-enabled session before
   rqbit can contact even an explicitly supplied peer;
 - password redaction and invalid proxy combinations;

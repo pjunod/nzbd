@@ -1324,6 +1324,7 @@ The exact constants should be centralized and tested:
 | One relative path | 4 KiB encoded | `422 path_too_long` |
 | All path bytes | 16 MiB | `422 metadata_too_large` |
 | Magnet URI | 16 KiB | `422 magnet_too_long` |
+| Explicit initial peers | 80 unique unicast IPv4 endpoints | `422 invalid_initial_peer` / `too_many_initial_peers` |
 | Display-safe error | 2 KiB | truncate with an explicit marker |
 
 Limits are guards, not tuning lore. If valid field data needs a higher value,
@@ -1333,7 +1334,9 @@ The dormant adapter centralizes and enforces the limits it can own before
 daemon integration: 10 MiB raw metainfo, 16 KiB magnet URIs, 100,000 files,
 255 encoded bytes per component, 4 KiB per projected relative payload path,
 16 MiB across projected paths, and 2 KiB for every rqbit operation or live-stat
-error that crosses the adapter. Projected paths include the multi-file root and
+error that crosses the adapter. It also deduplicates explicit peers in caller
+order, caps them at the proposed per-torrent peer limit, and rejects port zero,
+non-unicast, and IPv6 endpoints before rqbit sees them. Projected paths include the multi-file root and
 platform separator bytes, so the accounting bounds the paths later passed to
 storage rather than only the raw bencode component payloads. Exact-limit tests
 pass and the first excess byte or file returns a stable named error. Error
