@@ -10,9 +10,7 @@ on:
       - crates/nzbd/src/main.rs
       - crates/nzbd/src/tls.rs
       - scripts/check-bittorrent-deps.sh
-      - scripts/check-bittorrent-advisory-scope.sh
       - scripts/check-private-discovery-leaks.sh
-      - deny.toml
       - .github/workflows/bittorrent-m0.yml
   pull_request:
     paths:
@@ -22,9 +20,7 @@ on:
       - crates/nzbd/src/main.rs
       - crates/nzbd/src/tls.rs
       - scripts/check-bittorrent-deps.sh
-      - scripts/check-bittorrent-advisory-scope.sh
       - scripts/check-private-discovery-leaks.sh
-      - deny.toml
       - .github/workflows/bittorrent-m0.yml
   workflow_dispatch:
 
@@ -47,10 +43,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: bittorrent-m0-dependency-policy
-      - name: Check the pinned engine, TLS, and reviewed risk scope
-        run: |
-          scripts/check-bittorrent-deps.sh
-          scripts/check-bittorrent-advisory-scope.sh
+      - name: Check the pinned engine and TLS graph
+        run: scripts/check-bittorrent-deps.sh
 
   private-discovery-capture:
     name: private torrent DHT/LSD packet capture

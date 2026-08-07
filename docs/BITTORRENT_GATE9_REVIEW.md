@@ -19,7 +19,7 @@ per-torrent discovery health.
 
 ## 1. Decision requested — four costs and three exact exceptions
 
-The isolated M0 adapter measured the following on macOS 26.6 arm64:
+The isolated M0 adapter measured the following in one macOS 26.6 arm64 run:
 
 | Measurement | Recorded result | Reviewer question |
 |---|---:|---|
@@ -51,14 +51,28 @@ not proof the crate is safe. It is acceptable only while nzbd cannot construct
 the affected UPnP runtime path. The `time` functions named by its advisory are
 not compiled without the `parsing` feature.
 
-[`scripts/check-bittorrent-advisory-scope.sh`](../scripts/check-bittorrent-advisory-scope.sh)
-turns those statements into a blocking graph check. It fails if:
+[`scripts/check-reviewed-dependency-exceptions.sh`](../scripts/check-reviewed-dependency-exceptions.sh)
+turns those statements into a repository-wide blocking graph check. It fails
+if:
 
-- `quick-xml 0.37.5` gains a normal path outside the exact
+- the `quick-xml 0.37.5` package set differs from the reviewed
   `nzbd-torrent → librqbit → librqbit-upnp` chain;
-- `time 0.3.41` enables its `parsing` feature or gains another package path;
+- `time 0.3.41` gains another package path or its exact `alloc`/`std` feature
+  set changes;
 - the exact MPL-2.0 `option-ext 0.2.0` path changes; or
 - `deny.toml` ignores any RustSec identifier other than the three above.
+
+Workspace package versions are normalized before comparison, so an nzbd
+release bump does not masquerade as third-party graph drift. If a pinned
+package disappears, the check fails closed with the exception or license
+entry that must be reconsidered instead of exposing Cargo's unmatched-package
+error as the only diagnosis.
+
+The check lives in the repository-wide Supply chain workflow because the
+`time` exception and complete RustSec ignore set are not BitTorrent-only. That
+workflow runs on every pull request and push plus a daily schedule. The daily
+run refreshes RustSec data; the locked graph assertions rerun alongside it but
+can change only when tracked dependency inputs change.
 
 The adapter unit test separately requires the constructed rqbit options to
 keep UPnP false. Graph evidence and runtime-option evidence are intentionally
@@ -69,9 +83,9 @@ separate: either can regress without the other.
 Run the exact dependency and exception checks from the repository root:
 
 ```bash
-scripts/check-bittorrent-deps.sh                 # Exact rqbit/Rust-TLS graph; no OpenSSL.
-scripts/check-bittorrent-advisory-scope.sh       # Exact exception paths and feature absence.
-cargo test -p nzbd-torrent --lib                 # Includes the no-UPnP construction invariant.
+scripts/check-bittorrent-deps.sh                    # Exact rqbit/Rust-TLS graph; no OpenSSL.
+scripts/check-reviewed-dependency-exceptions.sh    # Exact exception package and feature sets.
+cargo test -p nzbd-torrent --lib                    # Includes the no-UPnP construction invariant.
 cargo deny --all-features --locked check bans licenses sources
 cargo deny --all-features --locked check advisories
 ```
@@ -92,8 +106,9 @@ byte-for-byte acceptance comparisons.
 
 Gate 9 may move from Partial to Pass only if a reviewer accepts all of these:
 
-1. **Binary and idle-memory cost.** The 9.61 MiB harness and 8.39 MiB idle RSS
-   are acceptable preliminary costs, subject to final-daemon remeasurement.
+1. **Binary and idle-memory cost.** The one-sample 9.61 MiB harness and
+   8.39 MiB idle RSS are acceptable preliminary costs, subject to
+   final-daemon remeasurement.
 2. **Dependency and license cost.** The 220-package closure, 176 new lockfile
    identities, and exact MPL-2.0 exception are acceptable.
 3. **UPnP restriction.** Compiling the affected `quick-xml` is acceptable only

@@ -13,8 +13,8 @@ unmaintained = "workspace"
 # only through that opt-in UPnP path, which remains disabled by M0. These exact
 # exceptions must be removed (or UPnP must remain unavailable) before the
 # production BitTorrent gate can allow port forwarding. The adapter has no
-# UPnP input, and check-bittorrent-advisory-scope.sh freezes this dependency
-# path plus the complete ignore set.
+# UPnP input, and check-reviewed-dependency-exceptions.sh freezes this
+# dependency path plus the complete repository-wide ignore set.
 ignore = [
     "RUSTSEC-2026-0194",
     "RUSTSEC-2026-0195",

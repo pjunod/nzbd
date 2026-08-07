@@ -632,6 +632,8 @@ mod tests {
 
     #[test]
     fn session_options_cannot_enable_upnp() {
+        // This pins the helper used by TorrentSession::start. If start stops
+        // delegating here, move the assertion to the replacement call path.
         let options = session_options(false, None, None);
         assert!(!options.enable_upnp_port_forwarding);
     }

@@ -1396,9 +1396,10 @@ whose prefix merely resembles the configured root. The existing job
   `time` exception is acceptable only while its vulnerable parsing feature is
   absent and Rust 1.85 remains the verified MSRV.
 - Run
-  [`check-bittorrent-advisory-scope.sh`](../scripts/check-bittorrent-advisory-scope.sh)
-  with the M0 dependency policy. It freezes the exact quick-xml, `time`, and
-  MPL-2.0 package paths plus the three permitted RustSec ignores; the adapter
+  [`check-reviewed-dependency-exceptions.sh`](../scripts/check-reviewed-dependency-exceptions.sh)
+  in the repository-wide Supply chain workflow. It freezes the reviewed
+  quick-xml, `time`, and MPL-2.0 package/feature sets plus the three permitted
+  RustSec ignores without pinning nzbd's own release version; the adapter
   separately tests that no input can enable rqbit UPnP.
 - Treat [the gate 9 review brief](BITTORRENT_GATE9_REVIEW.md) as the human
   decision record. CI can prove the reviewed boundary has not changed, but it
