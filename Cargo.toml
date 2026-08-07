@@ -82,7 +82,8 @@ clap = { version = "4", features = ["derive"] }
 toml = "1"
 bytes = "1"
 mdns-sd = "0.20.3"
-icu_normalizer = { version = "2.1", default-features = false, features = ["compiled_data"] }
+icu_normalizer = { version = "=2.1.1", default-features = false, features = ["compiled_data"] }
+icu_casemap = { version = "=2.1.1", default-features = false, features = ["compiled_data"] }
 librqbit = { version = "=8.1.1", default-features = false, features = ["rust-tls"] }
 url = "2"
 

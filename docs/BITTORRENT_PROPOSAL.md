@@ -1138,9 +1138,10 @@ Before starting a torrent, validate every metadata path:
 - no existing symlink may redirect a write outside that root, every existing
   intermediate payload component is a directory, and every existing leaf is
   a regular file;
-- exact, Unicode-NFC-equivalent, lowercase, and file-versus-directory-prefix
-  collisions are rejected before storage on every platform, conservatively
-  covering common normalization-insensitive and case-insensitive filesystems;
+- exact, Unicode-NFC-equivalent, simple-case-fold-equivalent, and
+  file-versus-directory-prefix collisions are rejected before storage on every
+  platform, conservatively covering common normalization-insensitive and
+  case-insensitive filesystems;
 - total file count, total path bytes, and metainfo bytes stay under fixed
   limits from §10.3;
 - padding files are not exposed as user content or importer paths.
@@ -1151,8 +1152,10 @@ The dormant M0 adapter implements the metadata-only portion itself before
 rqbit admission: portable root/components, UTF-8, empty/dot/parent names,
 cross-platform separators, Windows drive/device names, reserved characters and
 trailing dot/space aliases, metainfo-declared symlinks, exact duplicate paths,
-file-versus-directory-prefix overlaps, and collisions under Unicode lowercase
-comparison. It also checks v1 piece
+file-versus-directory-prefix overlaps, and collisions under Unicode simple
+case folding plus NFC. The collision key also includes Windows' dotless-i
+alias, while deliberately retaining compatibility-only ligature and width
+distinctions. It also checks v1 piece
 geometry before rqbit can construct its length table: piece length is nonzero,
 aggregate file length cannot overflow and is nonzero, the hash table is made of
 whole SHA-1 values, its count exactly covers the declared payload, and the
@@ -1165,7 +1168,11 @@ applies that same contract to magnets by resolving them through rqbit's
 list-only mode, which returns metadata before storage construction, and then
 admitting only the validated returned bytes. Before rqbit parses a magnet, the
 adapter requires the exact parameter and namespace spelling supported by the
-pinned engine, rejects unknown or malformed exact topics, and rejects `so=`.
+pinned engine, rejects unknown or malformed exact topics, normalizes lowercase
+base32 `btih` values to the uppercase spelling rqbit accepts, and rejects
+`so=`. Indexed and case-varied keys remain unsupported because pinned rqbit
+ignores them; tests pin that engine behavior so they cannot silently become a
+selection or tracker bypass after an upgrade.
 Stable 8.1.1 eagerly expands every `so=` range into a vector, so even a short
 URI can otherwise trigger an attacker-sized allocation; selective file
 admission must instead use a bounded, explicit nzbd-owned input. A fake BEP 9
@@ -1180,6 +1187,15 @@ external target stays empty. That preflight is defense in depth and does not
 close the check/write race. Descriptor-relative containment, filesystem-specific
 Unicode normalization/case rules, and persisted delete-root authority remain
 M5/M2 work, and no production path is wired.
+
+The Windows name restrictions are deliberately unconditional. `?`, `:`, and
+device basenames such as `aux.c` are legal on Linux, but accepting them would
+make the same persisted job impossible to restore on a supported Windows
+node. The first release has no sanitize-and-rename mode because changing a
+torrent's payload mapping without an engine-owned storage abstraction can
+break piece verification and seeding. If field data justifies a native-only
+mode, it needs an explicit storage-policy design and separate compatibility
+contract; it must not appear as a hidden platform default.
 
 ### 9.3 First release: no torrent post-processing
 
@@ -1570,8 +1586,8 @@ whose prefix merely resembles the configured root. The existing job
   separately tests that no input can enable rqbit UPnP.
 - Treat [the gate 9 review brief](BITTORRENT_GATE9_REVIEW.md) as the human
   decision record. CI can prove the reviewed boundary has not changed, but it
-  cannot decide whether 9.61 MiB of binary growth, 8.39 MiB of idle RSS, or a
-  220-package closure is acceptable.
+  cannot decide whether 9.64 MiB of binary growth, 8.41 MiB of idle RSS, or a
+  222-package closure is acceptable.
 - Subscribe to upstream releases and security notices, then test upgrades
   against the local swarm harness before changing the pin.
 - Keep the adapter's deterministic preflight mutation corpus in ordinary CI:
@@ -1928,7 +1944,8 @@ becomes reachable.
   oversize input, missing hash, and named v2-only/hybrid rejection for both
   magnets and metainfo.
 - Magnet preflight: only decoded `xt` parameters determine the info-hash
-  version. One valid 40-hex or 32-base32 `btih` is required; duplicate v1,
+  version. One valid 40-hex or 32-base32 `btih` is required; lowercase base32
+  is normalized before rqbit parsing. Duplicate v1,
   malformed v1, v2-only, and hybrid topics fail by stable name. Version-looking
   text in display names and tracker URLs is an explicit negative fixture. A
   fake BEP 9 peer also proves resolved metainfo is revalidated in list-only
@@ -1936,6 +1953,9 @@ becomes reachable.
   privacy-unknown magnet input is rejected before an explicit peer is
   contacted, and the paired DHT-disabled case proves a private magnet can
   still resolve through that explicit peer.
+- Private metainfo discovery: a known-private `.torrent` is rejected before
+  engine admission when session DHT is live; the same one-tracker metainfo is
+  accepted by policy when DHT is disabled.
 - Tracker preflight: malformed/non-UTF-8 URLs, missing hosts, UDP without an
   explicit port, and unsupported schemes fail by name for both metainfo and
   magnets; HTTP, HTTPS, and explicit-port UDP remain accepted when proxy policy
@@ -1949,10 +1969,12 @@ becomes reachable.
   existing-symlink integration case must leave its external target untouched;
   descriptor-relative containment and filesystem-specific Unicode
   normalization remain M5 probes.
-- Metainfo preflight: a deterministic mutation corpus runs in ordinary CI;
-  checked v1 payload/piece/hash geometry prevents zero-divide, length-wrap, and
-  inconsistent hash-table input from reaching rqbit; coverage-guided fuzzing
-  remains an M5 release gate.
+- Metainfo preflight: a deterministic mutation corpus runs in ordinary CI and
+  pins exact accepted/rejected counts for v1, v2-only, and hybrid seeds; a
+  validator replaced by `Ok(())` therefore fails rather than turning the
+  corpus into a no-panic-only test. Checked v1 payload/piece/hash geometry
+  prevents zero-divide, length-wrap, and inconsistent hash-table input from
+  reaching rqbit; coverage-guided fuzzing remains an M5 release gate.
 - State projection: every `TorrentPhase` maps to the expected native and
   qBittorrent status, with units/sentinel values pinned.
 - Seed policy: add/category/global precedence, ratio precision, time across
@@ -1961,9 +1983,16 @@ becomes reachable.
   and later reacquisition, slot release on readiness, seeding excluded from
   download slots.
 - Redaction: adapter engine/stat errors prove magnet, tracker/query/proxy,
-  secret-assignment, peer-address, absolute-path, control-character, and UTF-8
-  truncation fixtures; later source/API tests prove the same invariant through
-  logs, events, and metrics.
+  secret-assignment, embedded JSON/query assignments, private-tracker
+  `torrent_pass`/`authkey`, API keys, signatures, session identifiers,
+  peer-address, absolute-path, control-character, and UTF-8 truncation
+  fixtures; later source/API tests prove the same invariant through logs,
+  events, and metrics.
+
+Every new safety guard must have a discriminating negative case: remove or
+bypass the guard once, observe the named test fail, and record that evidence in
+the PR. A test-name filter must first prove it matched an exact test; an exit-0
+run with zero selected tests is not evidence.
 
 ### 16.2 Local swarm e2e
 
