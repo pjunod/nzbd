@@ -1370,6 +1370,11 @@ stable named error. Error
 truncation is UTF-8 safe and ends with an explicit marker. The 1–100 MiB
 metainfo configuration range, redirects, and fetched-body streaming remain
 API/source-fetch work; no production input is wired by these constants.
+The dormant managed-admission helper accepts preflighted metainfo bytes only;
+it cannot receive rqbit's URL variant. Authenticated HTTP(S) fetching remains
+an nzbd-owned boundary because stable rqbit buffers the response before nzbd
+can enforce its size limit and does not expose this proposal's redirect,
+timeout, or redaction policy.
 
 ---
 

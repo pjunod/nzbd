@@ -522,7 +522,7 @@ impl TorrentSession {
         normalize_initial_peers(&mut config.initial_peers)?;
         validate_metainfo_contract(&bytes, self.proxy_enabled)?;
         validate_existing_filesystem_paths(&bytes, &self.output_root)?;
-        self.add(AddTorrent::from_bytes(bytes), config).await
+        self.add_validated_metainfo(bytes.into(), config).await
     }
 
     pub async fn add_magnet(
@@ -559,19 +559,22 @@ impl TorrentSession {
         validate_metainfo_contract(resolved.torrent_bytes.as_ref(), self.proxy_enabled)?;
         validate_existing_filesystem_paths(resolved.torrent_bytes.as_ref(), &self.output_root)?;
         extend_with_resolved_peers(&mut config.initial_peers, resolved.seen_peers);
-        self.add(AddTorrent::from_bytes(resolved.torrent_bytes), config)
+        self.add_validated_metainfo(resolved.torrent_bytes, config)
             .await
     }
 
-    async fn add(
+    async fn add_validated_metainfo(
         &self,
-        source: AddTorrent<'_>,
+        bytes: bytes::Bytes,
         config: TorrentAddConfig,
     ) -> Result<TorrentHandle, TorrentError> {
         let options = managed_add_options(config);
         let handle = self
             .inner
-            .add_torrent(source, Some(options))
+            // Keep rqbit's URL variant outside managed admission. Its stable
+            // HTTP client buffers the response before nzbd can enforce the
+            // metainfo limit and does not expose the proposal's fetch policy.
+            .add_torrent(AddTorrent::from_bytes(bytes), Some(options))
             .await
             .map_err(engine_error)?
             .into_handle()

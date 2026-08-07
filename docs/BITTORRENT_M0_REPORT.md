@@ -76,6 +76,10 @@ code. The daemon does not depend on it. The boundary currently provides:
   10-second connect and read/write timeouts and 120-second keepalive interval;
   per-add options inherit this reviewed session policy instead of introducing
   another override;
+- bytes-only managed admission: the private engine handoff accepts only
+  metainfo bytes that already passed nzbd preflight. Stable rqbit's URL variant
+  cannot bypass nzbd's future source-fetch size, redirect, timeout, or
+  redaction policy through this helper;
 - named v2-only and hybrid rejection for both metainfo and magnets;
 - fail-closed HTTP/HTTPS/UDP tracker URL validation for metainfo and magnets,
   plus exact-one-tracker validation for private metainfo;
