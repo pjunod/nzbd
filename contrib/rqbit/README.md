@@ -6,8 +6,8 @@
 Companion to
 [BITTORRENT_M0_REPORT.md](../../docs/BITTORRENT_M0_REPORT.md) (why nzbd is
 blocked) — this directory is the submission package for the two rqbit APIs,
-tracker request controls, and live-peer budgets that must be accepted and
-released before nzbd starts M2.
+tracker request controls, live-peer budgets, and pre-routing handshake
+boundaries that must be accepted and released before nzbd starts M2.
 
 Read and review this kit in order. Submit the discovery-health design issue
 before its implementation, because that patch crosses three rqbit crates and
@@ -35,8 +35,8 @@ Before posting any draft:
    branch still applies.
 4. Keep independent contributions separate. Restore changes session
    admission; discovery health changes DHT, tracker, and public snapshot
-   contracts; tracker and peer budgets change distinct runtime resource
-   policies.
+   contracts; tracker, peer, and pending-handshake budgets change distinct
+   runtime resource policies.
 
 ## 2. Contribution map — stable evidence and current-main submissions
 
@@ -46,6 +46,7 @@ Before posting any draft:
 | Credential-safe per-torrent tracker and DHT health | [`0003`](0003-expose-per-torrent-discovery-health.patch) | [`0004`](0004-expose-per-torrent-discovery-health-main.patch) | [design-issue draft](DISCOVERY_HEALTH_ISSUE.md) |
 | Bounded tracker requests and announce intervals | [`0005`](0005-bound-tracker-requests.patch) | [`0006`](0006-bound-tracker-requests-main.patch) | [PR draft](TRACKER_REQUEST_BUDGET_PR.md) |
 | Per-torrent and shared-session live-peer budgets | [`0007`](0007-bound-session-peers.patch) | [`0008`](0008-bound-session-peers-main.patch) | [PR draft](SESSION_PEER_BUDGET_PR.md) |
+| Bounded incomplete incoming handshakes | [`0009`](0009-bound-pending-incoming-handshakes.patch) | Native configurable 256-check boundary; no patch | [review note](PENDING_HANDSHAKE_BUDGET.md) |
 
 The stable patches preserve the exact experiments behind nzbd's M0 report.
 The main patches are the contribution candidates. Do not submit the stable
@@ -71,13 +72,16 @@ backports upstream unless the maintainer explicitly asks for an 8.x backport.
 6. Submit the independent session peer-budget candidate only after human
    review of the public option name, aggregate counting boundary, and permit
    acquisition order. It does not depend on the tracker request controls.
-7. After both required APIs and the accepted resource controls ship, pin that
+7. Review the independent pending-handshake boundary. Do not submit `0009` to
+   rqbit main, which already has the configurable equivalent. Use the patch
+   only if the maintainer explicitly requests an 8.x backport.
+8. After both required APIs and the accepted resource controls ship, pin that
    stable release in nzbd and rerun all eleven
    M0 gates on native macOS, Linux glibc/musl, and Windows.
-8. Run the Linux packet-capture private-mode harness and obtain reviewer
+9. Run the Linux packet-capture private-mode harness and obtain reviewer
    acceptance of the resource, package, license, and advisory dispositions.
    A gate rerun cannot discharge those review decisions by itself.
-9. Only the complete M0 path can authorize M2.
+10. Only the complete M0 path can authorize M2.
 
 ## 4. Reproduction — verify the candidates against rqbit main
 
@@ -98,6 +102,7 @@ scripts/check-rqbit-authoritative-restore-patch.sh "$rqbit_tree"      # Format +
 scripts/check-rqbit-discovery-health-patch.sh "$rqbit_tree"          # Format + three affected crate suites.
 scripts/check-rqbit-tracker-request-budget-patch.sh "$rqbit_tree"    # Format + tracker response/interval suite.
 scripts/check-rqbit-session-peer-budget-patch.sh "$rqbit_tree"       # Format + exact local/shared permit tests.
+scripts/check-rqbit-pending-handshake-budget.sh "$rqbit_tree"        # Stable backport or current native boundary.
 ```
 
 For submission, apply only the matching main patch to a fresh branch and run
@@ -121,7 +126,9 @@ revise, or reject either contract without dragging the other through review.
 Use a third independent branch for the tracker request budget for the same
 reason; it changes resource policy, not either public API. Use a fourth branch
 for the session peer budget so rqbit can accept or revise tracker and peer
-resource policy independently.
+resource policy independently. There is no fifth current-main patch for the
+pending-handshake boundary because rqbit main already implements it; keep the
+stable-only backport separate from every main submission.
 
 ## 5. Non-goals — contribution evidence is not production permission
 
@@ -136,5 +143,8 @@ resource policy independently.
 - Do not treat the explicit/bootstrap peer-input limit as a live-peer budget.
   Incoming connections and later tracker, PEX, and DHT discoveries must share
   the same aggregate session permits.
+- Do not treat a live-peer permit as a pending-handshake budget. Stable 8.1.1
+  accepts sockets before torrent routing; that earlier work needs its own
+  reviewed ceiling.
 - Do not enable nzbd config, admission, listeners, trackers, DHT, or payload
   I/O from this kit. M2 remains blocked until a stable release passes M0.

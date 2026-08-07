@@ -1,0 +1,49 @@
+diff --git a/crates/librqbit/src/session.rs b/crates/librqbit/src/session.rs
+index f0edb50b594c563c8283c428538583709f9b2781..c7f3fdbfee1d74d4cd0a32a6ef2ab19aeb18838d 100644
+--- a/crates/librqbit/src/session.rs
++++ b/crates/librqbit/src/session.rs
+@@ -472,6 +472,12 @@ pub(crate) struct CheckedIncomingConnection {
+     pub handshake: Handshake<ByteBufOwned>,
+ }
+ 
++const MAX_PENDING_INCOMING_HANDSHAKE_CHECKS: usize = 256;
++
++fn can_accept_incoming_handshake(pending: usize) -> bool {
++    pending < MAX_PENDING_INCOMING_HANDSHAKE_CHECKS
++}
++
+ struct InternalAddResult {
+     info_hash: Id20,
+     metadata: Option<TorrentMetadata>,
+@@ -799,7 +805,7 @@ impl Session {
+ 
+         loop {
+             tokio::select! {
+-                r = l.accept() => {
++                r = l.accept(), if can_accept_incoming_handshake(futs.len()) => {
+                     match r {
+                         Ok((stream, addr)) => {
+                             trace!("accepted connection from {addr}");
+@@ -1552,7 +1558,21 @@ mod tests {
+     use itertools::Itertools;
+     use librqbit_core::torrent_metainfo::{torrent_from_bytes_ext, TorrentMetaV1};
+ 
+-    use super::torrent_file_from_info_bytes;
++    use super::{
++        can_accept_incoming_handshake, torrent_file_from_info_bytes,
++        MAX_PENDING_INCOMING_HANDSHAKE_CHECKS,
++    };
++
++    #[test]
++    fn pending_handshake_budget_is_exact() {
++        assert!(can_accept_incoming_handshake(
++            MAX_PENDING_INCOMING_HANDSHAKE_CHECKS - 1
++        ));
++        assert!(!can_accept_incoming_handshake(
++            MAX_PENDING_INCOMING_HANDSHAKE_CHECKS
++        ));
++        assert!(!can_accept_incoming_handshake(usize::MAX));
++    }
+ 
+     #[test]
+     fn test_torrent_file_from_info_and_bytes() {

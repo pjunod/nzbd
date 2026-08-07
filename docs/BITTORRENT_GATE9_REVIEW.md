@@ -11,8 +11,8 @@ Companion to
 and advisory decision. Review the table and §4; do not mark the gate Pass
 merely because CI is green. The remaining decision is whether the recorded
 cost and three constrained exceptions are acceptable for the eventual first
-release, and whether the missing live-peer and tracker-request resource
-controls must be resolved before this gate can pass.
+release, and whether the missing live-peer, tracker-request, and pre-routing
+handshake resource controls must be resolved before this gate can pass.
 
 No production BitTorrent path is enabled by this review. Gates 7 and 8 still
 fail until accepted stable rqbit APIs provide authoritative restore and honest
@@ -56,6 +56,17 @@ The contribution kit proves a candidate 30-second complete-request deadline,
 1 MiB streamed response cap, and 60-second minimum unforced HTTP/UDP interval
 on both source lines. Until equivalent controls ship in an accepted stable
 release, preliminary resource acceptance cannot authorize tracker networking.
+
+The live-peer permits also start after an incoming client has completed enough
+of its handshake to be routed to a torrent. Stable 8.1.1 accepts every TCP
+socket into an unbounded pending-check set, where each incomplete client can
+retain a socket, buffers, and a task for the 10-second handshake read timeout.
+Current rqbit main has a configurable per-listener ceiling of 256 pending
+checks. The contribution kit carries a stable-only 256-check backport and a
+verifier for main's native boundary. This is a distinct pre-routing resource
+budget: neither the 80/400 live-peer candidate nor the fixed timeout closes an
+unbounded concurrency set. Until an accepted stable release enforces a
+reviewed limit, production listener activation remains unauthorized.
 
 The normal closure is permissively licensed except for exact
 `option-ext 0.2.0`, which is MPL-2.0 file-level copyleft. The checked-in
@@ -116,6 +127,7 @@ cargo deny --all-features --locked check advisories
 # Against clean rqbit v8.1.1 and current-main trees, respectively.
 scripts/check-rqbit-tracker-request-budget-patch.sh /path/to/rqbit
 scripts/check-rqbit-session-peer-budget-patch.sh /path/to/rqbit
+scripts/check-rqbit-pending-handshake-budget.sh /path/to/rqbit
 ```
 
 Reproduce the macOS harness measurements rather than comparing a debug binary:
@@ -154,6 +166,12 @@ Gate 9 may move from Partial to Pass only if a reviewer accepts all of these:
    complete HTTP tracker request, decoded response body, and hostile unforced
    HTTP/UDP announce intervals. The prepared 30-second, 1 MiB, and 60-second
    candidate values are evidence for review, not shipped capability.
+8. **Pending incoming handshakes.** An accepted stable engine must bound
+   incomplete pre-routing handshake work separately from routed live peers.
+   The prepared stable 256-check backport and main's native per-listener
+   boundary are evidence for review, not shipped capability. A reviewer must
+   explicitly accept the preliminary value and the TCP-only first-release
+   scope or require a different measured ceiling.
 
 If any item is rejected, gate 9 remains Partial and the remedy must be named:
 upgrade or patch the dependency, remove the capability, change engines, or set
@@ -172,6 +190,8 @@ an accepted resource budget. Silence is not acceptance.
   shared-session patch still requires upstream acceptance and a stable release.
 - It does not treat the 64-tracker input cap as a request lifetime, body, or
   announce-rate budget.
+- It does not treat the 10-second read timeout or live-peer permits as a limit
+  on the number of incomplete incoming handshake tasks.
 - It does not submit any prepared patch upstream.
 
 Gate 9 is one required decision among eleven, not permission to skip the two

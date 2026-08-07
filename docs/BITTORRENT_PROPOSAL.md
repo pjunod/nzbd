@@ -1285,6 +1285,14 @@ source_redirects = 5
   incoming or outgoing peer holds its torrent permit and the optional shared
   session permit until release. The tested candidate does not become usable by
   nzbd until upstream accepts it and a stable release ships it.
+- live-peer permits do not cover incomplete incoming handshakes before torrent
+  routing. Stable 8.1.1 accepts those sockets into an unbounded pending set for
+  up to the 10-second read timeout. Current rqbit main defaults its
+  per-listener boundary to 256; the contribution kit proves the same fixed
+  ceiling as a stable-only backport. The value is preliminary and TCP-only for
+  the first release. Production needs an accepted stable boundary plus human
+  acceptance of that measured policy; a timeout by itself is not a
+  concurrency limit.
 - dormant torrent initialization is serialized explicitly. Stable rqbit's
   unset default permits three concurrent initialization integrity scans, which
   can multiply disk I/O before torrents become live. The one-scan guard does
@@ -2057,6 +2065,7 @@ data-loss change, not a feature toggle.
 | Stable library lacks BEP 52 | Some modern torrents reject | Honest v1 scope and named rejection; revisit on proven stable support. |
 | Stable library is TCP/IPv4 and private torrents use one tracker | Some peers/networks and tracker failover are unavailable | Publish the exact v1 matrix, verify primary-tracker private downloads, revisit only on a stable 9.x gate. |
 | Stable library cannot enforce the proposed 80/400 live-peer budgets | Tracker/PEX/DHT discovery can exceed configured resource expectations | Do not confuse the 80-entry bootstrap guard with a runtime cap; require an accepted stable per-torrent limit and caller-owned shared-session budget before M2. The tested contribution candidate is evidence, not released capability. |
+| Stable listener leaves incomplete incoming handshakes unbounded | Remote clients can retain sockets, buffers, and tasks before live-peer permits apply | Require an accepted stable pre-routing handshake ceiling and review it separately from the 80/400 live-peer policy. Current main's native 256-per-listener default and the tested stable backport are evidence, not released capability. |
 | Tracker response or interval is hostile | Memory/request tasks remain unbounded or a tracker is hammered | Require an accepted stable request deadline, streamed body cap, and minimum unforced interval; tracker-count preflight alone is insufficient. |
 | Private tracker rejects or bans an unapproved rqbit client | Grab fails or tracker account is penalized | No qBittorrent wire-identity claim; disclose whitelist requirements and gate each supported tracker policy before M4. |
 | Torrent PP corrupts seeds | Tracker hash failures and broken uploads | No torrent PP in v1; future reflink-or-copy derivative only. |
