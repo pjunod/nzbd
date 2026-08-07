@@ -19,6 +19,13 @@ The implementation therefore stops at the isolated `nzbd-torrent` boundary
 and queue schema-version groundwork. No config switch, API, daemon dependency,
 peer listener, or production torrent admission path has been added.
 
+A later hostile-input review found a third stable-engine prerequisite outside
+the two failed ownership/observability gates: magnet metadata is allocated up
+to rqbit's fixed 32 MiB ceiling before nzbd can apply its proposed 10 MiB
+default. Section 3.5 records the upstream candidate that moves a caller's
+limit ahead of that allocation. This does not change gates 7 or 8 and does not
+authorize production wiring.
+
 ---
 
 ## 1. Result against the eleven gates
@@ -419,10 +426,34 @@ with six upstream integration tests ignored.
 uses the same exact-stable and descendant-of-main rules as the restore
 verifier, reports the tested SHA, allows a three-way fallback only for main,
 checks formatting, and runs all three affected crate suites. The dedicated
-workflow tests both contributions against stable and main on relevant changes
-and weekly for upstream drift. This is contribution evidence only: nzbd still
-pins unmodified stable 8.1.1, gate 7 remains failed, and production wiring
-remains prohibited.
+workflow tests all contribution candidates against stable and main on
+relevant changes and weekly for upstream drift. This is contribution evidence
+only: nzbd still pins unmodified stable 8.1.1, gate 7 remains failed, and
+production wiring remains prohibited.
+
+### 3.5 The peer-metadata allocation ceiling is ready, not released
+
+Stable rqbit rejects BEP 9 metadata above 32 MiB, but the ceiling is hardcoded
+inside its peer metadata reader. An embedding application can reject resolved
+metainfo afterward, but that is too late to enforce nzbd's proposed 10 MiB
+hostile-input allocation limit for magnets.
+
+[`contrib/rqbit/0005-limit-peer-metadata-before-allocation.patch`](../contrib/rqbit/0005-limit-peer-metadata-before-allocation.patch)
+targets the exact v8.1.1 commit, and `0006` carries the same change for the
+documented rqbit-main base. They add an optional
+`PeerConnectionOptions::max_metadata_size`, merge it through the existing
+session/per-add peer-option path, retain 32 MiB when it is unset, and reject
+an oversized extended handshake before allocating a buffer or sending
+metadata requests. The focused test accepts the exact configured boundary and
+rejects one byte above it.
+
+[`scripts/check-rqbit-metadata-size-limit-patch.sh`](../scripts/check-rqbit-metadata-size-limit-patch.sh)
+applies the matching patch to a clean stable or main tree, checks formatting,
+and runs that test. The contribution workflow exercises both variants on
+relevant changes and weekly for upstream drift. This is a tested contribution
+artifact awaiting human review, not a production dependency: nzbd still pins
+unmodified 8.1.1 and must not admit magnets until an accepted stable release
+exposes an equivalent pre-allocation limit.
 
 ---
 
@@ -513,14 +544,15 @@ Preferred path:
    the public surface before nzbd treats the patch as an integration plan;
 2. review and submit the prepared authoritative-restore patch and the agreed
    discovery-health implementation upstream;
-3. reconcile both changes with upstream feedback without weakening nzbd's
+3. review and submit the independent peer-metadata allocation ceiling;
+4. reconcile all changes with upstream feedback without weakening nzbd's
    ownership, privacy, or observability contracts;
-4. pin the first stable release containing both accepted APIs;
-5. rerun all eleven M0 gates on native macOS, Linux glibc/musl, and Windows;
-6. run the packet-capture private-mode test and obtain reviewer acceptance of
+5. pin the first stable release containing the accepted contracts;
+6. rerun all eleven M0 gates on native macOS, Linux glibc/musl, and Windows;
+7. run the packet-capture private-mode test and obtain reviewer acceptance of
    the resource, package, license, and advisory dispositions isolated in the
    [gate 9 review brief](BITTORRENT_GATE9_REVIEW.md); and
-7. only then resume M2 daemon integration.
+8. only then resume M2 daemon integration.
 
 The human-review checklist, submission order, issue draft, PR draft, exact
 patch mapping, and reproduction commands are collected in the
@@ -528,11 +560,13 @@ patch mapping, and reproduction commands are collected in the
 kit has been posted upstream, and rqbit's AI policy requires human review and
 editing before it is.
 
-The two upstream changes may be designed, reviewed, and released separately,
-but they are not separate production gates. Starting M2 with authoritative
-restore alone would leave gate 7 failed and make tracker or DHT failure
-indistinguishable from an ordinary lack of peers. That degraded view is not an
-accepted shortcut around the observability contract.
+The two gate APIs and the metadata allocation ceiling may be designed,
+reviewed, and released separately, but they are not separate permission to
+start production wiring. Starting M2 with authoritative restore alone would
+leave gate 7 failed and make tracker or DHT failure indistinguishable from an
+ordinary lack of peers. Shipping the two gate APIs without a pre-allocation
+magnet ceiling would still violate the hostile-input contract. Neither is an
+accepted shortcut.
 
 Two alternatives require an explicit ADR-19 amendment:
 
@@ -573,6 +607,7 @@ scripts/check-rqbit-tracker-request-budget-patch.sh /path/to/rqbit
 scripts/check-rqbit-session-peer-budget-patch.sh /path/to/rqbit
 scripts/check-rqbit-pending-handshake-budget.sh /path/to/rqbit
 scripts/check-rqbit-known-peer-budget-patch.sh /path/to/rqbit
+scripts/check-rqbit-metadata-size-limit-patch.sh /path/to/rqbit
 ```
 
 The Rust 1.85 check must select both the 1.85 Cargo and `rustc`; this host also

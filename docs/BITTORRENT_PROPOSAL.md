@@ -1291,7 +1291,13 @@ source_redirects = 5
   seed; it does not silently invent a ratio.
 - fixed metainfo and redirect limits: torrent sources are hostile input and
   an authenticated caller still should not make the daemon allocate without
-  bound.
+  bound. Stable rqbit's peer metadata reader otherwise allocates up to its
+  fixed 32 MiB ceiling before nzbd can inspect a magnet's resolved metainfo.
+  The prepared upstream `max_metadata_size` patch carries the configured
+  ceiling through peer options and checks it before allocation or metadata
+  requests. nzbd must not enable magnet admission until that contract ships
+  in an accepted stable release; post-resolution validation is too late to
+  enforce the allocation boundary.
 - the `max_peers_per_torrent = 80` and `max_peers_total = 400` values are
   accepted runtime budgets, not descriptions of stable 8.1.1. That release
   hard-codes 128 live peers per torrent and exposes no session-wide cap. The
@@ -1398,6 +1404,9 @@ The exact constants should be centralized and tested:
 
 Limits are guards, not tuning lore. If valid field data needs a higher value,
 raise the bound with a regression fixture and measured memory impact.
+For magnets, `metainfo_max_mib` must reach the engine before BEP 9 buffer
+allocation; enforcing it only after metadata resolution does not satisfy this
+table.
 
 The dormant adapter centralizes and enforces the limits it can own before
 daemon integration: 10 MiB raw metainfo, 16 KiB magnet URIs, 100,000 files,

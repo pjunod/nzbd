@@ -1,4 +1,4 @@
-# rqbit contribution kit — upstream required APIs and network budgets without weakening nzbd
+# rqbit contribution kit — upstream required APIs and resource budgets without weakening nzbd
 
 **Status:** ready for human review, not submitted · **Upstream base:**
 `4e5f94cbcf1d57ec500885c77cf1e24d70232d89` · **Verified:** 2026-08-07
@@ -6,15 +6,17 @@
 Companion to
 [BITTORRENT_M0_REPORT.md](../../docs/BITTORRENT_M0_REPORT.md) (why nzbd is
 blocked) — this directory is the submission package for the two rqbit APIs,
-tracker request controls, live/retained-peer budgets, and pre-routing
-handshake boundaries that must be accepted and released before nzbd starts M2.
+the pre-allocation magnet-metadata ceiling, tracker request controls,
+live/retained-peer budgets, and pre-routing handshake boundaries that must be
+accepted and released before nzbd starts M2.
 
 Read and review this kit in order. Submit the discovery-health design issue
 before its implementation, because that patch crosses three rqbit crates and
 the maintainer should shape the public contract before reviewing the large
-current-main candidate. The smaller authoritative-restore change can move
-independently. Neither submission makes an nzbd production gate pass until an
-accepted stable rqbit release contains both contracts.
+current-main candidate. The smaller authoritative-restore and metadata-size
+changes can move independently. No submission makes an nzbd production gate
+pass until an accepted stable rqbit release contains the required contracts
+and the full M0 path is rerun.
 
 ## 1. Human submission boundary — rqbit requires more than disclosure
 
@@ -35,7 +37,8 @@ Before posting any draft:
    branch still applies.
 4. Keep independent contributions separate. Restore changes session
    admission; discovery health changes DHT, tracker, and public snapshot
-   contracts; tracker, live-peer, retained-peer, and pending-handshake budgets
+   contracts; the metadata ceiling changes the peer handshake's allocation
+   boundary; tracker, live-peer, retained-peer, and pending-handshake budgets
    change distinct runtime resource policies.
 
 ## 2. Contribution map — stable evidence and current-main submissions
@@ -48,6 +51,7 @@ Before posting any draft:
 | Per-torrent and shared-session live-peer budgets | [`0007`](0007-bound-session-peers.patch) | [`0008`](0008-bound-session-peers-main.patch) | [PR draft](SESSION_PEER_BUDGET_PR.md) |
 | Bounded incomplete incoming handshakes | [`0009`](0009-bound-pending-incoming-handshakes.patch) | Native configurable 256-check boundary; no patch | [review note](PENDING_HANDSHAKE_BUDGET.md) |
 | Per-torrent and shared-session retained-peer budgets | [`0010`](0010-bound-known-peer-records.patch) | [`0011`](0011-bound-known-peer-records-main.patch) | [PR draft](KNOWN_PEER_BUDGET_PR.md) |
+| Bound BEP 9 metadata before allocation | [`0005`](0005-limit-peer-metadata-before-allocation.patch) | [`0006`](0006-limit-peer-metadata-before-allocation-main.patch) | [PR draft](METADATA_SIZE_LIMIT_PR.md) |
 
 The stable patches preserve the exact experiments behind nzbd's M0 report.
 The main patches are the contribution candidates. Do not submit the stable
@@ -62,32 +66,38 @@ backports upstream unless the maintainer explicitly asks for an 8.x backport.
    is unchanged and its focused test demonstrates the ownership seam while
    reporting only the persisted 16 KiB even though the complete valid payload
    is on disk.
-3. Reconcile maintainer feedback on the discovery-health states, crate
+3. Submit the independent
+   [metadata-size PR](METADATA_SIZE_LIMIT_PR.md). Its default remains 32 MiB,
+   while an embedding caller can reject a smaller configured ceiling before
+   rqbit allocates or requests peer metadata.
+4. Reconcile maintainer feedback on the discovery-health states, crate
    boundary, and snapshot shape.
-4. Rework and submit `0004` only after the design direction is accepted. A
+5. Rework and submit `0004` only after the design direction is accepted. A
    smaller upstream implementation is preferable if it preserves honest
    per-torrent DHT/tracker state and credential-safe failures.
-5. Submit the independent tracker request-budget candidate only after human
+6. Submit the independent tracker request-budget candidate only after human
    review of its 30-second request deadline, 1 MiB response cap, and 60-second
-   minimum unforced announce interval. It does not depend on either public API.
-6. Submit the independent session peer-budget candidate only after human
+   minimum unforced announce interval. The floor deliberately delays a
+   legitimate 10-second tracker request to 60 seconds; it is a policy tradeoff,
+   not just an implementation bound, and does not depend on either public API.
+7. Submit the independent session peer-budget candidate only after human
    review of the public option name, aggregate counting boundary, and permit
    acquisition order. It does not depend on the tracker request controls.
-7. Review the independent pending-handshake boundary. Do not submit `0009` to
+8. Review the independent pending-handshake boundary. Do not submit `0009` to
    rqbit main, which already has the configurable equivalent. Use the patch
    only if the maintainer explicitly requests an 8.x backport.
-8. Submit the independent retained-peer candidate only after human review of
+9. Submit the independent retained-peer candidate only after human review of
    its option names, permit lifetime, cleanup behavior, and preliminary
    1,024/4,096 policy.
-9. After both required APIs and all accepted resource controls ship, pin that
-   stable release in nzbd and rerun all eleven
-   M0 gates on native macOS, Linux glibc/musl, and Windows.
-10. Run the Linux packet-capture private-mode harness and obtain reviewer
+10. After both required APIs, the allocation ceiling, and all accepted resource
+    controls ship, pin that stable release in nzbd and rerun all eleven M0
+    gates on native macOS, Linux glibc/musl, and Windows.
+11. Run the Linux packet-capture private-mode harness and obtain reviewer
    acceptance of the resource, package, license, and advisory dispositions.
    A gate rerun cannot discharge those review decisions by itself.
-11. Only the complete M0 path can authorize M2.
+12. Only the complete M0 path can authorize M2.
 
-## 4. Reproduction — verify the candidates against rqbit main
+## 4. Reproduction — verify all candidates against rqbit main
 
 The verifier accepts the documented main base or any descendant that still
 contains it. On drift, it permits a three-way apply and then runs the affected
@@ -108,6 +118,7 @@ scripts/check-rqbit-tracker-request-budget-patch.sh "$rqbit_tree"    # Format + 
 scripts/check-rqbit-session-peer-budget-patch.sh "$rqbit_tree"       # Format + exact local/shared permit tests.
 scripts/check-rqbit-pending-handshake-budget.sh "$rqbit_tree"        # Stable backport or current native boundary.
 scripts/check-rqbit-known-peer-budget-patch.sh "$rqbit_tree"         # Format + retained-record admission tests.
+scripts/check-rqbit-metadata-size-limit-patch.sh "$rqbit_tree"       # Format + pre-allocation limit test.
 ```
 
 For submission, apply only the matching main patch to a fresh branch and run
@@ -125,18 +136,13 @@ git -C "$rqbit_tree" apply "$PWD/contrib/rqbit/0002-allow-persistence-without-au
 )
 ```
 
-Use a separate fresh branch for discovery health. Do not stack it on restore:
-the APIs solve different problems, and independent history lets rqbit accept,
-revise, or reject either contract without dragging the other through review.
-Use a third independent branch for the tracker request budget for the same
-reason; it changes resource policy, not either public API. Use a fourth branch
-for the session peer budget so rqbit can accept or revise tracker and peer
-resource policy independently. There is no current-main patch for the
+Use separate fresh branches for discovery health, the metadata ceiling, the
+tracker request budget, the session peer budget, and the retained-peer budget.
+Do not stack the upstream submissions: the contracts solve different problems,
+and independent history lets rqbit accept, revise, or reject each one without
+dragging the others through review. There is no current-main patch for the
 pending-handshake boundary because rqbit main already implements it; keep the
-stable-only backport separate from every main submission. Use a fifth
-independent current-main branch for the retained-peer budget so its record
-lifetime and refusal policy can be reviewed without coupling it to live-peer
-concurrency.
+stable-only backport separate from every main submission.
 
 ## 5. Non-goals — contribution evidence is not production permission
 
