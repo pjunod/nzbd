@@ -11,8 +11,8 @@ Companion to
 and advisory decision. Review the table and §4; do not mark the gate Pass
 merely because CI is green. The remaining decision is whether the recorded
 cost and three constrained exceptions are acceptable for the eventual first
-release, and whether the missing live-peer resource controls must be resolved
-before this gate can pass.
+release, and whether the missing live-peer and tracker-request resource
+controls must be resolved before this gate can pass.
 
 No production BitTorrent path is enabled by this review. Gates 7 and 8 still
 fail until accepted stable rqbit APIs provide authoritative restore and honest
@@ -42,6 +42,15 @@ can fill all 128 engine slots. The pinned rqbit-main snapshot exposes a
 per-torrent `peer_limit`, but still no session-total budget. Preliminary
 binary/dependency acceptance therefore cannot authorize the advertised 80/400
 runtime contract.
+
+The tracker-count preflight is also not a tracker-request budget. Stable 8.1.1
+and the pinned rqbit-main snapshot issue HTTP tracker requests without a
+tracker-owned deadline, buffer the full decoded response, and accept a
+tracker-provided zero-second HTTP announce interval; UDP accepts five seconds.
+The contribution kit proves a candidate 30-second complete-request deadline,
+1 MiB streamed response cap, and 60-second minimum unforced HTTP/UDP interval
+on both source lines. Until equivalent controls ship in an accepted stable
+release, preliminary resource acceptance cannot authorize tracker networking.
 
 The normal closure is permissively licensed except for exact
 `option-ext 0.2.0`, which is MPL-2.0 file-level copyleft. The checked-in
@@ -98,6 +107,9 @@ scripts/check-reviewed-dependency-exceptions.sh    # Exact exception package and
 cargo test -p nzbd-torrent --lib                    # Includes the no-UPnP construction invariant.
 cargo deny --all-features --locked check bans licenses sources
 cargo deny --all-features --locked check advisories
+
+# Against clean rqbit v8.1.1 and current-main trees, respectively.
+scripts/check-rqbit-tracker-request-budget-patch.sh /path/to/rqbit
 ```
 
 Reproduce the macOS harness measurements rather than comparing a debug binary:
@@ -131,6 +143,10 @@ Gate 9 may move from Partial to Pass only if a reviewer accepts all of these:
    80/400 peer budgets are enforced. An accepted stable per-torrent limit and
    an nzbd-owned shared-session cap must exist first, or the proposal must be
    explicitly amended with new measured and reviewed limits.
+7. **Tracker request budgets.** An accepted stable engine must bound the
+   complete HTTP tracker request, decoded response body, and hostile unforced
+   HTTP/UDP announce intervals. The prepared 30-second, 1 MiB, and 60-second
+   candidate values are evidence for review, not shipped capability.
 
 If any item is rejected, gate 9 remains Partial and the remedy must be named:
 upgrade or patch the dependency, remove the capability, change engines, or set
@@ -146,7 +162,9 @@ an accepted resource budget. Silence is not acceptance.
   payload I/O, qBittorrent compatibility, or UI.
 - It does not treat the 80-entry bootstrap-input guard as a live-peer resource
   cap or accept stable 8.1.1's hard-coded 128-per-torrent behavior.
-- It does not submit either prepared patch upstream.
+- It does not treat the 64-tracker input cap as a request lifetime, body, or
+  announce-rate budget.
+- It does not submit any prepared patch upstream.
 
 Gate 9 is one required decision among eleven, not permission to skip the two
 engine stop conditions.

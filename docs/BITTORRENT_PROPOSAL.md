@@ -1379,6 +1379,15 @@ an nzbd-owned boundary because stable rqbit buffers the response before nzbd
 can enforce its size limit and does not expose this proposal's redirect,
 timeout, or redaction policy.
 
+Tracker input limits do not bound tracker responses. Stable 8.1.1 and the
+pinned rqbit-main snapshot issue HTTP announces without a tracker-owned
+deadline, buffer the complete response, and accept zero-second HTTP intervals;
+UDP accepts five seconds. Production requires an accepted engine release that
+bounds the complete HTTP request and decoded body and enforces a polite minimum
+unforced HTTP/UDP interval. The contribution kit's reviewed candidate uses 30
+seconds, 1 MiB, and 60 seconds respectively; those values remain proposal
+evidence until upstream accepts and releases a contract.
+
 ---
 
 ## 11. Security, privacy, and abuse boundaries
@@ -2041,6 +2050,7 @@ data-loss change, not a feature toggle.
 | Stable library lacks BEP 52 | Some modern torrents reject | Honest v1 scope and named rejection; revisit on proven stable support. |
 | Stable library is TCP/IPv4 and private torrents use one tracker | Some peers/networks and tracker failover are unavailable | Publish the exact v1 matrix, verify primary-tracker private downloads, revisit only on a stable 9.x gate. |
 | Stable library cannot enforce the proposed 80/400 live-peer budgets | Tracker/PEX/DHT discovery can exceed configured resource expectations | Do not confuse the 80-entry bootstrap guard with a runtime cap; require an accepted stable per-torrent limit and an nzbd-owned shared-session budget before M2. |
+| Tracker response or interval is hostile | Memory/request tasks remain unbounded or a tracker is hammered | Require an accepted stable request deadline, streamed body cap, and minimum unforced interval; tracker-count preflight alone is insufficient. |
 | Private tracker rejects or bans an unapproved rqbit client | Grab fails or tracker account is penalized | No qBittorrent wire-identity claim; disclose whitelist requirements and gate each supported tracker policy before M4. |
 | Torrent PP corrupts seeds | Tracker hash failures and broken uploads | No torrent PP in v1; future reflink-or-copy derivative only. |
 | Passkeys leak in logs/UI | Tracker account compromise | Secret classification, boundary redaction, fixtures in every output path. |
