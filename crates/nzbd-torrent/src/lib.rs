@@ -10,6 +10,7 @@ use librqbit::api::TorrentIdOrHash;
 use librqbit::{
     AddTorrent, AddTorrentOptions, ManagedTorrent, Session, SessionOptions, TorrentStatsState,
 };
+use std::borrow::Cow;
 use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::num::NonZeroU32;
@@ -29,6 +30,10 @@ pub const MAX_TORRENT_FILES: usize = 100_000;
 pub const MAX_TORRENT_RELATIVE_PATH_BYTES: usize = 4 * 1024;
 /// Maximum aggregate encoded length of all projected relative payload paths.
 pub const MAX_TORRENT_PATH_BYTES: usize = 16 * 1024 * 1024;
+/// Maximum display-safe engine error length from proposal §10.3.
+pub const DISPLAY_SAFE_ERROR_MAX_BYTES: usize = 2 * 1024;
+
+const ERROR_TRUNCATION_MARKER: &str = "... [truncated]";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CryptoProviderInstall {
@@ -85,7 +90,166 @@ pub enum TorrentError {
 }
 
 fn engine_error(error: impl std::fmt::Display) -> TorrentError {
-    TorrentError::Engine(error.to_string())
+    TorrentError::Engine(display_safe_error(&error.to_string()))
+}
+
+fn display_safe_error(message: &str) -> String {
+    let mut output = String::new();
+    for raw_token in message.split_whitespace() {
+        let normalized = if raw_token.chars().any(char::is_control) {
+            Cow::Owned(
+                raw_token
+                    .chars()
+                    .filter(|character| !character.is_control())
+                    .collect::<String>(),
+            )
+        } else {
+            Cow::Borrowed(raw_token)
+        };
+        if normalized.is_empty() {
+            continue;
+        }
+        let redacted = redact_error_token(&normalized);
+        let separator = usize::from(!output.is_empty());
+        if output
+            .len()
+            .saturating_add(separator)
+            .saturating_add(redacted.len())
+            > DISPLAY_SAFE_ERROR_MAX_BYTES
+        {
+            if separator != 0 && output.len() < DISPLAY_SAFE_ERROR_MAX_BYTES {
+                output.push(' ');
+            }
+            let remaining = DISPLAY_SAFE_ERROR_MAX_BYTES.saturating_sub(output.len());
+            let mut boundary = remaining.min(redacted.len());
+            while !redacted.is_char_boundary(boundary) {
+                boundary -= 1;
+            }
+            output.push_str(&redacted[..boundary]);
+            return mark_display_truncated(output);
+        }
+        if separator != 0 {
+            output.push(' ');
+        }
+        output.push_str(&redacted);
+    }
+    output
+}
+
+fn redact_error_token(token: &str) -> Cow<'_, str> {
+    let whole = redact_error_value(token);
+    if whole.as_ref() != token {
+        return whole;
+    }
+    if let Some((key, value)) = token.split_once('=') {
+        if is_secret_key(key) {
+            return Cow::Owned(format!("{key}=<redacted>"));
+        }
+        let redacted = redact_error_value(value);
+        if redacted.as_ref() != value {
+            return Cow::Owned(format!("{key}={redacted}"));
+        }
+    }
+    whole
+}
+
+fn redact_error_value(value: &str) -> Cow<'_, str> {
+    if value
+        .as_bytes()
+        .windows(b"magnet:?".len())
+        .any(|window| window.eq_ignore_ascii_case(b"magnet:?"))
+    {
+        return Cow::Borrowed("<redacted-magnet>");
+    }
+    if let Some(scheme_end) = value.find("://") {
+        if value.len() > DISPLAY_SAFE_ERROR_MAX_BYTES * 2 {
+            return Cow::Borrowed("<redacted-url>");
+        }
+        let scheme_start = value[..scheme_end]
+            .rfind(|character: char| {
+                !character.is_ascii_alphanumeric() && !matches!(character, '+' | '-' | '.')
+            })
+            .map_or(0, |index| index + 1);
+        let prefix = &value[..scheme_start];
+        let candidate = value[scheme_start..].trim_end_matches(|character: char| {
+            matches!(character, ',' | ';' | ')' | ']' | '}' | '"' | '\'')
+        });
+        let safe = url::Url::parse(candidate)
+            .ok()
+            .and_then(|url| {
+                let host = url.host_str()?;
+                let host = if host.contains(':') {
+                    format!("[{host}]")
+                } else {
+                    host.to_owned()
+                };
+                let port = url
+                    .port()
+                    .map(|port| format!(":{port}"))
+                    .unwrap_or_default();
+                Some(format!("{}://{host}{port}/<redacted>", url.scheme()))
+            })
+            .unwrap_or_else(|| "<redacted-url>".into());
+        return Cow::Owned(format!("{prefix}{safe}"));
+    }
+    if value
+        .find('?')
+        .is_some_and(|query| value[query + 1..].contains(['=', '&']))
+    {
+        return Cow::Borrowed("<redacted-query>");
+    }
+
+    let trimmed = value.trim_matches(|character: char| {
+        matches!(character, ',' | ';' | '(' | ')' | '{' | '}' | '"' | '\'')
+    });
+    let address = trimmed.parse::<SocketAddr>().is_ok()
+        || trimmed.parse::<std::net::IpAddr>().is_ok()
+        || trimmed
+            .trim_matches(['[', ']'])
+            .parse::<SocketAddr>()
+            .is_ok();
+    if address {
+        return Cow::Borrowed("<redacted-peer>");
+    }
+    let bytes = trimmed.as_bytes();
+    let windows_absolute = bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && matches!(bytes[2], b'/' | b'\\');
+    if trimmed.starts_with('/') || trimmed.starts_with("\\\\") || windows_absolute {
+        return Cow::Borrowed("<redacted-path>");
+    }
+    Cow::Borrowed(value)
+}
+
+fn is_secret_key(key: &str) -> bool {
+    let key = key
+        .rsplit(|character: char| !character.is_ascii_alphanumeric())
+        .find(|part| !part.is_empty())
+        .unwrap_or_default();
+    [
+        "auth",
+        "authorization",
+        "cookie",
+        "credential",
+        "passkey",
+        "passwd",
+        "password",
+        "secret",
+        "token",
+    ]
+    .iter()
+    .any(|secret| key.eq_ignore_ascii_case(secret))
+}
+
+fn mark_display_truncated(mut message: String) -> String {
+    let mut boundary = DISPLAY_SAFE_ERROR_MAX_BYTES - ERROR_TRUNCATION_MARKER.len();
+    while !message.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    message.truncate(boundary);
+    message.push_str(ERROR_TRUNCATION_MARKER);
+    message
 }
 
 /// Install nzbd's aws-lc provider before librqbit constructs its reqwest
@@ -800,7 +964,7 @@ impl TorrentHandle {
             eta_seconds,
             peers,
             finished: stats.finished,
-            error: stats.error,
+            error: stats.error.map(|error| display_safe_error(&error)),
         }
     }
 
@@ -857,6 +1021,7 @@ pub struct TorrentStats {
     pub eta_seconds: Option<u64>,
     pub peers: TorrentPeerStats,
     pub finished: bool,
+    /// Redacted, control-character-free, and bounded to 2 KiB.
     pub error: Option<String>,
 }
 
@@ -911,5 +1076,58 @@ mod tests {
             partial.engine_url(),
             Err(TorrentError::InvalidProxy(_))
         ));
+    }
+
+    #[test]
+    fn engine_errors_are_redacted_and_display_safe() {
+        let message = concat!(
+            "fetch magnet:?xt=urn:btih:0123456789012345678901234567890123456789&dn=secret-name ",
+            "tracker=https://alice:secret@tracker.example/passkey?auth=secret ",
+            "proxy=socks5://bob:hunter2@127.0.0.1:1080 ",
+            "socks_proxy_password=plain-secret ",
+            "query=tracker.example/private-passkey?auth=query-secret ",
+            "peers=[203.0.113.7:6881, /Users/alice/private/file]\nforbidden"
+        );
+        let shown = engine_error(message).to_string();
+
+        for secret in [
+            "secret-name",
+            "alice",
+            "hunter2",
+            "plain-secret",
+            "private-passkey",
+            "query-secret",
+            "203.0.113.7",
+            "/Users/alice",
+        ] {
+            assert!(!shown.contains(secret), "leaked {secret:?}: {shown}");
+        }
+        assert!(shown.contains("tracker.example"));
+        assert!(!shown.contains('\n'));
+    }
+
+    #[test]
+    fn display_safe_errors_are_utf8_safe_bounded_and_marked() {
+        let exact = display_safe_error(&"x".repeat(DISPLAY_SAFE_ERROR_MAX_BYTES));
+        assert_eq!(exact.len(), DISPLAY_SAFE_ERROR_MAX_BYTES);
+        assert!(!exact.ends_with(ERROR_TRUNCATION_MARKER));
+
+        let first_excess = display_safe_error(&format!(
+            "{}é",
+            "x".repeat(DISPLAY_SAFE_ERROR_MAX_BYTES - 1)
+        ));
+        assert_eq!(first_excess.len(), DISPLAY_SAFE_ERROR_MAX_BYTES);
+        assert!(first_excess.ends_with(ERROR_TRUNCATION_MARKER));
+
+        let unicode = display_safe_error(&"é".repeat(DISPLAY_SAFE_ERROR_MAX_BYTES));
+        assert!(unicode.len() <= DISPLAY_SAFE_ERROR_MAX_BYTES);
+        assert!(unicode.ends_with(ERROR_TRUNCATION_MARKER));
+        assert!(std::str::from_utf8(unicode.as_bytes()).is_ok());
+
+        let huge_url = display_safe_error(&format!(
+            "https://tracker.example/{}?passkey=secret",
+            "x".repeat(DISPLAY_SAFE_ERROR_MAX_BYTES * 4)
+        ));
+        assert_eq!(huge_url, "<redacted-url>");
     }
 }

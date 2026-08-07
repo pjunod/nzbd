@@ -1283,13 +1283,15 @@ raise the bound with a regression fixture and measured memory impact.
 
 The dormant adapter centralizes and enforces the limits it can own before
 daemon integration: 10 MiB raw metainfo, 16 KiB magnet URIs, 100,000 files,
-4 KiB per projected relative payload path, and 16 MiB across projected paths.
+4 KiB per projected relative payload path, 16 MiB across projected paths, and
+2 KiB for every rqbit operation or live-stat error that crosses the adapter.
 Projected paths include the multi-file root and platform separator bytes, so
 the accounting bounds the paths later passed to storage rather than only the
 raw bencode component payloads. Exact-limit tests pass and the first excess
-byte or file returns a stable named error. The 1–100 MiB metainfo configuration
-range, redirects, fetched-body streaming, and display-safe error truncation
-remain API/source-fetch work; no production input is wired by these constants.
+byte or file returns a stable named error. Error truncation is UTF-8 safe and
+ends with an explicit marker. The 1–100 MiB metainfo configuration range,
+redirects, and fetched-body streaming remain API/source-fetch work; no
+production input is wired by these constants.
 
 ---
 
@@ -1366,6 +1368,14 @@ operations. Metrics labels never include names, URLs, hashes, or peer IPs.
 The native torrent-detail endpoint returns tracker hosts and status, not full
 announce URLs. Exporting the retained `.torrent` is an explicit authenticated
 operation and is never embedded in a normal queue response.
+
+The dormant adapter already sanitizes rqbit operation errors and live
+`stats.error` values before returning them. It removes complete magnet URIs,
+URL userinfo/path/query data, recognized secret assignments, peer addresses,
+absolute paths, and control characters, then applies the 2 KiB display bound.
+The later source-fetch and daemon boundaries must keep applying the same
+invariant to their own errors rather than treating this adapter guard as a
+replacement.
 
 ### 11.4 Source fetching
 
@@ -1796,8 +1806,10 @@ becomes reachable.
 - Scheduler: mixed priorities/protocols, force semantics, stalled-slot yield
   and later reacquisition, slot release on readiness, seeding excluded from
   download slots.
-- Redaction: tracker/query/proxy credentials never survive into safe errors,
-  logs, events, or metrics.
+- Redaction: adapter engine/stat errors prove magnet, tracker/query/proxy,
+  secret-assignment, peer-address, absolute-path, control-character, and UTF-8
+  truncation fixtures; later source/API tests prove the same invariant through
+  logs, events, and metrics.
 
 ### 16.2 Local swarm e2e
 

@@ -59,7 +59,10 @@ code. The daemon does not depend on it. The boundary currently provides:
 - pause, resume, idempotent forget, and bounded delete-data delegation;
 - live session upload/download rate changes;
 - info hash, phase, progress, upload, per-file progress, rates, derived ETA,
-  peer aggregates, completion, and error facts;
+  peer aggregates, completion, and display-safe error facts;
+- a 2 KiB display-safe boundary for rqbit operation/stat errors that removes
+  magnet URIs, URL credentials/queries, secret assignments, peer addresses,
+  absolute paths, and control characters before returning adapter values;
 - split SOCKS URL/username/password input with password redaction, a strict
   credential form, named rejection of UDP trackers, and a recording relay
   proving the peer path did not also connect directly; and
@@ -88,6 +91,8 @@ The isolated suite covers:
   recording relay proving no parallel direct connection;
 - named rejection of proxy+DHT and proxy+UDP-tracker leak paths;
 - password redaction and invalid proxy combinations;
+- engine/stat error redaction and UTF-8-safe 2 KiB truncation with an explicit
+  marker;
 - one-tracker private-torrent discovery and multi-tracker rejection;
 - a positive-control PEX peer that public torrents contact and private torrents
   ignore; the canary address is available only through the peer-wire message;
