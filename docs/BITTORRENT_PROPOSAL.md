@@ -1140,10 +1140,11 @@ The library may perform its own checks. nzbd repeats the invariant at the
 boundary because delete-with-data and reported `content_path` trust it later.
 The dormant M0 adapter implements the metadata-only portion itself before
 rqbit admission: portable root/components, UTF-8, empty/dot/parent names,
-cross-platform separators, NUL, drive prefixes, and metainfo-declared symlinks.
-It deliberately does not claim the later filesystem proof: existing symlinks,
-canonical containment, normalized case collisions, and delete-root authority
-remain M5/M2 work and no production path is wired.
+cross-platform separators, NUL, drive prefixes, metainfo-declared symlinks,
+exact duplicate paths, and collisions under Unicode lowercase comparison. It
+deliberately does not claim the later filesystem proof: existing symlinks,
+canonical containment, filesystem-specific Unicode normalization/case rules,
+and delete-root authority remain M5/M2 work and no production path is wired.
 
 ### 9.3 First release: no torrent post-processing
 
@@ -1783,8 +1784,9 @@ becomes reachable.
 - Path validation: every platform prefix/separator, traversal, normalization,
   symlinks, case collisions, padding files, exact-root delete proof.
 - Adapter path preflight: the portable metadata-only subset and declared
-  symlink rejection run as socket-free unit tests before real-admission path
-  tests; existing-filesystem symlinks and case collisions remain M5 probes.
+  symlink, exact-duplicate, and lowercase-collision rejection run as
+  socket-free unit tests before real-admission path tests; existing-filesystem
+  symlinks and filesystem-specific Unicode normalization remain M5 probes.
 - Metainfo preflight: a deterministic mutation corpus runs in ordinary CI;
   coverage-guided fuzzing remains an M5 release gate.
 - State projection: every `TorrentPhase` maps to the expected native and

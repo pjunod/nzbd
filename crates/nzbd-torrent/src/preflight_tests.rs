@@ -92,6 +92,32 @@ fn multi_file_info(
     info
 }
 
+fn multi_file_info_many(root: &[u8], paths: &[&[&[u8]]]) -> Vec<u8> {
+    let mut info = vec![b'd'];
+    bencode_bytes(&mut info, b"files");
+    info.push(b'l');
+    for path in paths {
+        info.push(b'd');
+        bencode_bytes(&mut info, b"length");
+        info.extend_from_slice(b"i1e");
+        bencode_bytes(&mut info, b"path");
+        info.push(b'l');
+        for component in *path {
+            bencode_bytes(&mut info, component);
+        }
+        info.extend_from_slice(b"ee");
+    }
+    info.push(b'e');
+    bencode_bytes(&mut info, b"name");
+    bencode_bytes(&mut info, root);
+    bencode_bytes(&mut info, b"piece length");
+    info.extend_from_slice(b"i16384e");
+    bencode_bytes(&mut info, b"pieces");
+    bencode_bytes(&mut info, &[0; 20]);
+    info.push(b'e');
+    info
+}
+
 fn assert_preflight_does_not_panic(case: &str, bytes: &[u8]) {
     let result = catch_unwind(AssertUnwindSafe(|| {
         let _ = validate_metainfo_contract(bytes, false);
@@ -396,4 +422,31 @@ fn magnet_preflight_names_format_version_and_proxy_failures() {
         validate_magnet_contract(&udp, true),
         Err(TorrentError::ProxyWithUdpTracker)
     ));
+}
+
+#[test]
+fn adapter_rejects_exact_and_portable_case_path_collisions() {
+    let exact = metainfo(&multi_file_info_many(
+        b"release",
+        &[&[b"disc", b"movie.mkv"], &[b"disc", b"movie.mkv"]],
+    ));
+    assert!(matches!(
+        validate_metainfo_contract(&exact, false),
+        Err(TorrentError::PathCollision)
+    ));
+
+    let case = metainfo(&multi_file_info_many(
+        b"release",
+        &[&[b"Disc", b"Movie.mkv"], &[b"disc", b"movie.MKV"]],
+    ));
+    assert!(matches!(
+        validate_metainfo_contract(&case, false),
+        Err(TorrentError::PathCollision)
+    ));
+
+    let distinct = metainfo(&multi_file_info_many(
+        b"release",
+        &[&[b"disc-1", b"movie.mkv"], &[b"disc-2", b"movie.mkv"]],
+    ));
+    assert!(validate_metainfo_contract(&distinct, false).is_ok());
 }

@@ -80,6 +80,8 @@ pub enum TorrentError {
     PathTooLong { size: usize, limit: usize },
     #[error("torrent path metadata is too large ({size} bytes; maximum {limit})")]
     PathMetadataTooLarge { size: usize, limit: usize },
+    #[error("torrent contains payload paths that collide under portable case comparison")]
+    PathCollision,
 }
 
 fn engine_error(error: impl std::fmt::Display) -> TorrentError {
@@ -374,19 +376,23 @@ fn validate_metainfo_paths_with_limits<BufType: AsRef<[u8]>>(
     info: &librqbit::TorrentMetaV1Info<BufType>,
     limits: MetainfoPathLimits,
 ) -> Result<(), TorrentError> {
-    let root_path_bytes = if info.files.is_some() {
+    let (root_path_bytes, root_collision_key) = if info.files.is_some() {
         let root = info.name.as_ref().ok_or(TorrentError::UnsafeMetainfoPath(
             "multi-file torrents require a root name",
         ))?;
         validate_path_component(root.as_ref())?;
-        root.as_ref().len()
+        let root = std::str::from_utf8(root.as_ref()).map_err(|_| {
+            TorrentError::UnsafeMetainfoPath("path components must contain valid UTF-8")
+        })?;
+        (root.len(), portable_lowercase(root))
     } else {
-        0
+        (0, String::new())
     };
 
     let files = info.iter_file_details().map_err(engine_error)?;
     let mut file_count = 0usize;
     let mut all_path_bytes = 0usize;
+    let mut path_collision_keys = HashSet::new();
     for file in files {
         file_count = file_count.saturating_add(1);
         if file_count > limits.files {
@@ -403,6 +409,7 @@ fn validate_metainfo_paths_with_limits<BufType: AsRef<[u8]>>(
 
         let mut component_count = 0usize;
         let mut relative_path_bytes = root_path_bytes;
+        let mut collision_key = root_collision_key.clone();
         for component in file.filename.iter_components() {
             component_count += 1;
             let component = component.map_err(|_| {
@@ -411,6 +418,10 @@ fn validate_metainfo_paths_with_limits<BufType: AsRef<[u8]>>(
                 )
             })?;
             validate_path_component(component.as_bytes())?;
+            if !collision_key.is_empty() {
+                collision_key.push('/');
+            }
+            collision_key.push_str(&portable_lowercase(component));
             if relative_path_bytes != 0 {
                 relative_path_bytes = relative_path_bytes.saturating_add(1);
             }
@@ -427,6 +438,9 @@ fn validate_metainfo_paths_with_limits<BufType: AsRef<[u8]>>(
                 "file paths must contain at least one component",
             ));
         }
+        if !path_collision_keys.insert(collision_key) {
+            return Err(TorrentError::PathCollision);
+        }
         all_path_bytes = all_path_bytes.saturating_add(relative_path_bytes);
         if all_path_bytes > limits.all_path_bytes {
             return Err(TorrentError::PathMetadataTooLarge {
@@ -436,6 +450,10 @@ fn validate_metainfo_paths_with_limits<BufType: AsRef<[u8]>>(
         }
     }
     Ok(())
+}
+
+fn portable_lowercase(component: &str) -> String {
+    component.chars().flat_map(char::to_lowercase).collect()
 }
 
 fn validate_metainfo_size(size: usize) -> Result<(), TorrentError> {
