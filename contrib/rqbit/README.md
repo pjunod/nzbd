@@ -52,7 +52,8 @@ backports upstream unless the maintainer explicitly asks for an 8.x backport.
    human review and editing.
 2. Submit the independent
    [authoritative-restore PR](AUTHORITATIVE_RESTORE_PR.md). Its default behavior
-   is unchanged and its focused test demonstrates the ownership seam.
+   is unchanged and its focused test demonstrates the ownership seam while
+   retaining non-empty fast-resume progress.
 3. Reconcile maintainer feedback on the discovery-health states, crate
    boundary, and snapshot shape.
 4. Rework and submit `0004` only after the design direction is accepted. A

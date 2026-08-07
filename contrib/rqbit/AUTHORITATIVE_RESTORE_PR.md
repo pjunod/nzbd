@@ -34,15 +34,20 @@ still restore every stored record.
 
 The focused test:
 
-1. persists two paused torrents;
-2. constructs a persistent session with automatic restore disabled and proves
+1. creates two deterministic four-piece payloads and persists both paused
+   torrents;
+2. leaves exactly the first 16 KiB piece valid on disk for the selected
+   torrent;
+3. constructs a persistent session with automatic restore disabled and proves
    it starts empty;
-3. explicitly restores only the selected record under its original ID; and
-4. constructs a default session and proves both records are still restored.
+4. explicitly restores only the selected record under its original ID and
+   proves the 16 KiB of progress is retained without marking it complete; and
+5. constructs a default session and proves both records are still restored.
 
 The change does not expose rqbit's private persistence schema, delete records,
-or claim to alter payload verification. It only separates opening the store
-from admitting every stored torrent.
+or alter payload verification. It only separates opening the store from
+admitting every stored torrent while preserving the existing fast-resume
+path.
 
 ### Validation
 
