@@ -1336,6 +1336,14 @@ source_redirects = 5
   the first release. Production needs an accepted stable boundary plus human
   acceptance of that measured policy; a timeout by itself is not a
   concurrency limit.
+- live-peer admission, upload rate limits, and read/write timeouts also do not
+  bound response records queued after a peer is established. Valid piece
+  requests cross an unbounded upload scheduler and peer writer, while valid
+  BEP 9 metadata requests enter the writer directly. A tested stable/main
+  candidate gives each peer one 128-permit window spanning those stages and
+  holds each permit through the socket write. The value, backpressure policy,
+  and accepted stable release remain gate-9 prerequisites; the contribution
+  evidence does not authorize the production writer.
 - dormant torrent initialization is serialized explicitly. Stable rqbit's
   unset default permits three concurrent initialization integrity scans, which
   can multiply disk I/O before torrents become live. The one-scan guard does
@@ -2127,6 +2135,7 @@ data-loss change, not a feature toggle.
 | Stable and current engines retain unbounded known-peer records | Tracker/DHT/PEX or repeated incoming addresses can grow queued, backoff, dead, and not-needed state outside live-peer permits | Require accepted per-torrent and shared-session retained-record limits before M2. Review the preliminary 1,024/4,096 policy against full map/allocator measurements; the tested permit candidate is evidence, not released capability. |
 | Stable listener leaves incomplete incoming handshakes unbounded | Remote clients can retain sockets, buffers, and tasks before live-peer permits apply | Require an accepted stable pre-routing handshake ceiling and review it separately from the 80/400 live-peer policy. Current main's native 256-per-listener default and the tested stable backport are evidence, not released capability. |
 | Tracker response or interval is hostile | Memory/request tasks remain unbounded or a tracker is hammered | Require an accepted stable request deadline, streamed body cap, and minimum unforced interval; tracker-count preflight alone is insufficient. |
+| Established peer floods piece or metadata requests | The upload scheduler and peer writer retain unbounded response records behind rate limits or a slow socket | Require an accepted stable per-peer response window spanning scheduler and writer. The tested 128-permit candidate and negative control are evidence, not released capability. |
 | Private tracker rejects or bans an unapproved rqbit client | Grab fails or tracker account is penalized | No qBittorrent wire-identity claim; disclose whitelist requirements and gate each supported tracker policy before M4. |
 | Torrent PP corrupts seeds | Tracker hash failures and broken uploads | No torrent PP in v1; future reflink-or-copy derivative only. |
 | Passkeys leak in logs/UI | Tracker account compromise | Secret classification, boundary redaction, fixtures in every output path. |

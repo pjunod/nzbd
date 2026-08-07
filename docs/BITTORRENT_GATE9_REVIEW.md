@@ -12,8 +12,8 @@ and advisory decision. Review the table and §4; do not mark the gate Pass
 merely because CI is green. The remaining decision is whether the recorded
 cost and three constrained exceptions are acceptable for the eventual first
 release, and whether the missing live-peer, retained-peer, tracker-request,
-and pre-routing handshake resource controls must be resolved before this gate
-can pass.
+pre-routing handshake, and established-peer response-backlog controls must be
+resolved before this gate can pass.
 
 No production BitTorrent path is enabled by this review. Gates 7 and 8 still
 fail until accepted stable rqbit APIs provide authoritative restore and honest
@@ -83,6 +83,18 @@ budget: neither the 80/400 live-peer candidate nor the fixed timeout closes an
 unbounded concurrency set. Until an accepted stable release enforces a
 reviewed limit, production listener activation remains unauthorized.
 
+Established live-peer work has another independent gap. Valid BEP 3 piece
+requests enter an unbounded upload-scheduler channel and then an unbounded
+per-peer writer; valid BEP 9 metadata requests enter the writer directly. A
+rate limit or socket timeout slows draining but does not cap the number of
+queued records. The contribution kit proves one candidate 128-permit response
+window on both source lines. The permit follows a piece response across both
+queues and a metadata response through the writer, and is released only after
+the writer drops the item. The exact test remains blocked when work moves
+between queues, reopens after a writer drop, and fails under an intentional
+guard bypass. Until an accepted stable release enforces a reviewer-approved
+window and backpressure policy, established peer traffic remains unauthorized.
+
 The normal closure is permissively licensed except for exact
 `option-ext 0.2.0`, which is MPL-2.0 file-level copyleft. The checked-in
 `deny.toml` accepts only that package/version under MPL-2.0; another MPL package
@@ -144,6 +156,7 @@ scripts/check-rqbit-tracker-request-budget-patch.sh /path/to/rqbit
 scripts/check-rqbit-session-peer-budget-patch.sh /path/to/rqbit
 scripts/check-rqbit-pending-handshake-budget.sh /path/to/rqbit
 scripts/check-rqbit-known-peer-budget-patch.sh /path/to/rqbit
+scripts/check-rqbit-peer-response-budget-patch.sh /path/to/rqbit
 ```
 
 Reproduce the macOS harness measurements rather than comparing a debug binary:
@@ -195,6 +208,11 @@ Gate 9 may move from Partial to Pass only if a reviewer accepts all of these:
    must accept or revise the preliminary 1,024/4,096 limits and require
    additional target-specific memory evidence if the raw measurement is not
    sufficient.
+10. **Established-peer response backlog.** An accepted stable engine must
+    bound remote-triggered piece and metadata responses across the upload
+    scheduler and socket writer. The prepared 128-permit candidate and its
+    failing negative control are evidence for review, not shipped capability.
+    A reviewer must accept or revise the window and backpressure behavior.
 
 If any item is rejected, gate 9 remains Partial and the remedy must be named:
 upgrade or patch the dependency, remove the capability, change engines, or set
@@ -217,6 +235,8 @@ an accepted resource budget. Silence is not acceptance.
   on the number of incomplete incoming handshake tasks.
 - It does not treat the 80/400 live-manager limits as caps on retained queued,
   backoff, dead, or not-needed peer records.
+- It does not treat upload rate limiting or a socket timeout as a bound on
+  queued piece and metadata responses from an established peer.
 - It does not submit any prepared patch upstream.
 
 Gate 9 is one required decision among eleven, not permission to skip the two
