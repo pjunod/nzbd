@@ -258,6 +258,47 @@ fn adapter_owns_portable_single_file_path_rejection() {
 }
 
 #[test]
+fn adapter_rejects_windows_device_aliases_and_reserved_characters() {
+    for component in [
+        &b"CON"[..],
+        &b"con.txt"[..],
+        &b"NUL .log"[..],
+        &b"COM1"[..],
+        "com\u{00b9}.txt".as_bytes(),
+        &b"LPT9.bin"[..],
+        &b"CONIN$"[..],
+        &b"payload:stream"[..],
+        &b"question?.mkv"[..],
+        &b"quote\".mkv"[..],
+        &b"control-\x1f.mkv"[..],
+        &b"trailing."[..],
+        &b"trailing "[..],
+    ] {
+        assert!(
+            matches!(
+                validate_metainfo_contract(&v1_metainfo(component), false),
+                Err(TorrentError::UnsafeMetainfoPath(_))
+            ),
+            "Windows-unsafe component was accepted: {component:?}"
+        );
+    }
+
+    for component in [
+        &b"console.txt"[..],
+        &b"com0.bin"[..],
+        &b"com10.bin"[..],
+        &b"lpt0.bin"[..],
+        &b"auxiliary.mkv"[..],
+        &b"space inside.mkv"[..],
+    ] {
+        assert!(
+            validate_metainfo_contract(&v1_metainfo(component), false).is_ok(),
+            "portable component was rejected: {component:?}"
+        );
+    }
+}
+
+#[test]
 fn adapter_owns_multi_file_root_component_and_symlink_rejection() {
     let safe = metainfo(&multi_file_info(
         Some(b"release"),
@@ -270,6 +311,8 @@ fn adapter_owns_multi_file_root_component_and_symlink_rejection() {
     let cases = [
         multi_file_info(None, &[b"payload.bin"], None, None),
         multi_file_info(Some(b"C:release"), &[b"payload.bin"], None, None),
+        multi_file_info(Some(b"NUL"), &[b"payload.bin"], None, None),
+        multi_file_info(Some(b"release"), &[b"payload:stream"], None, None),
         multi_file_info(Some(b"release"), &[], None, None),
         multi_file_info(Some(b"release"), &[b"sub", b""], None, None),
         multi_file_info(

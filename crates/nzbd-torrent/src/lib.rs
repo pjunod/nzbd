@@ -771,10 +771,71 @@ fn validate_path_component(component: &[u8]) -> Result<(), TorrentError> {
             "Windows drive prefixes are not allowed",
         ));
     }
-    std::str::from_utf8(component).map_err(|_| {
+    if component
+        .iter()
+        .any(|byte| *byte < b' ' || b"<>:\"|?*".contains(byte))
+    {
+        return Err(TorrentError::UnsafeMetainfoPath(
+            "Windows-reserved characters are not allowed",
+        ));
+    }
+    if matches!(component.last(), Some(b'.' | b' ')) {
+        return Err(TorrentError::UnsafeMetainfoPath(
+            "path components cannot end with a dot or space",
+        ));
+    }
+    let component = std::str::from_utf8(component).map_err(|_| {
         TorrentError::UnsafeMetainfoPath("path components must contain valid UTF-8")
     })?;
+    if is_windows_reserved_component(component) {
+        return Err(TorrentError::UnsafeMetainfoPath(
+            "Windows device names are not allowed",
+        ));
+    }
     Ok(())
+}
+
+fn is_windows_reserved_component(component: &str) -> bool {
+    let basename = component
+        .split('.')
+        .next()
+        .unwrap_or(component)
+        .trim_end_matches(' ')
+        .to_ascii_uppercase();
+    matches!(
+        basename.as_str(),
+        "CON"
+            | "PRN"
+            | "AUX"
+            | "NUL"
+            | "CLOCK$"
+            | "CONIN$"
+            | "CONOUT$"
+            | "COM1"
+            | "COM2"
+            | "COM3"
+            | "COM4"
+            | "COM5"
+            | "COM6"
+            | "COM7"
+            | "COM8"
+            | "COM9"
+            | "COM¹"
+            | "COM²"
+            | "COM³"
+            | "LPT1"
+            | "LPT2"
+            | "LPT3"
+            | "LPT4"
+            | "LPT5"
+            | "LPT6"
+            | "LPT7"
+            | "LPT8"
+            | "LPT9"
+            | "LPT¹"
+            | "LPT²"
+            | "LPT³"
+    )
 }
 
 fn validate_metainfo_version(bytes: &[u8]) -> Result<(), TorrentError> {

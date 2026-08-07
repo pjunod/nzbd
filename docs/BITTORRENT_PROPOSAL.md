@@ -1143,8 +1143,9 @@ The library may perform its own checks. nzbd repeats the invariant at the
 boundary because delete-with-data and reported `content_path` trust it later.
 The dormant M0 adapter implements the metadata-only portion itself before
 rqbit admission: portable root/components, UTF-8, empty/dot/parent names,
-cross-platform separators, NUL, drive prefixes, metainfo-declared symlinks,
-exact duplicate paths, and collisions under Unicode lowercase comparison. It
+cross-platform separators, Windows drive/device names, reserved characters and
+trailing dot/space aliases, metainfo-declared symlinks, exact duplicate paths,
+and collisions under Unicode lowercase comparison. It
 projects a separate importer-safe content inventory from validated rqbit
 metadata and omits every BEP 47 padding entry while preserving engine file
 indices for low-level diagnostics. A parsed padding-metainfo test proves the
@@ -1830,11 +1831,12 @@ becomes reachable.
 - Path validation: every platform prefix/separator, traversal, normalization,
   symlinks, case collisions, padding files, exact-root delete proof.
 - Adapter path preflight: the portable metadata-only subset and declared
-  symlink, exact-duplicate, and lowercase-collision rejection run as
-  socket-free unit tests before real-admission path tests. The session root is
-  canonicalized, and an existing-symlink integration case must leave its
-  external target untouched; descriptor-relative containment and
-  filesystem-specific Unicode normalization remain M5 probes.
+  symlink, Windows device/character/alias, exact-duplicate, and
+  lowercase-collision rejection run as socket-free unit tests before
+  real-admission path tests. The session root is canonicalized, and an
+  existing-symlink integration case must leave its external target untouched;
+  descriptor-relative containment and filesystem-specific Unicode
+  normalization remain M5 probes.
 - Metainfo preflight: a deterministic mutation corpus runs in ordinary CI;
   coverage-guided fuzzing remains an M5 release gate.
 - State projection: every `TorrentPhase` maps to the expected native and
