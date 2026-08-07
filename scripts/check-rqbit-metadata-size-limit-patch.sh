@@ -17,7 +17,7 @@ readonly source_head
 
 case "$source_head" in
   "$stable_base")
-    readonly patch_file="contrib/rqbit/0001-allow-persistence-without-auto-restore.patch"
+    readonly patch_file="contrib/rqbit/0005-limit-peer-metadata-before-allocation.patch"
     readonly source_variant="stable"
     ;;
   *)
@@ -29,14 +29,14 @@ case "$source_head" in
       echo "expected rqbit v8.1.1 at $stable_base or a descendant of main base $main_base; found $source_head" >&2
       exit 1
     fi
-    readonly patch_file="contrib/rqbit/0002-allow-persistence-without-auto-restore-main.patch"
+    readonly patch_file="contrib/rqbit/0006-limit-peer-metadata-before-allocation-main.patch"
     readonly source_variant="main"
     ;;
 esac
 
-echo "verifying rqbit $source_variant patch against $source_head"
+echo "verifying rqbit $source_variant metadata-size patch against $source_head"
 
-readonly work_dir="$(mktemp -d "${TMPDIR:-/tmp}/nzbd-rqbit-patch.XXXXXX")"
+readonly work_dir="$(mktemp -d "${TMPDIR:-/tmp}/nzbd-rqbit-metadata-patch.XXXXXX")"
 trap 'rm -rf -- "$work_dir"' EXIT
 
 git clone --quiet --no-hardlinks "$source_dir" "$work_dir/rqbit"
@@ -50,17 +50,30 @@ else
   exit 1
 fi
 
+readonly options_source="$work_dir/rqbit/crates/librqbit/src/peer_connection.rs"
+readonly reader_source="$work_dir/rqbit/crates/librqbit/src/peer_info_reader/mod.rs"
+for invariant in \
+  'pub max_metadata_size: Option<u32>' \
+  'HandlerLocked::new(metadata_size, self.max_metadata_size)?' \
+  'configured_metadata_limit_is_checked_before_allocation'
+do
+  if ! grep -Fq "$invariant" "$options_source" "$reader_source"; then
+    echo "metadata-size patch is missing invariant: $invariant" >&2
+    exit 1
+  fi
+done
+
 (
   cd "$work_dir/rqbit"
   cargo fmt --all -- --check
-  readonly exact_test='tests::persistence::persistence_can_skip_implicit_admission_and_restore_an_authoritative_subset'
+  readonly exact_test='peer_info_reader::tests::configured_metadata_limit_is_checked_before_allocation'
   test_list="$(cargo test -p librqbit --lib \
     --no-default-features \
     --features rust-tls \
     -- --list)"
   readonly test_list
   if ! grep -Fxq "$exact_test: test" <<<"$test_list"; then
-    echo "authoritative-restore proof test was not discovered: $exact_test" >&2
+    echo "metadata-size proof test was not discovered: $exact_test" >&2
     exit 1
   fi
   cargo test -p librqbit --lib "$exact_test" \

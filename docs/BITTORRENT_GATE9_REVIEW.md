@@ -11,14 +11,15 @@ Companion to
 and advisory decision. Review the table and §4; do not mark the gate Pass
 merely because CI is green. The remaining decision is whether the recorded
 cost and three constrained exceptions are acceptable for the eventual first
-release, and whether the missing live-peer resource controls must be resolved
-before this gate can pass.
+release, and whether the missing live-peer, retained-peer, tracker-request,
+and pre-routing handshake resource controls must be resolved before this gate
+can pass.
 
 No production BitTorrent path is enabled by this review. Gates 7 and 8 still
 fail until accepted stable rqbit APIs provide authoritative restore and honest
 per-torrent discovery health.
 
-## 1. Decision requested — measured costs, exact exceptions, and one resource gap
+## 1. Decision requested — measured costs, exact exceptions, and resource gaps
 
 The isolated M0 adapter measured the following in one macOS 26.6 arm64 run:
 
@@ -41,7 +42,46 @@ only to explicit/resolved bootstrap peers; later tracker, PEX, or DHT discovery
 can fill all 128 engine slots. The pinned rqbit-main snapshot exposes a
 per-torrent `peer_limit`, but still no session-total budget. Preliminary
 binary/dependency acceptance therefore cannot authorize the advertised 80/400
-runtime contract.
+runtime contract. The contribution kit proves a candidate per-torrent default,
+per-add override, and shared session semaphore on both source lines. Incoming
+and outgoing peer managers hold both applicable permits through release, and
+two-torrent boundary tests exercise the aggregate ceiling. Until equivalent
+controls ship in an accepted stable release, the candidate remains evidence,
+not production capability.
+
+The live-peer ceiling also does not bound retained peer records. Stable 8.1.1
+and current main insert every unique tracker, DHT, PEX, explicit, or incoming
+address into a map and unbounded peer-adder channel before a live permit is
+acquired. Queued, backoff, dead, and not-needed records can therefore grow
+without the 80/400 live-manager budget. A contribution candidate adds
+caller-selected per-torrent and shared-session record permits, holds them for
+the map lifetime, removes incoming-only records when their manager exits, and
+prevents alternate-address reconnects from being queued repeatedly. The
+proposal's preliminary 1,024/4,096 policy is informed by an exact-8.1.1 macOS
+arm64 measurement: the 296-byte `Peer` struct makes 4,096 raw records
+1,212,416 bytes (1.16 MiB), excluding map, allocator, and live-bitfield
+overhead. That incomplete size measurement requires reviewer acceptance; it
+does not turn the candidate into shipped capability.
+
+The tracker-count preflight is also not a tracker-request budget. Stable 8.1.1
+and the pinned rqbit-main snapshot issue HTTP tracker requests without a
+tracker-owned deadline, buffer the full decoded response, and accept a
+tracker-provided zero-second HTTP announce interval; UDP accepts five seconds.
+The contribution kit proves a candidate 30-second complete-request deadline,
+1 MiB streamed response cap, and 60-second minimum unforced HTTP/UDP interval
+on both source lines. Until equivalent controls ship in an accepted stable
+release, preliminary resource acceptance cannot authorize tracker networking.
+
+The live-peer permits also start after an incoming client has completed enough
+of its handshake to be routed to a torrent. Stable 8.1.1 accepts every TCP
+socket into an unbounded pending-check set, where each incomplete client can
+retain a socket, buffers, and a task for the 10-second handshake read timeout.
+Current rqbit main has a configurable per-listener ceiling of 256 pending
+checks. The contribution kit carries a stable-only 256-check backport and a
+verifier for main's native boundary. This is a distinct pre-routing resource
+budget: neither the 80/400 live-peer candidate nor the fixed timeout closes an
+unbounded concurrency set. Until an accepted stable release enforces a
+reviewed limit, production listener activation remains unauthorized.
 
 The normal closure is permissively licensed except for exact
 `option-ext 0.2.0`, which is MPL-2.0 file-level copyleft. The checked-in
@@ -98,6 +138,12 @@ scripts/check-reviewed-dependency-exceptions.sh    # Exact exception package and
 cargo test -p nzbd-torrent --lib                    # Includes the no-UPnP construction invariant.
 cargo deny --all-features --locked check bans licenses sources
 cargo deny --all-features --locked check advisories
+
+# Against clean rqbit v8.1.1 and current-main trees, respectively.
+scripts/check-rqbit-tracker-request-budget-patch.sh /path/to/rqbit
+scripts/check-rqbit-session-peer-budget-patch.sh /path/to/rqbit
+scripts/check-rqbit-pending-handshake-budget.sh /path/to/rqbit
+scripts/check-rqbit-known-peer-budget-patch.sh /path/to/rqbit
 ```
 
 Reproduce the macOS harness measurements rather than comparing a debug binary:
@@ -129,8 +175,26 @@ Gate 9 may move from Partial to Pass only if a reviewer accepts all of these:
    change reopens this decision; a previous green run is not a waiver.
 6. **Runtime peer budgets.** Gate 9 cannot pass on the claim that the proposed
    80/400 peer budgets are enforced. An accepted stable per-torrent limit and
-   an nzbd-owned shared-session cap must exist first, or the proposal must be
-   explicitly amended with new measured and reviewed limits.
+   shared-session cap must exist first, or the proposal must be explicitly
+   amended with new measured and reviewed limits. The prepared combined-permit
+   candidate is evidence for that review, not shipped capability.
+7. **Tracker request budgets.** An accepted stable engine must bound the
+   complete HTTP tracker request, decoded response body, and hostile unforced
+   HTTP/UDP announce intervals. The prepared 30-second, 1 MiB, and 60-second
+   candidate values are evidence for review, not shipped capability.
+8. **Pending incoming handshakes.** An accepted stable engine must bound
+   incomplete pre-routing handshake work separately from routed live peers.
+   The prepared stable 256-check backport and main's native per-listener
+   boundary are evidence for review, not shipped capability. A reviewer must
+   explicitly accept the preliminary value and the TCP-only first-release
+   scope or require a different measured ceiling.
+9. **Retained peer records.** An accepted stable engine must separately bound
+   queued, backoff, dead, and not-needed peer records per torrent and across
+   the session. The prepared permit candidate and 296-byte raw-struct
+   measurement are evidence for review, not shipped capability. A reviewer
+   must accept or revise the preliminary 1,024/4,096 limits and require
+   additional target-specific memory evidence if the raw measurement is not
+   sufficient.
 
 If any item is rejected, gate 9 remains Partial and the remedy must be named:
 upgrade or patch the dependency, remove the capability, change engines, or set
@@ -145,8 +209,15 @@ an accepted resource budget. Silence is not acceptance.
 - It does not add torrent configuration, admission, listeners, trackers, DHT,
   payload I/O, qBittorrent compatibility, or UI.
 - It does not treat the 80-entry bootstrap-input guard as a live-peer resource
-  cap or accept stable 8.1.1's hard-coded 128-per-torrent behavior.
-- It does not submit either prepared patch upstream.
+  cap or accept stable 8.1.1's hard-coded 128-per-torrent behavior. The prepared
+  shared-session patch still requires upstream acceptance and a stable release.
+- It does not treat the 64-tracker input cap as a request lifetime, body, or
+  announce-rate budget.
+- It does not treat the 10-second read timeout or live-peer permits as a limit
+  on the number of incomplete incoming handshake tasks.
+- It does not treat the 80/400 live-manager limits as caps on retained queued,
+  backoff, dead, or not-needed peer records.
+- It does not submit any prepared patch upstream.
 
 Gate 9 is one required decision among eleven, not permission to skip the two
 engine stop conditions.

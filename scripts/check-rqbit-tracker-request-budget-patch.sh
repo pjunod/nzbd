@@ -1,0 +1,93 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+readonly stable_base="00b97485160ff5b5aa2b379ea0815d568ec665f0"
+readonly main_base="4e5f94cbcf1d57ec500885c77cf1e24d70232d89"
+
+if [[ $# -ne 1 ]]; then
+  echo "usage: $0 /path/to/clean/rqbit-v8.1.1-or-documented-main" >&2
+  exit 2
+fi
+
+readonly source_dir="$1"
+readonly repository_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+source_head="$(git -C "$source_dir" rev-parse HEAD)"
+readonly source_head
+
+case "$source_head" in
+  "$stable_base")
+    readonly patch_file="contrib/rqbit/0005-bound-tracker-requests.patch"
+    readonly source_variant="stable"
+    ;;
+  *)
+    if ! git -C "$source_dir" cat-file -e "$main_base^{commit}" 2>/dev/null; then
+      echo "rqbit main base $main_base is missing; use a full main checkout" >&2
+      exit 1
+    fi
+    if ! git -C "$source_dir" merge-base --is-ancestor "$main_base" "$source_head"; then
+      echo "expected rqbit v8.1.1 at $stable_base or a descendant of main base $main_base; found $source_head" >&2
+      exit 1
+    fi
+    readonly patch_file="contrib/rqbit/0006-bound-tracker-requests-main.patch"
+    readonly source_variant="main"
+    ;;
+esac
+
+echo "verifying rqbit $source_variant tracker-request-budget patch against $source_head"
+
+readonly work_dir="$(mktemp -d "${TMPDIR:-/tmp}/nzbd-rqbit-tracker-budget.XXXXXX")"
+trap 'rm -rf -- "$work_dir"' EXIT
+
+git clone --quiet --no-hardlinks "$source_dir" "$work_dir/rqbit"
+if git -C "$work_dir/rqbit" apply --check "$repository_root/$patch_file"; then
+  git -C "$work_dir/rqbit" apply "$repository_root/$patch_file"
+elif [[ "$source_variant" == "main" ]]; then
+  echo "direct apply drifted; attempting a three-way apply against $source_head" >&2
+  git -C "$work_dir/rqbit" apply --3way "$repository_root/$patch_file"
+else
+  echo "stable v8.1.1 patch no longer applies to its pinned base" >&2
+  exit 1
+fi
+
+readonly tracker_source="$work_dir/rqbit/crates/tracker_comms/src/tracker_comms.rs"
+for invariant in \
+  'HTTP_TRACKER_REQUEST_TIMEOUT: Duration = Duration::from_secs(30)' \
+  'MAX_HTTP_TRACKER_RESPONSE_BYTES: usize = 1024 \* 1024' \
+  'MIN_TRACKER_ANNOUNCE_INTERVAL: Duration = Duration::from_secs(60)' \
+  'http_tracker_response_is_bounded_and_timed' \
+  'hostile_tracker_intervals_are_clamped'
+do
+  if ! grep -q "$invariant" "$tracker_source"; then
+    echo "tracker request-budget patch is missing invariant: $invariant" >&2
+    exit 1
+  fi
+done
+
+(
+  cd "$work_dir/rqbit"
+  cargo fmt --all -- --check
+  readonly exact_tests=(
+    'tracker_comms::tests::http_tracker_response_is_bounded_and_timed'
+    'tracker_comms::tests::hostile_tracker_intervals_are_clamped'
+  )
+  if [[ "$source_variant" == "stable" ]]; then
+    test_list="$(cargo test -p librqbit-tracker-comms --lib \
+      --no-default-features --features sha1-ring -- --list)"
+  else
+    test_list="$(cargo test -p librqbit-tracker-comms --lib -- --list)"
+  fi
+  readonly test_list
+  for exact_test in "${exact_tests[@]}"; do
+    if ! grep -Fxq "$exact_test: test" <<<"$test_list"; then
+      echo "tracker request-budget proof test was not discovered: $exact_test" >&2
+      exit 1
+    fi
+    if [[ "$source_variant" == "stable" ]]; then
+      cargo test -p librqbit-tracker-comms --lib "$exact_test" \
+        --no-default-features --features sha1-ring -- --exact --nocapture
+    else
+      cargo test -p librqbit-tracker-comms --lib "$exact_test" -- --exact --nocapture
+    fi
+  done
+)

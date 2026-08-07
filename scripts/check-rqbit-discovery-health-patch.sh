@@ -61,12 +61,74 @@ fi
 (
   cd "$work_dir/rqbit"
   cargo fmt --all -- --check
-  cargo test -p librqbit --lib --no-default-features --features rust-tls
+
+  readonly librqbit_tests=(
+    'discovery_health::tests::tracker_endpoints_are_redacted_in_public_snapshot'
+    'discovery_health::tests::private_torrent_reports_dht_suppression'
+    'session::tests::public_discovery_health_is_redacted'
+  )
+  readonly dht_tests=(
+    'dht::health_tests::request_peers_health_tracks_current_run'
+  )
   if [[ "$source_variant" == "stable" ]]; then
-    cargo test -p librqbit-dht --lib --no-default-features --features sha1-ring
-    cargo test -p librqbit-tracker-comms --lib --no-default-features --features sha1-ring
+    tracker_tests=(
+      'tracker_comms::health_tests::http_failure_is_classified_without_exposing_tracker_secrets'
+      'tracker_health::tests::tracker_health_redacts_endpoint_and_retains_safe_failure'
+      'tracker_health::tests::unsupported_tracker_remains_rejected_when_other_monitors_stop'
+    )
   else
-    cargo test -p librqbit-dht --lib
-    cargo test -p librqbit-tracker-comms --lib
+    tracker_tests=(
+      'tracker_comms::health_tests::http_failure_is_classified_without_exposing_tracker_secrets'
+      'tracker_comms::health_tests::tracker_health_redacts_endpoint_and_retains_safe_failure'
+      'tracker_comms::health_tests::unsupported_tracker_remains_rejected_when_other_monitors_stop'
+      'tracker_comms::health_tests::safe_endpoint_formats_ipv6_without_path_or_query'
+    )
   fi
+  readonly tracker_tests
+
+  librqbit_list="$(cargo test -p librqbit --lib \
+    --no-default-features --features rust-tls -- --list)"
+  if [[ "$source_variant" == "stable" ]]; then
+    dht_list="$(cargo test -p librqbit-dht --lib \
+      --no-default-features --features sha1-ring -- --list)"
+    tracker_list="$(cargo test -p librqbit-tracker-comms --lib \
+      --no-default-features --features sha1-ring -- --list)"
+  else
+    dht_list="$(cargo test -p librqbit-dht --lib -- --list)"
+    tracker_list="$(cargo test -p librqbit-tracker-comms --lib -- --list)"
+  fi
+  readonly librqbit_list dht_list tracker_list
+
+  for exact_test in "${librqbit_tests[@]}"; do
+    if ! grep -Fxq "$exact_test: test" <<<"$librqbit_list"; then
+      echo "librqbit discovery-health proof test was not discovered: $exact_test" >&2
+      exit 1
+    fi
+    cargo test -p librqbit --lib "$exact_test" \
+      --no-default-features --features rust-tls -- --exact --nocapture
+  done
+  for exact_test in "${dht_tests[@]}"; do
+    if ! grep -Fxq "$exact_test: test" <<<"$dht_list"; then
+      echo "DHT discovery-health proof test was not discovered: $exact_test" >&2
+      exit 1
+    fi
+    if [[ "$source_variant" == "stable" ]]; then
+      cargo test -p librqbit-dht --lib "$exact_test" \
+        --no-default-features --features sha1-ring -- --exact --nocapture
+    else
+      cargo test -p librqbit-dht --lib "$exact_test" -- --exact --nocapture
+    fi
+  done
+  for exact_test in "${tracker_tests[@]}"; do
+    if ! grep -Fxq "$exact_test: test" <<<"$tracker_list"; then
+      echo "tracker discovery-health proof test was not discovered: $exact_test" >&2
+      exit 1
+    fi
+    if [[ "$source_variant" == "stable" ]]; then
+      cargo test -p librqbit-tracker-comms --lib "$exact_test" \
+        --no-default-features --features sha1-ring -- --exact --nocapture
+    else
+      cargo test -p librqbit-tracker-comms --lib "$exact_test" -- --exact --nocapture
+    fi
+  done
 )

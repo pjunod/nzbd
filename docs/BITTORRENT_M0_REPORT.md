@@ -19,6 +19,13 @@ The implementation therefore stops at the isolated `nzbd-torrent` boundary
 and queue schema-version groundwork. No config switch, API, daemon dependency,
 peer listener, or production torrent admission path has been added.
 
+A later hostile-input review found a third stable-engine prerequisite outside
+the two failed ownership/observability gates: magnet metadata is allocated up
+to rqbit's fixed 32 MiB ceiling before nzbd can apply its proposed 10 MiB
+default. Section 3.5 records the upstream candidate that moves a caller's
+limit ahead of that allocation. This does not change gates 7 or 8 and does not
+authorize production wiring.
+
 ---
 
 ## 1. Result against the eleven gates
@@ -33,7 +40,7 @@ peer listener, or production torrent admission path has been added.
 | 6. Path and delete safety | **Pass** | The adapter now repeats the portable lexical path invariant before rqbit admission: unnamed payloads, empty/dot/parent components, slash or backslash, absolute/UNC forms, Windows drive prefixes and device aliases, alternate-data-stream and other reserved characters, trailing dot/space aliases, malformed UTF-8, empty multi-file paths, missing/unsafe multi-file roots, metainfo-declared symlinks, exact duplicate paths, file-versus-directory-prefix overlaps, and portable Unicode NFC/simple-case-fold collisions fail with safe nzbd-owned errors. Greek sigma, long-s, and Windows dotless-i aliases are covered without collapsing compatibility-only ligature or width pairs. rqbit's shared `torrent-content` fallback is therefore never used for an unnamed single-file torrent. Magnet input first resolves through rqbit's list-only path, which returns before storage construction; nzbd then applies the same metainfo contract and admits only the validated bytes. A fake BEP 9 peer proves an unsafe resolved path leaves the destination empty, and the real-admission corpus still proves rejection before an escape file exists. The session canonicalizes its output root and preflights every existing payload prefix with no-follow metadata: symlinks fail, prefixes must be directories, and leaves must be regular files while an existing regular leaf remains valid resume input. A Unix test proves a symlink is rejected before storage and its external target remains empty. This is defense in depth, not a claim to close the check/write race. The importer-safe content inventory omits BEP 47 padding entries while raw engine-indexed progress remains available only as diagnostics. Delete-data removes only parsed torrent content; an unrelated sibling survives. Higher layers must still prove persisted delete-root authority, descriptor-relative containment across writes, and empirical filesystem-specific case/normalization behavior in M5/M2. |
 | 7. Public observability | **Fail** | Public stats expose phase, total/progress/upload bytes, file progress, rates, ETA inputs, peer counts, completion, and error. Stable 8.1.1 does not expose per-torrent tracker state, DHT state, or last tracker error. A tested upstream patch now supplies that snapshot, but this gate remains failed until an accepted stable release contains it. “No peers” cannot safely substitute for those facts. |
 | 8. nzbd-authoritative persistence | **Fail** | The contract test proves that `Session::new_with_opts` auto-restores the library record before returning. The persistence module and store injection point are private in 8.1.1, so nzbd cannot filter first. A tested upstream patch now supplies the missing opt-out, but this gate remains failed until an accepted stable release contains it. |
-| 9. Resource, package, and license delta | **Partial** | Measurements are recorded in §4. A blocking cargo-deny 0.20.2 policy passes locally across all features and the locked graph, and its [first Actions run passed](https://github.com/pjunod/nzbd/actions/runs/31064446916) on 2026-08-06 UTC. The repository-wide Supply chain check also freezes the reviewed advisory package/feature sets and sole MPL-2.0 package path without pinning nzbd's own version. Stable 8.1.1 also hard-codes 128 live peers per torrent and exposes no session-wide cap, so the proposed 80/400 runtime budgets are not yet enforceable; the 80-peer adapter guard applies only to explicit bootstrap input. The [gate 9 review brief](BITTORRENT_GATE9_REVIEW.md) isolates the remaining human acceptance and resource-control decisions. |
+| 9. Resource, package, and license delta | **Partial** | Measurements are recorded in §4. A blocking cargo-deny 0.20.2 policy passes locally across all features and the locked graph, and its [first Actions run passed](https://github.com/pjunod/nzbd/actions/runs/31064446916) on 2026-08-06 UTC. The repository-wide Supply chain check also freezes the reviewed advisory package/feature sets and sole MPL-2.0 package path without pinning nzbd's own version. Stable 8.1.1 hard-codes 128 live peers per torrent, exposes no session-wide cap, retains an unbounded known-peer set, and leaves the pre-routing incoming-handshake set unbounded; its HTTP tracker path also has no request deadline, buffers the whole response, and accepts a zero announce interval. Tested contribution candidates now prove each runtime boundary, but they are not shipped capability. The adapter's input caps cannot close those gaps. The [gate 9 review brief](BITTORRENT_GATE9_REVIEW.md) isolates the remaining human acceptance and resource-control decisions. |
 | 10. One explicit rustls provider | **Pass** | The process starts without a provider, explicitly installs aws-lc, and constructs librqbit’s rustls client without the mixed-provider panic. |
 | 11. v1-only boundary | **Pass** | Stable input uses v1 pieces/`btih`; v2-only and hybrid `.torrent` files and magnets return separate named errors before managed-torrent admission. Magnet classification reads decoded `xt` query parameters rather than searching the whole URI, so version-looking text in a display name or tracker URL cannot create a false v2/hybrid result. The adapter accepts one valid 40-hex or 32-base32 `btih`, rejects missing, malformed, or duplicate v1 topics by name, and rechecks the resolved info dictionary before storage exists. |
 
@@ -202,8 +209,51 @@ and resolved bootstrap vector handed to rqbit; tracker, PEX, and DHT discovery
 can still fill the engine's 128 live slots. The pinned rqbit-main snapshot
 `4e5f94cbcf1d57ec500885c77cf1e24d70232d89` exposes a per-torrent
 `peer_limit`, but still no session-total limit. Production integration must use
-an accepted stable per-torrent API and add an nzbd-owned shared-session budget
-before advertising the 80/400 configuration contract.
+an accepted stable per-torrent API and shared-session budget before advertising
+the 80/400 configuration contract. The contribution kit now carries matching
+stable and main candidates: every outgoing or routed incoming peer holds one
+per-torrent permit and, when configured, one session-shared permit until its
+manager exits. Exact-boundary tests prove two torrents share one aggregate
+ceiling. That patch is review evidence, not a stable engine capability, so it
+does not change gate 9 or authorize production networking.
+
+Neither stable 8.1.1 nor the pinned main snapshot bounds retained peer records.
+Every unique tracker, DHT, PEX, explicit, or incoming address enters a map and
+unbounded peer-adder channel before a live permit is acquired; queued,
+backoff, dead, and not-needed records do not count against the 80/400 manager
+limits. The contribution kit now carries stable and main candidates with
+caller-selected per-torrent and shared-session record permits. The permits
+live inside each map record, failed shared acquisition returns the local slot,
+incoming-only records are removed when their manager exits, and
+alternate-address reconnects carry the retained record handle and transition
+to queued before enqueue. Exact-limit and one-entry retry tests pass on both
+source lines. On exact stable 8.1.1, `Peer` measured 296
+bytes on macOS arm64; 4,096 raw structs are 1,212,416 bytes (1.16 MiB) before
+map, allocator, and live-bitfield overhead. The proposed 1,024/4,096 limits
+remain preliminary reviewer policy, and the patch remains unreleased evidence.
+
+Stable 8.1.1's TCP listener accepts every socket into an unbounded set of
+pending handshake checks before it can route a connection to a torrent or
+acquire either live-peer permit. Each incomplete check can retain its socket,
+buffers, and task for the 10-second read timeout, so a fixed timeout does not
+bound concurrent pre-routing work. Current rqbit main now exposes a
+per-listener `max_pending_incoming_handshake_checks` option with a default of
+256. The contribution kit carries an exact stable-only 256-check backport and
+tests its 255/256 boundary; its verifier checks main's native equivalent
+without applying a redundant patch. The preliminary value and TCP-only scope
+still need human acceptance and an accepted stable release. This evidence does
+not change gate 9 or authorize a production listener.
+
+Stable 8.1.1 and the pinned rqbit-main snapshot also share three tracker-side
+resource gaps. HTTP announces have no tracker-owned deadline, call
+`Response::bytes()` without a body limit, and accept a tracker-provided zero
+announce interval; UDP is clamped only to five seconds. The adapter now limits
+one source to 64 tracker URLs, but input fan-out is not a per-request memory,
+lifetime, or request-rate budget. The contribution kit carries tested stable
+and main candidates that stream at most 1 MiB within 30 seconds and clamp
+unforced HTTP/UDP intervals to at least 60 seconds. Those patches are review
+evidence, not a stable engine capability, so gate 9 remains Partial and
+production wiring remains disabled.
 
 ### 2.3 Queue schema version fallback
 
@@ -376,10 +426,34 @@ with six upstream integration tests ignored.
 uses the same exact-stable and descendant-of-main rules as the restore
 verifier, reports the tested SHA, allows a three-way fallback only for main,
 checks formatting, and runs all three affected crate suites. The dedicated
-workflow tests both contributions against stable and main on relevant changes
-and weekly for upstream drift. This is contribution evidence only: nzbd still
-pins unmodified stable 8.1.1, gate 7 remains failed, and production wiring
-remains prohibited.
+workflow tests all contribution candidates against stable and main on
+relevant changes and weekly for upstream drift. This is contribution evidence
+only: nzbd still pins unmodified stable 8.1.1, gate 7 remains failed, and
+production wiring remains prohibited.
+
+### 3.5 The peer-metadata allocation ceiling is ready, not released
+
+Stable rqbit rejects BEP 9 metadata above 32 MiB, but the ceiling is hardcoded
+inside its peer metadata reader. An embedding application can reject resolved
+metainfo afterward, but that is too late to enforce nzbd's proposed 10 MiB
+hostile-input allocation limit for magnets.
+
+[`contrib/rqbit/0005-limit-peer-metadata-before-allocation.patch`](../contrib/rqbit/0005-limit-peer-metadata-before-allocation.patch)
+targets the exact v8.1.1 commit, and `0006` carries the same change for the
+documented rqbit-main base. They add an optional
+`PeerConnectionOptions::max_metadata_size`, merge it through the existing
+session/per-add peer-option path, retain 32 MiB when it is unset, and reject
+an oversized extended handshake before allocating a buffer or sending
+metadata requests. The focused test accepts the exact configured boundary and
+rejects one byte above it.
+
+[`scripts/check-rqbit-metadata-size-limit-patch.sh`](../scripts/check-rqbit-metadata-size-limit-patch.sh)
+applies the matching patch to a clean stable or main tree, checks formatting,
+and runs that test. The contribution workflow exercises both variants on
+relevant changes and weekly for upstream drift. This is a tested contribution
+artifact awaiting human review, not a production dependency: nzbd still pins
+unmodified 8.1.1 and must not admit magnets until an accepted stable release
+exposes an equivalent pre-allocation limit.
 
 ---
 
@@ -470,14 +544,15 @@ Preferred path:
    the public surface before nzbd treats the patch as an integration plan;
 2. review and submit the prepared authoritative-restore patch and the agreed
    discovery-health implementation upstream;
-3. reconcile both changes with upstream feedback without weakening nzbd's
+3. review and submit the independent peer-metadata allocation ceiling;
+4. reconcile all changes with upstream feedback without weakening nzbd's
    ownership, privacy, or observability contracts;
-4. pin the first stable release containing both accepted APIs;
-5. rerun all eleven M0 gates on native macOS, Linux glibc/musl, and Windows;
-6. run the packet-capture private-mode test and obtain reviewer acceptance of
+5. pin the first stable release containing the accepted contracts;
+6. rerun all eleven M0 gates on native macOS, Linux glibc/musl, and Windows;
+7. run the packet-capture private-mode test and obtain reviewer acceptance of
    the resource, package, license, and advisory dispositions isolated in the
    [gate 9 review brief](BITTORRENT_GATE9_REVIEW.md); and
-7. only then resume M2 daemon integration.
+8. only then resume M2 daemon integration.
 
 The human-review checklist, submission order, issue draft, PR draft, exact
 patch mapping, and reproduction commands are collected in the
@@ -485,11 +560,13 @@ patch mapping, and reproduction commands are collected in the
 kit has been posted upstream, and rqbit's AI policy requires human review and
 editing before it is.
 
-The two upstream changes may be designed, reviewed, and released separately,
-but they are not separate production gates. Starting M2 with authoritative
-restore alone would leave gate 7 failed and make tracker or DHT failure
-indistinguishable from an ordinary lack of peers. That degraded view is not an
-accepted shortcut around the observability contract.
+The two gate APIs and the metadata allocation ceiling may be designed,
+reviewed, and released separately, but they are not separate permission to
+start production wiring. Starting M2 with authoritative restore alone would
+leave gate 7 failed and make tracker or DHT failure indistinguishable from an
+ordinary lack of peers. Shipping the two gate APIs without a pre-allocation
+magnet ceiling would still violate the hostile-input contract. Neither is an
+accepted shortcut.
 
 Two alternatives require an explicit ADR-19 amendment:
 
@@ -526,6 +603,11 @@ scripts/check-private-discovery-leaks.sh
 # Against a clean local checkout of rqbit v8.1.1 or main at the documented SHA.
 scripts/check-rqbit-authoritative-restore-patch.sh /path/to/rqbit
 scripts/check-rqbit-discovery-health-patch.sh /path/to/rqbit
+scripts/check-rqbit-tracker-request-budget-patch.sh /path/to/rqbit
+scripts/check-rqbit-session-peer-budget-patch.sh /path/to/rqbit
+scripts/check-rqbit-pending-handshake-budget.sh /path/to/rqbit
+scripts/check-rqbit-known-peer-budget-patch.sh /path/to/rqbit
+scripts/check-rqbit-metadata-size-limit-patch.sh /path/to/rqbit
 ```
 
 The Rust 1.85 check must select both the 1.85 Cargo and `rustc`; this host also
