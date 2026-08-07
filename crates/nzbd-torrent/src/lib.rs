@@ -48,6 +48,8 @@ pub enum TorrentError {
     UnsupportedV2Magnet,
     #[error("hybrid BitTorrent v1/v2 magnets are not supported in the first release")]
     UnsupportedHybridMagnet,
+    #[error("invalid BitTorrent magnet URI: {0}")]
+    InvalidMagnet(&'static str),
     #[error("BitTorrent v2-only metainfo is not supported by librqbit 8.1.1")]
     UnsupportedV2Metainfo,
     #[error("hybrid BitTorrent v1/v2 metainfo is not supported in the first release")]
@@ -241,16 +243,7 @@ impl TorrentSession {
         magnet: String,
         config: TorrentAddConfig,
     ) -> Result<TorrentHandle, TorrentError> {
-        validate_magnet_size(magnet.len())?;
-        let lower = magnet.to_ascii_lowercase();
-        let has_v1 = lower.contains("urn:btih:");
-        let has_v2 = lower.contains("urn:btmh:");
-        match (has_v1, has_v2) {
-            (true, true) => return Err(TorrentError::UnsupportedHybridMagnet),
-            (false, true) => return Err(TorrentError::UnsupportedV2Magnet),
-            _ => {}
-        }
-        validate_magnet_proxy_contract(&magnet, self.proxy_enabled)?;
+        validate_magnet_contract(&magnet, self.proxy_enabled)?;
         self.add(AddTorrent::from_url(magnet), config).await
     }
 
@@ -651,17 +644,74 @@ impl<'a> MetainfoVersionScanner<'a> {
     }
 }
 
-fn validate_magnet_proxy_contract(magnet: &str, proxy_enabled: bool) -> Result<(), TorrentError> {
-    if !proxy_enabled {
-        return Ok(());
+fn validate_magnet_contract(magnet: &str, proxy_enabled: bool) -> Result<(), TorrentError> {
+    validate_magnet_size(magnet.len())?;
+    let url = url::Url::parse(magnet)
+        .map_err(|_| TorrentError::InvalidMagnet("URI syntax is not valid"))?;
+    if !url.scheme().eq_ignore_ascii_case("magnet") || url.has_host() || !url.path().is_empty() {
+        return Err(TorrentError::InvalidMagnet(
+            "expected a magnet URI without an authority or path",
+        ));
     }
-    let url = url::Url::parse(magnet).map_err(engine_error)?;
-    if url.query_pairs().any(|(key, tracker)| {
-        key.eq_ignore_ascii_case("tr") && tracker_uses_udp(tracker.as_bytes())
-    }) {
+
+    let mut v1_topics = 0usize;
+    let mut has_v2 = false;
+    for (key, topic) in url.query_pairs() {
+        if !key.eq_ignore_ascii_case("xt") {
+            continue;
+        }
+        if let Some(hash) = strip_ascii_case_prefix(&topic, "urn:btih:") {
+            if !valid_btih(hash.as_bytes()) {
+                return Err(TorrentError::InvalidMagnet(
+                    "btih must be 40 hexadecimal or 32 base32 characters",
+                ));
+            }
+            v1_topics = v1_topics.saturating_add(1);
+        } else if strip_ascii_case_prefix(&topic, "urn:btmh:").is_some() {
+            has_v2 = true;
+        }
+    }
+
+    if v1_topics > 0 && has_v2 {
+        return Err(TorrentError::UnsupportedHybridMagnet);
+    }
+    if v1_topics == 0 && has_v2 {
+        return Err(TorrentError::UnsupportedV2Magnet);
+    }
+    if v1_topics == 0 {
+        return Err(TorrentError::InvalidMagnet(
+            "a v1 xt=urn:btih topic is required",
+        ));
+    }
+    if v1_topics > 1 {
+        return Err(TorrentError::InvalidMagnet(
+            "multiple v1 exact-topic values are ambiguous",
+        ));
+    }
+
+    if proxy_enabled
+        && url.query_pairs().any(|(key, tracker)| {
+            key.eq_ignore_ascii_case("tr") && tracker_uses_udp(tracker.as_bytes())
+        })
+    {
         return Err(TorrentError::ProxyWithUdpTracker);
     }
     Ok(())
+}
+
+fn strip_ascii_case_prefix<'a>(value: &'a str, prefix: &str) -> Option<&'a str> {
+    value
+        .get(..prefix.len())
+        .filter(|candidate| candidate.eq_ignore_ascii_case(prefix))
+        .map(|_| &value[prefix.len()..])
+}
+
+fn valid_btih(hash: &[u8]) -> bool {
+    (hash.len() == 40 && hash.iter().all(u8::is_ascii_hexdigit))
+        || (hash.len() == 32
+            && hash
+                .iter()
+                .all(|byte| byte.is_ascii_alphabetic() || matches!(byte, b'2'..=b'7')))
 }
 
 fn tracker_uses_udp(tracker: &[u8]) -> bool {

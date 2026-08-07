@@ -346,3 +346,54 @@ fn path_inventory_limits_fail_at_the_first_excess_byte_or_file() {
         Err(TorrentError::PathMetadataTooLarge { .. })
     ));
 }
+
+#[test]
+fn magnet_preflight_reads_exact_topics_instead_of_substrings() {
+    let hex = "00".repeat(20);
+    let base32 = "A".repeat(32);
+    assert!(validate_magnet_contract(&format!("magnet:?xt=urn:btih:{hex}"), false).is_ok());
+    assert!(validate_magnet_contract(&format!("MAGNET:?XT=URN:BTIH:{base32}"), false).is_ok());
+
+    let marker_in_display = format!("magnet:?xt=urn:btih:{hex}&dn=urn%3Abtmh%3Anot-a-topic");
+    assert!(validate_magnet_contract(&marker_in_display, false).is_ok());
+    let marker_in_tracker = format!(
+        "magnet:?xt=urn:btih:{hex}&tr=https%3A%2F%2Ftracker.example%2Furn%3Abtmh%3Aignored"
+    );
+    assert!(validate_magnet_contract(&marker_in_tracker, false).is_ok());
+}
+
+#[test]
+fn magnet_preflight_names_format_version_and_proxy_failures() {
+    let hex = "00".repeat(20);
+    let v2 = format!("urn:btmh:1220{}", "00".repeat(32));
+    assert!(matches!(
+        validate_magnet_contract(&format!("magnet:?xt={v2}"), false),
+        Err(TorrentError::UnsupportedV2Magnet)
+    ));
+    assert!(matches!(
+        validate_magnet_contract(&format!("magnet:?xt=urn:btih:{hex}&xt={v2}"), false),
+        Err(TorrentError::UnsupportedHybridMagnet)
+    ));
+
+    for magnet in [
+        "https://example.test/file.torrent".to_owned(),
+        "magnet:?dn=missing-topic".to_owned(),
+        "magnet:?xt=urn:btih:short".to_owned(),
+        format!("magnet:?xt=urn:btih:{}", "Z".repeat(40)),
+        format!("magnet:?xt=urn:btih:{hex}&xt=urn:btih:{hex}"),
+    ] {
+        assert!(
+            matches!(
+                validate_magnet_contract(&magnet, false),
+                Err(TorrentError::InvalidMagnet(_))
+            ),
+            "invalid magnet was accepted: {magnet}"
+        );
+    }
+
+    let udp = format!("magnet:?xt=urn:btih:{hex}&tr=udp%3A%2F%2F127.0.0.1%3A1%2Fannounce");
+    assert!(matches!(
+        validate_magnet_contract(&udp, true),
+        Err(TorrentError::ProxyWithUdpTracker)
+    ));
+}

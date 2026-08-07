@@ -1776,6 +1776,10 @@ becomes reachable.
 - Source parsing: v1 magnet forms, base32/hex `btih`, duplicate parameters,
   oversize input, missing hash, and named v2-only/hybrid rejection for both
   magnets and metainfo.
+- Magnet preflight: only decoded `xt` parameters determine the info-hash
+  version. One valid 40-hex or 32-base32 `btih` is required; duplicate v1,
+  malformed v1, v2-only, and hybrid topics fail by stable name. Version-looking
+  text in display names and tracker URLs is an explicit negative fixture.
 - Path validation: every platform prefix/separator, traversal, normalization,
   symlinks, case collisions, padding files, exact-root delete proof.
 - Adapter path preflight: the portable metadata-only subset and declared

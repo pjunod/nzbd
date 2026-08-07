@@ -35,7 +35,7 @@ peer listener, or production torrent admission path has been added.
 | 8. nzbd-authoritative persistence | **Fail** | The contract test proves that `Session::new_with_opts` auto-restores the library record before returning. The persistence module and store injection point are private in 8.1.1, so nzbd cannot filter first. A tested upstream patch now supplies the missing opt-out, but this gate remains failed until an accepted stable release contains it. |
 | 9. Resource, package, and license delta | **Partial** | Measurements are recorded in §4. A blocking cargo-deny 0.20.2 policy passes locally across all features and the locked graph, and its [first Actions run passed](https://github.com/pjunod/nzbd/actions/runs/31064446916) on 2026-08-06 UTC. The repository-wide Supply chain check also freezes the reviewed advisory package/feature sets and sole MPL-2.0 package path without pinning nzbd's own version. The [gate 9 review brief](BITTORRENT_GATE9_REVIEW.md) isolates the remaining human acceptance decision. |
 | 10. One explicit rustls provider | **Pass** | The process starts without a provider, explicitly installs aws-lc, and constructs librqbit’s rustls client without the mixed-provider panic. |
-| 11. v1-only boundary | **Pass** | Stable input uses v1 pieces/`btih`; v2-only and hybrid `.torrent` files and magnets return separate named errors before librqbit admission. |
+| 11. v1-only boundary | **Pass** | Stable input uses v1 pieces/`btih`; v2-only and hybrid `.torrent` files and magnets return separate named errors before librqbit admission. Magnet classification now reads decoded `xt` query parameters rather than searching the whole URI, so version-looking text in a display name or tracker URL cannot create a false v2/hybrid result. The adapter accepts one valid 40-hex or 32-base32 `btih` and rejects missing, malformed, or duplicate v1 topics by name. |
 
 Gates 7 and 8 are stop conditions in §4.3 of the proposal. This is an M0
 **no-go**, even though the data-path tests are healthy.
@@ -103,6 +103,8 @@ The isolated suite covers:
   trailing-byte, and framed-marker invariants;
 - the explicit aws-lc provider invariant;
 - v2-only and hybrid named rejection for metainfo and magnets; and
+- query-aware magnet validation for hex/base32 `btih`, duplicate/missing exact
+  topics, and false version markers outside `xt`;
 - the persistence auto-restore behavior that fails gate 8.
 
 All peers, trackers, proxies, and DHT responders in the suite are local and
