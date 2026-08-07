@@ -1274,6 +1274,13 @@ source_redirects = 5
 - fixed metainfo and redirect limits: torrent sources are hostile input and
   an authenticated caller still should not make the daemon allocate without
   bound.
+- the `max_peers_per_torrent = 80` and `max_peers_total = 400` values are
+  accepted runtime budgets, not descriptions of stable 8.1.1. That release
+  hard-codes 128 live peers per torrent and exposes no session-wide cap. The
+  dormant adapter's 80-peer guard bounds explicit bootstrap input only;
+  tracker/PEX/DHT discovery can still fill the engine limit. Current rqbit main
+  has a per-torrent `peer_limit`, but production still needs that API in an
+  accepted stable release plus an nzbd-owned shared-session budget.
 - proxy credentials are split fields: `socks_proxy_url` must contain no URL
   userinfo, `socks_proxy_username` is ordinary config, and
   `socks_proxy_password` uses the existing whole-field secret-mask and restore
@@ -1344,11 +1351,14 @@ daemon integration: 10 MiB raw metainfo, 16 KiB magnet URIs, 100,000 files,
 255 encoded bytes per component, 4 KiB per projected relative payload path,
 16 MiB across projected paths, and 2 KiB for every rqbit operation or live-stat
 error that crosses the adapter. It also deduplicates explicit peers in caller
-order, caps them at the proposed per-torrent peer limit, and rejects port zero,
-non-unicast, and IPv6 endpoints before rqbit sees them. Projected paths include the multi-file root and
-platform separator bytes, so the accounting bounds the paths later passed to
-storage rather than only the raw bencode component payloads. Exact-limit tests
-pass and the first excess byte or file returns a stable named error. Error
+order, caps that bootstrap vector at 80, and rejects port zero, non-unicast,
+and IPv6 endpoints before rqbit sees them. This is not the proposed runtime
+peer cap: stable 8.1.1 can still discover and connect up to its hard-coded 128
+live peers per torrent and has no session-total budget. Projected paths include
+the multi-file root and platform separator bytes, so the accounting bounds the
+paths later passed to storage rather than only the raw bencode component
+payloads. Exact-limit tests pass and the first excess byte or file returns a
+stable named error. Error
 truncation is UTF-8 safe and ends with an explicit marker. The 1–100 MiB
 metainfo configuration range, redirects, and fetched-body streaming remain
 API/source-fetch work; no production input is wired by these constants.
@@ -2014,6 +2024,7 @@ data-loss change, not a feature toggle.
 | `librqbit` lacks a required control or platform | Feature cannot meet nzbd’s contract | M0 gates before production architecture; `libtorrent` is the named fallback. |
 | Stable library lacks BEP 52 | Some modern torrents reject | Honest v1 scope and named rejection; revisit on proven stable support. |
 | Stable library is TCP/IPv4 and private torrents use one tracker | Some peers/networks and tracker failover are unavailable | Publish the exact v1 matrix, verify primary-tracker private downloads, revisit only on a stable 9.x gate. |
+| Stable library cannot enforce the proposed 80/400 live-peer budgets | Tracker/PEX/DHT discovery can exceed configured resource expectations | Do not confuse the 80-entry bootstrap guard with a runtime cap; require an accepted stable per-torrent limit and an nzbd-owned shared-session budget before M2. |
 | Private tracker rejects or bans an unapproved rqbit client | Grab fails or tracker account is penalized | No qBittorrent wire-identity claim; disclose whitelist requirements and gate each supported tracker policy before M4. |
 | Torrent PP corrupts seeds | Tracker hash failures and broken uploads | No torrent PP in v1; future reflink-or-copy derivative only. |
 | Passkeys leak in logs/UI | Tracker account compromise | Secret classification, boundary redaction, fixtures in every output path. |
