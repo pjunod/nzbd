@@ -41,6 +41,16 @@ fn metainfo(info: &[u8]) -> Vec<u8> {
     torrent
 }
 
+fn metainfo_with_announce(info: &[u8], announce: &[u8]) -> Vec<u8> {
+    let mut torrent = vec![b'd'];
+    bencode_bytes(&mut torrent, b"announce");
+    bencode_bytes(&mut torrent, announce);
+    bencode_bytes(&mut torrent, b"info");
+    torrent.extend_from_slice(info);
+    torrent.push(b'e');
+    torrent
+}
+
 fn v1_metainfo(name: &[u8]) -> Vec<u8> {
     metainfo(&single_file_info(name))
 }
@@ -551,6 +561,53 @@ fn magnet_preflight_names_format_version_and_proxy_failures() {
         validate_magnet_contract(&udp, true),
         Err(TorrentError::ProxyWithUdpTracker)
     ));
+}
+
+#[test]
+fn tracker_preflight_rejects_inputs_the_engine_would_silently_drop() {
+    for tracker in [
+        &b"not-a-url"[..],
+        &b"wss://tracker.example/announce"[..],
+        &b"udp://tracker.example/announce"[..],
+        &b"udp:/announce"[..],
+        &b"https://\xff/announce"[..],
+    ] {
+        let result = validate_metainfo_contract(
+            &metainfo_with_announce(&single_file_info(b"payload.bin"), tracker),
+            false,
+        );
+        assert!(
+            matches!(result, Err(TorrentError::InvalidTracker(_))),
+            "invalid tracker was accepted: {}",
+            String::from_utf8_lossy(tracker)
+        );
+    }
+
+    let hex = "00".repeat(20);
+    for tracker in [
+        "not-a-url",
+        "wss%3A%2F%2Ftracker.example%2Fannounce",
+        "udp%3A%2F%2Ftracker.example%2Fannounce",
+    ] {
+        assert!(matches!(
+            validate_magnet_contract(&format!("magnet:?xt=urn:btih:{hex}&tr={tracker}"), false),
+            Err(TorrentError::InvalidTracker(_))
+        ));
+    }
+    assert!(validate_magnet_contract(&format!("magnet:?xt=urn:btih:{hex}&tr="), false).is_ok());
+
+    for tracker in [
+        &b""[..],
+        &b"http://tracker.example/announce"[..],
+        &b"https://tracker.example/announce"[..],
+        &b"udp://tracker.example:6969/announce"[..],
+    ] {
+        assert!(validate_metainfo_contract(
+            &metainfo_with_announce(&single_file_info(b"payload.bin"), tracker),
+            false
+        )
+        .is_ok());
+    }
 }
 
 #[test]

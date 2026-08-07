@@ -1373,7 +1373,11 @@ tracker. The v1 adapter therefore accepts exactly one unique private tracker
 and returns a named `422 private_tracker_count` failure for metainfo with
 backup announce tiers. The qBittorrent shim projects that as an add failure;
 Sonarr/Radarr may retry another release, but nzbd does not rewrite or discard
-trackers silently.
+trackers silently. Stable rqbit also silently drops malformed, non-UTF-8, and
+unsupported tracker URLs. The adapter instead treats empty tracker slots as
+absent and validates every non-empty `.torrent` and magnet tracker before
+admission: HTTP and HTTPS require a host, UDP requires a host and explicit
+port, and every other scheme fails by name.
 
 Many private trackers whitelist client peer IDs or approved client families;
 rqbit is not assumed to be accepted. Before M4, the operator documentation and
@@ -1832,6 +1836,10 @@ becomes reachable.
   privacy-unknown magnet input is rejected before an explicit peer is
   contacted, and the paired DHT-disabled case proves a private magnet can
   still resolve through that explicit peer.
+- Tracker preflight: malformed/non-UTF-8 URLs, missing hosts, UDP without an
+  explicit port, and unsupported schemes fail by name for both metainfo and
+  magnets; HTTP, HTTPS, and explicit-port UDP remain accepted when proxy policy
+  permits them.
 - Path validation: every platform prefix/separator, traversal, normalization,
   symlinks, case collisions, padding files, exact-root delete proof.
 - Adapter path preflight: the portable metadata-only subset and declared

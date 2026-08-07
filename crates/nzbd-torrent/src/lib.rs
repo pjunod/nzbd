@@ -82,6 +82,8 @@ pub enum TorrentError {
         "private torrents must declare exactly one unique tracker in the first release (found {0})"
     )]
     PrivateTrackerCount(usize),
+    #[error("invalid BitTorrent tracker URL: {0}")]
+    InvalidTracker(&'static str),
     #[error("unsafe torrent metainfo path: {0}")]
     UnsafeMetainfoPath(&'static str),
     #[error("torrent metainfo is too large ({size} bytes; maximum {limit})")]
@@ -554,12 +556,10 @@ fn validate_metainfo_contract(bytes: &[u8], proxy_enabled: bool) -> Result<(), T
         librqbit::torrent_from_bytes::<librqbit::ByteBuf<'_>>(bytes).map_err(engine_error)?;
     validate_metainfo_geometry(&metainfo.info)?;
     validate_metainfo_paths(&metainfo.info)?;
-    if proxy_enabled
-        && metainfo
-            .iter_announce()
-            .any(|tracker| tracker_uses_udp(AsRef::<[u8]>::as_ref(tracker)))
-    {
-        return Err(TorrentError::ProxyWithUdpTracker);
+    for tracker in metainfo.iter_announce() {
+        if validate_tracker_url(AsRef::<[u8]>::as_ref(tracker))? && proxy_enabled {
+            return Err(TorrentError::ProxyWithUdpTracker);
+        }
     }
     if !metainfo.info.private {
         return Ok(());
@@ -1091,12 +1091,13 @@ fn validate_magnet_contract(magnet: &str, proxy_enabled: bool) -> Result<(), Tor
         ));
     }
 
-    if proxy_enabled
-        && url.query_pairs().any(|(key, tracker)| {
-            key.eq_ignore_ascii_case("tr") && tracker_uses_udp(tracker.as_bytes())
-        })
-    {
-        return Err(TorrentError::ProxyWithUdpTracker);
+    for (key, tracker) in url.query_pairs() {
+        if key.eq_ignore_ascii_case("tr")
+            && validate_tracker_url(tracker.as_bytes())?
+            && proxy_enabled
+        {
+            return Err(TorrentError::ProxyWithUdpTracker);
+        }
     }
     Ok(())
 }
@@ -1116,11 +1117,29 @@ fn valid_btih(hash: &[u8]) -> bool {
                 .all(|byte| byte.is_ascii_alphabetic() || matches!(byte, b'2'..=b'7')))
 }
 
-fn tracker_uses_udp(tracker: &[u8]) -> bool {
-    std::str::from_utf8(tracker)
-        .ok()
-        .and_then(|tracker| url::Url::parse(tracker).ok())
-        .is_some_and(|tracker| tracker.scheme().eq_ignore_ascii_case("udp"))
+fn validate_tracker_url(tracker: &[u8]) -> Result<bool, TorrentError> {
+    if tracker.is_empty() {
+        return Ok(false);
+    }
+    let tracker = std::str::from_utf8(tracker)
+        .map_err(|_| TorrentError::InvalidTracker("tracker URLs must contain valid UTF-8"))?;
+    let tracker = url::Url::parse(tracker)
+        .map_err(|_| TorrentError::InvalidTracker("tracker URL syntax is not valid"))?;
+    if tracker.host_str().is_none() {
+        return Err(TorrentError::InvalidTracker(
+            "tracker URLs must include a host",
+        ));
+    }
+    match tracker.scheme() {
+        "http" | "https" => Ok(false),
+        "udp" if tracker.port().is_some() => Ok(true),
+        "udp" => Err(TorrentError::InvalidTracker(
+            "UDP tracker URLs must include an explicit port",
+        )),
+        _ => Err(TorrentError::InvalidTracker(
+            "only HTTP, HTTPS, and UDP trackers are supported",
+        )),
+    }
 }
 
 #[derive(Clone)]
