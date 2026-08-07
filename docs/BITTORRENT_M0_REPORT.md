@@ -110,7 +110,8 @@ The isolated suite covers:
   endpoint to rqbit's retry/error path;
 - named rejection of privacy-unknown magnets in a DHT-enabled session before
   rqbit can contact even an explicitly supplied peer;
-- password redaction and invalid proxy combinations;
+- password redaction and invalid proxy combinations, including multi-token
+  authorization/cookie values and alternate assignment separators;
 - engine/stat error redaction and UTF-8-safe 2 KiB truncation with an explicit
   marker;
 - one-tracker private-torrent discovery and multi-tracker rejection;

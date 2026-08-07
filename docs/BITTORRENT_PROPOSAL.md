@@ -1436,8 +1436,9 @@ operation and is never embedded in a normal queue response.
 The dormant adapter already sanitizes rqbit operation errors and live
 `stats.error` values before returning them. It removes complete magnet URIs,
 URL userinfo/path/query data, recognized inline, colon-delimited, JSON-style,
-and whitespace-separated secret assignments, peer addresses, absolute paths,
-and control characters, then applies the 2 KiB display bound.
+whitespace-separated, and arrow-delimited secret assignments, multi-token
+authorization and cookie values, peer addresses, absolute paths, and control
+characters, then applies the 2 KiB display bound.
 The later source-fetch and daemon boundaries must keep applying the same
 invariant to their own errors rather than treating this adapter guard as a
 replacement.

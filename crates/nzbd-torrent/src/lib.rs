@@ -142,10 +142,10 @@ fn display_safe_error(message: &str) -> String {
             continue;
         }
         let redacted = if redact_next_secret_value {
-            if matches!(normalized.as_ref(), "=" | ":") {
+            if is_secret_assignment_separator(&normalized) {
                 Cow::Borrowed(normalized.as_ref())
             } else {
-                redact_next_secret_value = false;
+                redact_next_secret_value = secret_value_may_continue(&normalized);
                 Cow::Borrowed("<redacted>")
             }
         } else {
@@ -205,15 +205,46 @@ fn secret_value_follows(token: &str) -> bool {
         )
     };
     let token = token.trim_matches(wrapper);
-    let key = if let Some(key) = token.strip_suffix('=').or_else(|| token.strip_suffix(':')) {
-        key
-    } else if token.contains(['=', ':']) {
+    let (key, inline_value) =
+        if let Some(key) = token.strip_suffix('=').or_else(|| token.strip_suffix(':')) {
+            (key, None)
+        } else if let Some((key, value)) = token.split_once(['=', ':']) {
+            (key, Some(value))
+        } else {
+            (token, None)
+        };
+    let key = key.trim_matches(wrapper);
+    if key.is_empty() || !is_secret_key(key) {
         return false;
-    } else {
-        token
     }
-    .trim_matches(wrapper);
-    !key.is_empty() && is_secret_key(key)
+    inline_value.is_none_or(|value| {
+        let value = value.trim_matches(wrapper);
+        value.is_empty() || is_authorization_scheme(value) || value.ends_with([',', ';'])
+    })
+}
+
+fn is_secret_assignment_separator(token: &str) -> bool {
+    matches!(token, "=" | ":" | "=>" | ":=" | "->")
+}
+
+fn secret_value_may_continue(token: &str) -> bool {
+    let token = token.trim_matches(|character: char| {
+        matches!(character, '(' | ')' | '[' | ']' | '{' | '}' | '"' | '\'')
+    });
+    is_authorization_scheme(token.trim_end_matches([',', ';'])) || token.ends_with([',', ';'])
+}
+
+fn is_authorization_scheme(value: &str) -> bool {
+    [
+        "basic",
+        "bearer",
+        "digest",
+        "negotiate",
+        "token",
+        "aws4-hmac-sha256",
+    ]
+    .iter()
+    .any(|scheme| value.eq_ignore_ascii_case(scheme))
 }
 
 fn redact_error_value(value: &str) -> Cow<'_, str> {
@@ -1678,6 +1709,12 @@ mod tests {
             "socks_proxy_password=plain-secret ",
             "password: spaced-secret api_token = equals-secret ",
             "\"authorization\":\"json-secret\" cookie : cookie-secret ",
+            "authorization: Bearer bearer-secret visible-context ",
+            "proxy_authorization=Basic basic-secret visible-context ",
+            "password => arrow-secret visible-context ",
+            "secret := walrus-secret token -> pointer-secret visible-context ",
+            "authorization: Digest username=digest-user, response=digest-secret visible-context ",
+            "cookie: first-cookie=one; second-cookie=two visible-context ",
             "query=tracker.example/private-passkey?auth=query-secret ",
             "peers=[203.0.113.7:6881, /Users/alice/private/file]\nforbidden"
         );
@@ -1692,6 +1729,15 @@ mod tests {
             "equals-secret",
             "json-secret",
             "cookie-secret",
+            "bearer-secret",
+            "basic-secret",
+            "arrow-secret",
+            "walrus-secret",
+            "pointer-secret",
+            "digest-user",
+            "digest-secret",
+            "first-cookie",
+            "second-cookie",
             "private-passkey",
             "query-secret",
             "203.0.113.7",
@@ -1700,6 +1746,7 @@ mod tests {
             assert!(!shown.contains(secret), "leaked {secret:?}: {shown}");
         }
         assert!(shown.contains("tracker.example"));
+        assert!(shown.contains("visible-context"));
         assert!(!shown.contains('\n'));
     }
 
