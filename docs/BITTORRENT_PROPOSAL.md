@@ -2,8 +2,8 @@
 
 **Status:** review incorporated; M0 no-go; M1b merged; M2 blocked ·
 **Decision:** ADR-19, production engine blocked; neutral queue seam authorized ·
-**Written:** 2026-08-05 · **Revised:** 2026-08-06 ·
-**Verified against:** `5dfebb9` ·
+**Written:** 2026-08-05 · **Revised:** 2026-08-07 ·
+**Verified against:** `d8d7ca4` ·
 **Scope:** architecture, contracts, milestones, and review questions; no
 production BitTorrent path is authorized before the gates below pass
 
@@ -96,7 +96,7 @@ client before it becomes a feature catalogue.
 | Completion | Add durable `ready` state; keep seeding jobs live | A torrent is importable before it is removable. |
 | Post-processing | Off for torrents in the first release | nzbd’s PP pipeline renames and deletes inputs, which would break seeding. |
 | Seeding default | Unlimited until the caller or operator sets a limit | Guessing a ratio can cause tracker penalties; silently deleting at a limit can race import. |
-| Port mapping | Disabled by default | UPnP changes the router and exposes an inbound service; explicit opt-in is the right boundary. |
+| Port mapping | Unavailable in the first release | Stable rqbit's UPnP helper carries advisory-affected XML code. A future explicit opt-in requires a patched dependency and a fresh security review because it mutates the router and exposes an inbound service. |
 | Authentication | Reuse `[api]` credentials and token | One process should not grow a second credential database for a compatibility route. |
 | Cluster | Single-node first; whole-torrent leases later | Two sessions writing one payload is not an acceptable approximation of distribution. |
 
@@ -1395,6 +1395,15 @@ whose prefix merely resembles the configured root. The existing job
   remains unavailable until the dependency is patched or replaced. The
   `time` exception is acceptable only while its vulnerable parsing feature is
   absent and Rust 1.85 remains the verified MSRV.
+- Run
+  [`check-bittorrent-advisory-scope.sh`](../scripts/check-bittorrent-advisory-scope.sh)
+  with the M0 dependency policy. It freezes the exact quick-xml, `time`, and
+  MPL-2.0 package paths plus the three permitted RustSec ignores; the adapter
+  separately tests that no input can enable rqbit UPnP.
+- Treat [the gate 9 review brief](BITTORRENT_GATE9_REVIEW.md) as the human
+  decision record. CI can prove the reviewed boundary has not changed, but it
+  cannot decide whether 9.61 MiB of binary growth, 8.39 MiB of idle RSS, or a
+  220-package closure is acceptable.
 - Subscribe to upstream releases and security notices, then test upgrades
   against the local swarm harness before changing the pin.
 - Fuzz the adapter's preflight parsing and path validation even if upstream
@@ -1911,7 +1920,7 @@ both review passes as follows:
 | Private trackers | Exactly one unique tracker only in 8.1.1; backup tiers fail visibly, and tracker client-whitelist compatibility must be disclosed and tested before M4. |
 | Readiness | Add authoritative snapshot fields, not a duplicate Usenet event; keep `job_pp_finished` unchanged and do not emit it for unprocessed torrents. |
 | Quota | Count verified torrent payload and successfully written decoded NNTP payload; do not count upload or NNTP protocol overhead. |
-| UPnP | Disabled by default; router mutation requires explicit opt-in. |
+| UPnP | Unavailable in the first release; a future opt-in requires a patched dependency and fresh security review. |
 | Cluster | Keep torrent+cluster as a startup error. M6 still requires separate approval after single-node evidence. |
 
 The review authorized groundwork and the M0 spike, not a production torrent
