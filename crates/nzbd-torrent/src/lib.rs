@@ -416,6 +416,10 @@ fn is_secret_key(key: &str) -> bool {
         .filter(char::is_ascii_alphanumeric)
         .flat_map(char::to_lowercase)
         .collect::<String>();
+    // Match conservative substrings intentionally: engine error fields are
+    // untrusted, and over-redacting an innocent key such as `design` is safer
+    // than leaking tracker passkeys through a novel compound field name.
+    // Do not narrow this to exact names without equivalent leak coverage.
     [
         "auth",
         "cookie",

@@ -1197,6 +1197,12 @@ break piece verification and seeding. If field data justifies a native-only
 mode, it needs an explicit storage-policy design and separate compatibility
 contract; it must not appear as a hidden platform default.
 
+Before M2 wires production admission, ADR-19 must explicitly decide whether
+an operator-visible native-paths opt-in exists. Until that decision is recorded
+with its restore and migration contract, Linux-only names such as `aux.c` and
+`Movie: The Sequel (2020).mkv` continue to fail closed on every platform; a
+runtime platform check or undocumented override is not an acceptable shortcut.
+
 ### 9.3 First release: no torrent post-processing
 
 On piece completion, the torrent engine’s hash verification *is* the transfer
