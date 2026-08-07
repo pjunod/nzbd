@@ -732,6 +732,27 @@ fn adapter_rejects_canonically_equivalent_unicode_path_collisions() {
 }
 
 #[test]
+fn adapter_rejects_file_directory_path_collisions_in_either_order() {
+    let file: &[&[u8]] = &[b"Disc"];
+    let child: &[&[u8]] = &[b"disc", b"track.bin"];
+    for paths in [&[file, child][..], &[child, file][..]] {
+        let collision = metainfo(&multi_file_info_many(b"Release", paths));
+        assert!(matches!(
+            validate_metainfo_contract(&collision, false),
+            Err(TorrentError::PathCollision)
+        ));
+    }
+
+    let sibling_one: &[&[u8]] = &[b"disc-one", b"track.bin"];
+    let sibling_two: &[&[u8]] = &[b"disc-two", b"track.bin"];
+    let distinct = metainfo(&multi_file_info_many(
+        b"release",
+        &[sibling_one, sibling_two],
+    ));
+    assert!(validate_metainfo_contract(&distinct, false).is_ok());
+}
+
+#[test]
 fn adapter_rejects_existing_payload_path_type_conflicts() {
     let single_root = tempfile::tempdir().unwrap();
     std::fs::create_dir(single_root.path().join("payload.bin")).unwrap();

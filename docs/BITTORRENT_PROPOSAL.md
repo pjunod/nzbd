@@ -1138,9 +1138,9 @@ Before starting a torrent, validate every metadata path:
 - no existing symlink may redirect a write outside that root, every existing
   intermediate payload component is a directory, and every existing leaf is
   a regular file;
-- exact, Unicode-NFC-equivalent, and lowercase collisions are rejected before
-  storage on every platform, conservatively covering common
-  normalization-insensitive and case-insensitive filesystems;
+- exact, Unicode-NFC-equivalent, lowercase, and file-versus-directory-prefix
+  collisions are rejected before storage on every platform, conservatively
+  covering common normalization-insensitive and case-insensitive filesystems;
 - total file count, total path bytes, and metainfo bytes stay under fixed
   limits from §10.3;
 - padding files are not exposed as user content or importer paths.
@@ -1151,7 +1151,8 @@ The dormant M0 adapter implements the metadata-only portion itself before
 rqbit admission: portable root/components, UTF-8, empty/dot/parent names,
 cross-platform separators, Windows drive/device names, reserved characters and
 trailing dot/space aliases, metainfo-declared symlinks, exact duplicate paths,
-and collisions under Unicode lowercase comparison. It also checks v1 piece
+file-versus-directory-prefix overlaps, and collisions under Unicode lowercase
+comparison. It also checks v1 piece
 geometry before rqbit can construct its length table: piece length is nonzero,
 aggregate file length cannot overflow and is nonzero, the hash table is made of
 whole SHA-1 values, its count exactly covers the declared payload, and the

@@ -102,7 +102,7 @@ pub enum TorrentError {
     PathComponentTooLong { size: usize, limit: usize },
     #[error("torrent path metadata is too large ({size} bytes; maximum {limit})")]
     PathMetadataTooLarge { size: usize, limit: usize },
-    #[error("torrent contains payload paths that collide under portable case comparison")]
+    #[error("torrent contains payload paths that collide or overlap under portable comparison")]
     PathCollision,
     #[error("unsafe existing torrent path: a payload component is a symbolic link")]
     ExistingPathSymlink,
@@ -755,7 +755,8 @@ fn validate_metainfo_paths_with_limits<BufType: AsRef<[u8]>>(
     let files = info.iter_file_details().map_err(engine_error)?;
     let mut file_count = 0usize;
     let mut all_path_bytes = 0usize;
-    let mut path_collision_keys = HashSet::new();
+    let mut file_path_collision_keys = HashSet::new();
+    let mut directory_path_collision_keys = HashSet::new();
     for file in files {
         file_count = file_count.saturating_add(1);
         if file_count > limits.files {
@@ -773,7 +774,8 @@ fn validate_metainfo_paths_with_limits<BufType: AsRef<[u8]>>(
         let mut component_count = 0usize;
         let mut relative_path_bytes = root_path_bytes;
         let mut collision_key = root_collision_key.clone();
-        for component in file.filename.iter_components() {
+        let mut components = file.filename.iter_components().peekable();
+        while let Some(component) = components.next() {
             component_count += 1;
             let component = component.map_err(|_| {
                 TorrentError::UnsafeMetainfoPath(
@@ -795,13 +797,21 @@ fn validate_metainfo_paths_with_limits<BufType: AsRef<[u8]>>(
                     limit: limits.relative_path_bytes,
                 });
             }
+            if components.peek().is_some() {
+                if file_path_collision_keys.contains(&collision_key) {
+                    return Err(TorrentError::PathCollision);
+                }
+                directory_path_collision_keys.insert(collision_key.clone());
+            }
         }
         if component_count == 0 {
             return Err(TorrentError::UnsafeMetainfoPath(
                 "file paths must contain at least one component",
             ));
         }
-        if !path_collision_keys.insert(collision_key) {
+        if directory_path_collision_keys.contains(&collision_key)
+            || !file_path_collision_keys.insert(collision_key)
+        {
             return Err(TorrentError::PathCollision);
         }
         all_path_bytes = all_path_bytes.saturating_add(relative_path_bytes);
