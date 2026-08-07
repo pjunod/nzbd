@@ -14,6 +14,14 @@ fn single_file_info(name: &[u8]) -> Vec<u8> {
     single_file_info_with_geometry(name, 1, 16_384, &[0; 20])
 }
 
+fn private_single_file_info(name: &[u8]) -> Vec<u8> {
+    let mut info = single_file_info(name);
+    info.pop();
+    bencode_bytes(&mut info, b"private");
+    info.extend_from_slice(b"i1ee");
+    info
+}
+
 fn single_file_info_with_geometry(
     name: &[u8],
     length: u64,
@@ -608,6 +616,14 @@ fn tracker_preflight_rejects_inputs_the_engine_would_silently_drop() {
         )
         .is_ok());
     }
+
+    assert!(matches!(
+        validate_metainfo_contract(
+            &metainfo_with_announce(&private_single_file_info(b"payload.bin"), b""),
+            false,
+        ),
+        Err(TorrentError::PrivateTrackerCount(0))
+    ));
 }
 
 #[test]

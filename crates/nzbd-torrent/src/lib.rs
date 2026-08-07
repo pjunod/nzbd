@@ -567,6 +567,7 @@ fn validate_metainfo_contract(bytes: &[u8], proxy_enabled: bool) -> Result<(), T
     let trackers = metainfo
         .iter_announce()
         .map(AsRef::<[u8]>::as_ref)
+        .filter(|tracker| !tracker.is_empty())
         .collect::<HashSet<_>>();
     if trackers.len() != 1 {
         return Err(TorrentError::PrivateTrackerCount(trackers.len()));
