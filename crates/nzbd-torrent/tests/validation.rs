@@ -178,10 +178,10 @@ async fn unsafe_names_are_rejected_before_any_escape_file_exists() {
             .await;
         let error = match result {
             Ok(_) => panic!("unsafe metainfo name was accepted: {name:?}"),
-            Err(error) => error.to_string(),
+            Err(error) => error,
         };
         assert!(
-            error.contains("path traversal") || error.contains("separator"),
+            matches!(error, TorrentError::UnsafeMetainfoPath(_)),
             "unexpected error for {name:?}: {error}"
         );
     }

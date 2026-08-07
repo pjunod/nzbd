@@ -46,6 +46,52 @@ fn v2_metainfo(hybrid: bool) -> Vec<u8> {
     metainfo(&info)
 }
 
+fn multi_file_info(
+    root: Option<&[u8]>,
+    path: &[&[u8]],
+    attr: Option<&[u8]>,
+    symlink_path: Option<&[&[u8]]>,
+) -> Vec<u8> {
+    let mut file = vec![b'd'];
+    if let Some(attr) = attr {
+        bencode_bytes(&mut file, b"attr");
+        bencode_bytes(&mut file, attr);
+    }
+    bencode_bytes(&mut file, b"length");
+    file.extend_from_slice(b"i1e");
+    bencode_bytes(&mut file, b"path");
+    file.push(b'l');
+    for component in path {
+        bencode_bytes(&mut file, component);
+    }
+    file.push(b'e');
+    if let Some(symlink_path) = symlink_path {
+        bencode_bytes(&mut file, b"symlink path");
+        file.push(b'l');
+        for component in symlink_path {
+            bencode_bytes(&mut file, component);
+        }
+        file.push(b'e');
+    }
+    file.push(b'e');
+
+    let mut info = vec![b'd'];
+    bencode_bytes(&mut info, b"files");
+    info.push(b'l');
+    info.extend_from_slice(&file);
+    info.push(b'e');
+    if let Some(root) = root {
+        bencode_bytes(&mut info, b"name");
+        bencode_bytes(&mut info, root);
+    }
+    bencode_bytes(&mut info, b"piece length");
+    info.extend_from_slice(b"i16384e");
+    bencode_bytes(&mut info, b"pieces");
+    bencode_bytes(&mut info, &[0; 20]);
+    info.push(b'e');
+    info
+}
+
 fn assert_preflight_does_not_panic(case: &str, bytes: &[u8]) {
     let result = catch_unwind(AssertUnwindSafe(|| {
         let _ = validate_metainfo_contract(bytes, false);
@@ -157,4 +203,66 @@ fn scanner_enforces_structural_bounds_and_exact_root() {
     let mut trailing = v1_metainfo(b"payload.bin");
     trailing.push(b'e');
     assert!(MetainfoVersionScanner::new(&trailing).scan().is_err());
+}
+
+#[test]
+fn adapter_owns_portable_single_file_path_rejection() {
+    for component in [
+        &b""[..],
+        &b"."[..],
+        &b".."[..],
+        &b"../escape"[..],
+        &b"sub/escape"[..],
+        &b"sub\\escape"[..],
+        &b"/absolute"[..],
+        &b"\\\\server\\share"[..],
+        &b"C:escape"[..],
+        &b"nul\0name"[..],
+        &b"bad-utf8-\xff"[..],
+    ] {
+        assert!(
+            matches!(
+                validate_metainfo_contract(&v1_metainfo(component), false),
+                Err(TorrentError::UnsafeMetainfoPath(_))
+            ),
+            "unsafe single-file component was accepted: {component:?}"
+        );
+    }
+    assert!(validate_metainfo_contract(&v1_metainfo(b"payload.bin"), false).is_ok());
+}
+
+#[test]
+fn adapter_owns_multi_file_root_component_and_symlink_rejection() {
+    let safe = metainfo(&multi_file_info(
+        Some(b"release"),
+        &[b"sub", b"payload.bin"],
+        None,
+        None,
+    ));
+    assert!(validate_metainfo_contract(&safe, false).is_ok());
+
+    let cases = [
+        multi_file_info(None, &[b"payload.bin"], None, None),
+        multi_file_info(Some(b"C:release"), &[b"payload.bin"], None, None),
+        multi_file_info(Some(b"release"), &[], None, None),
+        multi_file_info(Some(b"release"), &[b"sub", b""], None, None),
+        multi_file_info(
+            Some(b"release"),
+            &[b"payload.bin"],
+            Some(b"l"),
+            Some(&[b"target"]),
+        ),
+        multi_file_info(
+            Some(b"release"),
+            &[b"payload.bin"],
+            None,
+            Some(&[b"target"]),
+        ),
+    ];
+    for info in cases {
+        assert!(matches!(
+            validate_metainfo_contract(&metainfo(&info), false),
+            Err(TorrentError::UnsafeMetainfoPath(_))
+        ));
+    }
 }

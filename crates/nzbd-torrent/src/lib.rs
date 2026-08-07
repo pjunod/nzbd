@@ -56,6 +56,8 @@ pub enum TorrentError {
         "private torrents must declare exactly one unique tracker in the first release (found {0})"
     )]
     PrivateTrackerCount(usize),
+    #[error("unsafe torrent metainfo path: {0}")]
+    UnsafeMetainfoPath(&'static str),
 }
 
 fn engine_error(error: impl std::fmt::Display) -> TorrentError {
@@ -311,6 +313,7 @@ fn validate_metainfo_contract(bytes: &[u8], proxy_enabled: bool) -> Result<(), T
     validate_metainfo_version(bytes)?;
     let metainfo =
         librqbit::torrent_from_bytes::<librqbit::ByteBuf<'_>>(bytes).map_err(engine_error)?;
+    validate_metainfo_paths(&metainfo.info)?;
     if proxy_enabled
         && metainfo
             .iter_announce()
@@ -328,6 +331,75 @@ fn validate_metainfo_contract(bytes: &[u8], proxy_enabled: bool) -> Result<(), T
     if trackers.len() != 1 {
         return Err(TorrentError::PrivateTrackerCount(trackers.len()));
     }
+    Ok(())
+}
+
+fn validate_metainfo_paths<BufType: AsRef<[u8]>>(
+    info: &librqbit::TorrentMetaV1Info<BufType>,
+) -> Result<(), TorrentError> {
+    if info.files.is_some() {
+        let root = info.name.as_ref().ok_or(TorrentError::UnsafeMetainfoPath(
+            "multi-file torrents require a root name",
+        ))?;
+        validate_path_component(root.as_ref())?;
+    }
+
+    let files = info.iter_file_details().map_err(engine_error)?;
+    for file in files {
+        if file.attrs().symlink || file.symlink_path.is_some() {
+            return Err(TorrentError::UnsafeMetainfoPath(
+                "metainfo-declared symlinks are not supported",
+            ));
+        }
+
+        let mut component_count = 0usize;
+        for component in file.filename.iter_components() {
+            component_count += 1;
+            let component = component.map_err(|_| {
+                TorrentError::UnsafeMetainfoPath(
+                    "components must be portable UTF-8 names without traversal or separators",
+                )
+            })?;
+            validate_path_component(component.as_bytes())?;
+        }
+        if component_count == 0 {
+            return Err(TorrentError::UnsafeMetainfoPath(
+                "file paths must contain at least one component",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_path_component(component: &[u8]) -> Result<(), TorrentError> {
+    if component.is_empty() {
+        return Err(TorrentError::UnsafeMetainfoPath(
+            "path components cannot be empty",
+        ));
+    }
+    if component.contains(&0) {
+        return Err(TorrentError::UnsafeMetainfoPath(
+            "path components cannot contain NUL",
+        ));
+    }
+    if component.contains(&b'/') || component.contains(&b'\\') {
+        return Err(TorrentError::UnsafeMetainfoPath(
+            "path components cannot contain platform separators",
+        ));
+    }
+    if matches!(component, b"." | b"..") {
+        return Err(TorrentError::UnsafeMetainfoPath(
+            "dot path components are not allowed",
+        ));
+    }
+    if component.len() >= 2 && component[0].is_ascii_alphabetic() && component[1] == b':' {
+        return Err(TorrentError::UnsafeMetainfoPath(
+            "Windows drive prefixes are not allowed",
+        ));
+    }
+    std::str::from_utf8(component).map_err(|_| {
+        TorrentError::UnsafeMetainfoPath("path components must contain valid UTF-8")
+    })?;
     Ok(())
 }
 
