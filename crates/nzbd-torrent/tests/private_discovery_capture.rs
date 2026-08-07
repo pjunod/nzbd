@@ -1,4 +1,4 @@
-use nzbd_torrent::{TorrentAddConfig, TorrentSession, TorrentSessionConfig};
+use nzbd_torrent::{TorrentAddConfig, TorrentError, TorrentSession, TorrentSessionConfig};
 use sha1::{Digest, Sha1};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -189,10 +189,13 @@ async fn private_torrent_never_queries_dht_when_the_session_dht_is_live() {
         "the DHT probe exited after the initial control"
     );
 
-    let _private = session
+    let private_result = session
         .add_metainfo(private_metainfo, TorrentAddConfig::default())
-        .await
-        .unwrap();
+        .await;
+    assert!(
+        matches!(private_result, Err(TorrentError::PrivateMetainfoWithDht)),
+        "the adapter must reject private metainfo before a DHT-enabled session can observe it"
+    );
     let private_window = Duration::from_secs(15);
     let private_window_deadline = tokio::time::Instant::now() + private_window;
     let _window_control = session
