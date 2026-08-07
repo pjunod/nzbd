@@ -1253,7 +1253,9 @@ source_redirects = 5
 
 - `enabled = false`: upgrades must not begin peer-to-peer traffic.
 - `listen_port = 6881`: conventional and easy to map; only one session owns
-  it. Failure to bind is a startup error when the feature is enabled.
+  it. The adapter admits exactly one explicit non-zero port, rather than
+  exposing rqbit's raw range probe or allowing port `0`; failure to bind is a
+  startup error when the feature is enabled.
 - `dht = false`, `pex = true`: public swarm discovery benefits from DHT, but
   the engine must suppress both for private torrents regardless of config.
   Stable rqbit cannot suppress DHT per unresolved magnet, so the dormant

@@ -70,6 +70,8 @@ pub enum TorrentError {
     UnsupportedHybridMetainfo,
     #[error("invalid SOCKS proxy configuration: {0}")]
     InvalidProxy(&'static str),
+    #[error("invalid TCP listen range: expected exactly one non-zero port")]
+    InvalidListenPortRange,
     #[error(
         "SOCKS proxy cannot be combined with DHT because librqbit 8.1.1 sends DHT traffic outside the proxy"
     )]
@@ -429,6 +431,7 @@ impl TorrentSession {
         output_root: PathBuf,
         config: TorrentSessionConfig,
     ) -> Result<Self, TorrentError> {
+        validate_listen_port_range(config.listen_port_range.as_ref())?;
         install_process_crypto_provider()?;
         let proxy_enabled = config.proxy.is_some();
         if proxy_enabled && config.dht {
@@ -594,6 +597,16 @@ fn session_options(
         socks_proxy_url,
         ..Default::default()
     }
+}
+
+fn validate_listen_port_range(range: Option<&Range<u16>>) -> Result<(), TorrentError> {
+    let Some(range) = range else {
+        return Ok(());
+    };
+    if range.start == 0 || range.start.checked_add(1) != Some(range.end) {
+        return Err(TorrentError::InvalidListenPortRange);
+    }
+    Ok(())
 }
 
 fn validate_metainfo_contract(bytes: &[u8], proxy_enabled: bool) -> Result<(), TorrentError> {
@@ -1464,6 +1477,19 @@ mod tests {
         // delegating here, move the assertion to the replacement call path.
         let options = session_options(false, None, None);
         assert!(!options.enable_upnp_port_forwarding);
+    }
+
+    #[test]
+    fn listen_range_is_exactly_one_explicit_port() {
+        assert!(validate_listen_port_range(None).is_ok());
+        assert!(validate_listen_port_range(Some(&(6881..6882))).is_ok());
+
+        for range in [0..1, 6881..6881, 6881..6883, u16::MAX..u16::MAX] {
+            assert!(matches!(
+                validate_listen_port_range(Some(&range)),
+                Err(TorrentError::InvalidListenPortRange)
+            ));
+        }
     }
 
     #[test]

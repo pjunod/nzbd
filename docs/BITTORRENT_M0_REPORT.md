@@ -95,6 +95,8 @@ The isolated suite covers:
 - a live 16 KiB/s limit followed by an unlimited transfer;
 - pause and resume before download completion;
 - keep-data and delete-data behavior, including idempotence;
+- named rejection of zero, empty, and multi-port TCP listen ranges so the
+  adapter cannot silently request an ephemeral port or probe a range;
 - authenticated SOCKS5 peer routing through a loopback proxy, with a
   recording relay proving no parallel direct connection;
 - origin-only SOCKS proxy validation, including rejection of paths, queries,
