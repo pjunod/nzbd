@@ -153,30 +153,38 @@ async fn proxy_rejects_dht_and_udp_tracker_leak_paths() {
 }
 
 #[tokio::test]
-async fn traversal_name_is_rejected_before_any_escape_file_exists() {
+async fn unsafe_names_are_rejected_before_any_escape_file_exists() {
     let parent = tempfile::tempdir().unwrap();
     let root = parent.path().join("payload");
     std::fs::create_dir(&root).unwrap();
     let session = TorrentSession::start(root.clone(), TorrentSessionConfig::default())
         .await
         .unwrap();
-    let result = session
-        .add_metainfo(
-            single_file_metainfo(b"../escape"),
-            TorrentAddConfig {
-                overwrite: true,
-                ..Default::default()
-            },
-        )
-        .await;
-    let error = match result {
-        Ok(_) => panic!("traversal metainfo was accepted"),
-        Err(error) => error.to_string(),
-    };
-    assert!(
-        error.contains("path traversal") || error.contains("separator"),
-        "unexpected error: {error}"
-    );
+    for name in [
+        &b"../escape"[..],
+        &b"sub/../../escape"[..],
+        &b"sub\\..\\..\\escape"[..],
+        &b"/absolute"[..],
+        &b"\\\\server\\share"[..],
+    ] {
+        let result = session
+            .add_metainfo(
+                single_file_metainfo(name),
+                TorrentAddConfig {
+                    overwrite: true,
+                    ..Default::default()
+                },
+            )
+            .await;
+        let error = match result {
+            Ok(_) => panic!("unsafe metainfo name was accepted: {name:?}"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            error.contains("path traversal") || error.contains("separator"),
+            "unexpected error for {name:?}: {error}"
+        );
+    }
     assert!(!parent.path().join("escape").exists());
     session.stop().await;
 }

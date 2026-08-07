@@ -1407,8 +1407,12 @@ whose prefix merely resembles the configured root. The existing job
   220-package closure is acceptable.
 - Subscribe to upstream releases and security notices, then test upgrades
   against the local swarm harness before changing the pin.
-- Fuzz the adapter's preflight parsing and path validation even if upstream
-  also fuzzes bencode.
+- Keep the adapter's deterministic preflight mutation corpus in ordinary CI:
+  every truncation plus bounded byte replacement, deletion, and insertion
+  around v1, v2-only, and hybrid seeds, with structural-limit invariants. It
+  complements rather than replaces an M5 coverage-guided fuzz target. Exercise
+  path rejection through real engine admission even if upstream also fuzzes
+  bencode; M5 still owns symlink and normalized case-collision probes.
 
 ---
 
@@ -1758,6 +1762,8 @@ becomes reachable.
   magnets and metainfo.
 - Path validation: every platform prefix/separator, traversal, normalization,
   symlinks, case collisions, padding files, exact-root delete proof.
+- Metainfo preflight: a deterministic mutation corpus runs in ordinary CI;
+  coverage-guided fuzzing remains an M5 release gate.
 - State projection: every `TorrentPhase` maps to the expected native and
   qBittorrent status, with units/sentinel values pinned.
 - Seed policy: add/category/global precedence, ratio precision, time across

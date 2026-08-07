@@ -30,7 +30,7 @@ peer listener, or production torrent admission path has been added.
 | 3. Controls and live limits | **Pass** | Pause/resume is exercised before completion, the live download limit is removed during transfer, and idempotent keep-data delete, idempotent delete-data, and unrelated-sibling retention pass. |
 | 4. Kill/restart never trusts partial data | **Blocked** | The accepted fast-resume design cannot be constructed without failing gate 8. A persistence-disabled full hash recheck is a possible safe but slower product decision, not an equivalent test of the accepted design. |
 | 5. Private-torrent discovery | **Pass** | A one-tracker private torrent downloads through a loopback HTTP tracker, and a deterministic peer-wire control proves public torrents consume an injected PEX peer while private torrents ignore it. A Linux capture harness starts live DHT, redirects both stable-8.1.1 bootstrap ports to a local KRPC probe, and observes separate public control hashes before and during a 15-second private canary window. It scans all captured UDP—not just redirected DHT—for the private hash in binary or LSD-style text form. The [first successful capture run](https://github.com/pjunod/nzbd/actions/runs/31128106994) passed on 2026-08-06 UTC: both DHT controls were observed and no private DHT/LSD hash appeared. Tracker order is still lost through a hash set before truncation, so the adapter rejects private metainfo unless it has exactly one unique tracker. |
-| 6. Path and delete safety | **Pass** | Traversal metainfo is rejected before an escape file exists. Delete-data removes only parsed torrent content; an unrelated sibling survives. Higher layers must still prove the persisted canonical root before requesting deletion. |
+| 6. Path and delete safety | **Pass** | A platform-neutral corpus of parent traversal, nested traversal, slash/backslash, absolute, and UNC-style single-file names is rejected before an escape file exists. Delete-data removes only parsed torrent content; an unrelated sibling survives. Higher layers must still prove the persisted canonical root before requesting deletion. Symlink and normalized case-collision checks remain M5 work. |
 | 7. Public observability | **Fail** | Public stats expose phase, total/progress/upload bytes, file progress, rates, ETA inputs, peer counts, completion, and error. Stable 8.1.1 does not expose per-torrent tracker state, DHT state, or last tracker error. A tested upstream patch now supplies that snapshot, but this gate remains failed until an accepted stable release contains it. “No peers” cannot safely substitute for those facts. |
 | 8. nzbd-authoritative persistence | **Fail** | The contract test proves that `Session::new_with_opts` auto-restores the library record before returning. The persistence module and store injection point are private in 8.1.1, so nzbd cannot filter first. A tested upstream patch now supplies the missing opt-out, but this gate remains failed until an accepted stable release contains it. |
 | 9. Resource, package, and license delta | **Partial** | Measurements are recorded in §4. A blocking cargo-deny 0.20.2 policy passes locally across all features and the locked graph, and its [first Actions run passed](https://github.com/pjunod/nzbd/actions/runs/31064446916) on 2026-08-06 UTC. The repository-wide Supply chain check also freezes the reviewed advisory package/feature sets and sole MPL-2.0 package path without pinning nzbd's own version. The [gate 9 review brief](BITTORRENT_GATE9_REVIEW.md) isolates the remaining human acceptance decision. |
@@ -92,6 +92,10 @@ The isolated suite covers:
 - a positive-control PEX peer that public torrents contact and private torrents
   ignore; the canary address is available only through the peer-wire message;
 - traversal rejection before filesystem escape;
+- deterministic, socket-free preflight mutations covering every truncation and
+  bounded single-byte replacement, deletion, and insertion around valid v1,
+  v2-only, and hybrid seeds, plus nesting, length-overflow, duplicate-info,
+  trailing-byte, and framed-marker invariants;
 - the explicit aws-lc provider invariant;
 - v2-only and hybrid named rejection for metainfo and magnets; and
 - the persistence auto-restore behavior that fails gate 8.
@@ -105,6 +109,11 @@ point. Separate public lookups prove the probe is live before and throughout a
 15-second private canary window. The harness scans every captured UDP packet,
 not only redirected DHT traffic, for the private binary hash and the ASCII hash
 used by LSD.
+
+The bounded mutation corpus is a fast CI regression layer, not a claim of
+coverage-guided fuzzing completeness. It exercises the adapter-owned scanner
+without sockets and leaves a persistent fuzz target plus symlink and
+case-collision filesystem probes for M5.
 
 ### 2.3 Queue schema version fallback
 

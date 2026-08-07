@@ -627,6 +627,9 @@ pub struct TorrentStats {
 }
 
 #[cfg(test)]
+mod preflight_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
