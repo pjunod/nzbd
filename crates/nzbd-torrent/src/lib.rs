@@ -19,6 +19,16 @@ use std::sync::Arc;
 
 /// The exact engine release the M0 contract and interop tests describe.
 pub const ENGINE_VERSION: &str = "8.1.1";
+/// Default raw or fetched `.torrent` admission limit from proposal §10.3.
+pub const DEFAULT_MAX_METAINFO_BYTES: usize = 10 * 1024 * 1024;
+/// Maximum magnet URI length from proposal §10.3.
+pub const MAX_MAGNET_URI_BYTES: usize = 16 * 1024;
+/// Maximum number of payload files described by one torrent.
+pub const MAX_TORRENT_FILES: usize = 100_000;
+/// Maximum encoded length of one projected relative payload path.
+pub const MAX_TORRENT_RELATIVE_PATH_BYTES: usize = 4 * 1024;
+/// Maximum aggregate encoded length of all projected relative payload paths.
+pub const MAX_TORRENT_PATH_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CryptoProviderInstall {
@@ -58,6 +68,16 @@ pub enum TorrentError {
     PrivateTrackerCount(usize),
     #[error("unsafe torrent metainfo path: {0}")]
     UnsafeMetainfoPath(&'static str),
+    #[error("torrent metainfo is too large ({size} bytes; maximum {limit})")]
+    MetainfoTooLarge { size: usize, limit: usize },
+    #[error("magnet URI is too long ({size} bytes; maximum {limit})")]
+    MagnetTooLong { size: usize, limit: usize },
+    #[error("torrent contains too many files ({count}; maximum {limit})")]
+    TooManyFiles { count: usize, limit: usize },
+    #[error("torrent relative path is too long ({size} bytes; maximum {limit})")]
+    PathTooLong { size: usize, limit: usize },
+    #[error("torrent path metadata is too large ({size} bytes; maximum {limit})")]
+    PathMetadataTooLarge { size: usize, limit: usize },
 }
 
 fn engine_error(error: impl std::fmt::Display) -> TorrentError {
@@ -221,6 +241,7 @@ impl TorrentSession {
         magnet: String,
         config: TorrentAddConfig,
     ) -> Result<TorrentHandle, TorrentError> {
+        validate_magnet_size(magnet.len())?;
         let lower = magnet.to_ascii_lowercase();
         let has_v1 = lower.contains("urn:btih:");
         let has_v2 = lower.contains("urn:btmh:");
@@ -310,6 +331,7 @@ fn session_options(
 }
 
 fn validate_metainfo_contract(bytes: &[u8], proxy_enabled: bool) -> Result<(), TorrentError> {
+    validate_metainfo_size(bytes.len())?;
     validate_metainfo_version(bytes)?;
     let metainfo =
         librqbit::torrent_from_bytes::<librqbit::ByteBuf<'_>>(bytes).map_err(engine_error)?;
@@ -337,15 +359,49 @@ fn validate_metainfo_contract(bytes: &[u8], proxy_enabled: bool) -> Result<(), T
 fn validate_metainfo_paths<BufType: AsRef<[u8]>>(
     info: &librqbit::TorrentMetaV1Info<BufType>,
 ) -> Result<(), TorrentError> {
-    if info.files.is_some() {
+    validate_metainfo_paths_with_limits(info, MetainfoPathLimits::PROPOSAL)
+}
+
+#[derive(Clone, Copy)]
+struct MetainfoPathLimits {
+    files: usize,
+    relative_path_bytes: usize,
+    all_path_bytes: usize,
+}
+
+impl MetainfoPathLimits {
+    const PROPOSAL: Self = Self {
+        files: MAX_TORRENT_FILES,
+        relative_path_bytes: MAX_TORRENT_RELATIVE_PATH_BYTES,
+        all_path_bytes: MAX_TORRENT_PATH_BYTES,
+    };
+}
+
+fn validate_metainfo_paths_with_limits<BufType: AsRef<[u8]>>(
+    info: &librqbit::TorrentMetaV1Info<BufType>,
+    limits: MetainfoPathLimits,
+) -> Result<(), TorrentError> {
+    let root_path_bytes = if info.files.is_some() {
         let root = info.name.as_ref().ok_or(TorrentError::UnsafeMetainfoPath(
             "multi-file torrents require a root name",
         ))?;
         validate_path_component(root.as_ref())?;
-    }
+        root.as_ref().len()
+    } else {
+        0
+    };
 
     let files = info.iter_file_details().map_err(engine_error)?;
+    let mut file_count = 0usize;
+    let mut all_path_bytes = 0usize;
     for file in files {
+        file_count = file_count.saturating_add(1);
+        if file_count > limits.files {
+            return Err(TorrentError::TooManyFiles {
+                count: file_count,
+                limit: limits.files,
+            });
+        }
         if file.attrs().symlink || file.symlink_path.is_some() {
             return Err(TorrentError::UnsafeMetainfoPath(
                 "metainfo-declared symlinks are not supported",
@@ -353,6 +409,7 @@ fn validate_metainfo_paths<BufType: AsRef<[u8]>>(
         }
 
         let mut component_count = 0usize;
+        let mut relative_path_bytes = root_path_bytes;
         for component in file.filename.iter_components() {
             component_count += 1;
             let component = component.map_err(|_| {
@@ -361,12 +418,49 @@ fn validate_metainfo_paths<BufType: AsRef<[u8]>>(
                 )
             })?;
             validate_path_component(component.as_bytes())?;
+            if relative_path_bytes != 0 {
+                relative_path_bytes = relative_path_bytes.saturating_add(1);
+            }
+            relative_path_bytes = relative_path_bytes.saturating_add(component.len());
+            if relative_path_bytes > limits.relative_path_bytes {
+                return Err(TorrentError::PathTooLong {
+                    size: relative_path_bytes,
+                    limit: limits.relative_path_bytes,
+                });
+            }
         }
         if component_count == 0 {
             return Err(TorrentError::UnsafeMetainfoPath(
                 "file paths must contain at least one component",
             ));
         }
+        all_path_bytes = all_path_bytes.saturating_add(relative_path_bytes);
+        if all_path_bytes > limits.all_path_bytes {
+            return Err(TorrentError::PathMetadataTooLarge {
+                size: all_path_bytes,
+                limit: limits.all_path_bytes,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn validate_metainfo_size(size: usize) -> Result<(), TorrentError> {
+    if size > DEFAULT_MAX_METAINFO_BYTES {
+        return Err(TorrentError::MetainfoTooLarge {
+            size,
+            limit: DEFAULT_MAX_METAINFO_BYTES,
+        });
+    }
+    Ok(())
+}
+
+fn validate_magnet_size(size: usize) -> Result<(), TorrentError> {
+    if size > MAX_MAGNET_URI_BYTES {
+        return Err(TorrentError::MagnetTooLong {
+            size,
+            limit: MAX_MAGNET_URI_BYTES,
+        });
     }
     Ok(())
 }

@@ -1280,6 +1280,16 @@ The exact constants should be centralized and tested:
 Limits are guards, not tuning lore. If valid field data needs a higher value,
 raise the bound with a regression fixture and measured memory impact.
 
+The dormant adapter centralizes and enforces the limits it can own before
+daemon integration: 10 MiB raw metainfo, 16 KiB magnet URIs, 100,000 files,
+4 KiB per projected relative payload path, and 16 MiB across projected paths.
+Projected paths include the multi-file root and platform separator bytes, so
+the accounting bounds the paths later passed to storage rather than only the
+raw bencode component payloads. Exact-limit tests pass and the first excess
+byte or file returns a stable named error. The 1–100 MiB metainfo configuration
+range, redirects, fetched-body streaming, and display-safe error truncation
+remain API/source-fetch work; no production input is wired by these constants.
+
 ---
 
 ## 11. Security, privacy, and abuse boundaries

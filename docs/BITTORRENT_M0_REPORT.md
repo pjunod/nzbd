@@ -94,6 +94,9 @@ The isolated suite covers:
 - traversal rejection before filesystem escape;
 - adapter-owned portable path preflight for single- and multi-file torrents,
   including safe named errors and metainfo-declared symlink rejection;
+- centralized proposal limits for raw metainfo, magnet length, file count, one
+  projected relative path, and aggregate projected path bytes, with exact
+  boundary and first-excess tests;
 - deterministic, socket-free preflight mutations covering every truncation and
   bounded single-byte replacement, deletion, and insertion around valid v1,
   v2-only, and hybrid seeds, plus nesting, length-overflow, duplicate-info,

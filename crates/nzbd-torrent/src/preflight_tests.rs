@@ -266,3 +266,83 @@ fn adapter_owns_multi_file_root_component_and_symlink_rejection() {
         ));
     }
 }
+
+fn parsed_info(bytes: &[u8]) -> librqbit::TorrentMetaV1<librqbit::ByteBuf<'_>> {
+    librqbit::torrent_from_bytes(bytes).unwrap()
+}
+
+#[test]
+fn proposal_admission_constants_and_input_boundaries_are_pinned() {
+    assert_eq!(DEFAULT_MAX_METAINFO_BYTES, 10 * 1024 * 1024);
+    assert_eq!(MAX_MAGNET_URI_BYTES, 16 * 1024);
+    assert_eq!(MAX_TORRENT_FILES, 100_000);
+    assert_eq!(MAX_TORRENT_RELATIVE_PATH_BYTES, 4 * 1024);
+    assert_eq!(MAX_TORRENT_PATH_BYTES, 16 * 1024 * 1024);
+
+    assert!(validate_metainfo_size(DEFAULT_MAX_METAINFO_BYTES).is_ok());
+    assert!(matches!(
+        validate_metainfo_size(DEFAULT_MAX_METAINFO_BYTES + 1),
+        Err(TorrentError::MetainfoTooLarge { .. })
+    ));
+    assert!(validate_magnet_size(MAX_MAGNET_URI_BYTES).is_ok());
+    assert!(matches!(
+        validate_magnet_size(MAX_MAGNET_URI_BYTES + 1),
+        Err(TorrentError::MagnetTooLong { .. })
+    ));
+}
+
+#[test]
+fn path_inventory_limits_fail_at_the_first_excess_byte_or_file() {
+    let bytes = metainfo(&multi_file_info(
+        Some(b"root"),
+        &[b"sub", b"payload.bin"],
+        None,
+        None,
+    ));
+    let metainfo = parsed_info(&bytes);
+    let projected_path_bytes = b"root/sub/payload.bin".len();
+
+    assert!(validate_metainfo_paths_with_limits(
+        &metainfo.info,
+        MetainfoPathLimits {
+            files: 1,
+            relative_path_bytes: projected_path_bytes,
+            all_path_bytes: projected_path_bytes,
+        },
+    )
+    .is_ok());
+
+    assert!(matches!(
+        validate_metainfo_paths_with_limits(
+            &metainfo.info,
+            MetainfoPathLimits {
+                files: 0,
+                relative_path_bytes: usize::MAX,
+                all_path_bytes: usize::MAX,
+            },
+        ),
+        Err(TorrentError::TooManyFiles { count: 1, limit: 0 })
+    ));
+    assert!(matches!(
+        validate_metainfo_paths_with_limits(
+            &metainfo.info,
+            MetainfoPathLimits {
+                files: 1,
+                relative_path_bytes: projected_path_bytes - 1,
+                all_path_bytes: usize::MAX,
+            },
+        ),
+        Err(TorrentError::PathTooLong { .. })
+    ));
+    assert!(matches!(
+        validate_metainfo_paths_with_limits(
+            &metainfo.info,
+            MetainfoPathLimits {
+                files: 1,
+                relative_path_bytes: usize::MAX,
+                all_path_bytes: projected_path_bytes - 1,
+            },
+        ),
+        Err(TorrentError::PathMetadataTooLarge { .. })
+    ));
+}
