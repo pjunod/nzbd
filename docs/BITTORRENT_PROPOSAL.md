@@ -1136,7 +1136,9 @@ Before starting a torrent, validate every metadata path:
   fallback shared by unrelated unnamed torrents;
 - resolved output remains under the canonical category torrent root;
 - no existing symlink may redirect a write outside that root;
-- normalized case collisions are rejected on case-insensitive filesystems;
+- exact, Unicode-NFC-equivalent, and lowercase collisions are rejected before
+  storage on every platform, conservatively covering common
+  normalization-insensitive and case-insensitive filesystems;
 - total file count, total path bytes, and metainfo bytes stay under fixed
   limits from §10.3;
 - padding files are not exposed as user content or importer paths.

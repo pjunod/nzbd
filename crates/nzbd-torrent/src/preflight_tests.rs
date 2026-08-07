@@ -706,3 +706,27 @@ fn adapter_rejects_exact_and_portable_case_path_collisions() {
     ));
     assert!(validate_metainfo_contract(&distinct, false).is_ok());
 }
+
+#[test]
+fn adapter_rejects_canonically_equivalent_unicode_path_collisions() {
+    let composed = "Caf\u{e9}.mkv".as_bytes();
+    let decomposed = "cafe\u{301}.mkv".as_bytes();
+    let composed_path: &[&[u8]] = &[b"Disc", composed];
+    let decomposed_path: &[&[u8]] = &[b"disc", decomposed];
+    let collision = metainfo(&multi_file_info_many(
+        b"release",
+        &[composed_path, decomposed_path],
+    ));
+    assert!(matches!(
+        validate_metainfo_contract(&collision, false),
+        Err(TorrentError::PathCollision)
+    ));
+
+    let distinct_accent = "cafe\u{300}.mkv".as_bytes();
+    let distinct_path: &[&[u8]] = &[b"disc", distinct_accent];
+    let distinct = metainfo(&multi_file_info_many(
+        b"release",
+        &[composed_path, distinct_path],
+    ));
+    assert!(validate_metainfo_contract(&distinct, false).is_ok());
+}

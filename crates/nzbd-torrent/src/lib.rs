@@ -725,7 +725,7 @@ fn validate_metainfo_paths_with_limits<BufType: AsRef<[u8]>>(
         let root = std::str::from_utf8(declared_name.as_ref()).map_err(|_| {
             TorrentError::UnsafeMetainfoPath("path components must contain valid UTF-8")
         })?;
-        (root.len(), portable_lowercase(root))
+        (root.len(), portable_collision_key(root))
     } else {
         (0, String::new())
     };
@@ -762,7 +762,7 @@ fn validate_metainfo_paths_with_limits<BufType: AsRef<[u8]>>(
             if !collision_key.is_empty() {
                 collision_key.push('/');
             }
-            collision_key.push_str(&portable_lowercase(component));
+            collision_key.push_str(&portable_collision_key(component));
             if relative_path_bytes != 0 {
                 relative_path_bytes = relative_path_bytes.saturating_add(1);
             }
@@ -793,8 +793,14 @@ fn validate_metainfo_paths_with_limits<BufType: AsRef<[u8]>>(
     Ok(())
 }
 
-fn portable_lowercase(component: &str) -> String {
-    component.chars().flat_map(char::to_lowercase).collect()
+fn portable_collision_key(component: &str) -> String {
+    let lowercase = component
+        .chars()
+        .flat_map(char::to_lowercase)
+        .collect::<String>();
+    icu_normalizer::ComposingNormalizer::new_nfc()
+        .normalize(&lowercase)
+        .into_owned()
 }
 
 fn validate_metainfo_size(size: usize) -> Result<(), TorrentError> {
