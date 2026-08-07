@@ -36,12 +36,13 @@ The focused test:
 
 1. creates two deterministic four-piece payloads and persists both paused
    torrents;
-2. leaves exactly the first 16 KiB piece valid on disk for the selected
-   torrent;
+2. records exactly the first 16 KiB piece as complete for the selected torrent,
+   then replaces its on-disk file with the complete valid 64 KiB payload;
 3. constructs a persistent session with automatic restore disabled and proves
    it starts empty;
 4. explicitly restores only the selected record under its original ID and
-   proves the 16 KiB of progress is retained without marking it complete; and
+   proves it reports only the persisted 16 KiB and remains incomplete, while a
+   full disk recheck would report 64 KiB and complete; and
 5. constructs a default session and proves both records are still restored.
 
 The change does not expose rqbit's private persistence schema, delete records,

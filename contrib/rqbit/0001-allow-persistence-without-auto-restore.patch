@@ -42,10 +42,10 @@ index 46314280..f86494bd 100644
  pub mod test_util;
 diff --git a/crates/librqbit/src/tests/persistence.rs b/crates/librqbit/src/tests/persistence.rs
 new file mode 100644
-index 00000000..e16f42f6
+index 00000000..a23526d5
 --- /dev/null
 +++ b/crates/librqbit/src/tests/persistence.rs
-@@ -0,0 +1,135 @@
+@@ -0,0 +1,142 @@
 +use crate::{
 +    create_torrent, AddTorrent, AddTorrentOptions, CreateTorrentOptions, Session, SessionOptions,
 +    SessionPersistenceConfig,
@@ -139,6 +139,13 @@ index 00000000..e16f42f6
 +    second.wait_until_initialized().await.unwrap();
 +    assert_eq!(second.stats().progress_bytes, PIECE_LENGTH as u64);
 +    first.stop().await;
++
++    // Diverge on-disk data from persisted piece state. If the restore path fell
++    // back to a full re-check, progress would read 64 KiB and finished would be
++    // true, so the assertions below can only pass via fast-resume.
++    tokio::fs::write(output.join("second.bin"), &second_payload)
++        .await
++        .unwrap();
 +
 +    let authoritative = Session::new_with_opts(output.clone(), options(persistence.clone(), true))
 +        .await

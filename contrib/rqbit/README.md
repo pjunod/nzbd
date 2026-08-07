@@ -1,7 +1,7 @@
 # rqbit contribution kit — upstream the two APIs without weakening nzbd
 
 **Status:** ready for human review, not submitted · **Upstream base:**
-`4e5f94cbcf1d57ec500885c77cf1e24d70232d89` · **Verified:** 2026-08-06
+`4e5f94cbcf1d57ec500885c77cf1e24d70232d89` · **Verified:** 2026-08-07
 
 Companion to
 [BITTORRENT_M0_REPORT.md](../../docs/BITTORRENT_M0_REPORT.md) (why nzbd is
@@ -53,7 +53,8 @@ backports upstream unless the maintainer explicitly asks for an 8.x backport.
 2. Submit the independent
    [authoritative-restore PR](AUTHORITATIVE_RESTORE_PR.md). Its default behavior
    is unchanged and its focused test demonstrates the ownership seam while
-   retaining non-empty fast-resume progress.
+   reporting only the persisted 16 KiB even though the complete valid payload
+   is on disk.
 3. Reconcile maintainer feedback on the discovery-health states, crate
    boundary, and snapshot shape.
 4. Rework and submit `0004` only after the design direction is accepted. A
@@ -71,7 +72,10 @@ backports upstream unless the maintainer explicitly asks for an 8.x backport.
 The verifier accepts the documented main base or any descendant that still
 contains it. On drift, it permits a three-way apply and then runs the affected
 tests; a conflict or failing test is a stop, not permission to hand-wave the
-patch forward.
+patch forward. Pull requests run both stable and current-main legs. Stable
+failures block the PR; current-main failures remain visible but non-blocking
+because upstream can move independently between nzbd changes. Pushes and the
+weekly schedule require every leg.
 
 ```bash
 rqbit_tree=/tmp/rqbit-upstream-main
