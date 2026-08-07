@@ -99,6 +99,8 @@ pub enum TorrentError {
         "magnet metadata cannot be resolved while DHT is enabled because torrent privacy is unknown until the metadata arrives"
     )]
     MagnetWithDht,
+    #[error("private torrent metainfo cannot be admitted while DHT is enabled")]
+    PrivateMetainfoWithDht,
     #[error(
         "SOCKS proxy cannot be used with UDP trackers because librqbit 8.1.1 sends UDP announces outside the proxy"
     )]
@@ -196,15 +198,19 @@ fn display_safe_error(message: &str) -> String {
 }
 
 fn redact_error_token(token: &str) -> Cow<'_, str> {
+    if let Some(assignments) = redact_secret_assignments(token) {
+        return Cow::Owned(redact_error_token_values(&assignments).into_owned());
+    }
+    redact_error_token_values(token)
+}
+
+fn redact_error_token_values(token: &str) -> Cow<'_, str> {
     let whole = redact_error_value(token);
     if whole.as_ref() != token {
         return whole;
     }
     for separator in ['=', ':'] {
         if let Some((key, value)) = token.split_once(separator) {
-            if is_secret_key(key) {
-                return Cow::Owned(format!("{key}{separator}<redacted>"));
-            }
             let redacted = redact_error_value(value);
             if redacted.as_ref() != value {
                 return Cow::Owned(format!("{key}{separator}{redacted}"));
@@ -212,6 +218,77 @@ fn redact_error_token(token: &str) -> Cow<'_, str> {
         }
     }
     whole
+}
+
+fn redact_secret_assignments(token: &str) -> Option<String> {
+    let bytes = token.as_bytes();
+    let mut ranges = Vec::new();
+    let mut index = 0usize;
+    while index < bytes.len() {
+        if !matches!(bytes[index], b'=' | b':') {
+            index += 1;
+            continue;
+        }
+
+        let mut key_end = index;
+        while key_end > 0 && matches!(bytes[key_end - 1], b'"' | b'\'') {
+            key_end -= 1;
+        }
+        let mut key_start = key_end;
+        while key_start > 0
+            && (bytes[key_start - 1].is_ascii_alphanumeric()
+                || matches!(bytes[key_start - 1], b'_' | b'-' | b'.'))
+        {
+            key_start -= 1;
+        }
+        if key_start == key_end || !is_secret_key(&token[key_start..key_end]) {
+            index += 1;
+            continue;
+        }
+
+        let mut value_start = index + 1;
+        while value_start < bytes.len() && matches!(bytes[value_start], b'"' | b'\'' | b'=' | b'>')
+        {
+            value_start += 1;
+        }
+        let mut value_end = value_start;
+        while value_end < bytes.len()
+            && !matches!(
+                bytes[value_end],
+                b'&' | b',' | b';' | b'}' | b']' | b')' | b'"' | b'\''
+            )
+        {
+            value_end += 1;
+        }
+        if value_start != value_end {
+            ranges.push(value_start..value_end);
+            index = value_end;
+        } else {
+            index += 1;
+        }
+    }
+
+    if ranges.is_empty() {
+        return None;
+    }
+    let redacted_bytes = ranges
+        .iter()
+        .map(|range| range.end.saturating_sub(range.start))
+        .sum::<usize>();
+    let mut output = String::with_capacity(
+        token
+            .len()
+            .saturating_sub(redacted_bytes)
+            .saturating_add(ranges.len() * "<redacted>".len()),
+    );
+    let mut copied = 0usize;
+    for range in ranges {
+        output.push_str(&token[copied..range.start]);
+        output.push_str("<redacted>");
+        copied = range.end;
+    }
+    output.push_str(&token[copied..]);
+    Some(output)
 }
 
 fn secret_value_follows(token: &str) -> bool {
@@ -335,22 +412,23 @@ fn redact_error_value(value: &str) -> Cow<'_, str> {
 
 fn is_secret_key(key: &str) -> bool {
     let key = key
-        .rsplit(|character: char| !character.is_ascii_alphanumeric())
-        .find(|part| !part.is_empty())
-        .unwrap_or_default();
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .flat_map(char::to_lowercase)
+        .collect::<String>();
     [
         "auth",
-        "authorization",
         "cookie",
         "credential",
-        "passkey",
-        "passwd",
-        "password",
+        "key",
+        "pass",
         "secret",
+        "session",
+        "sig",
         "token",
     ]
     .iter()
-    .any(|secret| key.eq_ignore_ascii_case(secret))
+    .any(|secret| key.contains(secret))
 }
 
 fn mark_display_truncated(mut message: String) -> String {
@@ -403,7 +481,7 @@ impl std::fmt::Debug for TorrentProxyConfig {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("TorrentProxyConfig")
-            .field("url", &self.url)
+            .field("url", &"<redacted>")
             .field("username", &self.username)
             .field("password", &self.password.as_ref().map(|_| "***"))
             .finish()
@@ -528,7 +606,7 @@ impl TorrentSession {
         mut config: TorrentAddConfig,
     ) -> Result<TorrentHandle, TorrentError> {
         normalize_initial_peers(&mut config.initial_peers)?;
-        validate_metainfo_contract(&bytes, self.proxy_enabled)?;
+        validate_metainfo_admission(&bytes, self.proxy_enabled, self.dht_enabled)?;
         validate_existing_filesystem_paths(&bytes, &self.output_root)?;
         self.add_validated_metainfo(bytes.into(), config).await
     }
@@ -539,7 +617,7 @@ impl TorrentSession {
         mut config: TorrentAddConfig,
     ) -> Result<TorrentHandle, TorrentError> {
         normalize_initial_peers(&mut config.initial_peers)?;
-        validate_magnet_contract(&magnet, self.proxy_enabled)?;
+        let magnet = validate_magnet_contract(&magnet, self.proxy_enabled)?;
         // A magnet does not reveal the private bit until BEP 9 metadata has
         // already been fetched. Stable rqbit has no per-add DHT suppression,
         // so a DHT-enabled session would query for the hash before nzbd could
@@ -769,7 +847,7 @@ fn valid_initial_peer(peer: SocketAddr) -> bool {
         && *address != std::net::Ipv4Addr::BROADCAST
 }
 
-fn validate_metainfo_contract(bytes: &[u8], proxy_enabled: bool) -> Result<(), TorrentError> {
+fn validate_metainfo_contract(bytes: &[u8], proxy_enabled: bool) -> Result<bool, TorrentError> {
     validate_metainfo_size(bytes.len())?;
     validate_metainfo_version(bytes)?;
     let metainfo =
@@ -793,10 +871,26 @@ fn validate_metainfo_contract(bytes: &[u8], proxy_enabled: bool) -> Result<(), T
         }
     }
     if !metainfo.info.private {
-        return Ok(());
+        return Ok(false);
     }
     if trackers.len() != 1 {
         return Err(TorrentError::PrivateTrackerCount(trackers.len()));
+    }
+    Ok(true)
+}
+
+fn validate_metainfo_admission(
+    bytes: &[u8],
+    proxy_enabled: bool,
+    dht_enabled: bool,
+) -> Result<(), TorrentError> {
+    let private = validate_metainfo_contract(bytes, proxy_enabled)?;
+    validate_private_discovery(private, dht_enabled)
+}
+
+fn validate_private_discovery(private: bool, dht_enabled: bool) -> Result<(), TorrentError> {
+    if private && dht_enabled {
+        return Err(TorrentError::PrivateMetainfoWithDht);
     }
     Ok(())
 }
@@ -1046,12 +1140,27 @@ fn validate_metainfo_paths_with_limits<BufType: AsRef<[u8]>>(
 }
 
 fn portable_collision_key(component: &str) -> String {
-    let lowercase = component
+    let case_mapper = icu_casemap::CaseMapper::new();
+    // Windows' invariant path comparison also aliases dotless i with ASCII I.
+    // Simple case folding deliberately preserves dotless i, so keep this one
+    // additional conservative portability mapping explicit. Simple folding
+    // also avoids collapsing compatibility-only ligatures and width variants.
+    let windows_folded = component
         .chars()
-        .flat_map(char::to_lowercase)
+        .map(|character| match character {
+            '\u{0131}' => 'i',
+            _ => {
+                let folded = case_mapper.simple_fold(character);
+                if folded == '\u{0131}' {
+                    'i'
+                } else {
+                    folded
+                }
+            }
+        })
         .collect::<String>();
     icu_normalizer::ComposingNormalizer::new_nfc()
-        .normalize(&lowercase)
+        .normalize(&windows_folded)
         .into_owned()
 }
 
@@ -1328,7 +1437,7 @@ impl<'a> MetainfoVersionScanner<'a> {
     }
 }
 
-fn validate_magnet_contract(magnet: &str, proxy_enabled: bool) -> Result<(), TorrentError> {
+fn validate_magnet_contract(magnet: &str, proxy_enabled: bool) -> Result<String, TorrentError> {
     validate_magnet_size(magnet.len())?;
     let url = url::Url::parse(magnet)
         .map_err(|_| TorrentError::InvalidMagnet("URI syntax is not valid"))?;
@@ -1340,15 +1449,18 @@ fn validate_magnet_contract(magnet: &str, proxy_enabled: bool) -> Result<(), Tor
 
     let mut v1_topics = 0usize;
     let mut has_v2 = false;
+    let mut normalize_base32 = false;
     for (key, topic) in url.query_pairs() {
         match key.as_ref() {
             "xt" => {
                 if let Some(hash) = topic.strip_prefix("urn:btih:") {
                     if !valid_btih(hash.as_bytes()) {
                         return Err(TorrentError::InvalidMagnet(
-                            "btih must be 40 hexadecimal or 32 uppercase base32 characters",
+                            "btih must be 40 hexadecimal or 32 base32 characters",
                         ));
                     }
+                    normalize_base32 |=
+                        hash.len() == 32 && hash.as_bytes().iter().any(u8::is_ascii_lowercase);
                     v1_topics = v1_topics.saturating_add(1);
                 } else if let Some(hash) = topic.strip_prefix("urn:btmh:") {
                     if !valid_btmh(hash.as_bytes()) {
@@ -1410,7 +1522,31 @@ fn validate_magnet_contract(magnet: &str, proxy_enabled: bool) -> Result<(), Tor
             }
         }
     }
-    Ok(())
+    if !normalize_base32 {
+        return Ok(magnet.to_owned());
+    }
+
+    let normalized_pairs = url
+        .query_pairs()
+        .map(|(key, value)| {
+            let value = if key == "xt" {
+                value
+                    .strip_prefix("urn:btih:")
+                    .filter(|hash| hash.len() == 32)
+                    .map(|hash| format!("urn:btih:{}", hash.to_ascii_uppercase()))
+                    .unwrap_or_else(|| value.into_owned())
+            } else {
+                value.into_owned()
+            };
+            (key.into_owned(), value)
+        })
+        .collect::<Vec<_>>();
+    let mut normalized = url;
+    normalized
+        .query_pairs_mut()
+        .clear()
+        .extend_pairs(normalized_pairs);
+    Ok(normalized.into())
 }
 
 fn valid_btih(hash: &[u8]) -> bool {
@@ -1418,7 +1554,7 @@ fn valid_btih(hash: &[u8]) -> bool {
         || (hash.len() == 32
             && hash
                 .iter()
-                .all(|byte| byte.is_ascii_uppercase() || matches!(byte, b'2'..=b'7')))
+                .all(|byte| byte.is_ascii_alphabetic() || matches!(byte, b'2'..=b'7')))
 }
 
 fn valid_btmh(hash: &[u8]) -> bool {
@@ -1821,6 +1957,9 @@ mod tests {
             url: "socks5://alice:secret@127.0.0.1:1080".into(),
             ..Default::default()
         };
+        let shown = format!("{embedded:?}");
+        assert!(!shown.contains("alice"));
+        assert!(!shown.contains("secret"));
         assert!(matches!(
             embedded.engine_url(),
             Err(TorrentError::InvalidProxy(_))
@@ -1914,6 +2053,36 @@ mod tests {
         assert!(shown.contains("tracker.example"));
         assert!(shown.contains("visible-context"));
         assert!(!shown.contains('\n'));
+    }
+
+    #[test]
+    fn engine_errors_redact_embedded_and_tracker_specific_credentials() {
+        let message = concat!(
+            "user=public&password=hunter2 ",
+            "{\"user\":\"public\",\"password\":\"p@ss\"} ",
+            "password=before-url,https://tracker.example/announce ",
+            "torrent_pass=gazelle authkey=tracker-auth apikey=api-one ",
+            "api_key=api-two sig=signed signature=signature-value ",
+            "sessionid=session-value"
+        );
+        let shown = engine_error(message).to_string();
+
+        for secret in [
+            "hunter2",
+            "p@ss",
+            "before-url",
+            "gazelle",
+            "tracker-auth",
+            "api-one",
+            "api-two",
+            "signed",
+            "signature-value",
+            "session-value",
+        ] {
+            assert!(!shown.contains(secret), "leaked {secret:?}: {shown}");
+        }
+        assert!(shown.contains("user=public"));
+        assert!(shown.contains("tracker.example"));
     }
 
     #[test]

@@ -24,10 +24,10 @@ The isolated M0 adapter measured the following in one macOS 26.6 arm64 run:
 
 | Measurement | Recorded result | Reviewer question |
 |---|---:|---|
-| Unstripped optimized `m0_idle` harness | 10,074,960 bytes (9.61 MiB) | Is this binary delta acceptable for the single-binary release? |
-| Maximum resident set for one idle session | 8,798,208 bytes (8.39 MiB) | Is this idle memory cost acceptable before real swarm load? |
-| Normal `nzbd-torrent` dependency closure | 220 package/version identities | Is the maintenance and audit surface acceptable? |
-| New workspace lockfile identities | 176 package/version identities | Is the dependency expansion proportionate to not implementing BitTorrent ourselves? |
+| Unstripped optimized `m0_idle` harness | 10,111,360 bytes (9.64 MiB) | Is this binary delta acceptable for the single-binary release? |
+| Maximum resident set for one idle session | 8,814,592 bytes (8.41 MiB) | Is this idle memory cost acceptable before real swarm load? |
+| Normal `nzbd-torrent` dependency closure | 222 package/version identities | Is the maintenance and audit surface acceptable? |
+| New workspace lockfile identities | 178 package/version identities | Is the dependency expansion proportionate to not implementing BitTorrent ourselves? |
 
 These are spike measurements, not permanent limits. The complete M0 rerun
 must measure the final daemon after an accepted rqbit release is linked. A
@@ -116,10 +116,10 @@ byte-for-byte acceptance comparisons.
 
 Gate 9 may move from Partial to Pass only if a reviewer accepts all of these:
 
-1. **Binary and idle-memory cost.** The one-sample 9.61 MiB harness and
-   8.39 MiB idle RSS are acceptable preliminary costs, subject to
+1. **Binary and idle-memory cost.** The one-sample 9.64 MiB harness and
+   8.41 MiB idle RSS are acceptable preliminary costs, subject to
    final-daemon remeasurement.
-2. **Dependency and license cost.** The 220-package closure, 176 new lockfile
+2. **Dependency and license cost.** The 222-package closure, 178 new lockfile
    identities, and exact MPL-2.0 exception are acceptable.
 3. **UPnP restriction.** Compiling the affected `quick-xml` is acceptable only
    because the first release cannot enable UPnP and CI guards that boundary.

@@ -197,24 +197,46 @@ fn multi_file_info_with_lengths(lengths: &[u64]) -> Vec<u8> {
     info
 }
 
-fn assert_preflight_does_not_panic(case: &str, bytes: &[u8]) {
+#[derive(Debug, Default, PartialEq, Eq)]
+struct MutationOutcomes {
+    accepted: usize,
+    rejected: usize,
+}
+
+impl MutationOutcomes {
+    fn record(&mut self, result: Result<bool, TorrentError>) {
+        if result.is_ok() {
+            self.accepted += 1;
+        } else {
+            self.rejected += 1;
+        }
+    }
+}
+
+fn assert_preflight_does_not_panic(case: &str, bytes: &[u8], outcomes: &mut MutationOutcomes) {
     let result = catch_unwind(AssertUnwindSafe(|| {
-        let _ = validate_metainfo_contract(bytes, false);
+        validate_metainfo_contract(bytes, false)
     }));
     assert!(result.is_ok(), "preflight panicked for {case}: {bytes:?}");
+    outcomes.record(result.unwrap());
 }
 
 #[test]
 fn bounded_mutation_corpus_never_panics_preflight() {
     let seeds = [
-        ("v1", v1_metainfo(b"payload.bin")),
-        ("v2", v2_metainfo(false)),
-        ("hybrid", v2_metainfo(true)),
+        ("v1", v1_metainfo(b"payload.bin"), (306, 1_489)),
+        ("v2", v2_metainfo(false), (0, 1_396)),
+        ("hybrid", v2_metainfo(true), (0, 1_985)),
     ];
 
-    for (seed_name, seed) in seeds {
+    for (seed_name, seed, (accepted, rejected)) in seeds {
+        let mut outcomes = MutationOutcomes::default();
         for end in 0..=seed.len() {
-            assert_preflight_does_not_panic(&format!("{seed_name}/truncate/{end}"), &seed[..end]);
+            assert_preflight_does_not_panic(
+                &format!("{seed_name}/truncate/{end}"),
+                &seed[..end],
+                &mut outcomes,
+            );
         }
 
         for position in 0..seed.len() {
@@ -224,12 +246,17 @@ fn bounded_mutation_corpus_never_panics_preflight() {
                 assert_preflight_does_not_panic(
                     &format!("{seed_name}/replace/{position}/{replacement}"),
                     &mutated,
+                    &mut outcomes,
                 );
             }
 
             let mut deleted = seed.clone();
             deleted.remove(position);
-            assert_preflight_does_not_panic(&format!("{seed_name}/delete/{position}"), &deleted);
+            assert_preflight_does_not_panic(
+                &format!("{seed_name}/delete/{position}"),
+                &deleted,
+                &mut outcomes,
+            );
         }
 
         for position in 0..=seed.len() {
@@ -239,9 +266,15 @@ fn bounded_mutation_corpus_never_panics_preflight() {
                 assert_preflight_does_not_panic(
                     &format!("{seed_name}/insert/{position}/{insertion}"),
                     &mutated,
+                    &mut outcomes,
                 );
             }
         }
+        assert_eq!(
+            outcomes,
+            MutationOutcomes { accepted, rejected },
+            "{seed_name} mutation disposition changed; review the exact cases before updating this snapshot"
+        );
     }
 }
 
@@ -375,6 +408,38 @@ fn adapter_rejects_windows_device_aliases_and_reserved_characters() {
             "portable component was rejected: {component:?}"
         );
     }
+}
+
+#[test]
+fn portable_component_limit_is_encoded_bytes_not_scalar_count() {
+    let at_limit = "日".repeat(MAX_TORRENT_PATH_COMPONENT_BYTES / 3);
+    assert_eq!(at_limit.chars().count(), 85);
+    assert_eq!(at_limit.len(), MAX_TORRENT_PATH_COMPONENT_BYTES);
+    assert!(validate_metainfo_contract(&v1_metainfo(at_limit.as_bytes()), false).is_ok());
+
+    let over_limit = format!("{at_limit}日");
+    assert_eq!(over_limit.chars().count(), 86);
+    assert_eq!(over_limit.len(), MAX_TORRENT_PATH_COMPONENT_BYTES + 3);
+    assert!(matches!(
+        validate_metainfo_contract(&v1_metainfo(over_limit.as_bytes()), false),
+        Err(TorrentError::PathComponentTooLong { size, limit })
+            if size == MAX_TORRENT_PATH_COMPONENT_BYTES + 3
+                && limit == MAX_TORRENT_PATH_COMPONENT_BYTES
+    ));
+}
+
+#[test]
+fn private_metainfo_discovery_policy_fails_closed_when_dht_is_live() {
+    let bytes = metainfo_with_announce(
+        &private_single_file_info(b"payload.bin"),
+        b"https://tracker.example/announce",
+    );
+    assert!(matches!(
+        validate_metainfo_admission(&bytes, false, true),
+        Err(TorrentError::PrivateMetainfoWithDht)
+    ));
+    assert!(validate_metainfo_admission(&bytes, false, false).is_ok());
+    assert!(validate_metainfo_admission(&v1_metainfo(b"public.bin"), false, true).is_ok());
 }
 
 #[test]
@@ -602,12 +667,46 @@ fn magnet_preflight_reads_exact_topics_instead_of_substrings() {
     assert!(validate_magnet_contract(&base32_magnet, false).is_ok());
     assert!(librqbit::Magnet::parse(&base32_magnet).is_ok());
 
+    let lowercase_base32 = "a".repeat(32);
+    let lowercase_magnet = format!("magnet:?xt=urn:btih:{lowercase_base32}");
+    let normalized = validate_magnet_contract(&lowercase_magnet, false).unwrap();
+    assert!(normalized.contains(&"A".repeat(32)));
+    assert!(librqbit::Magnet::parse(&normalized).is_ok());
+
     let marker_in_display = format!("magnet:?xt=urn:btih:{hex}&dn=urn%3Abtmh%3Anot-a-topic");
     assert!(validate_magnet_contract(&marker_in_display, false).is_ok());
     let marker_in_tracker = format!(
         "magnet:?xt=urn:btih:{hex}&tr=https%3A%2F%2Ftracker.example%2Furn%3Abtmh%3Aignored"
     );
     assert!(validate_magnet_contract(&marker_in_tracker, false).is_ok());
+}
+
+#[test]
+fn indexed_or_case_varied_magnet_keys_match_pinned_rqbit_behavior() {
+    let hex = "00".repeat(20);
+    for key in ["XT", "Xt", "xt.1"] {
+        let magnet = format!("magnet:?{key}=urn:btih:{hex}");
+        assert!(matches!(
+            validate_magnet_contract(&magnet, false),
+            Err(TorrentError::InvalidMagnet(_))
+        ));
+        assert!(librqbit::Magnet::parse(&magnet).is_err());
+    }
+
+    let indexed_selection = format!("magnet:?xt=urn:btih:{hex}&so.1=0-4000000000");
+    let normalized = validate_magnet_contract(&indexed_selection, false).unwrap();
+    assert!(librqbit::Magnet::parse(&normalized)
+        .unwrap()
+        .get_select_only()
+        .is_none());
+
+    let indexed_tracker =
+        format!("magnet:?xt=urn:btih:{hex}&tr.1=https%3A%2F%2Ftracker.example%2Fannounce");
+    let normalized = validate_magnet_contract(&indexed_tracker, false).unwrap();
+    assert!(librqbit::Magnet::parse(&normalized)
+        .unwrap()
+        .trackers
+        .is_empty());
 }
 
 #[test]
@@ -628,7 +727,6 @@ fn magnet_preflight_names_format_version_and_proxy_failures() {
         "magnet:?dn=missing-topic".to_owned(),
         "magnet:?xt=urn:btih:short".to_owned(),
         format!("magnet:?xt=urn:btih:{}", "Z".repeat(40)),
-        format!("magnet:?xt=urn:btih:{}", "a".repeat(32)),
         format!("magnet:?XT=urn:btih:{hex}"),
         format!("magnet:?xt=URN:BTIH:{hex}"),
         // rqbit 8.1.1 panics after decoding this advertised base32 Id32
@@ -821,6 +919,27 @@ fn adapter_rejects_canonically_equivalent_unicode_path_collisions() {
         &[composed_path, distinct_path],
     ));
     assert!(validate_metainfo_contract(&distinct, false).is_ok());
+
+    for (left, right) in [
+        ("ΣΑΣ.mkv", "σας.mkv"),
+        ("ſong.mkv", "song.mkv"),
+        ("ı.mkv", "i.mkv"),
+    ] {
+        let left_path: &[&[u8]] = &[b"disc", left.as_bytes()];
+        let right_path: &[&[u8]] = &[b"disc", right.as_bytes()];
+        let collision = metainfo(&multi_file_info_many(b"release", &[left_path, right_path]));
+        assert!(matches!(
+            validate_metainfo_contract(&collision, false),
+            Err(TorrentError::PathCollision)
+        ));
+    }
+
+    for (left, right) in [("ﬁle.mkv", "file.mkv"), ("Ｆ.mkv", "f.mkv")] {
+        let left_path: &[&[u8]] = &[b"disc", left.as_bytes()];
+        let right_path: &[&[u8]] = &[b"disc", right.as_bytes()];
+        let distinct = metainfo(&multi_file_info_many(b"release", &[left_path, right_path]));
+        assert!(validate_metainfo_contract(&distinct, false).is_ok());
+    }
 }
 
 #[test]

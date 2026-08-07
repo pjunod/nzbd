@@ -29,8 +29,8 @@ peer listener, or production torrent admission path has been added.
 | 2. v1 `.torrent`, magnet, TCP/IPv4, then seed | **Pass** | Deterministic generated payloads download through both admission paths; a local seeder accounts for both uploads and exact bytes match. The adapter checks nonzero piece length and total payload, checked aggregate length, whole SHA-1 hash width, exact hash count, and rqbit's `u32` absolute chunk-index boundary before the engine constructs its length table. |
 | 3. Controls and live limits | **Pass** | Pause/resume is exercised before completion, the live download limit is removed during transfer, and idempotent keep-data delete, idempotent delete-data, and unrelated-sibling retention pass. |
 | 4. Kill/restart never trusts partial data | **Blocked** | The accepted fast-resume design cannot be constructed without failing gate 8. A persistence-disabled full hash recheck is a possible safe but slower product decision, not an equivalent test of the accepted design. |
-| 5. Private-torrent discovery | **Pass** | A one-tracker private torrent downloads through a loopback HTTP tracker, and a deterministic peer-wire control proves public torrents consume an injected PEX peer while private torrents ignore it. A Linux capture harness starts live DHT, redirects both stable-8.1.1 bootstrap ports to a local KRPC probe, and observes separate public control hashes before and during a 15-second private canary window. It scans all captured UDP—not just redirected DHT—for the private hash in binary or LSD-style text form. The [first successful capture run](https://github.com/pjunod/nzbd/actions/runs/31128106994) passed on 2026-08-06 UTC: both DHT controls were observed and no private DHT/LSD hash appeared. Tracker order is still lost through a hash set before truncation, so the adapter rejects private metainfo unless it has exactly one unique tracker. Empty tracker slots are treated as absent; every non-empty tracker URL now fails closed before rqbit can silently discard malformed/non-UTF-8 input, unsupported schemes, missing hosts, or UDP without a port. A magnet does not expose the private bit before resolution; because stable rqbit has no per-add DHT suppression, the adapter rejects every magnet in a DHT-enabled session before calling the engine. A loopback pair proves rejection happens before explicit-peer contact while the same private magnet resolves through an explicit peer when session DHT is disabled. |
-| 6. Path and delete safety | **Pass** | The adapter now repeats the portable lexical path invariant before rqbit admission: unnamed payloads, empty/dot/parent components, slash or backslash, absolute/UNC forms, Windows drive prefixes and device aliases, alternate-data-stream and other reserved characters, trailing dot/space aliases, malformed UTF-8, empty multi-file paths, missing/unsafe multi-file roots, metainfo-declared symlinks, exact duplicate paths, file-versus-directory-prefix overlaps, and portable Unicode-NFC/lowercase collisions fail with safe nzbd-owned errors. rqbit's shared `torrent-content` fallback is therefore never used for an unnamed single-file torrent. Magnet input first resolves through rqbit's list-only path, which returns before storage construction; nzbd then applies the same metainfo contract and admits only the validated bytes. A fake BEP 9 peer proves an unsafe resolved path leaves the destination empty, and the real-admission corpus still proves rejection before an escape file exists. The session canonicalizes its output root and preflights every existing payload prefix with no-follow metadata: symlinks fail, prefixes must be directories, and leaves must be regular files while an existing regular leaf remains valid resume input. A Unix test proves a symlink is rejected before storage and its external target remains empty. This is defense in depth, not a claim to close the check/write race. The importer-safe content inventory omits BEP 47 padding entries while raw engine-indexed progress remains available only as diagnostics. Delete-data removes only parsed torrent content; an unrelated sibling survives. Higher layers must still prove persisted delete-root authority, descriptor-relative containment across writes, and empirical filesystem-specific case/normalization behavior in M5/M2. |
+| 5. Private-torrent discovery | **Pass** | A one-tracker private torrent downloads through a loopback HTTP tracker, and a deterministic peer-wire control proves public torrents consume an injected PEX peer while private torrents ignore it. A Linux capture harness starts live DHT, redirects both stable-8.1.1 bootstrap ports to a local KRPC probe, and observes separate public control hashes before and during a 15-second private canary window. It scans all captured UDP—not just redirected DHT—for the private hash in binary or LSD-style text form. The [first successful capture run](https://github.com/pjunod/nzbd/actions/runs/31128106994) passed on 2026-08-06 UTC: both DHT controls were observed and no private DHT/LSD hash appeared. Tracker order is still lost through a hash set before truncation, so the adapter rejects private metainfo unless it has exactly one unique tracker. Empty tracker slots are treated as absent; every non-empty tracker URL now fails closed before rqbit can silently discard malformed/non-UTF-8 input, unsupported schemes, missing hosts, or UDP without a port. A magnet does not expose the private bit before resolution; because stable rqbit has no per-add DHT suppression, the adapter rejects every magnet in a DHT-enabled session before calling the engine. A known-private `.torrent` is likewise rejected before engine admission when session DHT is live. Loopback and policy tests prove both guards fail before contact while DHT-disabled private admission remains available. |
+| 6. Path and delete safety | **Pass** | The adapter now repeats the portable lexical path invariant before rqbit admission: unnamed payloads, empty/dot/parent components, slash or backslash, absolute/UNC forms, Windows drive prefixes and device aliases, alternate-data-stream and other reserved characters, trailing dot/space aliases, malformed UTF-8, empty multi-file paths, missing/unsafe multi-file roots, metainfo-declared symlinks, exact duplicate paths, file-versus-directory-prefix overlaps, and portable Unicode NFC/simple-case-fold collisions fail with safe nzbd-owned errors. Greek sigma, long-s, and Windows dotless-i aliases are covered without collapsing compatibility-only ligature or width pairs. rqbit's shared `torrent-content` fallback is therefore never used for an unnamed single-file torrent. Magnet input first resolves through rqbit's list-only path, which returns before storage construction; nzbd then applies the same metainfo contract and admits only the validated bytes. A fake BEP 9 peer proves an unsafe resolved path leaves the destination empty, and the real-admission corpus still proves rejection before an escape file exists. The session canonicalizes its output root and preflights every existing payload prefix with no-follow metadata: symlinks fail, prefixes must be directories, and leaves must be regular files while an existing regular leaf remains valid resume input. A Unix test proves a symlink is rejected before storage and its external target remains empty. This is defense in depth, not a claim to close the check/write race. The importer-safe content inventory omits BEP 47 padding entries while raw engine-indexed progress remains available only as diagnostics. Delete-data removes only parsed torrent content; an unrelated sibling survives. Higher layers must still prove persisted delete-root authority, descriptor-relative containment across writes, and empirical filesystem-specific case/normalization behavior in M5/M2. |
 | 7. Public observability | **Fail** | Public stats expose phase, total/progress/upload bytes, file progress, rates, ETA inputs, peer counts, completion, and error. Stable 8.1.1 does not expose per-torrent tracker state, DHT state, or last tracker error. A tested upstream patch now supplies that snapshot, but this gate remains failed until an accepted stable release contains it. “No peers” cannot safely substitute for those facts. |
 | 8. nzbd-authoritative persistence | **Fail** | The contract test proves that `Session::new_with_opts` auto-restores the library record before returning. The persistence module and store injection point are private in 8.1.1, so nzbd cannot filter first. A tested upstream patch now supplies the missing opt-out, but this gate remains failed until an accepted stable release contains it. |
 | 9. Resource, package, and license delta | **Partial** | Measurements are recorded in §4. A blocking cargo-deny 0.20.2 policy passes locally across all features and the locked graph, and its [first Actions run passed](https://github.com/pjunod/nzbd/actions/runs/31064446916) on 2026-08-06 UTC. The repository-wide Supply chain check also freezes the reviewed advisory package/feature sets and sole MPL-2.0 package path without pinning nzbd's own version. Stable 8.1.1 also hard-codes 128 live peers per torrent and exposes no session-wide cap, so the proposed 80/400 runtime budgets are not yet enforceable; the 80-peer adapter guard applies only to explicit bootstrap input. The [gate 9 review brief](BITTORRENT_GATE9_REVIEW.md) isolates the remaining human acceptance and resource-control decisions. |
@@ -132,10 +132,13 @@ The isolated suite covers:
 - named rejection of proxy+DHT and proxy+UDP-tracker leak paths;
 - named rejection of tracker port zero rather than deferring an invalid
   endpoint to rqbit's retry/error path;
-- named rejection of privacy-unknown magnets in a DHT-enabled session before
-  rqbit can contact even an explicitly supplied peer;
-- password redaction and invalid proxy combinations, including multi-token
-  authorization/cookie values and alternate assignment separators;
+- named rejection of privacy-unknown magnets and known-private metainfo in a
+  DHT-enabled session before rqbit can contact even an explicitly supplied
+  peer;
+- password redaction and invalid proxy combinations, including embedded proxy
+  credentials before validation, multi-token authorization/cookie values,
+  embedded JSON/query assignments, private-tracker credential names, and
+  alternate assignment separators;
 - engine/stat error redaction and UTF-8-safe 2 KiB truncation with an explicit
   marker;
 - one-tracker private-torrent discovery and multi-tracker rejection;
@@ -146,7 +149,7 @@ The isolated suite covers:
   untouched, with the remaining check/write race called out explicitly;
 - adapter-owned portable path preflight for single- and multi-file torrents,
   including safe named errors, Windows device/character/alias rejection,
-  metainfo-declared symlink rejection, and exact or portable-lowercase
+  metainfo-declared symlink rejection, and exact or portable simple-case-fold
   duplicate path rejection;
 - parsed BEP 47 padding metainfo whose padding entry stays out of the
   importer-safe content inventory without shifting later file progress;
@@ -155,14 +158,16 @@ The isolated suite covers:
   bytes, with exact boundary and first-excess tests;
 - deterministic, socket-free preflight mutations covering every truncation and
   bounded single-byte replacement, deletion, and insertion around valid v1,
-  v2-only, and hybrid seeds, plus nesting, length-overflow, duplicate-info,
-  trailing-byte, and framed-marker invariants;
+  v2-only, and hybrid seeds, with exact accepted/rejected outcome counts plus
+  nesting, length-overflow, duplicate-info, trailing-byte, and framed-marker
+  invariants;
 - checked v1 payload/piece/hash geometry, including zero values, aggregate
   length overflow, malformed hash width, mismatched hash count, and valid
   zero-length sidecars;
 - the explicit aws-lc provider invariant;
 - v2-only and hybrid named rejection for metainfo and magnets;
-- query-aware magnet validation for hex/uppercase-base32 `btih`, valid `btmh`,
+- query-aware magnet validation for hex/base32 `btih` with lowercase base32
+  normalized to rqbit's accepted spelling, valid `btmh`,
   duplicate/missing/unknown exact topics, engine-incompatible casing, false
   version markers outside `xt`, and pre-engine rejection of unbounded `so=`
   file-range expansion; and
@@ -386,11 +391,16 @@ intentionally does not link the blocked adapter.
 
 | Measurement | Result |
 |---|---:|
-| Unstripped optimized harness | 10,074,960 bytes (9.61 MiB) |
-| Maximum resident set while starting/stopping one idle session | 8,798,208 bytes (8.39 MiB) |
-| Normal dependency closure of `nzbd-torrent` | 220 unique package/version identities |
-| New package/version identities in the workspace lockfile | 176 |
+| Unstripped optimized harness | 10,111,360 bytes (9.64 MiB) |
+| Maximum resident set while starting/stopping one idle session | 8,814,592 bytes (8.41 MiB) |
+| Normal dependency closure of `nzbd-torrent` | 222 unique package/version identities |
+| New package/version identities in the workspace lockfile | 178 |
 | OpenSSL dynamic link | none; only CoreFoundation, libiconv, and libSystem were listed on this host |
+
+The 2026-08-07 review remediation refreshed these measurements after adding
+`icu_casemap 2.1.1` and `icu_casemap_data 2.1.1` for Unicode simple case
+folding. The change added two package identities, 36,400 binary bytes, and
+16,384 bytes to the one-sample idle RSS measurement.
 
 The normal closure reports permissive licenses: MIT, Apache-2.0, BSD, ISC,
 Unicode-3.0, Zlib, Unlicense, CDLA-Permissive-2.0, and related compatible
