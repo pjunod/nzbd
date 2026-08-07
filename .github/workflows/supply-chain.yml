@@ -17,6 +17,21 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  reviewed-exceptions:
+    name: reviewed dependency exceptions
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.85"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: reviewed-dependency-exceptions
+      - name: Freeze reviewed package, feature, license, and advisory sets
+        run: scripts/check-reviewed-dependency-exceptions.sh
+
   policy:
     name: licenses, bans, and sources
     runs-on: ubuntu-latest

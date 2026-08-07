@@ -33,7 +33,7 @@ peer listener, or production torrent admission path has been added.
 | 6. Path and delete safety | **Pass** | Traversal metainfo is rejected before an escape file exists. Delete-data removes only parsed torrent content; an unrelated sibling survives. Higher layers must still prove the persisted canonical root before requesting deletion. |
 | 7. Public observability | **Fail** | Public stats expose phase, total/progress/upload bytes, file progress, rates, ETA inputs, peer counts, completion, and error. Stable 8.1.1 does not expose per-torrent tracker state, DHT state, or last tracker error. A tested upstream patch now supplies that snapshot, but this gate remains failed until an accepted stable release contains it. “No peers” cannot safely substitute for those facts. |
 | 8. nzbd-authoritative persistence | **Fail** | The contract test proves that `Session::new_with_opts` auto-restores the library record before returning. The persistence module and store injection point are private in 8.1.1, so nzbd cannot filter first. A tested upstream patch now supplies the missing opt-out, but this gate remains failed until an accepted stable release contains it. |
-| 9. Resource, package, and license delta | **Partial** | Measurements are recorded in §4. A blocking cargo-deny 0.20.2 policy passes locally across all features and the locked graph, and its [first Actions run passed](https://github.com/pjunod/nzbd/actions/runs/31064446916) on 2026-08-06 UTC. It runs on every PR, main/tag push, and a daily schedule. Gate 9 still needs reviewer acceptance of the measurements and three exact, unreachable-path advisory exceptions. |
+| 9. Resource, package, and license delta | **Partial** | Measurements are recorded in §4. A blocking cargo-deny 0.20.2 policy passes locally across all features and the locked graph, and its [first Actions run passed](https://github.com/pjunod/nzbd/actions/runs/31064446916) on 2026-08-06 UTC. The repository-wide Supply chain check also freezes the reviewed advisory package/feature sets and sole MPL-2.0 package path without pinning nzbd's own version. The [gate 9 review brief](BITTORRENT_GATE9_REVIEW.md) isolates the remaining human acceptance decision. |
 | 10. One explicit rustls provider | **Pass** | The process starts without a provider, explicitly installs aws-lc, and constructs librqbit’s rustls client without the mixed-provider panic. |
 | 11. v1-only boundary | **Pass** | Stable input uses v1 pieces/`btih`; v2-only and hybrid `.torrent` files and magnets return separate named errors before librqbit admission. |
 
@@ -50,9 +50,9 @@ Gates 7 and 8 are stop conditions in §4.3 of the proposal. This is an M0
 code. The daemon does not depend on it. The boundary currently provides:
 
 - explicit process-wide aws-lc provider installation;
-- session construction with DHT and UPnP off by default, DHT persistence
-  disabled unconditionally, and proxy+DHT rejected because DHT bypasses the
-  engine's SOCKS path;
+- session construction with DHT off by default, UPnP unavailable, DHT
+  persistence disabled unconditionally, and proxy+DHT rejected because DHT
+  bypasses the engine's SOCKS path;
 - raw v1 metainfo and v1 magnet admission;
 - named v2-only and hybrid rejection for both metainfo and magnets;
 - exact-one-tracker validation for private metainfo;
@@ -286,14 +286,14 @@ remains prohibited.
 
 ## 4. Measurements and dependency review
 
-Measurements are from the isolated optimized `m0_idle` harness on macOS 26.6
-arm64. They are not the final daemon delta because the daemon intentionally does
-not link the blocked adapter.
+Measurements are from one run of the isolated optimized `m0_idle` harness on
+macOS 26.6 arm64. They are not the final daemon delta because the daemon
+intentionally does not link the blocked adapter.
 
 | Measurement | Result |
 |---|---:|
-| Unstripped optimized harness | 10,092,928 bytes (9.63 MiB) |
-| Maximum resident set while starting/stopping one idle session | 8,732,672 bytes (8.33 MiB) |
+| Unstripped optimized harness | 10,074,960 bytes (9.61 MiB) |
+| Maximum resident set while starting/stopping one idle session | 8,798,208 bytes (8.39 MiB) |
 | Normal dependency closure of `nzbd-torrent` | 220 unique package/version identities |
 | New package/version identities in the workspace lockfile | 176 |
 | OpenSSL dynamic link | none; only CoreFoundation, libiconv, and libSystem were listed on this host |
@@ -326,9 +326,10 @@ by rustls. Three exact advisory exceptions remain:
   and
   [`RUSTSEC-2026-0195`](https://rustsec.org/advisories/RUSTSEC-2026-0195)
   affect quick-xml 0.37 through librqbit 8.1.1's unconditional UPnP helper.
-  The path is reachable only when UPnP port forwarding is enabled, which M0
-  keeps off. A production gate must remove both exceptions or keep UPnP
-  unavailable.
+  The path is reachable only when UPnP port forwarding is enabled. The adapter
+  no longer exposes an UPnP input and unconditionally constructs rqbit with
+  port forwarding false. A production gate must remove both exceptions or
+  keep UPnP unavailable.
 - [`RUSTSEC-2026-0009`](https://rustsec.org/advisories/RUSTSEC-2026-0009)
   affects `time`'s RFC 2822 parser. rcgen compiles `time` without its parsing
   feature, so the vulnerable parser is absent. The fixed `time 0.3.47` raises
@@ -342,6 +343,17 @@ schedule, and manual dispatch. The
 passed both jobs on 2026-08-06 UTC. Gate 9 remains **Partial** until a reviewer
 accepts both the recorded delta and the narrow advisory dispositions. A green
 exception is not evidence that the underlying code became safe to enable.
+
+[`scripts/check-reviewed-dependency-exceptions.sh`](../scripts/check-reviewed-dependency-exceptions.sh)
+now makes the disposition executable in the repository-wide Supply chain
+workflow. It requires the reviewed quick-xml package set, the exact `time`
+package and `alloc`/`std` feature sets, the MPL-2.0 `option-ext` path, and only
+the three named RustSec ignores. Workspace-member versions are normalized, and
+an obsolete package pin fails with the exception that must be reconsidered.
+The adapter unit test independently proves that its constructed rqbit options
+cannot enable UPnP. The [gate 9 review brief](BITTORRENT_GATE9_REVIEW.md)
+collects the measurements, exceptions, renewal rules, and exact decision the
+reviewer must accept or reject; this report does not pre-accept it.
 
 ---
 
@@ -359,7 +371,8 @@ Preferred path:
 4. pin the first stable release containing both accepted APIs;
 5. rerun all eleven M0 gates on native macOS, Linux glibc/musl, and Windows;
 6. run the packet-capture private-mode test and obtain reviewer acceptance of
-   the recorded resource, package, license, and advisory dispositions; and
+   the resource, package, license, and advisory dispositions isolated in the
+   [gate 9 review brief](BITTORRENT_GATE9_REVIEW.md); and
 7. only then resume M2 daemon integration.
 
 The human-review checklist, submission order, issue draft, PR draft, exact
@@ -396,6 +409,7 @@ The key local gates are:
 
 ```sh
 scripts/check-bittorrent-deps.sh
+scripts/check-reviewed-dependency-exceptions.sh
 cargo deny --all-features --locked check bans licenses sources
 cargo deny --all-features --locked check advisories
 cargo test -p nzbd-torrent -- --nocapture

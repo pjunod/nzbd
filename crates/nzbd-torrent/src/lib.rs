@@ -87,7 +87,6 @@ pub fn install_process_crypto_provider() -> Result<CryptoProviderInstall, Torren
 pub struct TorrentSessionConfig {
     pub dht: bool,
     pub listen_port_range: Option<Range<u16>>,
-    pub upnp_port_forwarding: bool,
     pub proxy: Option<TorrentProxyConfig>,
 }
 
@@ -184,17 +183,7 @@ impl TorrentSession {
             .as_ref()
             .map(TorrentProxyConfig::engine_url)
             .transpose()?;
-        let options = SessionOptions {
-            disable_dht: !config.dht,
-            // librqbit's default persistent DHT state lives in rqbit's
-            // process-global cache directory. nzbd must not share a listen
-            // port or routing table with another session on the same host.
-            disable_dht_persistence: true,
-            listen_port_range: config.listen_port_range,
-            enable_upnp_port_forwarding: config.upnp_port_forwarding,
-            socks_proxy_url,
-            ..Default::default()
-        };
+        let options = session_options(config.dht, config.listen_port_range, socks_proxy_url);
         let inner = Session::new_with_opts(output_root, options)
             .await
             .map_err(engine_error)?;
@@ -294,6 +283,27 @@ impl TorrentSession {
 
     pub async fn stop(&self) {
         self.inner.stop().await;
+    }
+}
+
+fn session_options(
+    dht: bool,
+    listen_port_range: Option<Range<u16>>,
+    socks_proxy_url: Option<String>,
+) -> SessionOptions {
+    SessionOptions {
+        disable_dht: !dht,
+        // librqbit's default persistent DHT state lives in rqbit's
+        // process-global cache directory. nzbd must not share a listen port or
+        // routing table with another session on the same host.
+        disable_dht_persistence: true,
+        listen_port_range,
+        // librqbit 8.1.1 unconditionally compiles an advisory-affected
+        // quick-xml through its UPnP helper. The M0 adapter deliberately has
+        // no input that can turn this runtime path on.
+        enable_upnp_port_forwarding: false,
+        socks_proxy_url,
+        ..Default::default()
     }
 }
 
@@ -619,6 +629,14 @@ pub struct TorrentStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_options_cannot_enable_upnp() {
+        // This pins the helper used by TorrentSession::start. If start stops
+        // delegating here, move the assertion to the replacement call path.
+        let options = session_options(false, None, None);
+        assert!(!options.enable_upnp_port_forwarding);
+    }
 
     #[test]
     fn proxy_credentials_are_separate_and_redacted() {
