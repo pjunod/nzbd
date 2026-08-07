@@ -536,11 +536,7 @@ impl TorrentSession {
             .inner
             .add_torrent(
                 AddTorrent::from_url(magnet),
-                Some(AddTorrentOptions {
-                    list_only: true,
-                    initial_peers: Some(config.initial_peers.clone()),
-                    ..Default::default()
-                }),
+                Some(magnet_resolution_options(config.initial_peers.clone())),
             )
             .await
             .map_err(engine_error)?;
@@ -563,12 +559,7 @@ impl TorrentSession {
         source: AddTorrent<'_>,
         config: TorrentAddConfig,
     ) -> Result<TorrentHandle, TorrentError> {
-        let options = AddTorrentOptions {
-            paused: config.paused,
-            overwrite: config.overwrite,
-            initial_peers: Some(config.initial_peers),
-            ..Default::default()
-        };
+        let options = managed_add_options(config);
         let handle = self
             .inner
             .add_torrent(source, Some(options))
@@ -610,6 +601,43 @@ impl TorrentSession {
 
     pub async fn stop(&self) {
         self.inner.stop().await;
+    }
+}
+
+fn magnet_resolution_options(initial_peers: Vec<SocketAddr>) -> AddTorrentOptions {
+    exact_add_options(false, false, true, initial_peers)
+}
+
+fn managed_add_options(config: TorrentAddConfig) -> AddTorrentOptions {
+    exact_add_options(config.paused, config.overwrite, false, config.initial_peers)
+}
+
+fn exact_add_options(
+    paused: bool,
+    overwrite: bool,
+    list_only: bool,
+    initial_peers: Vec<SocketAddr>,
+) -> AddTorrentOptions {
+    // Keep every stable 8.1.1 field explicit. In particular, the adapter does
+    // not allow selection, alternate output roots, injected trackers, custom
+    // storage, or deferred writes to appear through an upstream default.
+    AddTorrentOptions {
+        paused,
+        only_files_regex: None,
+        only_files: None,
+        overwrite,
+        list_only,
+        output_folder: None,
+        sub_folder: None,
+        peer_opts: None,
+        force_tracker_interval: None,
+        disable_trackers: false,
+        ratelimits: Default::default(),
+        initial_peers: Some(initial_peers),
+        preferred_id: None,
+        storage_factory: None,
+        defer_writes: None,
+        trackers: None,
     }
 }
 
@@ -1598,6 +1626,43 @@ mod tests {
         assert_eq!(options.ratelimits, Default::default());
         assert!(options.blocklist_url.is_none());
         assert!(options.trackers.is_empty());
+    }
+
+    #[test]
+    fn per_torrent_options_are_an_explicit_admission_boundary() {
+        let peer = "127.0.0.1:6881".parse().unwrap();
+        let resolving = magnet_resolution_options(vec![peer]);
+        assert!(!resolving.paused);
+        assert!(!resolving.overwrite);
+        assert!(resolving.list_only);
+        assert_eq!(resolving.initial_peers, Some(vec![peer]));
+        assert_add_options_cannot_redirect_or_expand_scope(&resolving);
+
+        let managed = managed_add_options(TorrentAddConfig {
+            paused: true,
+            overwrite: true,
+            initial_peers: vec![peer],
+        });
+        assert!(managed.paused);
+        assert!(managed.overwrite);
+        assert!(!managed.list_only);
+        assert_eq!(managed.initial_peers, Some(vec![peer]));
+        assert_add_options_cannot_redirect_or_expand_scope(&managed);
+    }
+
+    fn assert_add_options_cannot_redirect_or_expand_scope(options: &AddTorrentOptions) {
+        assert!(options.only_files_regex.is_none());
+        assert!(options.only_files.is_none());
+        assert!(options.output_folder.is_none());
+        assert!(options.sub_folder.is_none());
+        assert!(options.peer_opts.is_none());
+        assert!(options.force_tracker_interval.is_none());
+        assert!(!options.disable_trackers);
+        assert_eq!(options.ratelimits, Default::default());
+        assert!(options.preferred_id.is_none());
+        assert!(options.storage_factory.is_none());
+        assert!(options.defer_writes.is_none());
+        assert!(options.trackers.is_none());
     }
 
     #[test]

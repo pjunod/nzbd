@@ -56,6 +56,10 @@ code. The daemon does not depend on it. The boundary currently provides:
   and proxy+DHT rejected because DHT bypasses the engine's SOCKS path. Every
   stable 8.1.1 session option is assigned explicitly so a new upstream option
   becomes a compile-time review event instead of silently inheriting a default;
+- per-torrent admission options assigned explicitly for metadata resolution
+  and managed torrents, with selective files, alternate output roots, custom
+  trackers/storage, and deferred writes unavailable. Newly added upstream add
+  options likewise require an explicit adapter review;
 - raw v1 metainfo and two-stage v1 magnet admission, with an engine-compatible
   exact-topic grammar, eager `so=` expansion rejected before rqbit parsing,
   and resolved metadata returned by list-only mode and revalidated before

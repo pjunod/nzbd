@@ -1294,6 +1294,10 @@ source_redirects = 5
   fetching, deferred-write buffering, and UPnP remain off or absent. A future
   upstream field must therefore fail compilation and receive an explicit
   network/storage review instead of silently inheriting a new default.
+- the same compile-time boundary applies to every stable 8.1.1 per-torrent add
+  option. Metadata resolution and managed admission cannot silently gain file
+  selection, alternate output roots, injected trackers, custom storage, or
+  deferred writes through an upstream default.
 - the M0 adapter accepts only URL-unreserved ASCII in proxy credentials. M2
   must either percent-encode punctuation with redaction fixtures or expose
   this as a named validation limit; it may not silently broaden the accepted
