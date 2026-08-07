@@ -1163,8 +1163,14 @@ indices for low-level diagnostics. A parsed padding-metainfo test proves the
 padding path never appears in that content inventory. It
 applies that same contract to magnets by resolving them through rqbit's
 list-only mode, which returns metadata before storage construction, and then
-admitting only the validated returned bytes. A fake BEP 9 peer proves an unsafe
-resolved path leaves the destination empty. This closes write ordering but not
+admitting only the validated returned bytes. Before rqbit parses a magnet, the
+adapter requires the exact parameter and namespace spelling supported by the
+pinned engine, rejects unknown or malformed exact topics, and rejects `so=`.
+Stable 8.1.1 eagerly expands every `so=` range into a vector, so even a short
+URI can otherwise trigger an attacker-sized allocation; selective file
+admission must instead use a bounded, explicit nzbd-owned input. A fake BEP 9
+peer proves an unsafe resolved path leaves the destination empty. This closes
+write ordering but not
 the stable engine's internal metadata allocation: rqbit may allocate up to
 32 MiB before nzbd can enforce its 10 MiB returned-metainfo limit, so production
 magnet wiring still needs a reviewed pre-allocation answer. The adapter now

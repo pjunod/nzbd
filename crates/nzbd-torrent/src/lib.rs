@@ -1121,18 +1121,38 @@ fn validate_magnet_contract(magnet: &str, proxy_enabled: bool) -> Result<(), Tor
     let mut v1_topics = 0usize;
     let mut has_v2 = false;
     for (key, topic) in url.query_pairs() {
-        if !key.eq_ignore_ascii_case("xt") {
-            continue;
-        }
-        if let Some(hash) = strip_ascii_case_prefix(&topic, "urn:btih:") {
-            if !valid_btih(hash.as_bytes()) {
+        match key.as_ref() {
+            "xt" => {
+                if let Some(hash) = topic.strip_prefix("urn:btih:") {
+                    if !valid_btih(hash.as_bytes()) {
+                        return Err(TorrentError::InvalidMagnet(
+                            "btih must be 40 hexadecimal or 32 uppercase base32 characters",
+                        ));
+                    }
+                    v1_topics = v1_topics.saturating_add(1);
+                } else if let Some(hash) = topic.strip_prefix("urn:btmh:") {
+                    if !valid_btmh(hash.as_bytes()) {
+                        return Err(TorrentError::InvalidMagnet(
+                            "btmh must contain the 1220 multihash prefix and a 32-byte hexadecimal digest",
+                        ));
+                    }
+                    has_v2 = true;
+                } else {
+                    return Err(TorrentError::InvalidMagnet(
+                        "only v1 btih and v2 btmh exact topics are supported",
+                    ));
+                }
+            }
+            // rqbit 8.1.1 eagerly expands every selected range into a Vec
+            // while parsing the URI. The dormant adapter does not expose
+            // selective-file admission, so reject the parameter before an
+            // attacker-controlled range can allocate without a useful bound.
+            "so" => {
                 return Err(TorrentError::InvalidMagnet(
-                    "btih must be 40 hexadecimal or 32 base32 characters",
+                    "select-only parameters are not supported",
                 ));
             }
-            v1_topics = v1_topics.saturating_add(1);
-        } else if strip_ascii_case_prefix(&topic, "urn:btmh:").is_some() {
-            has_v2 = true;
+            _ => {}
         }
     }
 
@@ -1154,21 +1174,11 @@ fn validate_magnet_contract(magnet: &str, proxy_enabled: bool) -> Result<(), Tor
     }
 
     for (key, tracker) in url.query_pairs() {
-        if key.eq_ignore_ascii_case("tr")
-            && validate_tracker_url(tracker.as_bytes())?
-            && proxy_enabled
-        {
+        if key == "tr" && validate_tracker_url(tracker.as_bytes())? && proxy_enabled {
             return Err(TorrentError::ProxyWithUdpTracker);
         }
     }
     Ok(())
-}
-
-fn strip_ascii_case_prefix<'a>(value: &'a str, prefix: &str) -> Option<&'a str> {
-    value
-        .get(..prefix.len())
-        .filter(|candidate| candidate.eq_ignore_ascii_case(prefix))
-        .map(|_| &value[prefix.len()..])
 }
 
 fn valid_btih(hash: &[u8]) -> bool {
@@ -1176,7 +1186,11 @@ fn valid_btih(hash: &[u8]) -> bool {
         || (hash.len() == 32
             && hash
                 .iter()
-                .all(|byte| byte.is_ascii_alphabetic() || matches!(byte, b'2'..=b'7')))
+                .all(|byte| byte.is_ascii_uppercase() || matches!(byte, b'2'..=b'7')))
+}
+
+fn valid_btmh(hash: &[u8]) -> bool {
+    hash.len() == 68 && hash.starts_with(b"1220") && hash[4..].iter().all(u8::is_ascii_hexdigit)
 }
 
 fn validate_tracker_url(tracker: &[u8]) -> Result<bool, TorrentError> {

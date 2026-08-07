@@ -579,7 +579,9 @@ fn magnet_preflight_reads_exact_topics_instead_of_substrings() {
     let hex = "00".repeat(20);
     let base32 = "A".repeat(32);
     assert!(validate_magnet_contract(&format!("magnet:?xt=urn:btih:{hex}"), false).is_ok());
-    assert!(validate_magnet_contract(&format!("MAGNET:?XT=URN:BTIH:{base32}"), false).is_ok());
+    let base32_magnet = format!("MAGNET:?xt=urn:btih:{base32}");
+    assert!(validate_magnet_contract(&base32_magnet, false).is_ok());
+    assert!(librqbit::Magnet::parse(&base32_magnet).is_ok());
 
     let marker_in_display = format!("magnet:?xt=urn:btih:{hex}&dn=urn%3Abtmh%3Anot-a-topic");
     assert!(validate_magnet_contract(&marker_in_display, false).is_ok());
@@ -607,6 +609,15 @@ fn magnet_preflight_names_format_version_and_proxy_failures() {
         "magnet:?dn=missing-topic".to_owned(),
         "magnet:?xt=urn:btih:short".to_owned(),
         format!("magnet:?xt=urn:btih:{}", "Z".repeat(40)),
+        format!("magnet:?xt=urn:btih:{}", "a".repeat(32)),
+        format!("magnet:?XT=urn:btih:{hex}"),
+        format!("magnet:?xt=URN:BTIH:{hex}"),
+        // rqbit 8.1.1 panics after decoding this advertised base32 Id32
+        // length to 35 bytes and copying it into a 32-byte destination.
+        format!("magnet:?xt=urn:btmh:1220{}", "A".repeat(56)),
+        format!("magnet:?xt=urn:btmh:1220{}", "g".repeat(64)),
+        format!("magnet:?xt=urn:unknown:{hex}&xt=urn:btih:{hex}"),
+        format!("magnet:?xt=urn:btih:{hex}&so=0-4000000000"),
         format!("magnet:?xt=urn:btih:{hex}&xt=urn:btih:{hex}"),
     ] {
         assert!(

@@ -53,8 +53,10 @@ code. The daemon does not depend on it. The boundary currently provides:
 - session construction with DHT off by default, UPnP unavailable, DHT
   persistence disabled unconditionally, and proxy+DHT rejected because DHT
   bypasses the engine's SOCKS path;
-- raw v1 metainfo and two-stage v1 magnet admission, with resolved metadata
-  returned by rqbit list-only mode and revalidated before storage construction;
+- raw v1 metainfo and two-stage v1 magnet admission, with an engine-compatible
+  exact-topic grammar, eager `so=` expansion rejected before rqbit parsing,
+  and resolved metadata returned by list-only mode and revalidated before
+  storage construction;
 - named v2-only and hybrid rejection for both metainfo and magnets;
 - fail-closed HTTP/HTTPS/UDP tracker URL validation for metainfo and magnets,
   plus exact-one-tracker validation for private metainfo;
@@ -123,9 +125,11 @@ The isolated suite covers:
   length overflow, malformed hash width, mismatched hash count, and valid
   zero-length sidecars;
 - the explicit aws-lc provider invariant;
-- v2-only and hybrid named rejection for metainfo and magnets; and
-- query-aware magnet validation for hex/base32 `btih`, duplicate/missing exact
-  topics, and false version markers outside `xt`;
+- v2-only and hybrid named rejection for metainfo and magnets;
+- query-aware magnet validation for hex/uppercase-base32 `btih`, valid `btmh`,
+  duplicate/missing/unknown exact topics, engine-incompatible casing, false
+  version markers outside `xt`, and pre-engine rejection of unbounded `so=`
+  file-range expansion; and
 - the persistence auto-restore behavior that fails gate 8.
 
 All peers, trackers, proxies, and DHT responders in the suite are local and
