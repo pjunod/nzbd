@@ -1285,6 +1285,10 @@ source_redirects = 5
   unset default permits three concurrent initialization integrity scans, which
   can multiply disk I/O before torrents become live. The one-scan guard does
   not replace §8.1's future cross-protocol active-download scheduler.
+- stable rqbit's effective peer fallbacks are pinned explicitly: 10 seconds to
+  connect, 10 seconds for each read/write operation, and a 120-second keepalive
+  interval. Per-add options inherit that session policy, so engine-default
+  drift cannot silently lengthen peer connection lifetime.
 - proxy credentials are split fields: `socks_proxy_url` must contain no URL
   userinfo, `socks_proxy_username` is ordinary config, and
   `socks_proxy_password` uses the existing whole-field secret-mask and restore

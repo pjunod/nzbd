@@ -72,6 +72,10 @@ code. The daemon does not depend on it. The boundary currently provides:
   three payload integrity scans at once, while the dormant session explicitly
   serializes that disk-heavy work. This is an initialization-I/O guard, not the
   future shared active-download scheduler or a runtime peer cap;
+- explicit peer lifetimes: the dormant session pins stable 8.1.1's effective
+  10-second connect and read/write timeouts and 120-second keepalive interval;
+  per-add options inherit this reviewed session policy instead of introducing
+  another override;
 - named v2-only and hybrid rejection for both metainfo and magnets;
 - fail-closed HTTP/HTTPS/UDP tracker URL validation for metainfo and magnets,
   plus exact-one-tracker validation for private metainfo;

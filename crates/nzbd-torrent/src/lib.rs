@@ -8,8 +8,8 @@
 
 use librqbit::api::TorrentIdOrHash;
 use librqbit::{
-    AddTorrent, AddTorrentOptions, AddTorrentResponse, ManagedTorrent, Session, SessionOptions,
-    TorrentStatsState,
+    AddTorrent, AddTorrentOptions, AddTorrentResponse, ManagedTorrent, PeerConnectionOptions,
+    Session, SessionOptions, TorrentStatsState,
 };
 use std::borrow::Cow;
 use std::collections::HashSet;
@@ -18,6 +18,7 @@ use std::num::NonZeroU32;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 /// The exact engine release the M0 contract and interop tests describe.
 pub const ENGINE_VERSION: &str = "8.1.1";
@@ -37,6 +38,12 @@ pub const MAX_TORRENT_PATH_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_INITIAL_PEERS: usize = 80;
 /// Maximum concurrent engine integrity checks during torrent initialization.
 pub const MAX_CONCURRENT_TORRENT_INITIALIZATIONS: usize = 1;
+/// Timeout for establishing an outgoing peer connection.
+pub const PEER_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Timeout for one peer-protocol read or write operation.
+pub const PEER_READ_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Interval between idle peer keepalive messages.
+pub const PEER_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(120);
 /// Maximum display-safe engine error length from proposal §10.3.
 pub const DISPLAY_SAFE_ERROR_MAX_BYTES: usize = 2 * 1024;
 
@@ -667,7 +674,7 @@ fn session_options(
         fastresume: false,
         persistence: None,
         peer_id: None,
-        peer_opts: None,
+        peer_opts: Some(explicit_peer_connection_options()),
         defer_writes_up_to: None,
         default_storage_factory: None,
         cancellation_token: None,
@@ -679,6 +686,16 @@ fn session_options(
         ratelimits: Default::default(),
         blocklist_url: None,
         trackers: HashSet::new(),
+    }
+}
+
+fn explicit_peer_connection_options() -> PeerConnectionOptions {
+    // Pin stable 8.1.1's effective fallbacks so a future engine default cannot
+    // silently lengthen connection or I/O lifetime at nzbd's network boundary.
+    PeerConnectionOptions {
+        connect_timeout: Some(PEER_CONNECT_TIMEOUT),
+        read_write_timeout: Some(PEER_READ_WRITE_TIMEOUT),
+        keep_alive_interval: Some(PEER_KEEP_ALIVE_INTERVAL),
     }
 }
 
@@ -1619,7 +1636,16 @@ mod tests {
         assert!(!options.fastresume);
         assert!(options.persistence.is_none());
         assert!(options.peer_id.is_none());
-        assert!(options.peer_opts.is_none());
+        let peer_options = options.peer_opts.expect("peer policy must be explicit");
+        assert_eq!(peer_options.connect_timeout, Some(PEER_CONNECT_TIMEOUT));
+        assert_eq!(
+            peer_options.read_write_timeout,
+            Some(PEER_READ_WRITE_TIMEOUT)
+        );
+        assert_eq!(
+            peer_options.keep_alive_interval,
+            Some(PEER_KEEP_ALIVE_INTERVAL)
+        );
         assert!(options.listen_port_range.is_none());
         assert!(!options.enable_upnp_port_forwarding);
         assert!(options.defer_writes_up_to.is_none());
