@@ -1,0 +1,234 @@
+diff --git a/crates/librqbit/src/session.rs b/crates/librqbit/src/session.rs
+index f0edb50b594c563c8283c428538583709f9b2781..3f83402405d66f623b887323156dfde6b0fa0a87 100644
+--- a/crates/librqbit/src/session.rs
++++ b/crates/librqbit/src/session.rs
+@@ -128,6 +128,10 @@ pub struct Session {
+     // Limits and throttling
+     pub(crate) concurrent_initialize_semaphore: Arc<tokio::sync::Semaphore>,
+     pub ratelimits: Limits,
++    /// Default maximum number of live peers per torrent.
++    pub peer_limit: Option<usize>,
++    /// Shared live-peer permits across every torrent in this session.
++    pub(crate) peer_semaphore_total: Option<Arc<tokio::sync::Semaphore>>,
+ 
+     pub blocklist: blocklist::Blocklist,
+ 
+@@ -267,6 +271,9 @@ pub struct AddTorrentOptions {
+     /// Initial peers to start of with.
+     pub initial_peers: Option<Vec<SocketAddr>>,
+ 
++    /// Max concurrent connected peers for this torrent.
++    pub peer_limit: Option<usize>,
++
+     /// This is used to restore the session from serialized state.
+     pub preferred_id: Option<usize>,
+ 
+@@ -423,6 +430,12 @@ pub struct SessionOptions {
+ 
+     pub ratelimits: LimitsConfig,
+ 
++    /// Default maximum number of live peers per torrent.
++    pub peer_limit: Option<usize>,
++
++    /// Maximum number of live peers across the complete session.
++    pub peer_limit_total: Option<usize>,
++
+     pub blocklist_url: Option<String>,
+ 
+     // The list of tracker URLs to always use for each torrent.
+@@ -657,6 +670,10 @@ impl Session {
+                 )),
+                 udp_tracker_client,
+                 ratelimits: Limits::new(opts.ratelimits),
++                peer_limit: opts.peer_limit,
++                peer_semaphore_total: opts
++                    .peer_limit_total
++                    .map(|limit| Arc::new(tokio::sync::Semaphore::new(limit))),
+                 trackers: opts.trackers,
+                 #[cfg(feature = "disable-upload")]
+                 _disable_upload: opts.disable_upload,
+@@ -1167,6 +1184,7 @@ impl Session {
+                     disk_write_queue: self.disk_write_tx.clone(),
+                     ratelimits: opts.ratelimits,
+                     initial_peers: opts.initial_peers.clone().unwrap_or_default(),
++                    peer_limit: opts.peer_limit.or(self.peer_limit),
+                     #[cfg(feature = "disable-upload")]
+                     _disable_upload: self._disable_upload,
+                 },
+diff --git a/crates/librqbit/src/torrent_state/live/mod.rs b/crates/librqbit/src/torrent_state/live/mod.rs
+index 2bfaf66c8fb60d66c789026a28c48849dcaafb30..621e839180853d0d337538d9957bd5a0ebea4522 100644
+--- a/crates/librqbit/src/torrent_state/live/mod.rs
++++ b/crates/librqbit/src/torrent_state/live/mod.rs
+@@ -173,6 +173,103 @@ impl TorrentStateLocked {
+ 
+ const FLUSH_BITV_EVERY_BYTES: u64 = 16 * 1024 * 1024;
+ 
++struct PeerSemaphores {
++    torrent: Arc<Semaphore>,
++    session: Option<Arc<Semaphore>>,
++}
++
++struct PeerPermit {
++    _torrent: OwnedSemaphorePermit,
++    _session: Option<OwnedSemaphorePermit>,
++}
++
++impl PeerSemaphores {
++    fn new(torrent_limit: usize, session: Option<Arc<Semaphore>>) -> Self {
++        Self {
++            torrent: Arc::new(Semaphore::new(torrent_limit)),
++            session,
++        }
++    }
++
++    fn try_acquire(&self) -> Result<PeerPermit, tokio::sync::TryAcquireError> {
++        let torrent = self.torrent.clone().try_acquire_owned()?;
++        let session = self
++            .session
++            .as_ref()
++            .map(|semaphore| semaphore.clone().try_acquire_owned())
++            .transpose()?;
++        Ok(PeerPermit {
++            _torrent: torrent,
++            _session: session,
++        })
++    }
++
++    async fn acquire(&self) -> Result<PeerPermit, tokio::sync::AcquireError> {
++        let torrent = self.torrent.clone().acquire_owned().await?;
++        let session = match &self.session {
++            Some(semaphore) => Some(semaphore.clone().acquire_owned().await?),
++            None => None,
++        };
++        Ok(PeerPermit {
++            _torrent: torrent,
++            _session: session,
++        })
++    }
++}
++
++#[cfg(test)]
++mod peer_semaphore_tests {
++    use super::*;
++
++    #[test]
++    fn per_torrent_limit_is_exact() {
++        let semaphores = PeerSemaphores::new(2, None);
++        let first = semaphores.try_acquire().unwrap();
++        let _second = semaphores.try_acquire().unwrap();
++
++        assert!(semaphores.try_acquire().is_err());
++        drop(first);
++        assert!(semaphores.try_acquire().is_ok());
++    }
++
++    #[test]
++    fn session_limit_is_shared_between_torrents() {
++        let session = Arc::new(Semaphore::new(3));
++        let first_torrent = PeerSemaphores::new(2, Some(session.clone()));
++        let second_torrent = PeerSemaphores::new(2, Some(session));
++
++        let first = first_torrent.try_acquire().unwrap();
++        let _second = first_torrent.try_acquire().unwrap();
++        let _third = second_torrent.try_acquire().unwrap();
++        assert!(second_torrent.try_acquire().is_err());
++
++        drop(first);
++        assert!(second_torrent.try_acquire().is_ok());
++    }
++
++    #[tokio::test]
++    async fn waiting_peer_resumes_after_session_permit_is_released() {
++        let session = Arc::new(Semaphore::new(1));
++        let active_torrent = PeerSemaphores::new(1, Some(session.clone()));
++        let waiting_torrent = Arc::new(PeerSemaphores::new(1, Some(session)));
++        let active = active_torrent.try_acquire().unwrap();
++
++        let mut waiter = tokio::spawn({
++            let waiting_torrent = waiting_torrent.clone();
++            async move { waiting_torrent.acquire().await.unwrap() }
++        });
++        assert!(tokio::time::timeout(Duration::from_millis(20), &mut waiter)
++            .await
++            .is_err());
++
++        drop(active);
++        tokio::time::timeout(Duration::from_secs(1), waiter)
++            .await
++            .unwrap()
++            .unwrap();
++    }
++}
++
+ pub struct TorrentStateLive {
+     peers: PeerStates,
+     shared: Arc<ManagedTorrentShared>,
+@@ -187,7 +284,7 @@ pub struct TorrentStateLive {
+     lengths: Lengths,
+ 
+     // Limits how many active (occupying network resources) peers there are at a moment in time.
+-    peer_semaphore: Arc<Semaphore>,
++    peer_semaphores: PeerSemaphores,
+ 
+     // The queue for peer manager to connect to them.
+     peer_queue_tx: UnboundedSender<SocketAddr>,
+@@ -275,7 +372,10 @@ impl TorrentStateLive {
+                 ..Default::default()
+             },
+             lengths,
+-            peer_semaphore: Arc::new(Semaphore::new(128)),
++            peer_semaphores: PeerSemaphores::new(
++                paused.shared.options.peer_limit.unwrap_or(128),
++                session.peer_semaphore_total.clone(),
++            ),
+             new_pieces_notify: Notify::new(),
+             peer_queue_tx,
+             finished_notify: Notify::new(),
+@@ -357,7 +457,7 @@ impl TorrentStateLive {
+     ) -> anyhow::Result<()> {
+         use dashmap::mapref::entry::Entry;
+         let (tx, rx) = unbounded_channel();
+-        let permit = match self.peer_semaphore.clone().try_acquire_owned() {
++        let permit = match self.peer_semaphores.try_acquire() {
+             Ok(permit) => permit,
+             Err(_) => {
+                 debug!("limit of live peers reached, dropping incoming peer");
+@@ -435,7 +535,7 @@ impl TorrentStateLive {
+         counters: Arc<AtomicPeerCounters>,
+         tx: PeerTx,
+         rx: PeerRx,
+-        permit: OwnedSemaphorePermit,
++        permit: PeerPermit,
+     ) -> anyhow::Result<()> {
+         // TODO: bump counters for incoming
+         let handler = PeerHandler {
+@@ -494,7 +594,7 @@ impl TorrentStateLive {
+     async fn task_manage_outgoing_peer(
+         self: Arc<Self>,
+         addr: SocketAddr,
+-        permit: OwnedSemaphorePermit,
++        permit: PeerPermit,
+     ) -> anyhow::Result<()> {
+         let state = self;
+         let (rx, tx) = state.peers.mark_peer_connecting(addr)?;
+@@ -583,7 +683,7 @@ impl TorrentStateLive {
+                 continue;
+             }
+ 
+-            let permit = state.peer_semaphore.clone().acquire_owned().await?;
++            let permit = state.peer_semaphores.acquire().await?;
+             state.spawn(
+                 error_span!(parent: state.shared.span.clone(), "manage_peer", peer = addr.to_string()),
+                 aframe!(state.clone().task_manage_outgoing_peer(addr, permit)),
+diff --git a/crates/librqbit/src/torrent_state/mod.rs b/crates/librqbit/src/torrent_state/mod.rs
+index 51816097c9f4b1d3220efaabfbf1f9f1b002228c..c1fd2ceb20dd5d646ede2dd812e7edb6145ace2d 100644
+--- a/crates/librqbit/src/torrent_state/mod.rs
++++ b/crates/librqbit/src/torrent_state/mod.rs
+@@ -118,6 +118,7 @@ pub(crate) struct ManagedTorrentOptions {
+     pub disk_write_queue: Option<DiskWorkQueueSender>,
+     pub ratelimits: LimitsConfig,
+     pub initial_peers: Vec<SocketAddr>,
++    pub peer_limit: Option<usize>,
+     #[cfg(feature = "disable-upload")]
+     pub _disable_upload: bool,
+ }

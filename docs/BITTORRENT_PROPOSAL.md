@@ -1280,7 +1280,11 @@ source_redirects = 5
   dormant adapter's 80-peer guard bounds explicit bootstrap input only;
   tracker/PEX/DHT discovery can still fill the engine limit. Current rqbit main
   has a per-torrent `peer_limit`, but production still needs that API in an
-  accepted stable release plus an nzbd-owned shared-session budget.
+  accepted stable release plus a caller-owned shared-session budget. The
+  contribution kit now proves a candidate option on stable and main: each live
+  incoming or outgoing peer holds its torrent permit and the optional shared
+  session permit until release. The tested candidate does not become usable by
+  nzbd until upstream accepts it and a stable release ships it.
 - dormant torrent initialization is serialized explicitly. Stable rqbit's
   unset default permits three concurrent initialization integrity scans, which
   can multiply disk I/O before torrents become live. The one-scan guard does
@@ -1365,7 +1369,10 @@ crosses the adapter. It also deduplicates explicit peers in caller order, caps
 that bootstrap vector at 80, and rejects port zero, non-unicast, and IPv6
 endpoints before rqbit sees them. This is not the proposed runtime
 peer cap: stable 8.1.1 can still discover and connect up to its hard-coded 128
-live peers per torrent and has no session-total budget. Projected paths include
+live peers per torrent and has no session-total budget. Matching stable/main
+contribution candidates enforce caller-selected per-torrent and session-total
+limits across routed incoming peers and all outgoing discovery sources, but
+remain review evidence rather than shipped capability. Projected paths include
 the multi-file root and platform separator bytes, so the accounting bounds the
 paths later passed to storage rather than only the raw bencode component
 payloads. Exact-limit tests pass and the first excess byte or file returns a
@@ -2049,7 +2056,7 @@ data-loss change, not a feature toggle.
 | `librqbit` lacks a required control or platform | Feature cannot meet nzbd’s contract | M0 gates before production architecture; `libtorrent` is the named fallback. |
 | Stable library lacks BEP 52 | Some modern torrents reject | Honest v1 scope and named rejection; revisit on proven stable support. |
 | Stable library is TCP/IPv4 and private torrents use one tracker | Some peers/networks and tracker failover are unavailable | Publish the exact v1 matrix, verify primary-tracker private downloads, revisit only on a stable 9.x gate. |
-| Stable library cannot enforce the proposed 80/400 live-peer budgets | Tracker/PEX/DHT discovery can exceed configured resource expectations | Do not confuse the 80-entry bootstrap guard with a runtime cap; require an accepted stable per-torrent limit and an nzbd-owned shared-session budget before M2. |
+| Stable library cannot enforce the proposed 80/400 live-peer budgets | Tracker/PEX/DHT discovery can exceed configured resource expectations | Do not confuse the 80-entry bootstrap guard with a runtime cap; require an accepted stable per-torrent limit and caller-owned shared-session budget before M2. The tested contribution candidate is evidence, not released capability. |
 | Tracker response or interval is hostile | Memory/request tasks remain unbounded or a tracker is hammered | Require an accepted stable request deadline, streamed body cap, and minimum unforced interval; tracker-count preflight alone is insufficient. |
 | Private tracker rejects or bans an unapproved rqbit client | Grab fails or tracker account is penalized | No qBittorrent wire-identity claim; disclose whitelist requirements and gate each supported tracker policy before M4. |
 | Torrent PP corrupts seeds | Tracker hash failures and broken uploads | No torrent PP in v1; future reflink-or-copy derivative only. |

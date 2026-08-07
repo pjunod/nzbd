@@ -41,7 +41,12 @@ only to explicit/resolved bootstrap peers; later tracker, PEX, or DHT discovery
 can fill all 128 engine slots. The pinned rqbit-main snapshot exposes a
 per-torrent `peer_limit`, but still no session-total budget. Preliminary
 binary/dependency acceptance therefore cannot authorize the advertised 80/400
-runtime contract.
+runtime contract. The contribution kit proves a candidate per-torrent default,
+per-add override, and shared session semaphore on both source lines. Incoming
+and outgoing peer managers hold both applicable permits through release, and
+two-torrent boundary tests exercise the aggregate ceiling. Until equivalent
+controls ship in an accepted stable release, the candidate remains evidence,
+not production capability.
 
 The tracker-count preflight is also not a tracker-request budget. Stable 8.1.1
 and the pinned rqbit-main snapshot issue HTTP tracker requests without a
@@ -110,6 +115,7 @@ cargo deny --all-features --locked check advisories
 
 # Against clean rqbit v8.1.1 and current-main trees, respectively.
 scripts/check-rqbit-tracker-request-budget-patch.sh /path/to/rqbit
+scripts/check-rqbit-session-peer-budget-patch.sh /path/to/rqbit
 ```
 
 Reproduce the macOS harness measurements rather than comparing a debug binary:
@@ -141,8 +147,9 @@ Gate 9 may move from Partial to Pass only if a reviewer accepts all of these:
    change reopens this decision; a previous green run is not a waiver.
 6. **Runtime peer budgets.** Gate 9 cannot pass on the claim that the proposed
    80/400 peer budgets are enforced. An accepted stable per-torrent limit and
-   an nzbd-owned shared-session cap must exist first, or the proposal must be
-   explicitly amended with new measured and reviewed limits.
+   shared-session cap must exist first, or the proposal must be explicitly
+   amended with new measured and reviewed limits. The prepared combined-permit
+   candidate is evidence for that review, not shipped capability.
 7. **Tracker request budgets.** An accepted stable engine must bound the
    complete HTTP tracker request, decoded response body, and hostile unforced
    HTTP/UDP announce intervals. The prepared 30-second, 1 MiB, and 60-second
@@ -161,7 +168,8 @@ an accepted resource budget. Silence is not acceptance.
 - It does not add torrent configuration, admission, listeners, trackers, DHT,
   payload I/O, qBittorrent compatibility, or UI.
 - It does not treat the 80-entry bootstrap-input guard as a live-peer resource
-  cap or accept stable 8.1.1's hard-coded 128-per-torrent behavior.
+  cap or accept stable 8.1.1's hard-coded 128-per-torrent behavior. The prepared
+  shared-session patch still requires upstream acceptance and a stable release.
 - It does not treat the 64-tracker input cap as a request lifetime, body, or
   announce-rate budget.
 - It does not submit any prepared patch upstream.

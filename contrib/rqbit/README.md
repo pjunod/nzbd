@@ -5,9 +5,9 @@
 
 Companion to
 [BITTORRENT_M0_REPORT.md](../../docs/BITTORRENT_M0_REPORT.md) (why nzbd is
-blocked) — this directory is the submission package for the two rqbit APIs and
-the tracker resource controls that must be accepted and released before nzbd
-starts M2.
+blocked) — this directory is the submission package for the two rqbit APIs,
+tracker request controls, and live-peer budgets that must be accepted and
+released before nzbd starts M2.
 
 Read and review this kit in order. Submit the discovery-health design issue
 before its implementation, because that patch crosses three rqbit crates and
@@ -33,8 +33,10 @@ Before posting any draft:
 3. Re-run the matching verifier against the exact upstream head. A clean run
    from an older base is evidence of the design, not evidence that the current
    branch still applies.
-4. Keep the two contributions separate. Restore changes session admission;
-   discovery health changes DHT, tracker, and public snapshot contracts.
+4. Keep independent contributions separate. Restore changes session
+   admission; discovery health changes DHT, tracker, and public snapshot
+   contracts; tracker and peer budgets change distinct runtime resource
+   policies.
 
 ## 2. Contribution map — stable evidence and current-main submissions
 
@@ -43,6 +45,7 @@ Before posting any draft:
 | Skip implicit restore while retaining persistence | [`0001`](0001-allow-persistence-without-auto-restore.patch) | [`0002`](0002-allow-persistence-without-auto-restore-main.patch) | [PR draft](AUTHORITATIVE_RESTORE_PR.md) |
 | Credential-safe per-torrent tracker and DHT health | [`0003`](0003-expose-per-torrent-discovery-health.patch) | [`0004`](0004-expose-per-torrent-discovery-health-main.patch) | [design-issue draft](DISCOVERY_HEALTH_ISSUE.md) |
 | Bounded tracker requests and announce intervals | [`0005`](0005-bound-tracker-requests.patch) | [`0006`](0006-bound-tracker-requests-main.patch) | [PR draft](TRACKER_REQUEST_BUDGET_PR.md) |
+| Per-torrent and shared-session live-peer budgets | [`0007`](0007-bound-session-peers.patch) | [`0008`](0008-bound-session-peers-main.patch) | [PR draft](SESSION_PEER_BUDGET_PR.md) |
 
 The stable patches preserve the exact experiments behind nzbd's M0 report.
 The main patches are the contribution candidates. Do not submit the stable
@@ -65,13 +68,16 @@ backports upstream unless the maintainer explicitly asks for an 8.x backport.
 5. Submit the independent tracker request-budget candidate only after human
    review of its 30-second request deadline, 1 MiB response cap, and 60-second
    minimum unforced announce interval. It does not depend on either public API.
-6. After both required APIs and the accepted resource controls ship, pin that
+6. Submit the independent session peer-budget candidate only after human
+   review of the public option name, aggregate counting boundary, and permit
+   acquisition order. It does not depend on the tracker request controls.
+7. After both required APIs and the accepted resource controls ship, pin that
    stable release in nzbd and rerun all eleven
    M0 gates on native macOS, Linux glibc/musl, and Windows.
-7. Run the Linux packet-capture private-mode harness and obtain reviewer
+8. Run the Linux packet-capture private-mode harness and obtain reviewer
    acceptance of the resource, package, license, and advisory dispositions.
    A gate rerun cannot discharge those review decisions by itself.
-8. Only the complete M0 path can authorize M2.
+9. Only the complete M0 path can authorize M2.
 
 ## 4. Reproduction — verify the candidates against rqbit main
 
@@ -91,6 +97,7 @@ git -C "$rqbit_tree" checkout 4e5f94cbcf1d57ec500885c77cf1e24d70232d89
 scripts/check-rqbit-authoritative-restore-patch.sh "$rqbit_tree"      # Format + focused librqbit test.
 scripts/check-rqbit-discovery-health-patch.sh "$rqbit_tree"          # Format + three affected crate suites.
 scripts/check-rqbit-tracker-request-budget-patch.sh "$rqbit_tree"    # Format + tracker response/interval suite.
+scripts/check-rqbit-session-peer-budget-patch.sh "$rqbit_tree"       # Format + exact local/shared permit tests.
 ```
 
 For submission, apply only the matching main patch to a fresh branch and run
@@ -112,7 +119,9 @@ Use a separate fresh branch for discovery health. Do not stack it on restore:
 the APIs solve different problems, and independent history lets rqbit accept,
 revise, or reject either contract without dragging the other through review.
 Use a third independent branch for the tracker request budget for the same
-reason; it changes resource policy, not either public API.
+reason; it changes resource policy, not either public API. Use a fourth branch
+for the session peer budget so rqbit can accept or revise tracker and peer
+resource policy independently.
 
 ## 5. Non-goals — contribution evidence is not production permission
 
@@ -124,5 +133,8 @@ reason; it changes resource policy, not either public API.
   failed tracker are different states with different operator actions.
 - Do not treat nzbd's admitted tracker-count limit as a response budget. The
   engine must still bound every tracker request, body, and unforced interval.
+- Do not treat the explicit/bootstrap peer-input limit as a live-peer budget.
+  Incoming connections and later tracker, PEX, and DHT discoveries must share
+  the same aggregate session permits.
 - Do not enable nzbd config, admission, listeners, trackers, DHT, or payload
   I/O from this kit. M2 remains blocked until a stable release passes M0.
