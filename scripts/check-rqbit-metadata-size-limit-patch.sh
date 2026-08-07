@@ -50,12 +50,34 @@ else
   exit 1
 fi
 
+readonly options_source="$work_dir/rqbit/crates/librqbit/src/peer_connection.rs"
+readonly reader_source="$work_dir/rqbit/crates/librqbit/src/peer_info_reader/mod.rs"
+for invariant in \
+  'pub max_metadata_size: Option<u32>' \
+  'HandlerLocked::new(metadata_size, self.max_metadata_size)?' \
+  'configured_metadata_limit_is_checked_before_allocation'
+do
+  if ! grep -Fq "$invariant" "$options_source" "$reader_source"; then
+    echo "metadata-size patch is missing invariant: $invariant" >&2
+    exit 1
+  fi
+done
+
 (
   cd "$work_dir/rqbit"
   cargo fmt --all -- --check
-  cargo test -p librqbit \
-    configured_metadata_limit_is_checked_before_allocation \
+  readonly exact_test='peer_info_reader::tests::configured_metadata_limit_is_checked_before_allocation'
+  test_list="$(cargo test -p librqbit --lib \
     --no-default-features \
     --features rust-tls \
-    -- --nocapture
+    -- --list)"
+  readonly test_list
+  if ! grep -Fxq "$exact_test: test" <<<"$test_list"; then
+    echo "metadata-size proof test was not discovered: $exact_test" >&2
+    exit 1
+  fi
+  cargo test -p librqbit --lib "$exact_test" \
+    --no-default-features \
+    --features rust-tls \
+    -- --exact --nocapture
 )

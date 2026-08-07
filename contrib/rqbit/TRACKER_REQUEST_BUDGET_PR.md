@@ -37,6 +37,14 @@ The 60-second floor applies only to unforced tracker responses. Existing
 callers that deliberately set `force_tracker_interval` keep the exact override
 semantics. Retry backoff is unchanged.
 
+This is an intentional behavior change: a legitimate tracker response asking
+for a 10-second interval will be delayed to 60 seconds unless the caller uses
+the explicit force override. That reduces request pressure and hostile tight
+loops at the cost of slower participation in swarms whose trackers genuinely
+expect sub-minute announces. Upstream should accept that policy tradeoff or
+make the floor configurable; the draft does not present the clamp as a
+behavior-neutral safety check.
+
 The constants are intentionally local to tracker communications in this first
 candidate. If maintainers prefer public configuration, the behavior and tests
 can be retained while moving the values into a reviewed options type.

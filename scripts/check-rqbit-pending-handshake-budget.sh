@@ -47,8 +47,8 @@ if [[ "$source_variant" == "stable" ]]; then
   readonly session_source="$work_dir/rqbit/crates/librqbit/src/session.rs"
   for invariant in \
     'MAX_PENDING_INCOMING_HANDSHAKE_CHECKS: usize = 256' \
-    'can_accept_incoming_handshake(futs.len())' \
-    'pending_handshake_budget_is_exact'
+    'accept_incoming_handshake(&l, futs.len())' \
+    'pending_handshake_budget_blocks_and_resumes_listener_accepts'
   do
     if ! grep -Fq "$invariant" "$session_source"; then
       echo "stable pending-handshake patch is missing invariant: $invariant" >&2
@@ -74,7 +74,14 @@ fi
   cd "$work_dir/rqbit"
   cargo fmt --all -- --check
   if [[ "$source_variant" == "stable" ]]; then
-    cargo test -p librqbit --lib pending_handshake_budget_is_exact
+    readonly exact_test='session::tests::pending_handshake_budget_blocks_and_resumes_listener_accepts'
+    test_list="$(cargo test -p librqbit --lib -- --list)"
+    readonly test_list
+    if ! grep -Fxq "$exact_test: test" <<<"$test_list"; then
+      echo "stable pending-handshake proof test was not discovered: $exact_test" >&2
+      exit 1
+    fi
+    cargo test -p librqbit --lib "$exact_test" -- --exact --nocapture
   else
     cargo check -p librqbit --all-targets
   fi

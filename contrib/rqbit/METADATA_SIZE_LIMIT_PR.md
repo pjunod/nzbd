@@ -50,7 +50,10 @@ move the field if rqbit prefers a dedicated metadata-fetch contract.
 
 The focused unit test proves that a buffer exactly at the configured limit is
 accepted and that a value one byte above it is rejected before the allocation
-constructor can create a buffer.
+constructor can create a buffer. The nzbd verifier also checks the production
+option and pre-allocation call site structurally, requires the exact test name
+to appear in Cargo's test list, and then runs it with `--exact`; a renamed or
+missing test cannot pass by executing zero tests.
 
 ### Validation
 

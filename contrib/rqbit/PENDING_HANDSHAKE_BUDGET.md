@@ -34,11 +34,13 @@ fixed ceiling into 8.1.1; it does not add a new stable public option.
 ## Stable backport shape
 
 - Define one exact 256-check ceiling beside the stable session listener.
-- Guard `accept()` while the pending handshake set is full. Completed or
-  failed checks continue to be polled, so capacity can reopen.
+- Route the production listener through one accept helper that becomes
+  pending while the handshake set is full. Completed or failed checks continue
+  to be polled, so the next loop iteration can reopen capacity.
 - Preserve the existing 10-second handshake read timeout and all post-routing
   peer behavior.
-- Test the exact 255/256 boundary plus a defensive `usize::MAX` input.
+- Use a real loopback socket to prove a queued connection is not accepted at
+  256 and is accepted after the pending count returns to 255.
 
 The value is preliminary policy evidence. It becomes an nzbd release boundary
 only after human acceptance and inclusion in an accepted stable rqbit release.
@@ -51,10 +53,14 @@ as a combined two-listener total.
 
 ```text
 cargo fmt --all -- --check
-cargo test -p librqbit --lib pending_handshake_budget_is_exact
+cargo test -p librqbit --lib \
+  session::tests::pending_handshake_budget_blocks_and_resumes_listener_accepts \
+  -- --exact
 ```
 
-The nzbd verifier applies the patch only to exact rqbit 8.1.1. Against the
+The verifier first requires that exact test name to appear in Cargo's test
+list, preventing a renamed or missing test from reporting success with zero
+tests. It applies the patch only to exact rqbit 8.1.1. Against the
 documented rqbit-main source line it applies no patch, checks the native
 default, public option, and guarded listener, and compiles all librqbit
 targets.

@@ -46,15 +46,17 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - name: rqbit v8.1.1 patch
+          - name: "blocking: rqbit v8.1.1 patch"
             ref: v8.1.1
             blocking_on_pr: true
-          - name: rqbit main patch
+          - name: "drift: rqbit main patch"
             ref: main
             blocking_on_pr: false
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
       - name: Clone rqbit ${{ matrix.ref }}
         run: git clone --branch "${{ matrix.ref }}" https://github.com/ikatson/rqbit.git "$RUNNER_TEMP/rqbit"
       - uses: Swatinem/rust-cache@v2
@@ -75,15 +77,17 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - name: rqbit v8.1.1 patch
+          - name: "blocking: rqbit v8.1.1 patch"
             ref: v8.1.1
             blocking_on_pr: true
-          - name: rqbit main patch
+          - name: "drift: rqbit main patch"
             ref: main
             blocking_on_pr: false
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
       - name: Clone rqbit ${{ matrix.ref }}
         run: git clone --branch "${{ matrix.ref }}" https://github.com/ikatson/rqbit.git "$RUNNER_TEMP/rqbit"
       - uses: Swatinem/rust-cache@v2
@@ -102,11 +106,11 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - name: rqbit v8.1.1 patch / Rust 1.85
+          - name: "blocking: rqbit v8.1.1 patch / Rust 1.85"
             ref: v8.1.1
             toolchain: "1.85"
             blocking_on_pr: true
-          - name: rqbit main patch
+          - name: "drift: rqbit main patch"
             ref: main
             toolchain: stable
             blocking_on_pr: false
@@ -134,11 +138,11 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - name: rqbit v8.1.1 patch / Rust 1.85
+          - name: "blocking: rqbit v8.1.1 patch / Rust 1.85"
             ref: v8.1.1
             toolchain: "1.85"
             blocking_on_pr: true
-          - name: rqbit main patch
+          - name: "drift: rqbit main patch"
             ref: main
             toolchain: stable
             blocking_on_pr: false
@@ -166,11 +170,11 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - name: rqbit v8.1.1 patch / Rust 1.85
+          - name: "blocking: rqbit v8.1.1 patch / Rust 1.85"
             ref: v8.1.1
             toolchain: "1.85"
             blocking_on_pr: true
-          - name: rqbit main patch
+          - name: "drift: rqbit main patch"
             ref: main
             toolchain: stable
             blocking_on_pr: false
@@ -198,11 +202,11 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - name: rqbit v8.1.1 backport / Rust 1.85
+          - name: "blocking: rqbit v8.1.1 backport / Rust 1.85"
             ref: v8.1.1
             toolchain: "1.85"
             blocking_on_pr: true
-          - name: rqbit main native boundary
+          - name: "drift: rqbit main native boundary"
             ref: main
             toolchain: stable
             blocking_on_pr: false
@@ -230,11 +234,11 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - name: rqbit v8.1.1 patch / Rust 1.85
+          - name: "blocking: rqbit v8.1.1 patch / Rust 1.85"
             ref: v8.1.1
             toolchain: "1.85"
             blocking_on_pr: true
-          - name: rqbit main patch
+          - name: "drift: rqbit main patch"
             ref: main
             toolchain: stable
             blocking_on_pr: false

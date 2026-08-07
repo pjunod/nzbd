@@ -1,48 +1,70 @@
 diff --git a/crates/librqbit/src/session.rs b/crates/librqbit/src/session.rs
-index f0edb50b594c563c8283c428538583709f9b2781..c7f3fdbfee1d74d4cd0a32a6ef2ab19aeb18838d 100644
+index f0edb50b594c563c8283c428538583709f9b2781..3ea1495b52c25c58685e7a88b1b89d3194502c89 100644
 --- a/crates/librqbit/src/session.rs
 +++ b/crates/librqbit/src/session.rs
-@@ -472,6 +472,12 @@ pub(crate) struct CheckedIncomingConnection {
+@@ -472,6 +472,18 @@ pub(crate) struct CheckedIncomingConnection {
      pub handshake: Handshake<ByteBufOwned>,
  }
  
 +const MAX_PENDING_INCOMING_HANDSHAKE_CHECKS: usize = 256;
 +
-+fn can_accept_incoming_handshake(pending: usize) -> bool {
-+    pending < MAX_PENDING_INCOMING_HANDSHAKE_CHECKS
++async fn accept_incoming_handshake(
++    listener: &TcpListener,
++    pending: usize,
++) -> std::io::Result<(TcpStream, SocketAddr)> {
++    if pending >= MAX_PENDING_INCOMING_HANDSHAKE_CHECKS {
++        futures::future::pending().await
++    }
++    listener.accept().await
 +}
 +
  struct InternalAddResult {
      info_hash: Id20,
      metadata: Option<TorrentMetadata>,
-@@ -799,7 +805,7 @@ impl Session {
+@@ -799,7 +811,7 @@ impl Session {
  
          loop {
              tokio::select! {
 -                r = l.accept() => {
-+                r = l.accept(), if can_accept_incoming_handshake(futs.len()) => {
++                r = accept_incoming_handshake(&l, futs.len()) => {
                      match r {
                          Ok((stream, addr)) => {
                              trace!("accepted connection from {addr}");
-@@ -1552,7 +1558,21 @@ mod tests {
+@@ -1552,7 +1564,37 @@ mod tests {
      use itertools::Itertools;
      use librqbit_core::torrent_metainfo::{torrent_from_bytes_ext, TorrentMetaV1};
  
 -    use super::torrent_file_from_info_bytes;
++    use tokio::time::{timeout, Duration};
++
 +    use super::{
-+        can_accept_incoming_handshake, torrent_file_from_info_bytes,
++        accept_incoming_handshake, torrent_file_from_info_bytes, TcpListener, TcpStream,
 +        MAX_PENDING_INCOMING_HANDSHAKE_CHECKS,
 +    };
 +
-+    #[test]
-+    fn pending_handshake_budget_is_exact() {
-+        assert!(can_accept_incoming_handshake(
-+            MAX_PENDING_INCOMING_HANDSHAKE_CHECKS - 1
-+        ));
-+        assert!(!can_accept_incoming_handshake(
-+            MAX_PENDING_INCOMING_HANDSHAKE_CHECKS
-+        ));
-+        assert!(!can_accept_incoming_handshake(usize::MAX));
++    #[tokio::test]
++    async fn pending_handshake_budget_blocks_and_resumes_listener_accepts() {
++        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
++            .await
++            .unwrap();
++        let address = listener.local_addr().unwrap();
++        let client = TcpStream::connect(address).await.unwrap();
++
++        let blocked = timeout(
++            Duration::from_millis(50),
++            accept_incoming_handshake(&listener, MAX_PENDING_INCOMING_HANDSHAKE_CHECKS),
++        )
++        .await;
++        assert!(blocked.is_err(), "a full pending set must stop accept");
++
++        let (_, peer_address) = timeout(
++            Duration::from_secs(1),
++            accept_incoming_handshake(&listener, MAX_PENDING_INCOMING_HANDSHAKE_CHECKS - 1),
++        )
++        .await
++        .expect("accept should resume below the budget")
++        .expect("queued connection should be accepted");
++        assert_eq!(peer_address, client.local_addr().unwrap());
 +    }
  
      #[test]

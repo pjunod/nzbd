@@ -102,10 +102,11 @@ backports upstream unless the maintainer explicitly asks for an 8.x backport.
 The verifier accepts the documented main base or any descendant that still
 contains it. On drift, it permits a three-way apply and then runs the affected
 tests; a conflict or failing test is a stop, not permission to hand-wave the
-patch forward. Pull requests run both stable and current-main legs. Stable
-failures block the PR; current-main failures remain visible but non-blocking
-because upstream can move independently between nzbd changes. Pushes and the
-weekly schedule require every leg.
+patch forward. Pull requests run both stable and current-main legs. Every job
+name begins with `blocking:` or `drift:`: stable failures block the PR, while
+current-main drift remains visible but non-blocking because upstream can move
+independently between nzbd changes. Pushes and the weekly schedule require
+every leg.
 
 ```bash
 rqbit_tree=/tmp/rqbit-upstream-main
