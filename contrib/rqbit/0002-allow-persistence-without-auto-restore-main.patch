@@ -1,5 +1,5 @@
 diff --git a/crates/librqbit/src/session.rs b/crates/librqbit/src/session.rs
-index 75071b9..0709a35 100644
+index 75071b9c..fccf2160 100644
 --- a/crates/librqbit/src/session.rs
 +++ b/crates/librqbit/src/session.rs
 @@ -434,6 +434,14 @@ pub struct SessionOptions {
@@ -25,23 +25,22 @@ index 75071b9..0709a35 100644
              peer_id: None,
              listen: None,
              connect: None,
-@@ -858,7 +867,13 @@ impl Session {
-                 }
-             }
+@@ -860,7 +869,13 @@ impl Session {
  
              if let Some(persistence) = session.persistence.as_ref() {
                  info!("will use {persistence:?} for session persistence");
 +            }
-+
+ 
 +            if let Some(persistence) = session
 +                .persistence
 +                .as_ref()
 +                .filter(|_| !opts.disable_auto_restore)
 +            {
--
                  let mut ps = persistence.stream_all().await?;
+                 let mut added_all = false;
+                 let mut futs = FuturesUnordered::new();
 diff --git a/crates/librqbit/src/tests/mod.rs b/crates/librqbit/src/tests/mod.rs
-index 1454af0..12f733f 100644
+index 1454af07..12f733fa 100644
 --- a/crates/librqbit/src/tests/mod.rs
 +++ b/crates/librqbit/src/tests/mod.rs
 @@ -1,4 +1,5 @@
@@ -52,20 +51,31 @@ index 1454af0..12f733f 100644
  pub mod test_util;
 diff --git a/crates/librqbit/src/tests/persistence.rs b/crates/librqbit/src/tests/persistence.rs
 new file mode 100644
-index 0000000..71a1723
+index 00000000..047e6851
 --- /dev/null
 +++ b/crates/librqbit/src/tests/persistence.rs
-@@ -0,0 +1,109 @@
+@@ -0,0 +1,143 @@
 +use crate::{
 +    AddTorrent, AddTorrentOptions, CreateTorrentOptions, Session, SessionOptions,
 +    SessionPersistenceConfig, create_torrent, spawn_utils::BlockingSpawner,
 +};
 +
++const PIECE_LENGTH: usize = 16 * 1024;
++
++fn payload(seed: usize) -> Vec<u8> {
++    (0..PIECE_LENGTH * 4)
++        .map(|offset| ((offset * 31 + offset / 7 + seed) % 251) as u8)
++        .collect()
++}
++
 +async fn make_torrent_bytes(path: &std::path::Path, payload: &[u8]) -> bytes::Bytes {
 +    tokio::fs::write(path, payload).await.unwrap();
 +    create_torrent(
 +        path,
-+        CreateTorrentOptions::default(),
++        CreateTorrentOptions {
++            piece_length: Some(PIECE_LENGTH as u32),
++            ..Default::default()
++        },
 +        &BlockingSpawner::new(1),
 +    )
 +    .await
@@ -92,8 +102,17 @@ index 0000000..71a1723
 +    let root = tempfile::tempdir().unwrap();
 +    let output = root.path().join("output");
 +    let persistence = root.path().join("persistence");
-+    let first_bytes = make_torrent_bytes(&root.path().join("first.bin"), b"first").await;
-+    let second_bytes = make_torrent_bytes(&root.path().join("second.bin"), b"second").await;
++    let first_payload = payload(11);
++    let second_payload = payload(29);
++    let first_bytes = make_torrent_bytes(&root.path().join("first.bin"), &first_payload).await;
++    let second_bytes = make_torrent_bytes(&root.path().join("second.bin"), &second_payload).await;
++
++    tokio::fs::create_dir_all(&output).await.unwrap();
++    let mut partial_second = second_payload.clone();
++    partial_second[PIECE_LENGTH..].fill(0);
++    tokio::fs::write(output.join("second.bin"), partial_second)
++        .await
++        .unwrap();
 +
 +    let first = Session::new_with_opts(output.clone(), options(persistence.clone(), false))
 +        .await
@@ -112,7 +131,7 @@ index 0000000..71a1723
 +        .into_handle()
 +        .unwrap()
 +        .id();
-+    let second_id = first
++    let second = first
 +        .add_torrent(
 +            AddTorrent::TorrentFileBytes(second_bytes.clone()),
 +            Some(AddTorrentOptions {
@@ -124,10 +143,19 @@ index 0000000..71a1723
 +        .await
 +        .unwrap()
 +        .into_handle()
-+        .unwrap()
-+        .id();
++        .unwrap();
++    let second_id = second.id();
 +    assert_ne!(first_id, second_id);
++    second.wait_until_initialized().await.unwrap();
++    assert_eq!(second.stats().progress_bytes, PIECE_LENGTH as u64);
 +    first.stop().await;
++
++    // Diverge on-disk data from persisted piece state. If the restore path fell
++    // back to a full re-check, progress would read 64 KiB and finished would be
++    // true, so the assertions below can only pass via fast-resume.
++    tokio::fs::write(output.join("second.bin"), &second_payload)
++        .await
++        .unwrap();
 +
 +    let authoritative = Session::new_with_opts(output.clone(), options(persistence.clone(), true))
 +        .await
@@ -138,7 +166,7 @@ index 0000000..71a1723
 +        "constructing the session must not implicitly admit persisted torrents"
 +    );
 +
-+    authoritative
++    let restored = authoritative
 +        .add_torrent(
 +            AddTorrent::TorrentFileBytes(second_bytes),
 +            Some(AddTorrentOptions {
@@ -150,6 +178,11 @@ index 0000000..71a1723
 +        )
 +        .await
 +        .unwrap();
++    let restored = restored.into_handle().unwrap();
++    restored.wait_until_initialized().await.unwrap();
++    let restored_stats = restored.stats();
++    assert_eq!(restored_stats.progress_bytes, PIECE_LENGTH as u64);
++    assert!(!restored_stats.finished);
 +    let restored_ids =
 +        authoritative.with_torrents(|torrents| torrents.map(|(id, _)| id).collect::<Vec<_>>());
 +    assert_eq!(restored_ids, vec![second_id]);

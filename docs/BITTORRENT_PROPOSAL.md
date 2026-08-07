@@ -431,9 +431,11 @@ The first of those changes is now concrete. The tested
 targets the exact v8.1.1 tag and preserves rqbit's default behavior. Its
 contract proves that persistence can retain two records while the constructor
 admits none, after which nzbd can explicitly restore only its authoritative ID
-and select the matching persistence identity. The focused test does not yet
-assert restoration of non-empty piece progress. The reproducible verifier,
-scheduled drift check, and full result are recorded in
+and select the matching persistence identity. Its focused test also proves
+that the selected torrent reports only the persisted 16 KiB and remains
+incomplete even though its complete valid 64 KiB payload is on disk; a full
+recheck would report 64 KiB and complete. The reproducible verifier, scheduled
+drift check, and full result are recorded in
 [BITTORRENT_M0_REPORT.md](BITTORRENT_M0_REPORT.md#33-the-authoritative-restore-patch-is-ready-not-released).
 This preparation does not make gate 8 pass: the API must survive upstream
 review and ship in a stable release before nzbd can consume it.

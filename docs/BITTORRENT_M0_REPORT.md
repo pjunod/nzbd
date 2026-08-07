@@ -232,14 +232,16 @@ skipping only the constructor's implicit admission loop.
 
 Both the exact v8.1.1 backport and the contribution patch for rqbit main at
 `4e5f94cbcf1d57ec500885c77cf1e24d70232d89` carry the same contract. The test
-persists two paused torrents, constructs a session that
-starts empty, explicitly restores only the authoritative torrent with its
-persisted `preferred_id`, and finally proves that a legacy session still
-restores both records. That verifies the ownership seam without exposing the
-private persistence schema or deleting library state before startup.
-It does not independently prove restoration of non-empty piece progress, so
-the patch comment is deliberately limited to the persistence identity the
-test demonstrates.
+persists two paused torrents with deterministic four-piece payloads after the
+authoritative torrent validates exactly one 16 KiB piece. It then replaces that
+file with the complete valid 64 KiB payload before restart, constructs a
+session that starts empty, and explicitly restores only the authoritative
+torrent with its persisted `preferred_id`. The restored torrent still reports
+only the persisted 16 KiB and remains incomplete; a full disk recheck would
+report 64 KiB and complete. Finally, a legacy session still restores both
+records. That verifies the ownership and non-empty fast-resume seams without
+exposing the private persistence schema or deleting library state before
+startup.
 
 [`scripts/check-rqbit-authoritative-restore-patch.sh`](../scripts/check-rqbit-authoritative-restore-patch.sh)
 clones a supplied clean v8.1.1 or rqbit-main tree locally, requires the exact
