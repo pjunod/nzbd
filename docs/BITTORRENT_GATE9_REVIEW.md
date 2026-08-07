@@ -11,14 +11,15 @@ Companion to
 and advisory decision. Review the table and §4; do not mark the gate Pass
 merely because CI is green. The remaining decision is whether the recorded
 cost and three constrained exceptions are acceptable for the eventual first
-release, and whether the missing live-peer, tracker-request, and pre-routing
-handshake resource controls must be resolved before this gate can pass.
+release, and whether the missing live-peer, retained-peer, tracker-request,
+and pre-routing handshake resource controls must be resolved before this gate
+can pass.
 
 No production BitTorrent path is enabled by this review. Gates 7 and 8 still
 fail until accepted stable rqbit APIs provide authoritative restore and honest
 per-torrent discovery health.
 
-## 1. Decision requested — measured costs, exact exceptions, and one resource gap
+## 1. Decision requested — measured costs, exact exceptions, and resource gaps
 
 The isolated M0 adapter measured the following in one macOS 26.6 arm64 run:
 
@@ -47,6 +48,20 @@ and outgoing peer managers hold both applicable permits through release, and
 two-torrent boundary tests exercise the aggregate ceiling. Until equivalent
 controls ship in an accepted stable release, the candidate remains evidence,
 not production capability.
+
+The live-peer ceiling also does not bound retained peer records. Stable 8.1.1
+and current main insert every unique tracker, DHT, PEX, explicit, or incoming
+address into a map and unbounded peer-adder channel before a live permit is
+acquired. Queued, backoff, dead, and not-needed records can therefore grow
+without the 80/400 live-manager budget. A contribution candidate adds
+caller-selected per-torrent and shared-session record permits, holds them for
+the map lifetime, removes incoming-only records when their manager exits, and
+prevents alternate-address reconnects from being queued repeatedly. The
+proposal's preliminary 1,024/4,096 policy is informed by an exact-8.1.1 macOS
+arm64 measurement: the 296-byte `Peer` struct makes 4,096 raw records
+1,212,416 bytes (1.16 MiB), excluding map, allocator, and live-bitfield
+overhead. That incomplete size measurement requires reviewer acceptance; it
+does not turn the candidate into shipped capability.
 
 The tracker-count preflight is also not a tracker-request budget. Stable 8.1.1
 and the pinned rqbit-main snapshot issue HTTP tracker requests without a
@@ -128,6 +143,7 @@ cargo deny --all-features --locked check advisories
 scripts/check-rqbit-tracker-request-budget-patch.sh /path/to/rqbit
 scripts/check-rqbit-session-peer-budget-patch.sh /path/to/rqbit
 scripts/check-rqbit-pending-handshake-budget.sh /path/to/rqbit
+scripts/check-rqbit-known-peer-budget-patch.sh /path/to/rqbit
 ```
 
 Reproduce the macOS harness measurements rather than comparing a debug binary:
@@ -172,6 +188,13 @@ Gate 9 may move from Partial to Pass only if a reviewer accepts all of these:
    boundary are evidence for review, not shipped capability. A reviewer must
    explicitly accept the preliminary value and the TCP-only first-release
    scope or require a different measured ceiling.
+9. **Retained peer records.** An accepted stable engine must separately bound
+   queued, backoff, dead, and not-needed peer records per torrent and across
+   the session. The prepared permit candidate and 296-byte raw-struct
+   measurement are evidence for review, not shipped capability. A reviewer
+   must accept or revise the preliminary 1,024/4,096 limits and require
+   additional target-specific memory evidence if the raw measurement is not
+   sufficient.
 
 If any item is rejected, gate 9 remains Partial and the remedy must be named:
 upgrade or patch the dependency, remove the capability, change engines, or set
@@ -192,6 +215,8 @@ an accepted resource budget. Silence is not acceptance.
   announce-rate budget.
 - It does not treat the 10-second read timeout or live-peer permits as a limit
   on the number of incomplete incoming handshake tasks.
+- It does not treat the 80/400 live-manager limits as caps on retained queued,
+  backoff, dead, or not-needed peer records.
 - It does not submit any prepared patch upstream.
 
 Gate 9 is one required decision among eleven, not permission to skip the two

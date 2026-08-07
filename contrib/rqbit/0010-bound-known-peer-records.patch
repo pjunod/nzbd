@@ -1,0 +1,508 @@
+diff --git a/crates/librqbit/src/session.rs b/crates/librqbit/src/session.rs
+index f0edb50b..cebec13c 100644
+--- a/crates/librqbit/src/session.rs
++++ b/crates/librqbit/src/session.rs
+@@ -128,6 +128,8 @@ pub struct Session {
+     // Limits and throttling
+     pub(crate) concurrent_initialize_semaphore: Arc<tokio::sync::Semaphore>,
+     pub ratelimits: Limits,
++    known_peer_limit: Option<usize>,
++    known_peer_semaphore_total: Option<Arc<tokio::sync::Semaphore>>,
+ 
+     pub blocklist: blocklist::Blocklist,
+ 
+@@ -267,6 +269,10 @@ pub struct AddTorrentOptions {
+     /// Initial peers to start of with.
+     pub initial_peers: Option<Vec<SocketAddr>>,
+ 
++    /// Maximum retained known-peer records for this torrent. None preserves
++    /// the existing unlimited behavior; zero rejects every new record.
++    pub known_peer_limit: Option<usize>,
++
+     /// This is used to restore the session from serialized state.
+     pub preferred_id: Option<usize>,
+ 
+@@ -401,6 +407,14 @@ pub struct SessionOptions {
+     /// Configure default peer connection options. Can be overriden per torrent.
+     pub peer_opts: Option<PeerConnectionOptions>,
+ 
++    /// Default maximum retained known-peer records per torrent. None preserves
++    /// the existing unlimited behavior.
++    pub known_peer_limit: Option<usize>,
++
++    /// Maximum retained known-peer records across the session. None preserves
++    /// the existing unlimited behavior.
++    pub known_peer_limit_total: Option<usize>,
++
+     pub listen_port_range: Option<std::ops::Range<u16>>,
+     pub enable_upnp_port_forwarding: bool,
+ 
+@@ -657,6 +671,10 @@ impl Session {
+                 )),
+                 udp_tracker_client,
+                 ratelimits: Limits::new(opts.ratelimits),
++                known_peer_limit: opts.known_peer_limit,
++                known_peer_semaphore_total: opts
++                    .known_peer_limit_total
++                    .map(|limit| Arc::new(tokio::sync::Semaphore::new(limit))),
+                 trackers: opts.trackers,
+                 #[cfg(feature = "disable-upload")]
+                 _disable_upload: opts.disable_upload,
+@@ -1167,6 +1185,8 @@ impl Session {
+                     disk_write_queue: self.disk_write_tx.clone(),
+                     ratelimits: opts.ratelimits,
+                     initial_peers: opts.initial_peers.clone().unwrap_or_default(),
++                    known_peer_limit: opts.known_peer_limit.or(self.known_peer_limit),
++                    known_peer_semaphore_total: self.known_peer_semaphore_total.clone(),
+                     #[cfg(feature = "disable-upload")]
+                     _disable_upload: self._disable_upload,
+                 },
+diff --git a/crates/librqbit/src/torrent_state/live/mod.rs b/crates/librqbit/src/torrent_state/live/mod.rs
+index 2bfaf66c..bd9bcdb4 100644
+--- a/crates/librqbit/src/torrent_state/live/mod.rs
++++ b/crates/librqbit/src/torrent_state/live/mod.rs
+@@ -173,6 +173,8 @@ impl TorrentStateLocked {
+ 
+ const FLUSH_BITV_EVERY_BYTES: u64 = 16 * 1024 * 1024;
+ 
++type PeerQueueEntry = (PeerHandle, SocketAddr);
++
+ pub struct TorrentStateLive {
+     peers: PeerStates,
+     shared: Arc<ManagedTorrentShared>,
+@@ -190,7 +192,7 @@ pub struct TorrentStateLive {
+     peer_semaphore: Arc<Semaphore>,
+ 
+     // The queue for peer manager to connect to them.
+-    peer_queue_tx: UnboundedSender<SocketAddr>,
++    peer_queue_tx: UnboundedSender<PeerQueueEntry>,
+ 
+     finished_notify: Notify,
+     new_pieces_notify: Notify,
+@@ -260,6 +262,14 @@ impl TorrentStateLive {
+                 stats: Default::default(),
+                 states: Default::default(),
+                 live_outgoing_peers: Default::default(),
++                known_peer_semaphores: peers::KnownPeerSemaphores {
++                    per_torrent: paused
++                        .shared
++                        .options
++                        .known_peer_limit
++                        .map(|limit| Arc::new(Semaphore::new(limit))),
++                    total: paused.shared.options.known_peer_semaphore_total.clone(),
++                },
+             },
+             locked: RwLock::new(TorrentStateLocked {
+                 chunks: Some(paused.chunk_tracker),
+@@ -380,12 +390,18 @@ impl TorrentStateLive {
+                 peer.stats.counters.clone()
+             }
+             Entry::Vacant(vac) => {
++                let Some(known_peer_permits) = self.peers.known_peer_semaphores.try_acquire()
++                else {
++                    debug!("limit of known peers reached, dropping incoming peer");
++                    return Ok(());
++                };
+                 atomic_inc(&self.peers.stats.seen);
+                 let peer = Peer::new_live_for_incoming_connection(
+                     *vac.key(),
+                     Id20::new(checked_peer.handshake.peer_id),
+                     tx.clone(),
+                     &self.peers,
++                    known_peer_permits,
+                 );
+                 let counters = peer.stats.counters.clone();
+                 vac.insert(peer);
+@@ -493,18 +509,19 @@ impl TorrentStateLive {
+ 
+     async fn task_manage_outgoing_peer(
+         self: Arc<Self>,
++        handle: PeerHandle,
+         addr: SocketAddr,
+         permit: OwnedSemaphorePermit,
+     ) -> anyhow::Result<()> {
+         let state = self;
+-        let (rx, tx) = state.peers.mark_peer_connecting(addr)?;
++        let (rx, tx) = state.peers.mark_peer_connecting(handle)?;
+         let counters = state
+             .peers
+-            .with_peer(addr, |p| p.stats.counters.clone())
++            .with_peer(handle, |p| p.stats.counters.clone())
+             .context("bug: peer not found")?;
+ 
+         let handler = PeerHandler {
+-            addr,
++            addr: handle,
+             incoming: false,
+             on_bitfield_notify: Default::default(),
+             unchoke_notify: Default::default(),
+@@ -561,14 +578,14 @@ impl TorrentStateLive {
+ 
+     async fn task_peer_adder(
+         self: Arc<Self>,
+-        mut peer_queue_rx: UnboundedReceiver<SocketAddr>,
++        mut peer_queue_rx: UnboundedReceiver<PeerQueueEntry>,
+     ) -> anyhow::Result<()> {
+         let state = self;
+         loop {
+-            let addr = peer_queue_rx.recv().await.context("torrent closed")?;
++            let (handle, addr) = peer_queue_rx.recv().await.context("torrent closed")?;
+             if state.shared.options.disable_upload() && state.is_finished_and_no_active_streams() {
+                 debug!("ignoring peer {} as we are finished", addr);
+-                state.peers.mark_peer_not_needed(addr);
++                state.peers.mark_peer_not_needed(handle);
+                 continue;
+             }
+ 
+@@ -586,7 +603,9 @@ impl TorrentStateLive {
+             let permit = state.peer_semaphore.clone().acquire_owned().await?;
+             state.spawn(
+                 error_span!(parent: state.shared.span.clone(), "manage_peer", peer = addr.to_string()),
+-                aframe!(state.clone().task_manage_outgoing_peer(addr, permit)),
++                aframe!(state
++                    .clone()
++                    .task_manage_outgoing_peer(handle, addr, permit)),
+             );
+         }
+     }
+@@ -662,7 +681,7 @@ impl TorrentStateLive {
+             None => return Ok(false),
+         };
+ 
+-        self.peer_queue_tx.send(addr)?;
++        self.peer_queue_tx.send((addr, addr))?;
+         Ok(true)
+     }
+ 
+@@ -839,7 +858,7 @@ impl TorrentStateLive {
+             .states
+             .iter_mut()
+             .filter_map(|mut p| p.value_mut().reconnect_not_needed_peer(&self.peers))
+-            .map(|socket_addr| self.peer_queue_tx.send(socket_addr))
++            .map(|entry| self.peer_queue_tx.send(entry))
+             .take_while(|r| r.is_ok())
+             .last();
+     }
+@@ -1153,6 +1172,12 @@ impl PeerHandler {
+             }
+         };
+ 
++        if self.incoming && pe.value().outgoing_address.is_none() {
++            drop(pe);
++            self.state.peers.drop_peer(handle);
++            return Ok(());
++        }
++
+         let _error = match error {
+             Some(e) => e,
+             None => {
+@@ -1198,22 +1223,21 @@ impl PeerHandler {
+                     trace!("waiting to reconnect again");
+                     tokio::time::sleep(dur).await;
+                     trace!("finished waiting");
+-                    self.state
++                    let outgoing_addr = self
++                        .state
+                         .peers
+-                        .with_peer_mut(handle, "dead_to_queued", |peer| {
+-                            match peer.get_state() {
+-                                PeerState::Dead => {
+-                                    peer.set_state(PeerState::Queued, &self.state.peers)
+-                                }
+-                                other => bail!(
+-                                    "peer is in unexpected state: {}. Expected dead",
+-                                    other.name()
+-                                ),
+-                            };
+-                            Ok(())
++                        .with_peer_mut(handle, "dead_to_queued", |peer| match peer.get_state() {
++                            PeerState::Dead => {
++                                peer.set_state(PeerState::Queued, &self.state.peers);
++                                Ok(peer.outgoing_address.unwrap_or(handle))
++                            }
++                            other => bail!(
++                                "peer is in unexpected state: {}. Expected dead",
++                                other.name()
++                            ),
+                         })
+                         .context("bug: peer disappeared")??;
+-                    self.state.peer_queue_tx.send(handle)?;
++                    self.state.peer_queue_tx.send((handle, outgoing_addr))?;
+                     Ok::<_, anyhow::Error>(())
+                 },
+             );
+diff --git a/crates/librqbit/src/torrent_state/live/peer/mod.rs b/crates/librqbit/src/torrent_state/live/peer/mod.rs
+index 5d806507..58a0c872 100644
+--- a/crates/librqbit/src/torrent_state/live/peer/mod.rs
++++ b/crates/librqbit/src/torrent_state/live/peer/mod.rs
+@@ -13,7 +13,7 @@ use tracing::debug;
+ use crate::peer_connection::WriterRequest;
+ use crate::type_aliases::BF;
+ 
+-use super::PeerStates;
++use super::{peers::KnownPeerPermits, PeerStates};
+ 
+ pub(crate) type InflightRequest = ChunkInfo;
+ pub(crate) type PeerRx = UnboundedReceiver<WriterRequest>;
+@@ -25,6 +25,7 @@ pub(crate) struct Peer {
+     state: PeerState,
+     pub stats: stats::atomic::PeerStats,
+     pub outgoing_address: Option<SocketAddr>,
++    _known_peer_permits: KnownPeerPermits,
+ }
+ 
+ impl Peer {
+@@ -33,6 +34,7 @@ impl Peer {
+         peer_id: Id20,
+         tx: PeerTx,
+         counters: &PeerStates,
++        known_peer_permits: KnownPeerPermits,
+     ) -> Self {
+         let state = PeerState::Live(LivePeerState::new(peer_id, tx, true));
+         for counter in [&counters.session_stats.peers, &counters.stats] {
+@@ -43,36 +45,40 @@ impl Peer {
+             state,
+             stats: Default::default(),
+             outgoing_address: None,
++            _known_peer_permits: known_peer_permits,
+         }
+     }
+ 
+-    pub fn new_with_outgoing_address(addr: SocketAddr) -> Self {
++    pub fn new_with_outgoing_address(
++        addr: SocketAddr,
++        known_peer_permits: KnownPeerPermits,
++    ) -> Self {
+         Self {
+             addr,
+             outgoing_address: Some(addr),
+             stats: Default::default(),
+             state: Default::default(),
++            _known_peer_permits: known_peer_permits,
+         }
+     }
+ 
+     pub(crate) fn reconnect_not_needed_peer(
+         &mut self,
+         counters: &PeerStates,
+-    ) -> Option<SocketAddr> {
++    ) -> Option<(SocketAddr, SocketAddr)> {
+         if let PeerState::NotNeeded = self.get_state() {
+             match self.outgoing_address {
+                 None => None,
+-                Some(socket_addr) if self.addr == socket_addr => {
+-                    self.set_state(PeerState::Queued, counters);
+-                    Some(socket_addr)
+-                }
+                 Some(socket_addr) => {
+-                    debug!(
+-                        peer = %self.addr,
+-                        outgoing_addr = %socket_addr,
+-                        "peer will by retried on different address",
+-                    );
+-                    Some(socket_addr)
++                    if self.addr != socket_addr {
++                        debug!(
++                            peer = %self.addr,
++                            outgoing_addr = %socket_addr,
++                            "peer will by retried on different address",
++                        );
++                    }
++                    self.set_state(PeerState::Queued, counters);
++                    Some((self.addr, socket_addr))
+                 }
+             }
+         } else {
+diff --git a/crates/librqbit/src/torrent_state/live/peers/mod.rs b/crates/librqbit/src/torrent_state/live/peers/mod.rs
+index 17c07582..dc707f69 100644
+--- a/crates/librqbit/src/torrent_state/live/peers/mod.rs
++++ b/crates/librqbit/src/torrent_state/live/peers/mod.rs
+@@ -6,6 +6,7 @@ use dashmap::DashMap;
+ use librqbit_core::lengths::ValidPieceIndex;
+ use parking_lot::RwLock;
+ use peer_binary_protocol::{Message, Request};
++use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+ 
+ use crate::{
+     peer_connection::WriterRequest,
+@@ -20,6 +21,35 @@ use super::peer::{LivePeerState, Peer, PeerRx, PeerState, PeerTx};
+ 
+ pub mod stats;
+ 
++#[derive(Clone, Default)]
++pub(crate) struct KnownPeerSemaphores {
++    pub per_torrent: Option<Arc<Semaphore>>,
++    pub total: Option<Arc<Semaphore>>,
++}
++
++#[derive(Debug)]
++pub(crate) struct KnownPeerPermits {
++    _per_torrent: Option<OwnedSemaphorePermit>,
++    _total: Option<OwnedSemaphorePermit>,
++}
++
++impl KnownPeerSemaphores {
++    pub fn try_acquire(&self) -> Option<KnownPeerPermits> {
++        let per_torrent = match &self.per_torrent {
++            Some(semaphore) => Some(semaphore.clone().try_acquire_owned().ok()?),
++            None => None,
++        };
++        let total = match &self.total {
++            Some(semaphore) => Some(semaphore.clone().try_acquire_owned().ok()?),
++            None => None,
++        };
++        Some(KnownPeerPermits {
++            _per_torrent: per_torrent,
++            _total: total,
++        })
++    }
++}
++
+ pub(crate) struct PeerStates {
+     pub session_stats: Arc<AtomicSessionStats>,
+ 
+@@ -27,6 +57,7 @@ pub(crate) struct PeerStates {
+     pub live_outgoing_peers: RwLock<HashSet<PeerHandle>>,
+     pub stats: AggregatePeerStatsAtomic,
+     pub states: DashMap<PeerHandle, Peer>,
++    pub known_peer_semaphores: KnownPeerSemaphores,
+ }
+ 
+ impl Drop for PeerStates {
+@@ -47,7 +78,8 @@ impl PeerStates {
+         match self.states.entry(addr) {
+             Entry::Occupied(_) => None,
+             Entry::Vacant(vac) => {
+-                vac.insert(Peer::new_with_outgoing_address(addr));
++                let permits = self.known_peer_semaphores.try_acquire()?;
++                vac.insert(Peer::new_with_outgoing_address(addr, permits));
+                 atomic_inc(&self.stats.queued);
+                 atomic_inc(&self.session_stats.peers.queued);
+ 
+@@ -171,3 +203,100 @@ impl PeerStates {
+         });
+     }
+ }
++
++#[cfg(test)]
++mod known_peer_budget_tests {
++    use super::{KnownPeerSemaphores, PeerStates};
++    use crate::session_stats::atomic::AtomicSessionStats;
++    use crate::torrent_state::live::peer::PeerState;
++    use std::{net::SocketAddr, sync::Arc};
++    use tokio::sync::Semaphore;
++
++    fn peer_states(limit: usize) -> PeerStates {
++        PeerStates {
++            session_stats: Arc::new(AtomicSessionStats::default()),
++            live_outgoing_peers: Default::default(),
++            stats: Default::default(),
++            states: Default::default(),
++            known_peer_semaphores: KnownPeerSemaphores {
++                per_torrent: Some(Arc::new(Semaphore::new(limit))),
++                total: None,
++            },
++        }
++    }
++
++    #[test]
++    fn per_torrent_limit_is_exact_and_released() {
++        let semaphores = KnownPeerSemaphores {
++            per_torrent: Some(Arc::new(Semaphore::new(2))),
++            total: None,
++        };
++        let first = semaphores.try_acquire().unwrap();
++        let second = semaphores.try_acquire().unwrap();
++        assert!(semaphores.try_acquire().is_none());
++        drop(first);
++        assert!(semaphores.try_acquire().is_some());
++        drop(second);
++    }
++
++    #[test]
++    fn session_limit_is_shared_between_torrents() {
++        let total = Arc::new(Semaphore::new(3));
++        let torrent_a = KnownPeerSemaphores {
++            per_torrent: Some(Arc::new(Semaphore::new(3))),
++            total: Some(total.clone()),
++        };
++        let torrent_b = KnownPeerSemaphores {
++            per_torrent: Some(Arc::new(Semaphore::new(3))),
++            total: Some(total),
++        };
++        let first = torrent_a.try_acquire().unwrap();
++        let second = torrent_a.try_acquire().unwrap();
++        let third = torrent_b.try_acquire().unwrap();
++        assert!(torrent_b.try_acquire().is_none());
++        drop(second);
++        assert!(torrent_b.try_acquire().is_some());
++        drop((first, third));
++    }
++
++    #[test]
++    fn peer_records_hold_slots_until_removed() {
++        let peers = peer_states(2);
++        let first = SocketAddr::from(([127, 0, 0, 1], 1));
++        let second = SocketAddr::from(([127, 0, 0, 1], 2));
++        let third = SocketAddr::from(([127, 0, 0, 1], 3));
++        assert_eq!(peers.add_if_not_seen(first), Some(first));
++        assert_eq!(peers.add_if_not_seen(second), Some(second));
++        assert_eq!(peers.add_if_not_seen(third), None);
++        drop(peers.drop_peer(first));
++        assert_eq!(peers.add_if_not_seen(third), Some(third));
++    }
++
++    #[test]
++    fn failed_shared_acquisition_releases_the_local_slot() {
++        let per_torrent = Arc::new(Semaphore::new(1));
++        let semaphores = KnownPeerSemaphores {
++            per_torrent: Some(per_torrent.clone()),
++            total: Some(Arc::new(Semaphore::new(0))),
++        };
++        assert!(semaphores.try_acquire().is_none());
++        assert_eq!(per_torrent.available_permits(), 1);
++    }
++
++    #[test]
++    fn alternate_outgoing_address_is_queued_once_with_record_handle() {
++        let peers = peer_states(1);
++        let handle = SocketAddr::from(([127, 0, 0, 1], 1));
++        let outgoing = SocketAddr::from(([127, 0, 0, 1], 2));
++        assert_eq!(peers.add_if_not_seen(handle), Some(handle));
++
++        let mut peer = peers.states.get_mut(&handle).unwrap();
++        peer.outgoing_address = Some(outgoing);
++        peer.set_state(PeerState::NotNeeded, &peers);
++        assert_eq!(
++            peer.reconnect_not_needed_peer(&peers),
++            Some((handle, outgoing))
++        );
++        assert_eq!(peer.reconnect_not_needed_peer(&peers), None);
++    }
++}
+diff --git a/crates/librqbit/src/torrent_state/mod.rs b/crates/librqbit/src/torrent_state/mod.rs
+index 51816097..dba73d03 100644
+--- a/crates/librqbit/src/torrent_state/mod.rs
++++ b/crates/librqbit/src/torrent_state/mod.rs
+@@ -118,6 +118,8 @@ pub(crate) struct ManagedTorrentOptions {
+     pub disk_write_queue: Option<DiskWorkQueueSender>,
+     pub ratelimits: LimitsConfig,
+     pub initial_peers: Vec<SocketAddr>,
++    pub known_peer_limit: Option<usize>,
++    pub known_peer_semaphore_total: Option<Arc<tokio::sync::Semaphore>>,
+     #[cfg(feature = "disable-upload")]
+     pub _disable_upload: bool,
+ }
+diff --git a/crates/rqbit/src/main.rs b/crates/rqbit/src/main.rs
+index dde67076..4d7cbcdc 100644
+--- a/crates/rqbit/src/main.rs
++++ b/crates/rqbit/src/main.rs
+@@ -492,6 +492,8 @@ async fn async_main(opts: Opts, cancel: CancellationToken) -> anyhow::Result<()>
+             read_write_timeout: Some(opts.peer_read_write_timeout),
+             ..Default::default()
+         }),
++        known_peer_limit: None,
++        known_peer_limit_total: None,
+         listen_port_range: if !opts.disable_tcp_listen {
+             Some(opts.tcp_listen_min_port..opts.tcp_listen_max_port)
+         } else {

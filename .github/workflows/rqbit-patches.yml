@@ -11,6 +11,7 @@ on:
       - scripts/check-rqbit-tracker-request-budget-patch.sh
       - scripts/check-rqbit-session-peer-budget-patch.sh
       - scripts/check-rqbit-pending-handshake-budget.sh
+      - scripts/check-rqbit-known-peer-budget-patch.sh
       - .github/workflows/rqbit-patches.yml
   pull_request:
     paths:
@@ -21,6 +22,7 @@ on:
       - scripts/check-rqbit-tracker-request-budget-patch.sh
       - scripts/check-rqbit-session-peer-budget-patch.sh
       - scripts/check-rqbit-pending-handshake-budget.sh
+      - scripts/check-rqbit-known-peer-budget-patch.sh
       - .github/workflows/rqbit-patches.yml
   schedule:
     # Surface upstream-main drift even when nzbd has not changed.
@@ -184,3 +186,35 @@ jobs:
           workspaces: ${{ runner.temp }}/rqbit -> target
       - name: Verify the stable backport or current native boundary
         run: scripts/check-rqbit-pending-handshake-budget.sh "$RUNNER_TEMP/rqbit"
+
+  known-peer-budget:
+    name: known peer budget / ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    continue-on-error: ${{ github.event_name == 'pull_request' && !matrix.blocking_on_pr }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: rqbit v8.1.1 patch / Rust 1.85
+            ref: v8.1.1
+            toolchain: "1.85"
+            blocking_on_pr: true
+          - name: rqbit main patch
+            ref: main
+            toolchain: stable
+            blocking_on_pr: false
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ matrix.toolchain }}
+          components: rustfmt
+      - name: Clone rqbit ${{ matrix.ref }}
+        run: git clone --branch "${{ matrix.ref }}" https://github.com/ikatson/rqbit.git "$RUNNER_TEMP/rqbit"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: rqbit-known-peer-budget-${{ matrix.ref }}-${{ matrix.toolchain }}
+          workspaces: ${{ runner.temp }}/rqbit -> target
+      - name: Apply and test the contribution patch
+        run: scripts/check-rqbit-known-peer-budget-patch.sh "$RUNNER_TEMP/rqbit"

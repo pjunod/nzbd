@@ -1242,6 +1242,8 @@ upnp_port_forwarding = false
 # socks_proxy_password = "proxy-secret" # masked by Settings API
 max_peers_per_torrent = 80
 max_peers_total = 400
+max_known_peers_per_torrent = 1024
+max_known_peers_total = 4096
 upload_limit_kib = 0                     # 0 = unlimited
 default_seed_ratio = 0                   # 0 = unlimited
 default_seed_minutes = 0                 # 0 = unlimited
@@ -1285,6 +1287,19 @@ source_redirects = 5
   incoming or outgoing peer holds its torrent permit and the optional shared
   session permit until release. The tested candidate does not become usable by
   nzbd until upstream accepts it and a stable release ships it.
+- the retained-peer limits are distinct from the 80/400 live-manager limits.
+  Stable 8.1.1 and current rqbit main retain every unique tracker, DHT, PEX,
+  explicit, or incoming address in a map and unbounded peer-adder channel,
+  including queued, backoff, dead, and not-needed records. A tested candidate
+  holds per-torrent and shared-session permits for the entire record lifetime,
+  removes incoming-only records after their manager exits, and prevents
+  alternate-address reconnects from being queued repeatedly while preserving
+  the retained record handle separately from the connection address. The
+  preliminary 1,024/4,096 values cap the exact-8.1.1 296-byte raw `Peer`
+  structs at
+  1,212,416 bytes (1.16 MiB) session-wide before map, allocator, and live
+  bitfield overhead. Reviewer acceptance and an accepted stable release are
+  still required; the size sample is not a complete memory measurement.
 - live-peer permits do not cover incomplete incoming handshakes before torrent
   routing. Stable 8.1.1 accepts those sockets into an unbounded pending set for
   up to the 10-second read timeout. Current rqbit main defaults its
@@ -2065,6 +2080,7 @@ data-loss change, not a feature toggle.
 | Stable library lacks BEP 52 | Some modern torrents reject | Honest v1 scope and named rejection; revisit on proven stable support. |
 | Stable library is TCP/IPv4 and private torrents use one tracker | Some peers/networks and tracker failover are unavailable | Publish the exact v1 matrix, verify primary-tracker private downloads, revisit only on a stable 9.x gate. |
 | Stable library cannot enforce the proposed 80/400 live-peer budgets | Tracker/PEX/DHT discovery can exceed configured resource expectations | Do not confuse the 80-entry bootstrap guard with a runtime cap; require an accepted stable per-torrent limit and caller-owned shared-session budget before M2. The tested contribution candidate is evidence, not released capability. |
+| Stable and current engines retain unbounded known-peer records | Tracker/DHT/PEX or repeated incoming addresses can grow queued, backoff, dead, and not-needed state outside live-peer permits | Require accepted per-torrent and shared-session retained-record limits before M2. Review the preliminary 1,024/4,096 policy against full map/allocator measurements; the tested permit candidate is evidence, not released capability. |
 | Stable listener leaves incomplete incoming handshakes unbounded | Remote clients can retain sockets, buffers, and tasks before live-peer permits apply | Require an accepted stable pre-routing handshake ceiling and review it separately from the 80/400 live-peer policy. Current main's native 256-per-listener default and the tested stable backport are evidence, not released capability. |
 | Tracker response or interval is hostile | Memory/request tasks remain unbounded or a tracker is hammered | Require an accepted stable request deadline, streamed body cap, and minimum unforced interval; tracker-count preflight alone is insufficient. |
 | Private tracker rejects or bans an unapproved rqbit client | Grab fails or tracker account is penalized | No qBittorrent wire-identity claim; disclose whitelist requirements and gate each supported tracker policy before M4. |
