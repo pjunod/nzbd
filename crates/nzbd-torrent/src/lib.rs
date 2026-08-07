@@ -8,7 +8,8 @@
 
 use librqbit::api::TorrentIdOrHash;
 use librqbit::{
-    AddTorrent, AddTorrentOptions, ManagedTorrent, Session, SessionOptions, TorrentStatsState,
+    AddTorrent, AddTorrentOptions, AddTorrentResponse, ManagedTorrent, Session, SessionOptions,
+    TorrentStatsState,
 };
 use std::borrow::Cow;
 use std::collections::HashSet;
@@ -49,6 +50,8 @@ pub enum TorrentError {
     Engine(String),
     #[error("torrent engine returned no managed handle")]
     MissingHandle,
+    #[error("torrent engine did not return resolved magnet metadata")]
+    MissingResolvedMagnet,
     #[error("BitTorrent v2-only magnets are not supported by librqbit 8.1.1")]
     UnsupportedV2Magnet,
     #[error("hybrid BitTorrent v1/v2 magnets are not supported in the first release")]
@@ -407,10 +410,36 @@ impl TorrentSession {
     pub async fn add_magnet(
         &self,
         magnet: String,
-        config: TorrentAddConfig,
+        mut config: TorrentAddConfig,
     ) -> Result<TorrentHandle, TorrentError> {
         validate_magnet_contract(&magnet, self.proxy_enabled)?;
-        self.add(AddTorrent::from_url(magnet), config).await
+        let resolved = self
+            .inner
+            .add_torrent(
+                AddTorrent::from_url(magnet),
+                Some(AddTorrentOptions {
+                    list_only: true,
+                    initial_peers: Some(config.initial_peers.clone()),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .map_err(engine_error)?;
+        let AddTorrentResponse::ListOnly(resolved) = resolved else {
+            return Err(TorrentError::MissingResolvedMagnet);
+        };
+
+        // rqbit's list-only path resolves BEP 9 metadata but returns before it
+        // constructs storage or manages the torrent. Re-run every nzbd-owned
+        // metainfo invariant here, then admit only the validated bytes.
+        validate_metainfo_contract(resolved.torrent_bytes.as_ref(), self.proxy_enabled)?;
+        for peer in resolved.seen_peers {
+            if !config.initial_peers.contains(&peer) {
+                config.initial_peers.push(peer);
+            }
+        }
+        self.add(AddTorrent::from_bytes(resolved.torrent_bytes), config)
+            .await
     }
 
     async fn add(

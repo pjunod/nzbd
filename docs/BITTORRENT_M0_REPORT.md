@@ -30,12 +30,12 @@ peer listener, or production torrent admission path has been added.
 | 3. Controls and live limits | **Pass** | Pause/resume is exercised before completion, the live download limit is removed during transfer, and idempotent keep-data delete, idempotent delete-data, and unrelated-sibling retention pass. |
 | 4. Kill/restart never trusts partial data | **Blocked** | The accepted fast-resume design cannot be constructed without failing gate 8. A persistence-disabled full hash recheck is a possible safe but slower product decision, not an equivalent test of the accepted design. |
 | 5. Private-torrent discovery | **Pass** | A one-tracker private torrent downloads through a loopback HTTP tracker, and a deterministic peer-wire control proves public torrents consume an injected PEX peer while private torrents ignore it. A Linux capture harness starts live DHT, redirects both stable-8.1.1 bootstrap ports to a local KRPC probe, and observes separate public control hashes before and during a 15-second private canary window. It scans all captured UDP—not just redirected DHT—for the private hash in binary or LSD-style text form. The [first successful capture run](https://github.com/pjunod/nzbd/actions/runs/31128106994) passed on 2026-08-06 UTC: both DHT controls were observed and no private DHT/LSD hash appeared. Tracker order is still lost through a hash set before truncation, so the adapter rejects private metainfo unless it has exactly one unique tracker. |
-| 6. Path and delete safety | **Pass** | The adapter now repeats the portable lexical path invariant before rqbit admission: empty/dot/parent components, slash or backslash, absolute/UNC forms, Windows drive prefixes, NUL, malformed UTF-8, empty multi-file paths, missing/unsafe multi-file roots, metainfo-declared symlinks, exact duplicate paths, and portable lowercase collisions fail with safe nzbd-owned errors. A real-admission corpus still proves rejection before an escape file exists. Delete-data removes only parsed torrent content; an unrelated sibling survives. Higher layers must still prove the persisted canonical root before deletion; existing-filesystem symlink and filesystem-specific Unicode normalization/case checks remain M5 work. |
+| 6. Path and delete safety | **Pass** | The adapter now repeats the portable lexical path invariant before rqbit admission: empty/dot/parent components, slash or backslash, absolute/UNC forms, Windows drive prefixes, NUL, malformed UTF-8, empty multi-file paths, missing/unsafe multi-file roots, metainfo-declared symlinks, exact duplicate paths, and portable lowercase collisions fail with safe nzbd-owned errors. Magnet input first resolves through rqbit's list-only path, which returns before storage construction; nzbd then applies the same metainfo contract and admits only the validated bytes. A fake BEP 9 peer proves an unsafe resolved path leaves the destination empty, and the real-admission corpus still proves rejection before an escape file exists. Delete-data removes only parsed torrent content; an unrelated sibling survives. Higher layers must still prove the persisted canonical root before deletion; existing-filesystem symlink and filesystem-specific Unicode normalization/case checks remain M5 work. |
 | 7. Public observability | **Fail** | Public stats expose phase, total/progress/upload bytes, file progress, rates, ETA inputs, peer counts, completion, and error. Stable 8.1.1 does not expose per-torrent tracker state, DHT state, or last tracker error. A tested upstream patch now supplies that snapshot, but this gate remains failed until an accepted stable release contains it. “No peers” cannot safely substitute for those facts. |
 | 8. nzbd-authoritative persistence | **Fail** | The contract test proves that `Session::new_with_opts` auto-restores the library record before returning. The persistence module and store injection point are private in 8.1.1, so nzbd cannot filter first. A tested upstream patch now supplies the missing opt-out, but this gate remains failed until an accepted stable release contains it. |
 | 9. Resource, package, and license delta | **Partial** | Measurements are recorded in §4. A blocking cargo-deny 0.20.2 policy passes locally across all features and the locked graph, and its [first Actions run passed](https://github.com/pjunod/nzbd/actions/runs/31064446916) on 2026-08-06 UTC. The repository-wide Supply chain check also freezes the reviewed advisory package/feature sets and sole MPL-2.0 package path without pinning nzbd's own version. The [gate 9 review brief](BITTORRENT_GATE9_REVIEW.md) isolates the remaining human acceptance decision. |
 | 10. One explicit rustls provider | **Pass** | The process starts without a provider, explicitly installs aws-lc, and constructs librqbit’s rustls client without the mixed-provider panic. |
-| 11. v1-only boundary | **Pass** | Stable input uses v1 pieces/`btih`; v2-only and hybrid `.torrent` files and magnets return separate named errors before librqbit admission. Magnet classification now reads decoded `xt` query parameters rather than searching the whole URI, so version-looking text in a display name or tracker URL cannot create a false v2/hybrid result. The adapter accepts one valid 40-hex or 32-base32 `btih` and rejects missing, malformed, or duplicate v1 topics by name. |
+| 11. v1-only boundary | **Pass** | Stable input uses v1 pieces/`btih`; v2-only and hybrid `.torrent` files and magnets return separate named errors before managed-torrent admission. Magnet classification reads decoded `xt` query parameters rather than searching the whole URI, so version-looking text in a display name or tracker URL cannot create a false v2/hybrid result. The adapter accepts one valid 40-hex or 32-base32 `btih`, rejects missing, malformed, or duplicate v1 topics by name, and rechecks the resolved info dictionary before storage exists. |
 
 Gates 7 and 8 are stop conditions in §4.3 of the proposal. This is an M0
 **no-go**, even though the data-path tests are healthy.
@@ -53,7 +53,8 @@ code. The daemon does not depend on it. The boundary currently provides:
 - session construction with DHT off by default, UPnP unavailable, DHT
   persistence disabled unconditionally, and proxy+DHT rejected because DHT
   bypasses the engine's SOCKS path;
-- raw v1 metainfo and v1 magnet admission;
+- raw v1 metainfo and two-stage v1 magnet admission, with resolved metadata
+  returned by rqbit list-only mode and revalidated before storage construction;
 - named v2-only and hybrid rejection for both metainfo and magnets;
 - exact-one-tracker validation for private metainfo;
 - pause, resume, idempotent forget, and bounded delete-data delegation;
@@ -83,6 +84,8 @@ daemon behavior changed by the spike.
 The isolated suite covers:
 
 - `.torrent` and magnet download from one local TCP seeder;
+- a fake BEP 9 metadata peer proving unsafe magnet-resolved paths fail while
+  the destination directory remains empty;
 - exact-byte verification and upload accounting;
 - a live 16 KiB/s limit followed by an unlimited transfer;
 - pause and resume before download completion;
@@ -127,6 +130,12 @@ The bounded mutation corpus is a fast CI regression layer, not a claim of
 coverage-guided fuzzing completeness. It exercises the adapter-owned scanner
 without sockets and leaves a persistent fuzz target plus symlink and
 case-collision filesystem probes for M5.
+
+The two-stage magnet guard closes the storage-ordering gap, not the allocation
+gap inside stable rqbit: its metadata reader may allocate up to 32 MiB before
+returning list-only bytes, after which nzbd applies the 10 MiB contract. A
+production magnet path still needs a reviewed pre-allocation answer; gates 7
+and 8 already keep that path disabled.
 
 ### 2.3 Queue schema version fallback
 

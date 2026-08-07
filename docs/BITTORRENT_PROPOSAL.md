@@ -1142,6 +1142,13 @@ The dormant M0 adapter implements the metadata-only portion itself before
 rqbit admission: portable root/components, UTF-8, empty/dot/parent names,
 cross-platform separators, NUL, drive prefixes, metainfo-declared symlinks,
 exact duplicate paths, and collisions under Unicode lowercase comparison. It
+applies that same contract to magnets by resolving them through rqbit's
+list-only mode, which returns metadata before storage construction, and then
+admitting only the validated returned bytes. A fake BEP 9 peer proves an unsafe
+resolved path leaves the destination empty. This closes write ordering but not
+the stable engine's internal metadata allocation: rqbit may allocate up to
+32 MiB before nzbd can enforce its 10 MiB returned-metainfo limit, so production
+magnet wiring still needs a reviewed pre-allocation answer. The adapter
 deliberately does not claim the later filesystem proof: existing symlinks,
 canonical containment, filesystem-specific Unicode normalization/case rules,
 and delete-root authority remain M5/M2 work and no production path is wired.
@@ -1790,7 +1797,9 @@ becomes reachable.
 - Magnet preflight: only decoded `xt` parameters determine the info-hash
   version. One valid 40-hex or 32-base32 `btih` is required; duplicate v1,
   malformed v1, v2-only, and hybrid topics fail by stable name. Version-looking
-  text in display names and tracker URLs is an explicit negative fixture.
+  text in display names and tracker URLs is an explicit negative fixture. A
+  fake BEP 9 peer also proves resolved metainfo is revalidated in list-only
+  mode before any payload storage exists.
 - Path validation: every platform prefix/separator, traversal, normalization,
   symlinks, case collisions, padding files, exact-root delete proof.
 - Adapter path preflight: the portable metadata-only subset and declared
