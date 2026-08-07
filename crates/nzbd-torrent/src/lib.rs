@@ -36,6 +36,10 @@ pub const MAX_TORRENT_PATH_BYTES: usize = 16 * 1024 * 1024;
 /// Maximum display-safe engine error length from proposal §10.3.
 pub const DISPLAY_SAFE_ERROR_MAX_BYTES: usize = 2 * 1024;
 
+// librqbit-core 5.0.0 divides pieces into 16 KiB chunks and stores absolute
+// chunk indices in u32. Keep this version-pinned representation check at the
+// adapter boundary until the engine makes its arithmetic checked.
+const RQBIT_CHUNK_BYTES: u64 = 16 * 1024;
 const ERROR_TRUNCATION_MARKER: &str = "... [truncated]";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -610,6 +614,25 @@ fn validate_metainfo_geometry<BufType: AsRef<[u8]>>(
     if u64::try_from(actual_piece_count).ok() != Some(expected_piece_count) {
         return Err(TorrentError::InvalidMetainfoGeometry(
             "piece hash count does not match payload length and piece length",
+        ));
+    }
+
+    let piece_length = u64::from(info.piece_length);
+    let normal_chunks = piece_length.div_ceil(RQBIT_CHUNK_BYTES);
+    let last_piece_length = match total_length % piece_length {
+        0 => piece_length,
+        remainder => remainder,
+    };
+    let total_chunks = expected_piece_count
+        .checked_sub(1)
+        .and_then(|normal_pieces| normal_pieces.checked_mul(normal_chunks))
+        .and_then(|chunks| chunks.checked_add(last_piece_length.div_ceil(RQBIT_CHUNK_BYTES)))
+        .ok_or(TorrentError::InvalidMetainfoGeometry(
+            "aggregate chunk count overflows the adapter representation",
+        ))?;
+    if total_chunks > u64::from(u32::MAX) {
+        return Err(TorrentError::InvalidMetainfoGeometry(
+            "aggregate chunk count exceeds rqbit's u32 representation",
         ));
     }
 

@@ -351,6 +351,15 @@ fn adapter_rejects_windows_device_aliases_and_reserved_characters() {
 
 #[test]
 fn adapter_owns_checked_v1_piece_geometry() {
+    let engine_piece_length = u32::MAX;
+    let engine_piece_count = 16_384_u64;
+    let engine_chunks_per_piece = u64::from(engine_piece_length).div_ceil(RQBIT_CHUNK_BYTES);
+    let engine_chunk_overflow = single_file_info_with_geometry(
+        b"payload.bin",
+        u64::from(engine_piece_length) * engine_piece_count,
+        engine_piece_length,
+        &vec![0; engine_piece_count as usize * 20],
+    );
     for (case, info) in [
         (
             "zero piece length",
@@ -376,6 +385,7 @@ fn adapter_owns_checked_v1_piece_geometry() {
             "aggregate length overflow",
             multi_file_info_with_lengths(&[i64::MAX as u64, i64::MAX as u64, 2]),
         ),
+        ("rqbit chunk count overflow", engine_chunk_overflow),
     ] {
         let result = validate_metainfo_contract(&metainfo(&info), false);
         assert!(
@@ -388,6 +398,15 @@ fn adapter_owns_checked_v1_piece_geometry() {
     assert!(validate_metainfo_contract(&metainfo(&two_pieces), false).is_ok());
     let zero_length_sidecar = multi_file_info_with_lengths(&[0, 1]);
     assert!(validate_metainfo_contract(&metainfo(&zero_length_sidecar), false).is_ok());
+
+    let maximum_engine_chunks = single_file_info_with_geometry(
+        b"payload.bin",
+        u64::from(engine_piece_length) * (engine_piece_count - 1)
+            + (engine_chunks_per_piece - 1) * RQBIT_CHUNK_BYTES,
+        engine_piece_length,
+        &vec![0; engine_piece_count as usize * 20],
+    );
+    assert!(validate_metainfo_contract(&metainfo(&maximum_engine_chunks), false).is_ok());
 }
 
 #[test]

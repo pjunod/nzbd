@@ -1148,7 +1148,8 @@ trailing dot/space aliases, metainfo-declared symlinks, exact duplicate paths,
 and collisions under Unicode lowercase comparison. It also checks v1 piece
 geometry before rqbit can construct its length table: piece length is nonzero,
 aggregate file length cannot overflow and is nonzero, the hash table is made of
-whole SHA-1 values, and its count exactly covers the declared payload. It
+whole SHA-1 values, its count exactly covers the declared payload, and the
+derived 16 KiB chunk count fits rqbit's `u32` absolute-index representation. It
 projects a separate importer-safe content inventory from validated rqbit
 metadata and omits every BEP 47 padding entry while preserving engine file
 indices for low-level diagnostics. A parsed padding-metainfo test proves the
