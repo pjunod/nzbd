@@ -1281,6 +1281,10 @@ source_redirects = 5
   tracker/PEX/DHT discovery can still fill the engine limit. Current rqbit main
   has a per-torrent `peer_limit`, but production still needs that API in an
   accepted stable release plus an nzbd-owned shared-session budget.
+- dormant torrent initialization is serialized explicitly. Stable rqbit's
+  unset default permits three concurrent initialization integrity scans, which
+  can multiply disk I/O before torrents become live. The one-scan guard does
+  not replace §8.1's future cross-protocol active-download scheduler.
 - proxy credentials are split fields: `socks_proxy_url` must contain no URL
   userinfo, `socks_proxy_username` is ordinary config, and
   `socks_proxy_password` uses the existing whole-field secret-mask and restore

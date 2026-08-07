@@ -68,6 +68,10 @@ code. The daemon does not depend on it. The boundary currently provides:
   non-unicast/port-zero/IPv6 endpoints fail by name, and resolved magnet peers
   cannot grow the handoff beyond 80. This bounds admission input only; it does
   not cap peers later discovered from trackers, PEX, or DHT;
+- one concurrent torrent initialization: stable rqbit's unset default permits
+  three payload integrity scans at once, while the dormant session explicitly
+  serializes that disk-heavy work. This is an initialization-I/O guard, not the
+  future shared active-download scheduler or a runtime peer cap;
 - named v2-only and hybrid rejection for both metainfo and magnets;
 - fail-closed HTTP/HTTPS/UDP tracker URL validation for metainfo and magnets,
   plus exact-one-tracker validation for private metainfo;

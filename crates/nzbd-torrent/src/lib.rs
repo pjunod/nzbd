@@ -35,6 +35,8 @@ pub const MAX_TORRENT_PATH_COMPONENT_BYTES: usize = 255;
 pub const MAX_TORRENT_PATH_BYTES: usize = 16 * 1024 * 1024;
 /// Maximum unique explicit bootstrap peers accepted for one torrent.
 pub const MAX_INITIAL_PEERS: usize = 80;
+/// Maximum concurrent engine integrity checks during torrent initialization.
+pub const MAX_CONCURRENT_TORRENT_INITIALIZATIONS: usize = 1;
 /// Maximum display-safe engine error length from proposal §10.3.
 pub const DISPLAY_SAFE_ERROR_MAX_BYTES: usize = 2 * 1024;
 
@@ -669,7 +671,10 @@ fn session_options(
         defer_writes_up_to: None,
         default_storage_factory: None,
         cancellation_token: None,
-        concurrent_init_limit: None,
+        // An initialization can scan and hash the payload before a torrent
+        // becomes live. Keep that disk-heavy work serial even though stable
+        // rqbit's unset default permits three concurrent initializations.
+        concurrent_init_limit: Some(MAX_CONCURRENT_TORRENT_INITIALIZATIONS),
         root_span: None,
         ratelimits: Default::default(),
         blocklist_url: None,
@@ -1621,7 +1626,10 @@ mod tests {
         assert!(options.default_storage_factory.is_none());
         assert!(options.socks_proxy_url.is_none());
         assert!(options.cancellation_token.is_none());
-        assert!(options.concurrent_init_limit.is_none());
+        assert_eq!(
+            options.concurrent_init_limit,
+            Some(MAX_CONCURRENT_TORRENT_INITIALIZATIONS)
+        );
         assert!(options.root_span.is_none());
         assert_eq!(options.ratelimits, Default::default());
         assert!(options.blocklist_url.is_none());
