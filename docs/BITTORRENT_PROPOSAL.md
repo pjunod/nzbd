@@ -1348,6 +1348,8 @@ The exact constants should be centralized and tested:
 | One relative path | 4 KiB encoded | `422 path_too_long` |
 | All path bytes | 16 MiB | `422 metadata_too_large` |
 | Magnet URI | 16 KiB | `422 magnet_too_long` |
+| Unique non-empty trackers | 64 per source | `422 too_many_trackers` |
+| One decoded tracker URL | 2 KiB | `422 tracker_url_too_long` |
 | Explicit initial peers | 80 unique unicast IPv4 endpoints | `422 invalid_initial_peer` / `too_many_initial_peers` |
 | Display-safe error | 2 KiB | truncate with an explicit marker |
 
@@ -1357,10 +1359,11 @@ raise the bound with a regression fixture and measured memory impact.
 The dormant adapter centralizes and enforces the limits it can own before
 daemon integration: 10 MiB raw metainfo, 16 KiB magnet URIs, 100,000 files,
 255 encoded bytes per component, 4 KiB per projected relative payload path,
-16 MiB across projected paths, and 2 KiB for every rqbit operation or live-stat
-error that crosses the adapter. It also deduplicates explicit peers in caller
-order, caps that bootstrap vector at 80, and rejects port zero, non-unicast,
-and IPv6 endpoints before rqbit sees them. This is not the proposed runtime
+16 MiB across projected paths, 64 unique non-empty trackers, 2 KiB per decoded
+tracker URL, and 2 KiB for every rqbit operation or live-stat error that
+crosses the adapter. It also deduplicates explicit peers in caller order, caps
+that bootstrap vector at 80, and rejects port zero, non-unicast, and IPv6
+endpoints before rqbit sees them. This is not the proposed runtime
 peer cap: stable 8.1.1 can still discover and connect up to its hard-coded 128
 live peers per torrent and has no session-total budget. Projected paths include
 the multi-file root and platform separator bytes, so the accounting bounds the

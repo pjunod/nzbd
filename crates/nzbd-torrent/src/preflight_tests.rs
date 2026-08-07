@@ -71,6 +71,22 @@ fn metainfo_with_announce(info: &[u8], announce: &[u8]) -> Vec<u8> {
     torrent
 }
 
+fn metainfo_with_announce_list(info: &[u8], trackers: &[Vec<u8>]) -> Vec<u8> {
+    let mut torrent = vec![b'd'];
+    bencode_bytes(&mut torrent, b"announce-list");
+    torrent.push(b'l');
+    for tracker in trackers {
+        torrent.push(b'l');
+        bencode_bytes(&mut torrent, tracker);
+        torrent.push(b'e');
+    }
+    torrent.push(b'e');
+    bencode_bytes(&mut torrent, b"info");
+    torrent.extend_from_slice(info);
+    torrent.push(b'e');
+    torrent
+}
+
 fn v1_metainfo(name: &[u8]) -> Vec<u8> {
     metainfo(&single_file_info(name))
 }
@@ -495,6 +511,8 @@ fn proposal_admission_constants_and_input_boundaries_are_pinned() {
     assert_eq!(MAX_TORRENT_PATH_COMPONENT_BYTES, 255);
     assert_eq!(MAX_TORRENT_PATH_BYTES, 16 * 1024 * 1024);
     assert_eq!(MAX_INITIAL_PEERS, 80);
+    assert_eq!(MAX_TRACKERS_PER_TORRENT, 64);
+    assert_eq!(MAX_TRACKER_URL_BYTES, 2 * 1024);
 
     assert!(validate_metainfo_size(DEFAULT_MAX_METAINFO_BYTES).is_ok());
     assert!(matches!(
@@ -693,6 +711,64 @@ fn tracker_preflight_rejects_inputs_the_engine_would_silently_drop() {
             false,
         ),
         Err(TorrentError::PrivateTrackerCount(0))
+    ));
+}
+
+#[test]
+fn tracker_fanout_and_url_length_fail_at_the_first_excess() {
+    let trackers = (0..=MAX_TRACKERS_PER_TORRENT)
+        .map(|index| format!("https://tracker-{index}.example/announce").into_bytes())
+        .collect::<Vec<_>>();
+    assert!(validate_metainfo_contract(
+        &metainfo_with_announce_list(
+            &single_file_info(b"payload.bin"),
+            &trackers[..MAX_TRACKERS_PER_TORRENT],
+        ),
+        false,
+    )
+    .is_ok());
+    assert!(matches!(
+        validate_metainfo_contract(
+            &metainfo_with_announce_list(&single_file_info(b"payload.bin"), &trackers),
+            false,
+        ),
+        Err(TorrentError::TooManyTrackers {
+            count,
+            limit: MAX_TRACKERS_PER_TORRENT,
+        }) if count == MAX_TRACKERS_PER_TORRENT + 1
+    ));
+
+    let tracker_at_limit = format!(
+        "https://tracker.example/{}",
+        "a".repeat(MAX_TRACKER_URL_BYTES - "https://tracker.example/".len())
+    );
+    assert_eq!(tracker_at_limit.len(), MAX_TRACKER_URL_BYTES);
+    assert!(validate_tracker_url(tracker_at_limit.as_bytes()).is_ok());
+    assert!(matches!(
+        validate_tracker_url(format!("{tracker_at_limit}a").as_bytes()),
+        Err(TorrentError::TrackerUrlTooLong {
+            size,
+            limit: MAX_TRACKER_URL_BYTES,
+        }) if size == MAX_TRACKER_URL_BYTES + 1
+    ));
+
+    let hex = "00".repeat(20);
+    let magnet = |count: usize| {
+        let mut magnet = format!("magnet:?xt=urn:btih:{hex}");
+        for index in 0..count {
+            magnet.push_str(&format!(
+                "&tr=https%3A%2F%2Ftracker-{index}.example%2Fannounce"
+            ));
+        }
+        magnet
+    };
+    assert!(validate_magnet_contract(&magnet(MAX_TRACKERS_PER_TORRENT), false).is_ok());
+    assert!(matches!(
+        validate_magnet_contract(&magnet(MAX_TRACKERS_PER_TORRENT + 1), false),
+        Err(TorrentError::TooManyTrackers {
+            count,
+            limit: MAX_TRACKERS_PER_TORRENT,
+        }) if count == MAX_TRACKERS_PER_TORRENT + 1
     ));
 }
 

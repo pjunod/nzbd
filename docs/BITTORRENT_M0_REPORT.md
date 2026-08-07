@@ -82,7 +82,8 @@ code. The daemon does not depend on it. The boundary currently provides:
   redaction policy through this helper;
 - named v2-only and hybrid rejection for both metainfo and magnets;
 - fail-closed HTTP/HTTPS/UDP tracker URL validation for metainfo and magnets,
-  plus exact-one-tracker validation for private metainfo;
+  with at most 64 unique non-empty trackers and 2 KiB per decoded URL, plus
+  exact-one-tracker validation for private metainfo;
 - pause, resume, idempotent forget, and bounded delete-data delegation;
 - live session upload/download rate changes;
 - info hash, phase, progress, upload, per-file progress, rates, derived ETA,

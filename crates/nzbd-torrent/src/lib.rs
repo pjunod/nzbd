@@ -36,6 +36,10 @@ pub const MAX_TORRENT_PATH_COMPONENT_BYTES: usize = 255;
 pub const MAX_TORRENT_PATH_BYTES: usize = 16 * 1024 * 1024;
 /// Maximum unique explicit bootstrap peers accepted for one torrent.
 pub const MAX_INITIAL_PEERS: usize = 80;
+/// Maximum unique non-empty trackers accepted from one torrent source.
+pub const MAX_TRACKERS_PER_TORRENT: usize = 64;
+/// Maximum decoded byte length of one tracker URL.
+pub const MAX_TRACKER_URL_BYTES: usize = 2 * 1024;
 /// Maximum concurrent engine integrity checks during torrent initialization.
 pub const MAX_CONCURRENT_TORRENT_INITIALIZATIONS: usize = 1;
 /// Timeout for establishing an outgoing peer connection.
@@ -105,6 +109,10 @@ pub enum TorrentError {
     PrivateTrackerCount(usize),
     #[error("invalid BitTorrent tracker URL: {0}")]
     InvalidTracker(&'static str),
+    #[error("BitTorrent tracker URL is too long ({size} bytes; maximum {limit})")]
+    TrackerUrlTooLong { size: usize, limit: usize },
+    #[error("too many unique BitTorrent trackers ({count}; maximum {limit})")]
+    TooManyTrackers { count: usize, limit: usize },
     #[error("unsafe torrent metainfo path: {0}")]
     UnsafeMetainfoPath(&'static str),
     #[error("torrent metainfo is too large ({size} bytes; maximum {limit})")]
@@ -768,19 +776,25 @@ fn validate_metainfo_contract(bytes: &[u8], proxy_enabled: bool) -> Result<(), T
         librqbit::torrent_from_bytes::<librqbit::ByteBuf<'_>>(bytes).map_err(engine_error)?;
     validate_metainfo_geometry(&metainfo.info)?;
     validate_metainfo_paths(&metainfo.info)?;
+    let mut trackers = HashSet::new();
     for tracker in metainfo.iter_announce() {
-        if validate_tracker_url(AsRef::<[u8]>::as_ref(tracker))? && proxy_enabled {
+        let tracker = AsRef::<[u8]>::as_ref(tracker);
+        if validate_tracker_url(tracker)? && proxy_enabled {
             return Err(TorrentError::ProxyWithUdpTracker);
+        }
+        if !tracker.is_empty()
+            && trackers.insert(tracker.to_vec())
+            && trackers.len() > MAX_TRACKERS_PER_TORRENT
+        {
+            return Err(TorrentError::TooManyTrackers {
+                count: trackers.len(),
+                limit: MAX_TRACKERS_PER_TORRENT,
+            });
         }
     }
     if !metainfo.info.private {
         return Ok(());
     }
-    let trackers = metainfo
-        .iter_announce()
-        .map(AsRef::<[u8]>::as_ref)
-        .filter(|tracker| !tracker.is_empty())
-        .collect::<HashSet<_>>();
     if trackers.len() != 1 {
         return Err(TorrentError::PrivateTrackerCount(trackers.len()));
     }
@@ -1379,9 +1393,21 @@ fn validate_magnet_contract(magnet: &str, proxy_enabled: bool) -> Result<(), Tor
         ));
     }
 
+    let mut trackers = HashSet::new();
     for (key, tracker) in url.query_pairs() {
-        if key == "tr" && validate_tracker_url(tracker.as_bytes())? && proxy_enabled {
-            return Err(TorrentError::ProxyWithUdpTracker);
+        if key == "tr" {
+            if validate_tracker_url(tracker.as_bytes())? && proxy_enabled {
+                return Err(TorrentError::ProxyWithUdpTracker);
+            }
+            if !tracker.is_empty()
+                && trackers.insert(tracker.into_owned())
+                && trackers.len() > MAX_TRACKERS_PER_TORRENT
+            {
+                return Err(TorrentError::TooManyTrackers {
+                    count: trackers.len(),
+                    limit: MAX_TRACKERS_PER_TORRENT,
+                });
+            }
         }
     }
     Ok(())
@@ -1402,6 +1428,12 @@ fn valid_btmh(hash: &[u8]) -> bool {
 fn validate_tracker_url(tracker: &[u8]) -> Result<bool, TorrentError> {
     if tracker.is_empty() {
         return Ok(false);
+    }
+    if tracker.len() > MAX_TRACKER_URL_BYTES {
+        return Err(TorrentError::TrackerUrlTooLong {
+            size: tracker.len(),
+            limit: MAX_TRACKER_URL_BYTES,
+        });
     }
     let tracker = std::str::from_utf8(tracker)
         .map_err(|_| TorrentError::InvalidTracker("tracker URLs must contain valid UTF-8"))?;
