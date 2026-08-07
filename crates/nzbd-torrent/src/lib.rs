@@ -995,6 +995,12 @@ impl TorrentHandle {
                 )
             })
             .unwrap_or_default();
+        let content_files = self
+            .inner
+            .with_metadata(|metadata| {
+                project_content_files(&metadata.file_infos, &stats.file_progress)
+            })
+            .unwrap_or_default();
         let eta_seconds = (download_bps > 0 && stats.progress_bytes < stats.total_bytes)
             .then(|| (stats.total_bytes - stats.progress_bytes).div_ceil(download_bps));
         TorrentStats {
@@ -1003,6 +1009,7 @@ impl TorrentHandle {
             uploaded_bytes: stats.uploaded_bytes,
             total_bytes: stats.total_bytes,
             file_progress_bytes: stats.file_progress,
+            content_files,
             download_bps,
             upload_bps,
             eta_seconds,
@@ -1025,6 +1032,22 @@ impl TorrentHandle {
             .await
             .map_err(engine_error)
     }
+}
+
+fn project_content_files(
+    file_infos: &[librqbit::file_info::FileInfo],
+    file_progress: &[u64],
+) -> Vec<TorrentContentFile> {
+    file_infos
+        .iter()
+        .enumerate()
+        .filter(|(_, file)| !file.attrs.padding)
+        .map(|(index, file)| TorrentContentFile {
+            relative_path: file.relative_filename.clone(),
+            size_bytes: file.len,
+            progress_bytes: file_progress.get(index).copied().unwrap_or(0),
+        })
+        .collect()
 }
 
 fn mib_per_second_to_bps(mib_per_second: f64) -> u64 {
@@ -1059,7 +1082,10 @@ pub struct TorrentStats {
     pub progress_bytes: u64,
     pub uploaded_bytes: u64,
     pub total_bytes: u64,
+    /// Engine-indexed progress retained for low-level diagnostics.
     pub file_progress_bytes: Vec<u64>,
+    /// Importer-safe file inventory. BEP 47 padding entries are omitted.
+    pub content_files: Vec<TorrentContentFile>,
     pub download_bps: u64,
     pub upload_bps: u64,
     pub eta_seconds: Option<u64>,
@@ -1069,12 +1095,56 @@ pub struct TorrentStats {
     pub error: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TorrentContentFile {
+    pub relative_path: PathBuf,
+    pub size_bytes: u64,
+    pub progress_bytes: u64,
+}
+
 #[cfg(test)]
 mod preflight_tests;
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn file_info(path: &str, len: u64, padding: bool) -> librqbit::file_info::FileInfo {
+        let mut file = librqbit::file_info::FileInfo {
+            relative_filename: PathBuf::from(path),
+            offset_in_torrent: 0,
+            piece_range: 0..1,
+            attrs: Default::default(),
+            len,
+        };
+        file.attrs.padding = padding;
+        file
+    }
+
+    #[test]
+    fn content_file_projection_hides_padding_and_keeps_engine_progress_alignment() {
+        let files = vec![
+            file_info("release/video.mkv", 100, false),
+            file_info("release/.pad/64", 64, true),
+            file_info("release/readme.txt", 10, false),
+        ];
+
+        assert_eq!(
+            project_content_files(&files, &[75, 64, 3]),
+            vec![
+                TorrentContentFile {
+                    relative_path: PathBuf::from("release/video.mkv"),
+                    size_bytes: 100,
+                    progress_bytes: 75,
+                },
+                TorrentContentFile {
+                    relative_path: PathBuf::from("release/readme.txt"),
+                    size_bytes: 10,
+                    progress_bytes: 3,
+                },
+            ]
+        );
+    }
 
     #[test]
     fn session_options_cannot_enable_upnp() {

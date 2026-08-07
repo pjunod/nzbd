@@ -1145,6 +1145,10 @@ The dormant M0 adapter implements the metadata-only portion itself before
 rqbit admission: portable root/components, UTF-8, empty/dot/parent names,
 cross-platform separators, NUL, drive prefixes, metainfo-declared symlinks,
 exact duplicate paths, and collisions under Unicode lowercase comparison. It
+projects a separate importer-safe content inventory from validated rqbit
+metadata and omits every BEP 47 padding entry while preserving engine file
+indices for low-level diagnostics. A parsed padding-metainfo test proves the
+padding path never appears in that content inventory. It
 applies that same contract to magnets by resolving them through rqbit's
 list-only mode, which returns metadata before storage construction, and then
 admitting only the validated returned bytes. A fake BEP 9 peer proves an unsafe
