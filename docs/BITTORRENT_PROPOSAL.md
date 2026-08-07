@@ -1155,10 +1155,13 @@ admitting only the validated returned bytes. A fake BEP 9 peer proves an unsafe
 resolved path leaves the destination empty. This closes write ordering but not
 the stable engine's internal metadata allocation: rqbit may allocate up to
 32 MiB before nzbd can enforce its 10 MiB returned-metainfo limit, so production
-magnet wiring still needs a reviewed pre-allocation answer. The adapter
-deliberately does not claim the later filesystem proof: existing symlinks,
-canonical containment, filesystem-specific Unicode normalization/case rules,
-and delete-root authority remain M5/M2 work and no production path is wired.
+magnet wiring still needs a reviewed pre-allocation answer. The adapter now
+canonicalizes the session output root and rejects every payload prefix that is
+an existing symlink before rqbit constructs storage; a Unix test proves the
+external target stays empty. That preflight is defense in depth and does not
+close the check/write race. Descriptor-relative containment, filesystem-specific
+Unicode normalization/case rules, and persisted delete-root authority remain
+M5/M2 work, and no production path is wired.
 
 ### 9.3 First release: no torrent post-processing
 
@@ -1828,8 +1831,10 @@ becomes reachable.
   symlinks, case collisions, padding files, exact-root delete proof.
 - Adapter path preflight: the portable metadata-only subset and declared
   symlink, exact-duplicate, and lowercase-collision rejection run as
-  socket-free unit tests before real-admission path tests; existing-filesystem
-  symlinks and filesystem-specific Unicode normalization remain M5 probes.
+  socket-free unit tests before real-admission path tests. The session root is
+  canonicalized, and an existing-symlink integration case must leave its
+  external target untouched; descriptor-relative containment and
+  filesystem-specific Unicode normalization remain M5 probes.
 - Metainfo preflight: a deterministic mutation corpus runs in ordinary CI;
   coverage-guided fuzzing remains an M5 release gate.
 - State projection: every `TorrentPhase` maps to the expected native and

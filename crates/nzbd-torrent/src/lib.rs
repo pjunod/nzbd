@@ -16,7 +16,7 @@ use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::num::NonZeroU32;
 use std::ops::Range;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 /// The exact engine release the M0 contract and interop tests describe.
@@ -94,6 +94,8 @@ pub enum TorrentError {
     PathMetadataTooLarge { size: usize, limit: usize },
     #[error("torrent contains payload paths that collide under portable case comparison")]
     PathCollision,
+    #[error("unsafe existing torrent path: a payload component is a symbolic link")]
+    ExistingPathSymlink,
 }
 
 fn engine_error(error: impl std::fmt::Display) -> TorrentError {
@@ -363,6 +365,7 @@ pub struct TorrentAddConfig {
 pub struct TorrentSession {
     inner: Arc<Session>,
     dht_enabled: bool,
+    output_root: PathBuf,
     proxy_enabled: bool,
 }
 
@@ -381,13 +384,16 @@ impl TorrentSession {
             .as_ref()
             .map(TorrentProxyConfig::engine_url)
             .transpose()?;
+        std::fs::create_dir_all(&output_root).map_err(engine_error)?;
+        let output_root = std::fs::canonicalize(output_root).map_err(engine_error)?;
         let options = session_options(config.dht, config.listen_port_range, socks_proxy_url);
-        let inner = Session::new_with_opts(output_root, options)
+        let inner = Session::new_with_opts(output_root.clone(), options)
             .await
             .map_err(engine_error)?;
         Ok(Self {
             inner,
             dht_enabled: config.dht,
+            output_root,
             proxy_enabled,
         })
     }
@@ -410,6 +416,7 @@ impl TorrentSession {
         config: TorrentAddConfig,
     ) -> Result<TorrentHandle, TorrentError> {
         validate_metainfo_contract(&bytes, self.proxy_enabled)?;
+        validate_existing_filesystem_paths(&bytes, &self.output_root)?;
         self.add(AddTorrent::from_bytes(bytes), config).await
     }
 
@@ -448,6 +455,7 @@ impl TorrentSession {
         // constructs storage or manages the torrent. Re-run every nzbd-owned
         // metainfo invariant here, then admit only the validated bytes.
         validate_metainfo_contract(resolved.torrent_bytes.as_ref(), self.proxy_enabled)?;
+        validate_existing_filesystem_paths(resolved.torrent_bytes.as_ref(), &self.output_root)?;
         for peer in resolved.seen_peers {
             if !config.initial_peers.contains(&peer) {
                 config.initial_peers.push(peer);
@@ -557,6 +565,59 @@ fn validate_metainfo_contract(bytes: &[u8], proxy_enabled: bool) -> Result<(), T
         return Err(TorrentError::PrivateTrackerCount(trackers.len()));
     }
     Ok(())
+}
+
+fn validate_existing_filesystem_paths(
+    bytes: &[u8],
+    output_root: &Path,
+) -> Result<(), TorrentError> {
+    let metainfo =
+        librqbit::torrent_from_bytes::<librqbit::ByteBuf<'_>>(bytes).map_err(engine_error)?;
+    let multi_file_root = metainfo
+        .info
+        .files
+        .as_ref()
+        .and(metainfo.info.name.as_ref())
+        .map(|name| {
+            std::str::from_utf8(name.as_ref()).map_err(|_| {
+                TorrentError::UnsafeMetainfoPath("path components must contain valid UTF-8")
+            })
+        })
+        .transpose()?;
+
+    for file in metainfo.info.iter_file_details().map_err(engine_error)? {
+        let mut candidate = output_root.to_path_buf();
+        if let Some(root) = multi_file_root {
+            candidate.push(root);
+            if reject_existing_symlink(&candidate)? {
+                continue;
+            }
+        }
+        for component in file.filename.iter_components() {
+            let component = component.map_err(|_| {
+                TorrentError::UnsafeMetainfoPath(
+                    "components must be portable UTF-8 names without traversal or separators",
+                )
+            })?;
+            candidate.push(component);
+            if reject_existing_symlink(&candidate)? {
+                break;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Returns true once a missing prefix proves that no deeper existing symlink
+/// can currently exist. Production writes still require a descriptor-relative
+/// containment design to close the check/write race.
+fn reject_existing_symlink(path: &Path) -> Result<bool, TorrentError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(TorrentError::ExistingPathSymlink),
+        Ok(_) => Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
+        Err(error) => Err(engine_error(error)),
+    }
 }
 
 fn validate_metainfo_paths<BufType: AsRef<[u8]>>(
