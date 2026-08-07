@@ -107,6 +107,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: ${{ matrix.toolchain }}
+          components: rustfmt
       - name: Clone rqbit ${{ matrix.ref }}
         run: git clone --branch "${{ matrix.ref }}" https://github.com/ikatson/rqbit.git "$RUNNER_TEMP/rqbit"
       - uses: Swatinem/rust-cache@v2
