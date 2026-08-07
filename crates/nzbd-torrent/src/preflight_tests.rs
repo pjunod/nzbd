@@ -730,3 +730,38 @@ fn adapter_rejects_canonically_equivalent_unicode_path_collisions() {
     ));
     assert!(validate_metainfo_contract(&distinct, false).is_ok());
 }
+
+#[test]
+fn adapter_rejects_existing_payload_path_type_conflicts() {
+    let single_root = tempfile::tempdir().unwrap();
+    std::fs::create_dir(single_root.path().join("payload.bin")).unwrap();
+    assert!(matches!(
+        validate_existing_filesystem_paths(&v1_metainfo(b"payload.bin"), single_root.path()),
+        Err(TorrentError::ExistingPathType(
+            "a payload leaf is not a regular file"
+        ))
+    ));
+
+    let multi_root = tempfile::tempdir().unwrap();
+    std::fs::write(multi_root.path().join("release"), b"not a directory").unwrap();
+    let nested = metainfo(&multi_file_info(
+        Some(b"release"),
+        &[b"sub", b"payload.bin"],
+        None,
+        None,
+    ));
+    assert!(matches!(
+        validate_existing_filesystem_paths(&nested, multi_root.path()),
+        Err(TorrentError::ExistingPathType(
+            "a payload prefix is not a directory"
+        ))
+    ));
+
+    let resumable_root = tempfile::tempdir().unwrap();
+    std::fs::write(resumable_root.path().join("payload.bin"), [0]).unwrap();
+    assert!(validate_existing_filesystem_paths(
+        &v1_metainfo(b"payload.bin"),
+        resumable_root.path()
+    )
+    .is_ok());
+}

@@ -106,6 +106,8 @@ pub enum TorrentError {
     PathCollision,
     #[error("unsafe existing torrent path: a payload component is a symbolic link")]
     ExistingPathSymlink,
+    #[error("unsafe existing torrent path: {0}")]
+    ExistingPathType(&'static str),
     #[error("invalid torrent piece geometry: {0}")]
     InvalidMetainfoGeometry(&'static str),
 }
@@ -661,18 +663,24 @@ fn validate_existing_filesystem_paths(
         let mut candidate = output_root.to_path_buf();
         if let Some(root) = multi_file_root {
             candidate.push(root);
-            if reject_existing_symlink(&candidate)? {
+            if validate_existing_path(&candidate, ExistingPathKind::Directory)? {
                 continue;
             }
         }
-        for component in file.filename.iter_components() {
+        let mut components = file.filename.iter_components().peekable();
+        while let Some(component) = components.next() {
             let component = component.map_err(|_| {
                 TorrentError::UnsafeMetainfoPath(
                     "components must be portable UTF-8 names without traversal or separators",
                 )
             })?;
             candidate.push(component);
-            if reject_existing_symlink(&candidate)? {
+            let expected = if components.peek().is_some() {
+                ExistingPathKind::Directory
+            } else {
+                ExistingPathKind::File
+            };
+            if validate_existing_path(&candidate, expected)? {
                 break;
             }
         }
@@ -683,9 +691,23 @@ fn validate_existing_filesystem_paths(
 /// Returns true once a missing prefix proves that no deeper existing symlink
 /// can currently exist. Production writes still require a descriptor-relative
 /// containment design to close the check/write race.
-fn reject_existing_symlink(path: &Path) -> Result<bool, TorrentError> {
+#[derive(Clone, Copy)]
+enum ExistingPathKind {
+    Directory,
+    File,
+}
+
+fn validate_existing_path(path: &Path, expected: ExistingPathKind) -> Result<bool, TorrentError> {
     match std::fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_symlink() => Err(TorrentError::ExistingPathSymlink),
+        Ok(metadata) if matches!(expected, ExistingPathKind::Directory) && !metadata.is_dir() => {
+            Err(TorrentError::ExistingPathType(
+                "a payload prefix is not a directory",
+            ))
+        }
+        Ok(metadata) if matches!(expected, ExistingPathKind::File) && !metadata.is_file() => Err(
+            TorrentError::ExistingPathType("a payload leaf is not a regular file"),
+        ),
         Ok(_) => Ok(false),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
         Err(error) => Err(engine_error(error)),

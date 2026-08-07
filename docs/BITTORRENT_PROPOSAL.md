@@ -1135,7 +1135,9 @@ Before starting a torrent, validate every metadata path:
 - an explicit payload name is required; do not accept an engine-generated
   fallback shared by unrelated unnamed torrents;
 - resolved output remains under the canonical category torrent root;
-- no existing symlink may redirect a write outside that root;
+- no existing symlink may redirect a write outside that root, every existing
+  intermediate payload component is a directory, and every existing leaf is
+  a regular file;
 - exact, Unicode-NFC-equivalent, and lowercase collisions are rejected before
   storage on every platform, conservatively covering common
   normalization-insensitive and case-insensitive filesystems;
