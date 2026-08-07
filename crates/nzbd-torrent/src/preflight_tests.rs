@@ -11,15 +11,24 @@ fn bencode_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
 }
 
 fn single_file_info(name: &[u8]) -> Vec<u8> {
+    single_file_info_with_geometry(name, 1, 16_384, &[0; 20])
+}
+
+fn single_file_info_with_geometry(
+    name: &[u8],
+    length: u64,
+    piece_length: u32,
+    pieces: &[u8],
+) -> Vec<u8> {
     let mut info = vec![b'd'];
     bencode_bytes(&mut info, b"length");
-    info.extend_from_slice(b"i1e");
+    info.extend_from_slice(format!("i{length}e").as_bytes());
     bencode_bytes(&mut info, b"name");
     bencode_bytes(&mut info, name);
     bencode_bytes(&mut info, b"piece length");
-    info.extend_from_slice(b"i16384e");
+    info.extend_from_slice(format!("i{piece_length}e").as_bytes());
     bencode_bytes(&mut info, b"pieces");
-    bencode_bytes(&mut info, &[0; 20]);
+    bencode_bytes(&mut info, pieces);
     info.push(b'e');
     info
 }
@@ -110,6 +119,30 @@ fn multi_file_info_many(root: &[u8], paths: &[&[&[u8]]]) -> Vec<u8> {
     info.push(b'e');
     bencode_bytes(&mut info, b"name");
     bencode_bytes(&mut info, root);
+    bencode_bytes(&mut info, b"piece length");
+    info.extend_from_slice(b"i16384e");
+    bencode_bytes(&mut info, b"pieces");
+    bencode_bytes(&mut info, &[0; 20]);
+    info.push(b'e');
+    info
+}
+
+fn multi_file_info_with_lengths(lengths: &[u64]) -> Vec<u8> {
+    let mut info = vec![b'd'];
+    bencode_bytes(&mut info, b"files");
+    info.push(b'l');
+    for (index, length) in lengths.iter().enumerate() {
+        info.push(b'd');
+        bencode_bytes(&mut info, b"length");
+        info.extend_from_slice(format!("i{length}e").as_bytes());
+        bencode_bytes(&mut info, b"path");
+        info.push(b'l');
+        bencode_bytes(&mut info, format!("file-{index}").as_bytes());
+        info.extend_from_slice(b"ee");
+    }
+    info.push(b'e');
+    bencode_bytes(&mut info, b"name");
+    bencode_bytes(&mut info, b"release");
     bencode_bytes(&mut info, b"piece length");
     info.extend_from_slice(b"i16384e");
     bencode_bytes(&mut info, b"pieces");
@@ -296,6 +329,47 @@ fn adapter_rejects_windows_device_aliases_and_reserved_characters() {
             "portable component was rejected: {component:?}"
         );
     }
+}
+
+#[test]
+fn adapter_owns_checked_v1_piece_geometry() {
+    for (case, info) in [
+        (
+            "zero piece length",
+            single_file_info_with_geometry(b"payload.bin", 1, 0, &[0; 20]),
+        ),
+        (
+            "zero aggregate length",
+            single_file_info_with_geometry(b"payload.bin", 0, 16_384, &[]),
+        ),
+        (
+            "partial SHA-1",
+            single_file_info_with_geometry(b"payload.bin", 1, 16_384, &[0; 19]),
+        ),
+        (
+            "too many hashes",
+            single_file_info_with_geometry(b"payload.bin", 1, 16_384, &[0; 40]),
+        ),
+        (
+            "too few hashes",
+            single_file_info_with_geometry(b"payload.bin", 16_385, 16_384, &[0; 20]),
+        ),
+        (
+            "aggregate length overflow",
+            multi_file_info_with_lengths(&[i64::MAX as u64, i64::MAX as u64, 2]),
+        ),
+    ] {
+        let result = validate_metainfo_contract(&metainfo(&info), false);
+        assert!(
+            matches!(result, Err(TorrentError::InvalidMetainfoGeometry(_))),
+            "{case}: {result:?}"
+        );
+    }
+
+    let two_pieces = single_file_info_with_geometry(b"payload.bin", 16_385, 16_384, &[0; 40]);
+    assert!(validate_metainfo_contract(&metainfo(&two_pieces), false).is_ok());
+    let zero_length_sidecar = multi_file_info_with_lengths(&[0, 1]);
+    assert!(validate_metainfo_contract(&metainfo(&zero_length_sidecar), false).is_ok());
 }
 
 #[test]

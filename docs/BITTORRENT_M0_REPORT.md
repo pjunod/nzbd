@@ -26,7 +26,7 @@ peer listener, or production torrent admission path has been added.
 | Gate | Result | Evidence and consequence |
 |---:|---|---|
 | 1. Rust 1.85 and platform packaging | **Pass** | A real Rust 1.85.1 macOS build passes, and the release harness links only macOS system libraries, not OpenSSL. The first checked-in `BitTorrent M0` run caught Tokio 1.53.0 using Rust 1.86's `OnceLock::wait` on Windows. After the workspace pinned Tokio 1.52.4, the [corrected run completed successfully](https://github.com/pjunod/nzbd/actions/runs/31060326800) on 2026-08-06 UTC: the isolated adapter suite passed on Linux glibc, macOS arm64, Windows MSVC, and x86-64/aarch64 musl under Rust 1.85, and the exact-engine/Rust-TLS dependency policy also passed. |
-| 2. v1 `.torrent`, magnet, TCP/IPv4, then seed | **Pass** | Deterministic generated payloads download through both admission paths; a local seeder accounts for both uploads and exact bytes match. |
+| 2. v1 `.torrent`, magnet, TCP/IPv4, then seed | **Pass** | Deterministic generated payloads download through both admission paths; a local seeder accounts for both uploads and exact bytes match. The adapter checks nonzero piece length and total payload, checked aggregate length, whole SHA-1 hash width, and exact hash count before rqbit constructs its length table. |
 | 3. Controls and live limits | **Pass** | Pause/resume is exercised before completion, the live download limit is removed during transfer, and idempotent keep-data delete, idempotent delete-data, and unrelated-sibling retention pass. |
 | 4. Kill/restart never trusts partial data | **Blocked** | The accepted fast-resume design cannot be constructed without failing gate 8. A persistence-disabled full hash recheck is a possible safe but slower product decision, not an equivalent test of the accepted design. |
 | 5. Private-torrent discovery | **Pass** | A one-tracker private torrent downloads through a loopback HTTP tracker, and a deterministic peer-wire control proves public torrents consume an injected PEX peer while private torrents ignore it. A Linux capture harness starts live DHT, redirects both stable-8.1.1 bootstrap ports to a local KRPC probe, and observes separate public control hashes before and during a 15-second private canary window. It scans all captured UDP—not just redirected DHT—for the private hash in binary or LSD-style text form. The [first successful capture run](https://github.com/pjunod/nzbd/actions/runs/31128106994) passed on 2026-08-06 UTC: both DHT controls were observed and no private DHT/LSD hash appeared. Tracker order is still lost through a hash set before truncation, so the adapter rejects private metainfo unless it has exactly one unique tracker. A magnet does not expose the private bit before resolution; because stable rqbit has no per-add DHT suppression, the adapter rejects every magnet in a DHT-enabled session before calling the engine. A loopback pair proves rejection happens before explicit-peer contact while the same private magnet resolves through an explicit peer when session DHT is disabled. |
@@ -118,6 +118,9 @@ The isolated suite covers:
   bounded single-byte replacement, deletion, and insertion around valid v1,
   v2-only, and hybrid seeds, plus nesting, length-overflow, duplicate-info,
   trailing-byte, and framed-marker invariants;
+- checked v1 payload/piece/hash geometry, including zero values, aggregate
+  length overflow, malformed hash width, mismatched hash count, and valid
+  zero-length sidecars;
 - the explicit aws-lc provider invariant;
 - v2-only and hybrid named rejection for metainfo and magnets; and
 - query-aware magnet validation for hex/base32 `btih`, duplicate/missing exact

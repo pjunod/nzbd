@@ -1145,7 +1145,10 @@ The dormant M0 adapter implements the metadata-only portion itself before
 rqbit admission: portable root/components, UTF-8, empty/dot/parent names,
 cross-platform separators, Windows drive/device names, reserved characters and
 trailing dot/space aliases, metainfo-declared symlinks, exact duplicate paths,
-and collisions under Unicode lowercase comparison. It
+and collisions under Unicode lowercase comparison. It also checks v1 piece
+geometry before rqbit can construct its length table: piece length is nonzero,
+aggregate file length cannot overflow and is nonzero, the hash table is made of
+whole SHA-1 values, and its count exactly covers the declared payload. It
 projects a separate importer-safe content inventory from validated rqbit
 metadata and omits every BEP 47 padding entry while preserving engine file
 indices for low-level diagnostics. A parsed padding-metainfo test proves the
@@ -1839,7 +1842,9 @@ becomes reachable.
   descriptor-relative containment and filesystem-specific Unicode
   normalization remain M5 probes.
 - Metainfo preflight: a deterministic mutation corpus runs in ordinary CI;
-  coverage-guided fuzzing remains an M5 release gate.
+  checked v1 payload/piece/hash geometry prevents zero-divide, length-wrap, and
+  inconsistent hash-table input from reaching rqbit; coverage-guided fuzzing
+  remains an M5 release gate.
 - State projection: every `TorrentPhase` maps to the expected native and
   qBittorrent status, with units/sentinel values pinned.
 - Seed policy: add/category/global precedence, ratio precision, time across

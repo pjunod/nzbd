@@ -100,6 +100,8 @@ pub enum TorrentError {
     PathCollision,
     #[error("unsafe existing torrent path: a payload component is a symbolic link")]
     ExistingPathSymlink,
+    #[error("invalid torrent piece geometry: {0}")]
+    InvalidMetainfoGeometry(&'static str),
 }
 
 fn engine_error(error: impl std::fmt::Display) -> TorrentError {
@@ -550,6 +552,7 @@ fn validate_metainfo_contract(bytes: &[u8], proxy_enabled: bool) -> Result<(), T
     validate_metainfo_version(bytes)?;
     let metainfo =
         librqbit::torrent_from_bytes::<librqbit::ByteBuf<'_>>(bytes).map_err(engine_error)?;
+    validate_metainfo_geometry(&metainfo.info)?;
     validate_metainfo_paths(&metainfo.info)?;
     if proxy_enabled
         && metainfo
@@ -568,6 +571,47 @@ fn validate_metainfo_contract(bytes: &[u8], proxy_enabled: bool) -> Result<(), T
     if trackers.len() != 1 {
         return Err(TorrentError::PrivateTrackerCount(trackers.len()));
     }
+    Ok(())
+}
+
+fn validate_metainfo_geometry<BufType: AsRef<[u8]>>(
+    info: &librqbit::TorrentMetaV1Info<BufType>,
+) -> Result<(), TorrentError> {
+    if info.piece_length == 0 {
+        return Err(TorrentError::InvalidMetainfoGeometry(
+            "piece length must be greater than zero",
+        ));
+    }
+
+    let mut total_length = 0_u64;
+    for length in info.iter_file_lengths().map_err(engine_error)? {
+        total_length =
+            total_length
+                .checked_add(length)
+                .ok_or(TorrentError::InvalidMetainfoGeometry(
+                    "aggregate payload length overflows u64",
+                ))?;
+    }
+    if total_length == 0 {
+        return Err(TorrentError::InvalidMetainfoGeometry(
+            "aggregate payload length must be greater than zero",
+        ));
+    }
+
+    let piece_hash_bytes = info.pieces.as_ref().len();
+    if piece_hash_bytes % 20 != 0 {
+        return Err(TorrentError::InvalidMetainfoGeometry(
+            "v1 piece hashes must be a whole number of 20-byte SHA-1 values",
+        ));
+    }
+    let actual_piece_count = piece_hash_bytes / 20;
+    let expected_piece_count = total_length.div_ceil(u64::from(info.piece_length));
+    if u64::try_from(actual_piece_count).ok() != Some(expected_piece_count) {
+        return Err(TorrentError::InvalidMetainfoGeometry(
+            "piece hash count does not match payload length and piece length",
+        ));
+    }
+
     Ok(())
 }
 
