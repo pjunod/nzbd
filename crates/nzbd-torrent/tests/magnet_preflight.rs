@@ -27,6 +27,24 @@ fn unsafe_info() -> (Vec<u8>, [u8; 20]) {
     (info, info_hash)
 }
 
+fn private_info() -> (Vec<u8>, [u8; 20]) {
+    let payload = b"x";
+    let mut info = vec![b'd'];
+    bencode_bytes(&mut info, b"length");
+    info.extend_from_slice(b"i1e");
+    bencode_bytes(&mut info, b"name");
+    bencode_bytes(&mut info, b"private.bin");
+    bencode_bytes(&mut info, b"piece length");
+    info.extend_from_slice(b"i1e");
+    bencode_bytes(&mut info, b"private");
+    info.extend_from_slice(b"i1e");
+    bencode_bytes(&mut info, b"pieces");
+    bencode_bytes(&mut info, &Sha1::digest(payload));
+    info.push(b'e');
+    let info_hash = Sha1::digest(&info).into();
+    (info, info_hash)
+}
+
 fn handshake(info_hash: [u8; 20]) -> Vec<u8> {
     let mut handshake = Vec::with_capacity(68);
     handshake.push(19);
@@ -160,5 +178,94 @@ async fn magnet_metadata_is_preflighted_before_payload_storage_exists() {
         "list-only resolution must reject unsafe metadata before storage is constructed"
     );
 
+    session.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dht_enabled_session_rejects_magnet_before_contacting_an_explicit_peer() {
+    let (_info, info_hash) = private_info();
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let peer = listener.local_addr().unwrap();
+
+    let root = tempfile::tempdir().unwrap();
+    let session = TorrentSession::start(
+        root.path().to_path_buf(),
+        TorrentSessionConfig {
+            dht: true,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let magnet = format!(
+        "magnet:?xt=urn:btih:{}&tr=http%3A%2F%2F127.0.0.1%3A9%2Fannounce",
+        info_hash
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    );
+    let result = session
+        .add_magnet(
+            magnet,
+            TorrentAddConfig {
+                initial_peers: vec![peer],
+                ..Default::default()
+            },
+        )
+        .await;
+
+    assert!(
+        matches!(result, Err(TorrentError::MagnetWithDht)),
+        "unexpected result from the private-magnet discovery guard"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(250), listener.accept())
+            .await
+            .is_err(),
+        "magnet rejection must happen before rqbit contacts an explicit peer"
+    );
+    assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+
+    session.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dht_disabled_private_magnet_can_resolve_through_an_explicit_peer() {
+    let (info, info_hash) = private_info();
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let peer = listener.local_addr().unwrap();
+    let peer_task = tokio::spawn(metadata_peer(listener, info, info_hash));
+
+    let root = tempfile::tempdir().unwrap();
+    let session = TorrentSession::start(root.path().to_path_buf(), TorrentSessionConfig::default())
+        .await
+        .unwrap();
+    let magnet = format!(
+        "magnet:?xt=urn:btih:{}&tr=http%3A%2F%2F127.0.0.1%3A9%2Fannounce",
+        info_hash
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    );
+    let handle = tokio::time::timeout(
+        Duration::from_secs(10),
+        session.add_magnet(
+            magnet,
+            TorrentAddConfig {
+                paused: true,
+                initial_peers: vec![peer],
+                ..Default::default()
+            },
+        ),
+    )
+    .await
+    .expect("private magnet metadata resolution timed out")
+    .expect("DHT-disabled private magnet should resolve through its explicit peer");
+
+    tokio::time::timeout(Duration::from_secs(5), peer_task)
+        .await
+        .expect("metadata peer did not finish")
+        .expect("metadata peer failed");
+    session.delete(&handle, false).await.unwrap();
     session.stop().await;
 }

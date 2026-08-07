@@ -46,7 +46,8 @@ or daemon wiring until the engine gates pass.
 
 The Fable review later that day found a real proxy leak boundary and several
 plan inconsistencies. This revision rejects proxy+DHT and proxy+UDP trackers,
-disables process-global DHT persistence, completes v2/hybrid admission checks
+rejects privacy-unknown magnets in a DHT-enabled session, disables
+process-global DHT persistence, completes v2/hybrid admission checks
 for metainfo, reserves schema version 3 for torrent job records, defines how a
 stalled torrent yields the shared slot, and originally split completed M1a
 schema work from then-blocked M1b routing. The §4.3.2 amendment now permits
@@ -340,7 +341,9 @@ M0 passes only if it proves all of the following:
    converts trackers to a hash set before truncating private torrents to one,
    so M0 must prove a one-tracker private torrent and the adapter must reject
    zero or multiple unique trackers rather than pretending a primary tracker
-   is deterministic.
+   is deterministic. Because a magnet's private bit is unknown until metadata
+   arrives, magnet resolution must also avoid DHT until that metadata has been
+   validated.
 6. File paths are either rejected safely by the library or can be validated
    before any file is created.
 7. Torrent stats expose enough information for the §7 contracts without
@@ -1205,7 +1208,7 @@ torrent_dir = "/data/torrents"          # immutable seed payloads
 [torrent]
 enabled = false
 listen_port = 6881                       # one TCP/IPv4 peer port in v1
-dht = true
+dht = false                              # safe until per-add magnet suppression exists
 pex = true
 local_discovery = false
 upnp_port_forwarding = false
@@ -1226,8 +1229,13 @@ source_redirects = 5
 - `enabled = false`: upgrades must not begin peer-to-peer traffic.
 - `listen_port = 6881`: conventional and easy to map; only one session owns
   it. Failure to bind is a startup error when the feature is enabled.
-- `dht = true`, `pex = true`: magnets and public swarm discovery need them;
+- `dht = false`, `pex = true`: public swarm discovery benefits from DHT, but
   the engine must suppress both for private torrents regardless of config.
+  Stable rqbit cannot suppress DHT per unresolved magnet, so the dormant
+  adapter rejects magnets while session DHT is enabled; tracker or explicit
+  peer resolution remains available when DHT is disabled. The safe
+  first-release default is therefore DHT off. A reviewed per-add suppression
+  mechanism can later make DHT-on magnet resolution safe.
   When `socks_proxy_url` is set, settings validation requires `dht = false`
   because librqbit 8.1.1 does not proxy DHT UDP traffic.
 - `local_discovery = false`: LAN multicast reveals torrent participation and
@@ -1309,7 +1317,7 @@ production input is wired by these constants.
 When enabled, startup logs one redacted summary:
 
 ```
-BitTorrent enabled: listen=:6881 dht=on pex=on lsd=off upnp=off proxy=none
+BitTorrent enabled: listen=:6881 dht=off pex=on lsd=off upnp=off proxy=none
 ```
 
 The Settings UI repeats that state and warns when the API is LAN-exposed but
@@ -1335,6 +1343,15 @@ For metainfo marked private:
 - do not merge global public trackers;
 - preserve the private flag through resume and cluster handoff;
 - add an interop test that observes no DHT announce or PEX messages.
+
+An unresolved magnet is privacy-unknown input. Stable rqbit 8.1.1 constructs
+its DHT peer stream before BEP 9 metadata reveals the private bit and exposes
+no per-add DHT override. The dormant adapter therefore rejects all magnets in
+a DHT-enabled session before calling rqbit. With session DHT disabled, magnets
+may resolve through embedded HTTP(S) trackers or explicitly supplied peers and
+the returned metainfo is then subjected to the full private-torrent contract.
+This restriction can be relaxed only after a reviewed engine API makes
+pre-metadata discovery policy explicit.
 
 If the selected library cannot prove this per torrent, M0 fails. Private
 tracker rules are not a UI preference.
@@ -1799,7 +1816,10 @@ becomes reachable.
   malformed v1, v2-only, and hybrid topics fail by stable name. Version-looking
   text in display names and tracker URLs is an explicit negative fixture. A
   fake BEP 9 peer also proves resolved metainfo is revalidated in list-only
-  mode before any payload storage exists.
+  mode before any payload storage exists. A DHT-enabled-session case proves
+  privacy-unknown magnet input is rejected before an explicit peer is
+  contacted, and the paired DHT-disabled case proves a private magnet can
+  still resolve through that explicit peer.
 - Path validation: every platform prefix/separator, traversal, normalization,
   symlinks, case collisions, padding files, exact-root delete proof.
 - Adapter path preflight: the portable metadata-only subset and declared

@@ -69,6 +69,10 @@ pub enum TorrentError {
     )]
     ProxyWithDht,
     #[error(
+        "magnet metadata cannot be resolved while DHT is enabled because torrent privacy is unknown until the metadata arrives"
+    )]
+    MagnetWithDht,
+    #[error(
         "SOCKS proxy cannot be used with UDP trackers because librqbit 8.1.1 sends UDP announces outside the proxy"
     )]
     ProxyWithUdpTracker,
@@ -358,6 +362,7 @@ pub struct TorrentAddConfig {
 #[derive(Clone)]
 pub struct TorrentSession {
     inner: Arc<Session>,
+    dht_enabled: bool,
     proxy_enabled: bool,
 }
 
@@ -382,6 +387,7 @@ impl TorrentSession {
             .map_err(engine_error)?;
         Ok(Self {
             inner,
+            dht_enabled: config.dht,
             proxy_enabled,
         })
     }
@@ -413,6 +419,15 @@ impl TorrentSession {
         mut config: TorrentAddConfig,
     ) -> Result<TorrentHandle, TorrentError> {
         validate_magnet_contract(&magnet, self.proxy_enabled)?;
+        // A magnet does not reveal the private bit until BEP 9 metadata has
+        // already been fetched. Stable rqbit has no per-add DHT suppression,
+        // so a DHT-enabled session would query for the hash before nzbd could
+        // learn that the torrent is private. Fail closed before calling the
+        // engine; tracker/explicit-peer resolution remains available in a
+        // DHT-disabled session.
+        if self.dht_enabled {
+            return Err(TorrentError::MagnetWithDht);
+        }
         let resolved = self
             .inner
             .add_torrent(
