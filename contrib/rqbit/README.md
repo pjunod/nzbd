@@ -1,4 +1,4 @@
-# rqbit contribution kit — upstream the two APIs without weakening nzbd
+# rqbit contribution kit — upstream the required APIs without weakening nzbd
 
 **Status:** ready for human review, not submitted · **Upstream base:**
 `4e5f94cbcf1d57ec500885c77cf1e24d70232d89` · **Verified:** 2026-08-07
@@ -6,14 +6,17 @@
 Companion to
 [BITTORRENT_M0_REPORT.md](../../docs/BITTORRENT_M0_REPORT.md) (why nzbd is
 blocked) — this directory is the submission package for the two rqbit APIs
-that must be accepted and released before nzbd starts M2.
+that must be accepted and released before nzbd starts M2, plus the
+pre-allocation magnet-metadata ceiling required by nzbd's hostile-input
+boundary.
 
 Read and review this kit in order. Submit the discovery-health design issue
 before its implementation, because that patch crosses three rqbit crates and
 the maintainer should shape the public contract before reviewing the large
-current-main candidate. The smaller authoritative-restore change can move
-independently. Neither submission makes an nzbd production gate pass until an
-accepted stable rqbit release contains both contracts.
+current-main candidate. The smaller authoritative-restore and metadata-size
+changes can move independently. No submission makes an nzbd production gate
+pass until an accepted stable rqbit release contains the required contracts
+and the full M0 path is rerun.
 
 ## 1. Human submission boundary — rqbit requires more than disclosure
 
@@ -23,7 +26,7 @@ all AI assistance to be disclosed, and it requires a human to review and edit
 AI-assisted issues, discussions, and code before submission. The human must be
 able to explain the contribution without an AI tool.
 
-Before posting either draft:
+Before posting any draft:
 
 1. Read the affected rqbit modules and every added test. This is the proof that
    the human owns the behavior, not a ceremonial checkbox.
@@ -32,8 +35,9 @@ Before posting either draft:
 3. Re-run the matching verifier against the exact upstream head. A clean run
    from an older base is evidence of the design, not evidence that the current
    branch still applies.
-4. Keep the two contributions separate. Restore changes session admission;
-   discovery health changes DHT, tracker, and public snapshot contracts.
+4. Keep the three contributions separate. Restore changes session admission;
+   discovery health changes DHT, tracker, and public snapshot contracts; the
+   metadata ceiling changes the peer handshake's allocation boundary.
 
 ## 2. Contribution map — stable evidence and current-main submissions
 
@@ -41,6 +45,7 @@ Before posting either draft:
 |---|---|---|---|
 | Skip implicit restore while retaining persistence | [`0001`](0001-allow-persistence-without-auto-restore.patch) | [`0002`](0002-allow-persistence-without-auto-restore-main.patch) | [PR draft](AUTHORITATIVE_RESTORE_PR.md) |
 | Credential-safe per-torrent tracker and DHT health | [`0003`](0003-expose-per-torrent-discovery-health.patch) | [`0004`](0004-expose-per-torrent-discovery-health-main.patch) | [design-issue draft](DISCOVERY_HEALTH_ISSUE.md) |
+| Bound BEP 9 metadata before allocation | [`0005`](0005-limit-peer-metadata-before-allocation.patch) | [`0006`](0006-limit-peer-metadata-before-allocation-main.patch) | [PR draft](METADATA_SIZE_LIMIT_PR.md) |
 
 The stable patches preserve the exact experiments behind nzbd's M0 report.
 The main patches are the contribution candidates. Do not submit the stable
@@ -55,19 +60,24 @@ backports upstream unless the maintainer explicitly asks for an 8.x backport.
    is unchanged and its focused test demonstrates the ownership seam while
    reporting only the persisted 16 KiB even though the complete valid payload
    is on disk.
-3. Reconcile maintainer feedback on the discovery-health states, crate
+3. Submit the independent
+   [metadata-size PR](METADATA_SIZE_LIMIT_PR.md). Its default remains 32 MiB,
+   while an embedding caller can reject a smaller configured ceiling before
+   rqbit allocates or requests peer metadata.
+4. Reconcile maintainer feedback on the discovery-health states, crate
    boundary, and snapshot shape.
-4. Rework and submit `0004` only after the design direction is accepted. A
+5. Rework and submit `0004` only after the design direction is accepted. A
    smaller upstream implementation is preferable if it preserves honest
    per-torrent DHT/tracker state and credential-safe failures.
-5. After both APIs ship, pin that stable release in nzbd and rerun all eleven
-   M0 gates on native macOS, Linux glibc/musl, and Windows.
-6. Run the Linux packet-capture private-mode harness and obtain reviewer
+6. After the required APIs and allocation ceiling ship, pin that stable
+   release in nzbd and rerun all eleven M0 gates on native macOS, Linux
+   glibc/musl, and Windows.
+7. Run the Linux packet-capture private-mode harness and obtain reviewer
    acceptance of the resource, package, license, and advisory dispositions.
    A gate rerun cannot discharge those review decisions by itself.
-7. Only the complete M0 path can authorize M2.
+8. Only the complete M0 path can authorize M2.
 
-## 4. Reproduction — verify both candidates against rqbit main
+## 4. Reproduction — verify all candidates against rqbit main
 
 The verifier accepts the documented main base or any descendant that still
 contains it. On drift, it permits a three-way apply and then runs the affected
@@ -84,6 +94,7 @@ git -C "$rqbit_tree" checkout 4e5f94cbcf1d57ec500885c77cf1e24d70232d89
 
 scripts/check-rqbit-authoritative-restore-patch.sh "$rqbit_tree"      # Format + focused librqbit test.
 scripts/check-rqbit-discovery-health-patch.sh "$rqbit_tree"          # Format + three affected crate suites.
+scripts/check-rqbit-metadata-size-limit-patch.sh "$rqbit_tree"       # Format + pre-allocation limit test.
 ```
 
 For submission, apply only the matching main patch to a fresh branch and run
@@ -101,9 +112,10 @@ git -C "$rqbit_tree" apply "$PWD/contrib/rqbit/0002-allow-persistence-without-au
 )
 ```
 
-Use a separate fresh branch for discovery health. Do not stack it on restore:
-the APIs solve different problems, and independent history lets rqbit accept,
-revise, or reject either contract without dragging the other through review.
+Use separate fresh branches for discovery health and the metadata ceiling. Do
+not stack the submissions: the contracts solve different problems, and
+independent history lets rqbit accept, revise, or reject each one without
+dragging the others through review.
 
 ## 5. Non-goals — contribution evidence is not production permission
 
