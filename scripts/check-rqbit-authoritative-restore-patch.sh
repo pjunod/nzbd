@@ -53,9 +53,18 @@ fi
 (
   cd "$work_dir/rqbit"
   cargo fmt --all -- --check
-  cargo test -p librqbit \
-    persistence_can_skip_implicit_admission_and_restore_an_authoritative_subset \
+  readonly exact_test='tests::persistence::persistence_can_skip_implicit_admission_and_restore_an_authoritative_subset'
+  test_list="$(cargo test -p librqbit --lib \
     --no-default-features \
     --features rust-tls \
-    -- --nocapture
+    -- --list)"
+  readonly test_list
+  if ! grep -Fxq "$exact_test: test" <<<"$test_list"; then
+    echo "authoritative-restore proof test was not discovered: $exact_test" >&2
+    exit 1
+  fi
+  cargo test -p librqbit --lib "$exact_test" \
+    --no-default-features \
+    --features rust-tls \
+    -- --exact --nocapture
 )

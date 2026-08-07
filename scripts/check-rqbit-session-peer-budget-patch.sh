@@ -74,5 +74,18 @@ done
 (
   cd "$work_dir/rqbit"
   cargo fmt --all -- --check
-  cargo test -p librqbit --lib peer_semaphore_tests
+  readonly exact_tests=(
+    'torrent_state::live::peer_semaphore_tests::per_torrent_limit_is_exact'
+    'torrent_state::live::peer_semaphore_tests::session_limit_is_shared_between_torrents'
+    'torrent_state::live::peer_semaphore_tests::waiting_peer_resumes_after_session_permit_is_released'
+  )
+  test_list="$(cargo test -p librqbit --lib -- --list)"
+  readonly test_list
+  for exact_test in "${exact_tests[@]}"; do
+    if ! grep -Fxq "$exact_test: test" <<<"$test_list"; then
+      echo "session peer-budget proof test was not discovered: $exact_test" >&2
+      exit 1
+    fi
+    cargo test -p librqbit --lib "$exact_test" -- --exact --nocapture
+  done
 )

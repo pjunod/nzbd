@@ -35,7 +35,11 @@ Before posting any draft:
 3. Re-run the matching verifier against the exact upstream head. A clean run
    from an older base is evidence of the design, not evidence that the current
    branch still applies.
-4. Keep independent contributions separate. Restore changes session
+4. Demonstrate every new guard's sensitivity once: temporarily remove or
+   bypass the guard, run its exact proof, and paste the named failure into the
+   human-authored upstream PR before restoring the clean tree. A green test is
+   evidence only after the dangerous mutation is known to make it red.
+5. Keep independent contributions separate. Restore changes session
    admission; discovery health changes DHT, tracker, and public snapshot
    contracts; the metadata ceiling changes the peer handshake's allocation
    boundary; tracker, live-peer, retained-peer, and pending-handshake budgets

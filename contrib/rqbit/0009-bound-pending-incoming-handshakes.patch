@@ -30,11 +30,12 @@ index f0edb50b594c563c8283c428538583709f9b2781..3ea1495b52c25c58685e7a88b1b89d31
                      match r {
                          Ok((stream, addr)) => {
                              trace!("accepted connection from {addr}");
-@@ -1552,7 +1564,37 @@ mod tests {
+@@ -1552,7 +1564,38 @@ mod tests {
      use itertools::Itertools;
      use librqbit_core::torrent_metainfo::{torrent_from_bytes_ext, TorrentMetaV1};
  
 -    use super::torrent_file_from_info_bytes;
++    use futures::FutureExt;
 +    use tokio::time::{timeout, Duration};
 +
 +    use super::{
@@ -50,12 +51,12 @@ index f0edb50b594c563c8283c428538583709f9b2781..3ea1495b52c25c58685e7a88b1b89d31
 +        let address = listener.local_addr().unwrap();
 +        let client = TcpStream::connect(address).await.unwrap();
 +
-+        let blocked = timeout(
-+            Duration::from_millis(50),
-+            accept_incoming_handshake(&listener, MAX_PENDING_INCOMING_HANDSHAKE_CHECKS),
-+        )
-+        .await;
-+        assert!(blocked.is_err(), "a full pending set must stop accept");
++        let blocked = accept_incoming_handshake(&listener, MAX_PENDING_INCOMING_HANDSHAKE_CHECKS)
++            .now_or_never();
++        assert!(
++            blocked.is_none(),
++            "a full pending set must stop accept without relying on a timeout"
++        );
 +
 +        let (_, peer_address) = timeout(
 +            Duration::from_secs(1),

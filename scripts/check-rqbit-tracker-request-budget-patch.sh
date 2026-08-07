@@ -67,9 +67,27 @@ done
 (
   cd "$work_dir/rqbit"
   cargo fmt --all -- --check
+  readonly exact_tests=(
+    'tracker_comms::tests::http_tracker_response_is_bounded_and_timed'
+    'tracker_comms::tests::hostile_tracker_intervals_are_clamped'
+  )
   if [[ "$source_variant" == "stable" ]]; then
-    cargo test -p librqbit-tracker-comms --lib --no-default-features --features sha1-ring
+    test_list="$(cargo test -p librqbit-tracker-comms --lib \
+      --no-default-features --features sha1-ring -- --list)"
   else
-    cargo test -p librqbit-tracker-comms --lib
+    test_list="$(cargo test -p librqbit-tracker-comms --lib -- --list)"
   fi
+  readonly test_list
+  for exact_test in "${exact_tests[@]}"; do
+    if ! grep -Fxq "$exact_test: test" <<<"$test_list"; then
+      echo "tracker request-budget proof test was not discovered: $exact_test" >&2
+      exit 1
+    fi
+    if [[ "$source_variant" == "stable" ]]; then
+      cargo test -p librqbit-tracker-comms --lib "$exact_test" \
+        --no-default-features --features sha1-ring -- --exact --nocapture
+    else
+      cargo test -p librqbit-tracker-comms --lib "$exact_test" -- --exact --nocapture
+    fi
+  done
 )

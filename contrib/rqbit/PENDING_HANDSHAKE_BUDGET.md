@@ -40,7 +40,10 @@ fixed ceiling into 8.1.1; it does not add a new stable public option.
 - Preserve the existing 10-second handshake read timeout and all post-routing
   peer behavior.
 - Use a real loopback socket to prove a queued connection is not accepted at
-  256 and is accepted after the pending count returns to 255.
+  256 and is accepted after the pending count returns to 255. The blocked
+  assertion polls the ready socket future once with `now_or_never`; it does
+  not use a short timeout that an overloaded runner could mistake for the
+  intended pending state.
 
 The value is preliminary policy evidence. It becomes an nzbd release boundary
 only after human acceptance and inclusion in an accepted stable rqbit release.
@@ -64,6 +67,33 @@ tests. It applies the patch only to exact rqbit 8.1.1. Against the
 documented rqbit-main source line it applies no patch, checks the native
 default, public option, and guarded listener, and compiles all librqbit
 targets.
+
+Before an upstream submission, temporarily bypass the full-budget branch and
+run the exact proof once. The negative control must fail at `a full pending set
+must stop accept without relying on a timeout`; paste that failing output into
+the human-authored upstream PR, then restore the real guard and rerun the clean
+verifier. This mutation is evidence that the test detects the dangerous
+direction, never a commit to either repository.
+
+### Recorded negative control
+
+On 2026-08-07, the exact rqbit 8.1.1 test was run after changing only the
+full-budget condition to `false && pending >=
+MAX_PENDING_INCOMING_HANDSHAKE_CHECKS` in a disposable patched tree. It failed
+in 0.00 seconds with the expected assertion:
+
+```text
+test session::tests::pending_handshake_budget_blocks_and_resumes_listener_accepts ... FAILED
+
+a full pending set must stop accept without relying on a timeout
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 14 filtered out
+```
+
+The real guard was unchanged in the packaged patch, whose clean exact test
+passed immediately afterward. This excerpt is suitable evidence for a future
+human-authored upstream PR; that PR must still explain the mutation and link
+its own fresh run.
 
 ## Human review checklist
 

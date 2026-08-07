@@ -84,6 +84,21 @@ fi
 (
   cd "$work_dir/rqbit"
   cargo fmt --all -- --check
-  cargo test -p librqbit --lib known_peer_budget_tests
+  readonly exact_tests=(
+    'torrent_state::live::peers::known_peer_budget_tests::per_torrent_limit_is_exact_and_released'
+    'torrent_state::live::peers::known_peer_budget_tests::session_limit_is_shared_between_torrents'
+    'torrent_state::live::peers::known_peer_budget_tests::peer_records_hold_slots_until_removed'
+    'torrent_state::live::peers::known_peer_budget_tests::failed_shared_acquisition_releases_the_local_slot'
+    'torrent_state::live::peers::known_peer_budget_tests::alternate_outgoing_address_is_queued_once_with_record_handle'
+  )
+  test_list="$(cargo test -p librqbit --lib -- --list)"
+  readonly test_list
+  for exact_test in "${exact_tests[@]}"; do
+    if ! grep -Fxq "$exact_test: test" <<<"$test_list"; then
+      echo "known-peer-budget proof test was not discovered: $exact_test" >&2
+      exit 1
+    fi
+    cargo test -p librqbit --lib "$exact_test" -- --exact --nocapture
+  done
   cargo check -p rqbit --all-targets
 )
