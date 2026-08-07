@@ -118,6 +118,7 @@ fn engine_error(error: impl std::fmt::Display) -> TorrentError {
 
 fn display_safe_error(message: &str) -> String {
     let mut output = String::new();
+    let mut redact_next_secret_value = false;
     for raw_token in message.split_whitespace() {
         let normalized = if raw_token.chars().any(char::is_control) {
             Cow::Owned(
@@ -132,7 +133,17 @@ fn display_safe_error(message: &str) -> String {
         if normalized.is_empty() {
             continue;
         }
-        let redacted = redact_error_token(&normalized);
+        let redacted = if redact_next_secret_value {
+            if matches!(normalized.as_ref(), "=" | ":") {
+                Cow::Borrowed(normalized.as_ref())
+            } else {
+                redact_next_secret_value = false;
+                Cow::Borrowed("<redacted>")
+            }
+        } else {
+            redact_next_secret_value = secret_value_follows(&normalized);
+            redact_error_token(&normalized)
+        };
         let separator = usize::from(!output.is_empty());
         if output
             .len()
@@ -164,16 +175,37 @@ fn redact_error_token(token: &str) -> Cow<'_, str> {
     if whole.as_ref() != token {
         return whole;
     }
-    if let Some((key, value)) = token.split_once('=') {
-        if is_secret_key(key) {
-            return Cow::Owned(format!("{key}=<redacted>"));
-        }
-        let redacted = redact_error_value(value);
-        if redacted.as_ref() != value {
-            return Cow::Owned(format!("{key}={redacted}"));
+    for separator in ['=', ':'] {
+        if let Some((key, value)) = token.split_once(separator) {
+            if is_secret_key(key) {
+                return Cow::Owned(format!("{key}{separator}<redacted>"));
+            }
+            let redacted = redact_error_value(value);
+            if redacted.as_ref() != value {
+                return Cow::Owned(format!("{key}{separator}{redacted}"));
+            }
         }
     }
     whole
+}
+
+fn secret_value_follows(token: &str) -> bool {
+    let wrapper = |character: char| {
+        matches!(
+            character,
+            ',' | ';' | '(' | ')' | '[' | ']' | '{' | '}' | '"' | '\''
+        )
+    };
+    let token = token.trim_matches(wrapper);
+    let key = if let Some(key) = token.strip_suffix('=').or_else(|| token.strip_suffix(':')) {
+        key
+    } else if token.contains(['=', ':']) {
+        return false;
+    } else {
+        token
+    }
+    .trim_matches(wrapper);
+    !key.is_empty() && is_secret_key(key)
 }
 
 fn redact_error_value(value: &str) -> Cow<'_, str> {
@@ -1470,6 +1502,8 @@ mod tests {
             "tracker=https://alice:secret@tracker.example/passkey?auth=secret ",
             "proxy=socks5://bob:hunter2@127.0.0.1:1080 ",
             "socks_proxy_password=plain-secret ",
+            "password: spaced-secret api_token = equals-secret ",
+            "\"authorization\":\"json-secret\" cookie : cookie-secret ",
             "query=tracker.example/private-passkey?auth=query-secret ",
             "peers=[203.0.113.7:6881, /Users/alice/private/file]\nforbidden"
         );
@@ -1480,6 +1514,10 @@ mod tests {
             "alice",
             "hunter2",
             "plain-secret",
+            "spaced-secret",
+            "equals-secret",
+            "json-secret",
+            "cookie-secret",
             "private-passkey",
             "query-secret",
             "203.0.113.7",

@@ -66,8 +66,9 @@ code. The daemon does not depend on it. The boundary currently provides:
   peer aggregates, completion, display-safe error facts, and an importer-safe
   content-file inventory that omits BEP 47 padding entries;
 - a 2 KiB display-safe boundary for rqbit operation/stat errors that removes
-  magnet URIs, URL credentials/queries, secret assignments, peer addresses,
-  absolute paths, and control characters before returning adapter values;
+  magnet URIs, URL credentials/queries, inline, colon-delimited, JSON-style,
+  and whitespace-separated secret assignments, peer addresses, absolute
+  paths, and control characters before returning adapter values;
 - split SOCKS URL/username/password input with password redaction, a strict
   credential form, named rejection of UDP trackers, and a recording relay
   proving the peer path did not also connect directly; and
