@@ -1289,6 +1289,11 @@ source_redirects = 5
   announces. HTTP(S) tracker announces and TCP peers remain eligible. DHT
   persistence stays disabled until nzbd can place it under its own state
   directory instead of rqbit's process-global cache.
+- the dormant adapter assigns every stable 8.1.1 session option explicitly.
+  Library fast-resume/session persistence, global trackers, remote blocklist
+  fetching, deferred-write buffering, and UPnP remain off or absent. A future
+  upstream field must therefore fail compilation and receive an explicit
+  network/storage review instead of silently inheriting a new default.
 - the M0 adapter accepts only URL-unreserved ASCII in proxy credentials. M2
   must either percent-encode punctuation with redaction fixtures or expose
   this as a named validation limit; it may not silently broaden the accepted

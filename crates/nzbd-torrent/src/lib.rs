@@ -630,7 +630,22 @@ fn session_options(
         // no input that can turn this runtime path on.
         enable_upnp_port_forwarding: false,
         socks_proxy_url,
-        ..Default::default()
+        // Spell out every stable 8.1.1 option instead of inheriting upstream
+        // defaults. A newly added engine capability must become a compile-time
+        // review event before it can affect nzbd's network or storage boundary.
+        dht_config: None,
+        fastresume: false,
+        persistence: None,
+        peer_id: None,
+        peer_opts: None,
+        defer_writes_up_to: None,
+        default_storage_factory: None,
+        cancellation_token: None,
+        concurrent_init_limit: None,
+        root_span: None,
+        ratelimits: Default::default(),
+        blocklist_url: None,
+        trackers: HashSet::new(),
     }
 }
 
@@ -1561,11 +1576,28 @@ mod tests {
     }
 
     #[test]
-    fn session_options_cannot_enable_upnp() {
+    fn session_options_are_an_explicit_dormant_boundary() {
         // This pins the helper used by TorrentSession::start. If start stops
         // delegating here, move the assertion to the replacement call path.
         let options = session_options(false, None, None);
+        assert!(options.disable_dht);
+        assert!(options.disable_dht_persistence);
+        assert!(options.dht_config.is_none());
+        assert!(!options.fastresume);
+        assert!(options.persistence.is_none());
+        assert!(options.peer_id.is_none());
+        assert!(options.peer_opts.is_none());
+        assert!(options.listen_port_range.is_none());
         assert!(!options.enable_upnp_port_forwarding);
+        assert!(options.defer_writes_up_to.is_none());
+        assert!(options.default_storage_factory.is_none());
+        assert!(options.socks_proxy_url.is_none());
+        assert!(options.cancellation_token.is_none());
+        assert!(options.concurrent_init_limit.is_none());
+        assert!(options.root_span.is_none());
+        assert_eq!(options.ratelimits, Default::default());
+        assert!(options.blocklist_url.is_none());
+        assert!(options.trackers.is_empty());
     }
 
     #[test]

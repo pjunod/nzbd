@@ -51,8 +51,11 @@ code. The daemon does not depend on it. The boundary currently provides:
 
 - explicit process-wide aws-lc provider installation;
 - session construction with DHT off by default, UPnP unavailable, DHT
-  persistence disabled unconditionally, and proxy+DHT rejected because DHT
-  bypasses the engine's SOCKS path;
+  persistence disabled unconditionally, no library fast-resume/session
+  persistence, global trackers, remote blocklist, or deferred-write buffer,
+  and proxy+DHT rejected because DHT bypasses the engine's SOCKS path. Every
+  stable 8.1.1 session option is assigned explicitly so a new upstream option
+  becomes a compile-time review event instead of silently inheriting a default;
 - raw v1 metainfo and two-stage v1 magnet admission, with an engine-compatible
   exact-topic grammar, eager `so=` expansion rejected before rqbit parsing,
   and resolved metadata returned by list-only mode and revalidated before
