@@ -97,6 +97,9 @@ The isolated suite covers:
 - keep-data and delete-data behavior, including idempotence;
 - authenticated SOCKS5 peer routing through a loopback proxy, with a
   recording relay proving no parallel direct connection;
+- origin-only SOCKS proxy validation, including rejection of paths, queries,
+  and fragments before rqbit's peer and tracker clients can interpret the
+  same setting differently;
 - named rejection of proxy+DHT and proxy+UDP-tracker leak paths;
 - named rejection of privacy-unknown magnets in a DHT-enabled session before
   rqbit can contact even an explicitly supplied peer;

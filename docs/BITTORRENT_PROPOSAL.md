@@ -1277,6 +1277,11 @@ source_redirects = 5
   `socks_proxy_password` uses the existing whole-field secret-mask and restore
   path. The adapter constructs an authenticated URL only in memory. This
   avoids exposing a password inside a partly masked URL.
+- `socks_proxy_url` is an origin only: `socks5://host:port`, with an optional
+  trailing slash normalized away. Paths, queries, and fragments are rejected
+  before rqbit sees them. Stable rqbit otherwise ignores those components for
+  peer TCP while handing the full string to its HTTP tracker client, creating
+  two interpretations of one security-sensitive setting.
 - proxy routing is fail-closed: proxy+DHT is invalid, and metainfo or magnets
   containing `udp://` trackers are rejected because 8.1.1 does not proxy UDP
   announces. HTTP(S) tracker announces and TCP peers remain eligible. DHT

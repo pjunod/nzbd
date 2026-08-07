@@ -371,6 +371,15 @@ impl TorrentProxyConfig {
                 "put credentials in the separate username and password fields",
             ));
         }
+        if !matches!(url.path(), "" | "/") || url.query().is_some() || url.fragment().is_some() {
+            return Err(TorrentError::InvalidProxy(
+                "URL must not contain a path, query, or fragment",
+            ));
+        }
+        // Treat a trailing slash as the same origin, but never pass alternate
+        // URL syntax to rqbit's peer and HTTP tracker clients. Stable rqbit
+        // parses these two paths differently.
+        url.set_path("");
         match (&self.username, &self.password) {
             (None, None) => {}
             (Some(username), Some(password)) if !username.is_empty() => {
@@ -1493,6 +1502,35 @@ mod tests {
             partial.engine_url(),
             Err(TorrentError::InvalidProxy(_))
         ));
+    }
+
+    #[test]
+    fn proxy_accepts_only_an_origin_url() {
+        let trailing_slash = TorrentProxyConfig {
+            url: "socks5://127.0.0.1:1080/".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            trailing_slash.engine_url().unwrap(),
+            "socks5://127.0.0.1:1080"
+        );
+
+        for url in [
+            "socks5://127.0.0.1:1080/private",
+            "socks5://127.0.0.1:1080/?token=secret",
+            "socks5://127.0.0.1:1080/#fragment",
+        ] {
+            let proxy = TorrentProxyConfig {
+                url: url.into(),
+                ..Default::default()
+            };
+            assert!(matches!(
+                proxy.engine_url(),
+                Err(TorrentError::InvalidProxy(
+                    "URL must not contain a path, query, or fragment"
+                ))
+            ));
+        }
     }
 
     #[test]
