@@ -717,12 +717,12 @@ fn validate_metainfo_paths_with_limits<BufType: AsRef<[u8]>>(
     info: &librqbit::TorrentMetaV1Info<BufType>,
     limits: MetainfoPathLimits,
 ) -> Result<(), TorrentError> {
+    let declared_name = info.name.as_ref().ok_or(TorrentError::UnsafeMetainfoPath(
+        "torrent metainfo must declare an explicit payload name",
+    ))?;
     let (root_path_bytes, root_collision_key) = if info.files.is_some() {
-        let root = info.name.as_ref().ok_or(TorrentError::UnsafeMetainfoPath(
-            "multi-file torrents require a root name",
-        ))?;
-        validate_path_component(root.as_ref())?;
-        let root = std::str::from_utf8(root.as_ref()).map_err(|_| {
+        validate_path_component(declared_name.as_ref())?;
+        let root = std::str::from_utf8(declared_name.as_ref()).map_err(|_| {
             TorrentError::UnsafeMetainfoPath("path components must contain valid UTF-8")
         })?;
         (root.len(), portable_lowercase(root))

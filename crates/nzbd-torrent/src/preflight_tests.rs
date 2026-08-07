@@ -14,6 +14,18 @@ fn single_file_info(name: &[u8]) -> Vec<u8> {
     single_file_info_with_geometry(name, 1, 16_384, &[0; 20])
 }
 
+fn unnamed_single_file_info() -> Vec<u8> {
+    let mut info = vec![b'd'];
+    bencode_bytes(&mut info, b"length");
+    info.extend_from_slice(b"i1e");
+    bencode_bytes(&mut info, b"piece length");
+    info.extend_from_slice(b"i16384e");
+    bencode_bytes(&mut info, b"pieces");
+    bencode_bytes(&mut info, &[0; 20]);
+    info.push(b'e');
+    info
+}
+
 fn private_single_file_info(name: &[u8]) -> Vec<u8> {
     let mut info = single_file_info(name);
     info.pop();
@@ -445,6 +457,29 @@ fn adapter_owns_multi_file_root_component_and_symlink_rejection() {
             Err(TorrentError::UnsafeMetainfoPath(_))
         ));
     }
+}
+
+#[test]
+fn adapter_rejects_rqbits_shared_fallback_for_unnamed_single_file_torrents() {
+    let bytes = metainfo(&unnamed_single_file_info());
+    let parsed = parsed_info(&bytes);
+    let fallback = parsed
+        .info
+        .iter_file_details()
+        .unwrap()
+        .next()
+        .unwrap()
+        .filename
+        .to_string()
+        .unwrap();
+    assert_eq!(fallback, "torrent-content");
+
+    assert!(matches!(
+        validate_metainfo_contract(&bytes, false),
+        Err(TorrentError::UnsafeMetainfoPath(
+            "torrent metainfo must declare an explicit payload name"
+        ))
+    ));
 }
 
 fn parsed_info(bytes: &[u8]) -> librqbit::TorrentMetaV1<librqbit::ByteBuf<'_>> {

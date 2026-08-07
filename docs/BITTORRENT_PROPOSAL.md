@@ -1132,6 +1132,8 @@ Before starting a torrent, validate every metadata path:
 
 - relative only; no absolute path, drive prefix, UNC prefix, `..`, empty
   component, NUL, or platform separator ambiguity;
+- an explicit payload name is required; do not accept an engine-generated
+  fallback shared by unrelated unnamed torrents;
 - resolved output remains under the canonical category torrent root;
 - no existing symlink may redirect a write outside that root;
 - normalized case collisions are rejected on case-insensitive filesystems;
