@@ -71,25 +71,28 @@ pub struct Recovered {
 /// cannot be derived from `paths.main_dir` — these are the places that
 /// answer "where does this install keep its data" without one:
 ///
-/// 1. `$NZBD_MAIN_DIR` — set by our image to the declared `VOLUME`, and
-///    the documented escape hatch for a non-standard layout.
-/// 2. The compiled-in default `paths.main_dir` — covers every plain
-///    (non-container) install that never changed it.
-/// 3. `/data` — the container convention this project documents in the
-///    Dockerfile, every compose example and the deploy guide.
+/// When `$NZBD_MAIN_DIR` is set, it is authoritative. The image and test
+/// harness use it to name the one data volume that belongs to this process;
+/// probing unrelated defaults as fallbacks could recover another install's
+/// mirror. Without the variable, the compiled-in default and `/data`
+/// container convention are searched.
 ///
 /// Both `<dir>/queue` (the default `state_dir()`) and `<dir>` itself are
 /// searched, so a config that set `paths.queue_dir` to the data root is
 /// still found.
 pub fn candidate_state_dirs() -> Vec<PathBuf> {
-    let mut roots: Vec<PathBuf> = Vec::new();
-    if let Some(v) = std::env::var_os(MAIN_DIR_ENV) {
-        if !v.is_empty() {
-            roots.push(crate::expand_home(Path::new(&v)));
-        }
-    }
-    roots.push(crate::expand_home(&Config::default().paths.main_dir));
-    roots.push(PathBuf::from("/data"));
+    let main_dir = std::env::var_os(MAIN_DIR_ENV);
+    candidate_state_dirs_for(main_dir.as_deref())
+}
+
+fn candidate_state_dirs_for(main_dir: Option<&std::ffi::OsStr>) -> Vec<PathBuf> {
+    let roots = match main_dir.filter(|v| !v.is_empty()) {
+        Some(v) => vec![crate::expand_home(Path::new(v))],
+        None => vec![
+            crate::expand_home(&Config::default().paths.main_dir),
+            PathBuf::from("/data"),
+        ],
+    };
 
     let mut out = Vec::new();
     for r in roots {
@@ -322,10 +325,8 @@ mod tests {
     }
 
     #[test]
-    fn candidates_cover_the_data_volume_and_prefer_the_env() {
-        // Not using set_var (process-wide, races other tests): assert the
-        // shape that does not depend on it.
-        let c = candidate_state_dirs();
+    fn candidates_cover_defaults_unless_an_authoritative_env_is_supplied() {
+        let c = candidate_state_dirs_for(None);
         assert!(c.contains(&PathBuf::from("/data/queue")));
         assert!(c.contains(&PathBuf::from("/data")));
         let dflt = crate::expand_home(&Config::default().paths.main_dir).join("queue");
@@ -338,6 +339,14 @@ mod tests {
         let qi = c.iter().position(|p| p == &PathBuf::from("/data/queue"));
         let di = c.iter().position(|p| p == &PathBuf::from("/data"));
         assert!(qi < di);
+
+        let explicit = PathBuf::from("/srv/nzbd-test");
+        let c = candidate_state_dirs_for(Some(explicit.as_os_str()));
+        assert_eq!(
+            c,
+            vec![explicit.join("queue"), explicit],
+            "an explicit main dir must prevent fallback recovery from /data or HOME"
+        );
     }
 
     #[test]

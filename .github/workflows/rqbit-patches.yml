@@ -13,6 +13,8 @@ on:
       - scripts/check-rqbit-pending-handshake-budget.sh
       - scripts/check-rqbit-known-peer-budget-patch.sh
       - scripts/check-rqbit-metadata-size-limit-patch.sh
+      - scripts/check-rqbit-peer-response-budget-patch.sh
+      - scripts/check-rqbit-discovery-pressure-patch.sh
       - .github/workflows/rqbit-patches.yml
   pull_request:
     paths:
@@ -25,6 +27,8 @@ on:
       - scripts/check-rqbit-pending-handshake-budget.sh
       - scripts/check-rqbit-known-peer-budget-patch.sh
       - scripts/check-rqbit-metadata-size-limit-patch.sh
+      - scripts/check-rqbit-peer-response-budget-patch.sh
+      - scripts/check-rqbit-discovery-pressure-patch.sh
       - .github/workflows/rqbit-patches.yml
   schedule:
     # Surface upstream-main drift even when nzbd has not changed.
@@ -36,7 +40,7 @@ permissions:
 
 jobs:
   authoritative-restore:
-    name: authoritative restore / ${{ matrix.name }}
+    name: ${{ matrix.name }} / authoritative restore
     runs-on: ubuntu-latest
     timeout-minutes: 20
     # Stable evidence blocks PRs. Upstream main still runs so drift is visible,
@@ -64,10 +68,12 @@ jobs:
           shared-key: rqbit-${{ matrix.ref }}
           workspaces: ${{ runner.temp }}/rqbit -> target
       - name: Apply and test the contribution patch
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/rqbit/target
         run: scripts/check-rqbit-authoritative-restore-patch.sh "$RUNNER_TEMP/rqbit"
 
   discovery-health:
-    name: discovery health / ${{ matrix.name }}
+    name: ${{ matrix.name }} / discovery health
     runs-on: ubuntu-latest
     timeout-minutes: 30
     # Match the restore job: test current main on PRs without letting upstream
@@ -95,10 +101,12 @@ jobs:
           shared-key: rqbit-${{ matrix.ref }}
           workspaces: ${{ runner.temp }}/rqbit -> target
       - name: Apply and test the contribution patch
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/rqbit/target
         run: scripts/check-rqbit-discovery-health-patch.sh "$RUNNER_TEMP/rqbit"
 
   metadata-size-limit:
-    name: metadata size limit / ${{ matrix.name }}
+    name: ${{ matrix.name }} / metadata size limit
     runs-on: ubuntu-latest
     timeout-minutes: 20
     continue-on-error: ${{ github.event_name == 'pull_request' && !matrix.blocking_on_pr }}
@@ -127,10 +135,12 @@ jobs:
           shared-key: rqbit-metadata-size-${{ matrix.ref }}-${{ matrix.toolchain }}
           workspaces: ${{ runner.temp }}/rqbit -> target
       - name: Apply and test the contribution patch
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/rqbit/target
         run: scripts/check-rqbit-metadata-size-limit-patch.sh "$RUNNER_TEMP/rqbit"
 
   tracker-request-budget:
-    name: tracker request budget / ${{ matrix.name }}
+    name: ${{ matrix.name }} / tracker request budget
     runs-on: ubuntu-latest
     timeout-minutes: 20
     continue-on-error: ${{ github.event_name == 'pull_request' && !matrix.blocking_on_pr }}
@@ -159,10 +169,12 @@ jobs:
           shared-key: rqbit-tracker-budget-${{ matrix.ref }}-${{ matrix.toolchain }}
           workspaces: ${{ runner.temp }}/rqbit -> target
       - name: Apply and test the contribution patch
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/rqbit/target
         run: scripts/check-rqbit-tracker-request-budget-patch.sh "$RUNNER_TEMP/rqbit"
 
   session-peer-budget:
-    name: session peer budget / ${{ matrix.name }}
+    name: ${{ matrix.name }} / session peer budget
     runs-on: ubuntu-latest
     timeout-minutes: 20
     continue-on-error: ${{ github.event_name == 'pull_request' && !matrix.blocking_on_pr }}
@@ -191,10 +203,12 @@ jobs:
           shared-key: rqbit-peer-budget-${{ matrix.ref }}-${{ matrix.toolchain }}
           workspaces: ${{ runner.temp }}/rqbit -> target
       - name: Apply and test the contribution patch
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/rqbit/target
         run: scripts/check-rqbit-session-peer-budget-patch.sh "$RUNNER_TEMP/rqbit"
 
   pending-handshake-budget:
-    name: pending handshake budget / ${{ matrix.name }}
+    name: ${{ matrix.name }} / pending handshake budget
     runs-on: ubuntu-latest
     timeout-minutes: 20
     continue-on-error: ${{ github.event_name == 'pull_request' && !matrix.blocking_on_pr }}
@@ -223,10 +237,12 @@ jobs:
           shared-key: rqbit-handshake-budget-${{ matrix.ref }}-${{ matrix.toolchain }}
           workspaces: ${{ runner.temp }}/rqbit -> target
       - name: Verify the stable backport or current native boundary
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/rqbit/target
         run: scripts/check-rqbit-pending-handshake-budget.sh "$RUNNER_TEMP/rqbit"
 
   known-peer-budget:
-    name: known peer budget / ${{ matrix.name }}
+    name: ${{ matrix.name }} / known peer budget
     runs-on: ubuntu-latest
     timeout-minutes: 30
     continue-on-error: ${{ github.event_name == 'pull_request' && !matrix.blocking_on_pr }}
@@ -255,4 +271,74 @@ jobs:
           shared-key: rqbit-known-peer-budget-${{ matrix.ref }}-${{ matrix.toolchain }}
           workspaces: ${{ runner.temp }}/rqbit -> target
       - name: Apply and test the contribution patch
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/rqbit/target
         run: scripts/check-rqbit-known-peer-budget-patch.sh "$RUNNER_TEMP/rqbit"
+
+  peer-response-budget:
+    name: ${{ matrix.name }} / peer response budget
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    continue-on-error: ${{ github.event_name == 'pull_request' && !matrix.blocking_on_pr }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: "blocking: rqbit v8.1.1 patch / Rust 1.85"
+            ref: v8.1.1
+            toolchain: "1.85"
+            blocking_on_pr: true
+          - name: "drift: rqbit main patch"
+            ref: main
+            toolchain: stable
+            blocking_on_pr: false
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ matrix.toolchain }}
+          components: rustfmt
+      - name: Clone rqbit ${{ matrix.ref }}
+        run: git clone --branch "${{ matrix.ref }}" https://github.com/ikatson/rqbit.git "$RUNNER_TEMP/rqbit"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: rqbit-peer-response-budget-${{ matrix.ref }}-${{ matrix.toolchain }}
+          workspaces: ${{ runner.temp }}/rqbit -> target
+      - name: Apply and test the contribution patch
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/rqbit/target
+        run: scripts/check-rqbit-peer-response-budget-patch.sh "$RUNNER_TEMP/rqbit"
+
+  discovery-pressure-budget:
+    name: ${{ matrix.name }} / discovery pressure budget
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    continue-on-error: ${{ github.event_name == 'pull_request' && !matrix.blocking_on_pr }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: "blocking: rqbit v8.1.1 patch / Rust 1.85"
+            ref: v8.1.1
+            toolchain: "1.85"
+            blocking_on_pr: true
+          - name: "drift: rqbit main patch"
+            ref: main
+            toolchain: stable
+            blocking_on_pr: false
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ matrix.toolchain }}
+          components: rustfmt
+      - name: Clone rqbit ${{ matrix.ref }}
+        run: git clone --branch "${{ matrix.ref }}" https://github.com/ikatson/rqbit.git "$RUNNER_TEMP/rqbit"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: rqbit-discovery-pressure-${{ matrix.ref }}-${{ matrix.toolchain }}
+          workspaces: ${{ runner.temp }}/rqbit -> target
+      - name: Apply and test the contribution patch
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/rqbit/target
+        run: scripts/check-rqbit-discovery-pressure-patch.sh "$RUNNER_TEMP/rqbit"

@@ -17,7 +17,7 @@ readonly source_head
 
 case "$source_head" in
   "$stable_base")
-    readonly patch_file="contrib/rqbit/0005-limit-peer-metadata-before-allocation.patch"
+    readonly patch_file="contrib/rqbit/0016-limit-peer-metadata-before-allocation.patch"
     readonly source_variant="stable"
     ;;
   *)
@@ -29,7 +29,7 @@ case "$source_head" in
       echo "expected rqbit v8.1.1 at $stable_base or a descendant of main base $main_base; found $source_head" >&2
       exit 1
     fi
-    readonly patch_file="contrib/rqbit/0006-limit-peer-metadata-before-allocation-main.patch"
+    readonly patch_file="contrib/rqbit/0017-limit-peer-metadata-before-allocation-main.patch"
     readonly source_variant="main"
     ;;
 esac

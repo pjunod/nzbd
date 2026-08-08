@@ -649,6 +649,14 @@ fn setup_unwritable_config_offers_copyable_toml() {
         .args(["run", "--config"])
         .arg(&cfg_path)
         .args(["--bind", &addr])
+        // First-run mode boots with Config::default() until setup writes the
+        // real file. Keep that default state under this test's tempdir rather
+        // than touching the invoking user's ~/downloads tree.
+        .env("HOME", tmp.path())
+        .env(
+            nzbd_config::durable::MAIN_DIR_ENV,
+            tmp.path().join("isolated-main"),
+        )
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -749,6 +757,7 @@ fn a_missing_config_is_recovered_from_the_data_volume_not_replaced_by_the_wizard
         // How recovery finds the data volume with no config to read it from
         // — set by the image, so a container needs no extra wiring.
         .env(nzbd_config::durable::MAIN_DIR_ENV, &main_dir)
+        .env("HOME", tmp.path())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -819,6 +828,14 @@ fn first_run_setup_wizard_writes_config_and_reloads() {
         .args(["run", "--config"])
         .arg(&cfg_path)
         .args(["--bind", &api_addr])
+        // First-run mode boots with Config::default() until setup writes the
+        // real file. Keep that default state under this test's tempdir rather
+        // than touching the invoking user's ~/downloads tree.
+        .env("HOME", tmp.path())
+        .env(
+            nzbd_config::durable::MAIN_DIR_ENV,
+            tmp.path().join("isolated-main"),
+        )
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
