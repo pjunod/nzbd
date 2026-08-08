@@ -188,5 +188,8 @@ fi
     fi
     cargo test -p librqbit-lsd --lib "$lsd_test" -- --exact --nocapture
   fi
-  cargo check --workspace
+  # The desktop member requires host WebKit/GTK development packages. This
+  # verifier is intentionally headless, but still compiles every affected
+  # library, CLI, example, and test workspace member.
+  cargo check --workspace --exclude rqbit-desktop
 )

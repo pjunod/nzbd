@@ -96,8 +96,12 @@ cargo test -p librqbit --lib \
 cargo test -p librqbit --lib \
   peer_connection::peer_response_writer_tests::production_writer_holds_permit_until_socket_write_finishes \
   -- --exact
-cargo check --workspace
+cargo check --workspace --exclude rqbit-desktop
 ```
+
+The headless verifier excludes only `rqbit-desktop`, whose Linux build needs
+host WebKit/GTK development packages. The changed libraries, CLI, examples,
+and tests remain inside the workspace check.
 
 ### AI disclosure
 

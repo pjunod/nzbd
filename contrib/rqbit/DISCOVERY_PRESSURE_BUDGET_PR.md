@@ -101,8 +101,10 @@ then uses the production spawn/lifecycle helper to prove a stale stream
 teardown does not remove a newer registration and current-stream teardown both
 cancels its spawned task and removes its own registration.
 
-All affected crate suites and `cargo check --workspace` pass on exact rqbit
-8.1.1 and the documented current-main source line.
+All affected crate suites and the headless workspace check pass on exact rqbit
+8.1.1 and the documented current-main source line. The verifier excludes only
+`rqbit-desktop`, whose Linux build needs host WebKit/GTK development packages;
+the changed libraries, CLI, examples, and tests remain inside the check.
 
 ### Negative controls
 
@@ -140,7 +142,7 @@ cargo test -p librqbit --lib \
 cargo test -p librqbit-lsd --lib \
   queue_budget_tests::production_queue_and_announce_lifecycle_are_bounded \
   -- --exact
-cargo check --workspace
+cargo check --workspace --exclude rqbit-desktop
 ```
 
 The LSD command applies only to current main.
