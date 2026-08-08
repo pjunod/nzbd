@@ -14,6 +14,7 @@ on:
       - scripts/check-rqbit-known-peer-budget-patch.sh
       - scripts/check-rqbit-metadata-size-limit-patch.sh
       - scripts/check-rqbit-peer-response-budget-patch.sh
+      - scripts/check-rqbit-discovery-pressure-patch.sh
       - .github/workflows/rqbit-patches.yml
   pull_request:
     paths:
@@ -27,6 +28,7 @@ on:
       - scripts/check-rqbit-known-peer-budget-patch.sh
       - scripts/check-rqbit-metadata-size-limit-patch.sh
       - scripts/check-rqbit-peer-response-budget-patch.sh
+      - scripts/check-rqbit-discovery-pressure-patch.sh
       - .github/workflows/rqbit-patches.yml
   schedule:
     # Surface upstream-main drift even when nzbd has not changed.
@@ -290,3 +292,35 @@ jobs:
           workspaces: ${{ runner.temp }}/rqbit -> target
       - name: Apply and test the contribution patch
         run: scripts/check-rqbit-peer-response-budget-patch.sh "$RUNNER_TEMP/rqbit"
+
+  discovery-pressure-budget:
+    name: discovery pressure budget / ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    continue-on-error: ${{ github.event_name == 'pull_request' && !matrix.blocking_on_pr }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: "blocking: rqbit v8.1.1 patch / Rust 1.85"
+            ref: v8.1.1
+            toolchain: "1.85"
+            blocking_on_pr: true
+          - name: "drift: rqbit main patch"
+            ref: main
+            toolchain: stable
+            blocking_on_pr: false
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ matrix.toolchain }}
+          components: rustfmt
+      - name: Clone rqbit ${{ matrix.ref }}
+        run: git clone --branch "${{ matrix.ref }}" https://github.com/ikatson/rqbit.git "$RUNNER_TEMP/rqbit"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: rqbit-discovery-pressure-${{ matrix.ref }}-${{ matrix.toolchain }}
+          workspaces: ${{ runner.temp }}/rqbit -> target
+      - name: Apply and test the contribution patch
+        run: scripts/check-rqbit-discovery-pressure-patch.sh "$RUNNER_TEMP/rqbit"

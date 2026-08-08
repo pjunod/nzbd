@@ -8,8 +8,8 @@ Companion to
 blocked) — this directory is the submission package for the two rqbit APIs,
 the pre-allocation magnet-metadata ceiling, tracker request controls,
 live/retained-peer budgets, pre-routing handshake boundaries, and established
-peer-response backlog control that must be accepted and released before nzbd
-starts M2.
+peer-response plus discovery-pipeline backlog controls that must be accepted
+and released before nzbd starts M2.
 
 Read and review this kit in order. Submit the discovery-health design issue
 before its implementation, because that patch crosses three rqbit crates and
@@ -45,7 +45,9 @@ Before posting any draft:
    contracts; the metadata ceiling changes the peer handshake's allocation
    boundary; tracker, live-peer, retained-peer, and pending-handshake budgets
    change distinct runtime resource policies; the peer-response budget bounds
-   remote work after a live connection is established.
+   remote work after a live connection is established; the discovery-pressure
+   budget bounds DHT/LSD foreground, maintenance, and bootstrap work plus
+   metadata candidates before peer admission.
 
 ## 2. Contribution map — stable evidence and current-main submissions
 
@@ -58,6 +60,7 @@ Before posting any draft:
 | Bounded incomplete incoming handshakes | [`0009`](0009-bound-pending-incoming-handshakes.patch) | Native configurable 256-check boundary; no patch | [review note](PENDING_HANDSHAKE_BUDGET.md) |
 | Per-torrent and shared-session retained-peer budgets | [`0010`](0010-bound-known-peer-records.patch) | [`0011`](0011-bound-known-peer-records-main.patch) | [PR draft](KNOWN_PEER_BUDGET_PR.md) |
 | Bounded per-peer payload and metadata response backlog | [`0012`](0012-bound-peer-response-backlog.patch) | [`0013`](0013-bound-peer-response-backlog-main.patch) | [PR draft](PEER_RESPONSE_BUDGET_PR.md) |
+| Bounded DHT, metadata-resolution, maintenance, bootstrap, and LSD pressure | [`0014`](0014-bound-discovery-pressure.patch) | [`0015`](0015-bound-discovery-pressure-main.patch) | [PR draft](DISCOVERY_PRESSURE_BUDGET_PR.md) |
 | Bound BEP 9 metadata before allocation | [`0005`](0005-limit-peer-metadata-before-allocation.patch) | [`0006`](0006-limit-peer-metadata-before-allocation-main.patch) | [PR draft](METADATA_SIZE_LIMIT_PR.md) |
 
 The stable patches preserve the exact experiments behind nzbd's M0 report.
@@ -99,13 +102,17 @@ backports upstream unless the maintainer explicitly asks for an 8.x backport.
 10. Submit the independent peer-response candidate only after human review of
     its 128-response window, backpressure policy, and permit lifetime across
     both scheduler and writer queues.
-11. After both required APIs, the allocation ceiling, and all accepted resource
+11. Submit the discovery-pressure candidate only after human review of its
+    DHT/LSD overload policy, foreground and maintenance concurrency, bootstrap
+    fan-out, metadata candidate ceiling, and the current-main-only LSD
+    lifecycle change.
+12. After both required APIs, the allocation ceiling, and all accepted resource
     controls ship, pin that stable release in nzbd and rerun all eleven M0
     gates on native macOS, Linux glibc/musl, and Windows.
-12. Run the Linux packet-capture private-mode harness and obtain reviewer
-   acceptance of the resource, package, license, and advisory dispositions.
-   A gate rerun cannot discharge those review decisions by itself.
-13. Only the complete M0 path can authorize M2.
+13. Run the Linux packet-capture private-mode harness and obtain reviewer
+    acceptance of the resource, package, license, and advisory dispositions.
+    A gate rerun cannot discharge those review decisions by itself.
+14. Only the complete M0 path can authorize M2.
 
 ## 4. Reproduction — verify all candidates against rqbit main
 
@@ -131,6 +138,7 @@ scripts/check-rqbit-pending-handshake-budget.sh "$rqbit_tree"        # Stable ba
 scripts/check-rqbit-known-peer-budget-patch.sh "$rqbit_tree"         # Format + retained-record admission tests.
 scripts/check-rqbit-metadata-size-limit-patch.sh "$rqbit_tree"       # Format + pre-allocation limit test.
 scripts/check-rqbit-peer-response-budget-patch.sh "$rqbit_tree"      # Format + scheduler/writer lifetime proof.
+scripts/check-rqbit-discovery-pressure-patch.sh "$rqbit_tree"        # Format + DHT/metadata/LSD queue proofs.
 ```
 
 For submission, apply only the matching main patch to a fresh branch and run
@@ -150,10 +158,10 @@ git -C "$rqbit_tree" apply "$PWD/contrib/rqbit/0002-allow-persistence-without-au
 
 Use separate fresh branches for discovery health, the metadata ceiling, the
 tracker request budget, the session peer budget, the retained-peer budget, and
-the peer-response budget. Do not stack the upstream submissions: the contracts
-solve different problems, and independent history lets rqbit accept, revise,
-or reject each one without dragging the others through review. There is no
-current-main patch for the
+the peer-response and discovery-pressure budgets. Do not stack the upstream
+submissions: the contracts solve different problems, and independent history
+lets rqbit accept, revise, or reject each one without dragging the others
+through review. There is no current-main patch for the
 pending-handshake boundary because rqbit main already implements it; keep the
 stable-only backport separate from every main submission.
 
@@ -179,5 +187,9 @@ stable-only backport separate from every main submission.
 - Do not treat upload rate limiting or a socket timeout as a response-backlog
   bound. A remote peer can pipeline piece and metadata requests through the
   scheduler and writer faster than those stages drain.
+- Do not treat bounded live or retained peers as bounds on discovery work.
+  DHT datagrams, recursive nodes, maintenance/bootstraps, delivered peers,
+  metadata candidates, and current-main LSD streams exist before or beside
+  those admission permits.
 - Do not enable nzbd config, admission, listeners, trackers, DHT, or payload
   I/O from this kit. M2 remains blocked until a stable release passes M0.

@@ -1344,6 +1344,18 @@ source_redirects = 5
   holds each permit through the socket write. The value, backpressure policy,
   and accepted stable release remain gate-9 prerequisites; the contribution
   evidence does not authorize the production writer.
+- live/retained-peer permits also do not bound discovery work before admission.
+  Stable 8.1.1 and current main leave outgoing DHT datagrams, recursive nodes,
+  delivered peers, and metadata candidates on unbounded retained-work paths;
+  current main adds an unbounded LSD result stream. A tested stable/main
+  candidate bounds DHT queues at 256, recursive work at 32 active requests per
+  worker, delivered peers at 256, maintenance at 256 queued/32 active requests,
+  bootstraps at eight active attempts, metadata work at 128 active attempts and
+  4,096 retained candidates, and current-main LSD results at 256. It also ties
+  the LSD task to its stream, protects replacement registrations, and reuses
+  one response instead of sending every recursive DHT request twice. The fixed
+  values, UDP drop policy, and accepted stable release remain gate-9
+  prerequisites; the contribution evidence does not authorize discovery.
 - dormant torrent initialization is serialized explicitly. Stable rqbit's
   unset default permits three concurrent initialization integrity scans, which
   can multiply disk I/O before torrents become live. The one-scan guard does
@@ -2136,6 +2148,7 @@ data-loss change, not a feature toggle.
 | Stable listener leaves incomplete incoming handshakes unbounded | Remote clients can retain sockets, buffers, and tasks before live-peer permits apply | Require an accepted stable pre-routing handshake ceiling and review it separately from the 80/400 live-peer policy. Current main's native 256-per-listener default and the tested stable backport are evidence, not released capability. |
 | Tracker response or interval is hostile | Memory/request tasks remain unbounded or a tracker is hammered | Require an accepted stable request deadline, streamed body cap, and minimum unforced interval; tracker-count preflight alone is insufficient. |
 | Established peer floods piece or metadata requests | The upload scheduler and peer writer retain unbounded response records behind rate limits or a slow socket | Require an accepted stable per-peer response window spanning scheduler and writer. The tested 128-permit candidate and negative control are evidence, not released capability. |
+| DHT, LSD, or magnet discovery outruns its consumer | Datagram, recursive-node, maintenance, delivered-peer, bootstrap, metadata-future, candidate, or LSD work retains without a fixed bound before peer admission | Require accepted stable end-to-end discovery budgets. Review the candidate 256-record queues, 32-request workers, eight bootstraps, 128 metadata attempts, 4,096 candidates, current-main LSD lifecycle, and UDP overload policy; tested patches are evidence, not released capability. |
 | Private tracker rejects or bans an unapproved rqbit client | Grab fails or tracker account is penalized | No qBittorrent wire-identity claim; disclose whitelist requirements and gate each supported tracker policy before M4. |
 | Torrent PP corrupts seeds | Tracker hash failures and broken uploads | No torrent PP in v1; future reflink-or-copy derivative only. |
 | Passkeys leak in logs/UI | Tracker account compromise | Secret classification, boundary redaction, fixtures in every output path. |

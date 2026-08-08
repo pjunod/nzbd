@@ -13,7 +13,8 @@ merely because CI is green. The remaining decision is whether the recorded
 cost and three constrained exceptions are acceptable for the eventual first
 release, and whether the missing live-peer, retained-peer, tracker-request,
 pre-routing handshake, and established-peer response-backlog controls must be
-resolved before this gate can pass.
+resolved before this gate can pass. DHT, metadata-resolution, and current-main
+LSD queues also need explicit discovery-pressure boundaries.
 
 No production BitTorrent path is enabled by this review. Gates 7 and 8 still
 fail until accepted stable rqbit APIs provide authoritative restore and honest
@@ -95,6 +96,24 @@ between queues, reopens after a writer drop, and fails under an intentional
 guard bypass. Until an accepted stable release enforces a reviewer-approved
 window and backpressure policy, established peer traffic remains unauthorized.
 
+Discovery has its own retained-work chain before a peer becomes live. Stable
+8.1.1 and the pinned rqbit-main snapshot use unbounded channels for outgoing
+DHT datagrams, recursive nodes, and delivered peers, and can grow the active
+recursive future set without a fixed ceiling. Magnet metadata resolution uses
+a 128-permit semaphore around I/O but can retain an unbounded future queue and
+unique-address set before those permits. DHT maintenance uses unbounded
+refresher/pinger channels and active future sets, and bootstrap starts every
+configured hostname at once. Current main adds an unbounded LSD result channel
+whose periodic announce task survives result-stream drop. The
+contribution kit now proves candidate 256-record DHT send, recursive-node,
+delivered-peer, DHT-maintenance, and LSD queues; 32 active recursive and 32
+active maintenance requests per worker; eight concurrent bootstraps; 128
+active metadata attempts; and 4,096 retained metadata candidates. It also
+cancels LSD work with its owning stream, protects replacement registrations,
+and removes an existing duplicate DHT request per recursive step. These fixed
+values and UDP drop/backpressure choices are preliminary review evidence, not
+released capability.
+
 The normal closure is permissively licensed except for exact
 `option-ext 0.2.0`, which is MPL-2.0 file-level copyleft. The checked-in
 `deny.toml` accepts only that package/version under MPL-2.0; another MPL package
@@ -157,6 +176,7 @@ scripts/check-rqbit-session-peer-budget-patch.sh /path/to/rqbit
 scripts/check-rqbit-pending-handshake-budget.sh /path/to/rqbit
 scripts/check-rqbit-known-peer-budget-patch.sh /path/to/rqbit
 scripts/check-rqbit-peer-response-budget-patch.sh /path/to/rqbit
+scripts/check-rqbit-discovery-pressure-patch.sh /path/to/rqbit
 ```
 
 Reproduce the macOS harness measurements rather than comparing a debug binary:
@@ -213,6 +233,14 @@ Gate 9 may move from Partial to Pass only if a reviewer accepts all of these:
     scheduler and socket writer. The prepared 128-permit candidate and its
     failing negative control are evidence for review, not shipped capability.
     A reviewer must accept or revise the window and backpressure behavior.
+11. **Discovery-pressure budgets.** An accepted stable engine must bound DHT
+    datagrams, recursive work, delivered peers, and retained metadata
+    candidates. Any stable line that includes LSD must also tie its bounded
+    result stream and announce task to one lifecycle. The prepared
+    256-record queue, 32-request worker, eight-bootstrap, 128-attempt, and
+    4,096-candidate limits, UDP overload policy, exact-boundary proofs, and
+    failing negative controls are evidence for review, not shipped capability.
+    A reviewer must accept or revise each boundary.
 
 If any item is rejected, gate 9 remains Partial and the remedy must be named:
 upgrade or patch the dependency, remove the capability, change engines, or set
@@ -237,6 +265,8 @@ an accepted resource budget. Silence is not acceptance.
   backoff, dead, or not-needed peer records.
 - It does not treat upload rate limiting or a socket timeout as a bound on
   queued piece and metadata responses from an established peer.
+- It does not treat live-peer or retained-peer permits as bounds on DHT, LSD,
+  or magnet-metadata discovery queues and candidate sets.
 - It does not submit any prepared patch upstream.
 
 Gate 9 is one required decision among eleven, not permission to skip the two
