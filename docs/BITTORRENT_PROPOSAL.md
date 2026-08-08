@@ -1183,13 +1183,16 @@ the stable engine's internal metadata allocation: rqbit may allocate up to
 magnet wiring still needs a reviewed pre-allocation answer. The adapter now
 canonicalizes the session output root and rejects every payload prefix that is
 an existing symlink before rqbit constructs storage; a Unix test proves the
-external target stays empty. A native Linux, macOS, and Windows probe records
-whether each hosted runner filesystem aliases or distinguishes ASCII-case and
-Unicode NFC/NFD name pairs, then proves the portable adapter rejects both pairs
-either way. These observations cover the hosted runner volumes, not every
-operator mount. The preflight remains defense in depth and does not close the
-check/write race. Descriptor-relative containment and persisted delete-root
-authority remain M5/M2 work, and no production path is wired.
+external target stays empty. The
+[first native filesystem-probe run](https://github.com/pjunod/nzbd/actions/runs/31240896567)
+passed on 2026-08-08 UTC: the hosted Linux volume distinguished both the
+ASCII-case and Unicode NFC/NFD pairs, macOS aliased both pairs, and Windows
+aliased case but distinguished NFC/NFD. The portable adapter rejected both
+pairs on every runner regardless of that behavior. These observations cover
+the hosted runner volumes, not every operator mount. The preflight remains
+defense in depth and does not close the check/write race. Descriptor-relative
+containment and persisted delete-root authority remain M5/M2 work, and no
+production path is wired.
 
 The Windows name restrictions are deliberately unconditional. `?`, `:`, and
 device basenames such as `aux.c` are legal on Linux, but accepting them would
