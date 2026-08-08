@@ -924,6 +924,8 @@ fn adapter_rejects_canonically_equivalent_unicode_path_collisions() {
         ("ΣΑΣ.mkv", "σας.mkv"),
         ("ſong.mkv", "song.mkv"),
         ("ı.mkv", "i.mkv"),
+        ("ﬁle.mkv", "file.mkv"),
+        ("ß.mkv", "SS.mkv"),
     ] {
         let left_path: &[&[u8]] = &[b"disc", left.as_bytes()];
         let right_path: &[&[u8]] = &[b"disc", right.as_bytes()];
@@ -934,12 +936,35 @@ fn adapter_rejects_canonically_equivalent_unicode_path_collisions() {
         ));
     }
 
-    for (left, right) in [("ﬁle.mkv", "file.mkv"), ("Ｆ.mkv", "f.mkv")] {
-        let left_path: &[&[u8]] = &[b"disc", left.as_bytes()];
-        let right_path: &[&[u8]] = &[b"disc", right.as_bytes()];
-        let distinct = metainfo(&multi_file_info_many(b"release", &[left_path, right_path]));
-        assert!(validate_metainfo_contract(&distinct, false).is_ok());
-    }
+    let left_path: &[&[u8]] = &[b"disc", "Ｆ.mkv".as_bytes()];
+    let right_path: &[&[u8]] = &[b"disc", b"f.mkv"];
+    let distinct = metainfo(&multi_file_info_many(b"release", &[left_path, right_path]));
+    assert!(validate_metainfo_contract(&distinct, false).is_ok());
+}
+
+#[test]
+fn adapter_rejects_case_and_nfc_alias_pairs_before_storage() {
+    let upper_case_path: &[&[u8]] = &[b"CaseProbe"];
+    let lower_case_path: &[&[u8]] = &[b"caseprobe"];
+    let case_collision = metainfo(&multi_file_info_many(
+        b"release",
+        &[upper_case_path, lower_case_path],
+    ));
+    assert!(matches!(
+        validate_metainfo_contract(&case_collision, false),
+        Err(TorrentError::PathCollision)
+    ));
+
+    let composed_path: &[&[u8]] = &["Caf\u{e9}Probe".as_bytes()];
+    let decomposed_path: &[&[u8]] = &["Cafe\u{301}Probe".as_bytes()];
+    let unicode_collision = metainfo(&multi_file_info_many(
+        b"release",
+        &[composed_path, decomposed_path],
+    ));
+    assert!(matches!(
+        validate_metainfo_contract(&unicode_collision, false),
+        Err(TorrentError::PathCollision)
+    ));
 }
 
 #[test]
