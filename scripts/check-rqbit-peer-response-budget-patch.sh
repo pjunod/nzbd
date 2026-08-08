@@ -53,39 +53,103 @@ fi
 readonly peer_connection_source="$work_dir/rqbit/crates/librqbit/src/peer_connection.rs"
 readonly live_source="$work_dir/rqbit/crates/librqbit/src/torrent_state/live/mod.rs"
 
+extract_rust_item() {
+  local signature="$1"
+  local source="$2"
+  awk -v signature="$signature" '
+    index($0, signature) { printing = 1 }
+    printing {
+      print
+      opens = gsub(/{/, "{")
+      closes = gsub(/}/, "}")
+      depth += opens - closes
+      if (opens > 0) { saw_body = 1 }
+      if (saw_body && depth == 0) { exit }
+    }
+  ' "$source"
+}
+
 for invariant in \
   'MAX_PENDING_PEER_RESPONSES_PER_PEER: usize = 128' \
-  'peer_responses_sem' \
-  'acquire_peer_response_permit' \
-  'WriterRequest::ReadChunkRequest(ci, permit)' \
-  'peer_response_permit_spans_scheduler_and_writer_queues'
+  'struct PeerResponseBudget' \
+  'fn try_acquire(&self)' \
+  'handshake.reqq = Some(MAX_PENDING_PEER_RESPONSES_PER_PEER as u32)' \
+  'production_admission_spans_scheduler_and_writer_queues'
 do
-  if ! grep -Fq "$invariant" "$peer_connection_source" "$live_source"; then
-    echo "peer-response-budget patch is missing invariant: $invariant" >&2
+  if ! grep -Fq "$invariant" "$live_source"; then
+    echo "peer-response-budget live path is missing invariant: $invariant" >&2
     exit 1
   fi
 done
 
+readonly download_request_source="$(extract_rust_item 'fn on_download_request(' "$live_source")"
+readonly metadata_response_source="$(extract_rust_item 'fn send_metadata_piece(' "$live_source")"
+readonly upload_scheduler_source="$(extract_rust_item 'async fn task_upload_scheduler(' "$live_source")"
+readonly socket_writer_source="$(extract_rust_item 'async fn write_with_peer_response_permit(' "$peer_connection_source")"
+
+if ! grep -Fq 'enqueue_piece_response(' <<<"$download_request_source"; then
+  echo "production on_download_request does not use bounded peer-response admission" >&2
+  exit 1
+fi
+if grep -Fq '.await' <<<"$download_request_source"; then
+  echo "production on_download_request may park the socket reader" >&2
+  exit 1
+fi
+if ! grep -Fq 'enqueue_metadata_response(' <<<"$metadata_response_source"; then
+  echo "production metadata response does not share bounded peer-response admission" >&2
+  exit 1
+fi
+if ! grep -Fq 'forward_piece_response(' <<<"$upload_scheduler_source"; then
+  echo "production upload scheduler bypasses permit-carrying writer forwarding" >&2
+  exit 1
+fi
+for invariant in 'let _peer_response_permit = peer_response_permit' 'write.write_all(bytes)'; do
+  if ! grep -Fq "$invariant" <<<"$socket_writer_source"; then
+    echo "socket writer does not retain the peer-response permit through write: $invariant" >&2
+    exit 1
+  fi
+done
+if ! grep -Fq 'production_writer_holds_permit_until_socket_write_finishes' "$peer_connection_source"; then
+  echo "peer-response writer lifetime proof is missing" >&2
+  exit 1
+fi
+
 case "$source_variant" in
   stable)
-    grep -Fq 'MessageWithPermit(MessageOwned, OwnedSemaphorePermit)' "$peer_connection_source"
-    grep -Fq 'WriterRequest::MessageWithPermit' "$live_source"
+    if ! grep -Fq 'MessageWithPermit(MessageOwned, OwnedSemaphorePermit)' "$peer_connection_source"; then
+      echo "stable writer request does not carry a metadata response permit" >&2
+      exit 1
+    fi
+    if ! grep -Fq 'send(WriterRequest::MessageWithPermit(message, permit))' "$live_source"; then
+      echo "stable metadata enqueue does not attach its response permit" >&2
+      exit 1
+    fi
     ;;
   main)
-    grep -Fq 'UtMetadata(UtMetadata<ByteBufOwned>, OwnedSemaphorePermit)' "$peer_connection_source"
-    grep -Fq 'WriterRequest::UtMetadata(' "$live_source"
+    if ! grep -Fq 'UtMetadata(UtMetadata<ByteBufOwned>, OwnedSemaphorePermit)' "$peer_connection_source"; then
+      echo "main writer request does not carry a metadata response permit" >&2
+      exit 1
+    fi
+    if ! grep -Fq 'send(WriterRequest::UtMetadata(message, permit))' "$live_source"; then
+      echo "main metadata enqueue does not attach its response permit" >&2
+      exit 1
+    fi
     ;;
 esac
 
 (
   cd "$work_dir/rqbit"
   cargo fmt --all -- --check
-  readonly exact_test='torrent_state::live::peer_response_budget_tests::peer_response_permit_spans_scheduler_and_writer_queues'
+  readonly admission_test='torrent_state::live::peer_response_budget_tests::production_admission_spans_scheduler_and_writer_queues'
+  readonly writer_test='peer_connection::peer_response_writer_tests::production_writer_holds_permit_until_socket_write_finishes'
   test_list="$(cargo test -p librqbit --lib -- --list)"
   readonly test_list
-  if ! grep -Fxq "$exact_test: test" <<<"$test_list"; then
-    echo "peer-response-budget proof test was not discovered: $exact_test" >&2
-    exit 1
-  fi
-  cargo test -p librqbit --lib "$exact_test" -- --exact --nocapture
+  for exact_test in "$admission_test" "$writer_test"; do
+    if ! grep -Fxq "$exact_test: test" <<<"$test_list"; then
+      echo "peer-response-budget proof test was not discovered: $exact_test" >&2
+      exit 1
+    fi
+    cargo test -p librqbit --lib "$exact_test" -- --exact --nocapture
+  done
+  cargo check --workspace
 )

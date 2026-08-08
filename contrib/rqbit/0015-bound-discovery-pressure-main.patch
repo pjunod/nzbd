@@ -1,5 +1,5 @@
 diff --git a/crates/dht/src/dht.rs b/crates/dht/src/dht.rs
-index c2defd32..a412b306 100644
+index c2defd32..da7dc931 100644
 --- a/crates/dht/src/dht.rs
 +++ b/crates/dht/src/dht.rs
 @@ -38,7 +38,7 @@ use librqbit_dualstack_sockets::{BindDevice, UdpSocket};
@@ -11,7 +11,7 @@ index c2defd32..a412b306 100644
  
  use tokio_util::sync::CancellationToken;
  use tracing::{Instrument, debug, debug_span, error, info, trace, warn};
-@@ -67,6 +67,40 @@ pub struct WorkerSendRequest {
+@@ -67,6 +67,83 @@ pub struct WorkerSendRequest {
      addr: SocketAddr,
  }
  
@@ -21,7 +21,6 @@ index c2defd32..a412b306 100644
 +const MAX_CONCURRENT_RECURSIVE_REQUESTS: usize = 32;
 +const MAX_PENDING_MAINTENANCE_REQUESTS: usize = 256;
 +const MAX_CONCURRENT_MAINTENANCE_REQUESTS: usize = 32;
-+const MAX_CONCURRENT_BOOTSTRAPS: usize = 8;
 +
 +type RecursiveNode = (Option<Id20>, SocketAddr, usize);
 +
@@ -41,27 +40,78 @@ index c2defd32..a412b306 100644
 +    channel(MAX_PENDING_MAINTENANCE_REQUESTS)
 +}
 +
-+fn can_schedule_recursive_request(active: usize) -> bool {
-+    active < MAX_CONCURRENT_RECURSIVE_REQUESTS
++struct BoundedFuturesUnordered<F> {
++    futures: FuturesUnordered<F>,
++    limit: usize,
 +}
 +
-+fn can_schedule_maintenance_request(active: usize) -> bool {
-+    active < MAX_CONCURRENT_MAINTENANCE_REQUESTS
++impl<F> BoundedFuturesUnordered<F> {
++    fn new(limit: usize) -> Self {
++        Self {
++            futures: FuturesUnordered::new(),
++            limit,
++        }
++    }
++
++    fn try_push(&self, future: F) -> Result<(), F> {
++        if self.futures.len() >= self.limit {
++            return Err(future);
++        }
++        self.futures.push(future);
++        Ok(())
++    }
++
++    fn is_empty(&self) -> bool {
++        self.futures.is_empty()
++    }
++
++    fn is_full(&self) -> bool {
++        self.futures.len() >= self.limit
++    }
++
++    async fn next(&mut self) -> Option<F::Output>
++    where
++        F: std::future::Future,
++    {
++        self.futures.next().await
++    }
++}
++
++#[derive(Debug, PartialEq, Eq)]
++enum RootQueueStatus {
++    Empty,
++    Queued(usize),
++    Saturated,
++}
++
++fn root_queue_delay(status: &RootQueueStatus) -> Duration {
++    match status {
++        RootQueueStatus::Empty => Duration::from_secs(1),
++        RootQueueStatus::Queued(n) if *n < 8 => REQUERY_INTERVAL / 8 * (*n as u32),
++        RootQueueStatus::Queued(_) | RootQueueStatus::Saturated => REQUERY_INTERVAL,
++    }
 +}
 +
  #[derive(Debug)]
  struct MaybeUsefulNode {
      id: Id20,
-@@ -149,7 +183,7 @@ impl RecursiveRequestCallbacks for RecursiveRequestCallbacksGetPeers {
+@@ -149,11 +226,13 @@ impl RecursiveRequestCallbacks for RecursiveRequestCallbacksGetPeers {
              addr,
          );
  
 -        let _ = req.dht.worker_sender.send(WorkerSendRequest {
-+        let _ = req.dht.try_send_worker(WorkerSendRequest {
++        if let Err(error) = req.dht.try_send_worker(WorkerSendRequest {
              our_tid: Some(tid),
              message,
              addr,
-@@ -192,22 +226,22 @@ struct RecursiveRequest<C: RecursiveRequestCallbacks> {
+-        });
++        }) {
++            debug!(?error, "failed to enqueue DHT announce");
++        }
+     }
+ }
+ 
+@@ -192,22 +271,22 @@ struct RecursiveRequest<C: RecursiveRequestCallbacks> {
      request: Request,
      dht: Arc<DhtState>,
      useful_nodes: RwLock<Vec<MaybeUsefulNode>>,
@@ -90,7 +140,7 @@ index c2defd32..a412b306 100644
              let rp = Arc::new(RecursiveRequest {
                  max_depth: 4,
                  info_hash,
-@@ -264,7 +298,7 @@ impl RecursiveRequest<RecursiveRequestCallbacksFindNodes> {
+@@ -264,7 +343,7 @@ impl RecursiveRequest<RecursiveRequestCallbacksFindNodes> {
          target: Id20,
          addrs: impl Iterator<Item = SocketAddr>,
      ) -> crate::Result<()> {
@@ -99,7 +149,7 @@ index c2defd32..a412b306 100644
          let req = RecursiveRequest {
              max_depth: 4,
              info_hash: target,
-@@ -272,7 +306,7 @@ impl RecursiveRequest<RecursiveRequestCallbacksFindNodes> {
+@@ -272,7 +351,7 @@ impl RecursiveRequest<RecursiveRequestCallbacksFindNodes> {
              dht,
              useful_nodes_limit: 32,
              useful_nodes: RwLock::new(Vec::new()),
@@ -108,7 +158,7 @@ index c2defd32..a412b306 100644
              node_tx,
              callbacks: RecursiveRequestCallbacksFindNodes {},
          };
-@@ -290,33 +324,33 @@ impl RecursiveRequest<RecursiveRequestCallbacksFindNodes> {
+@@ -290,33 +369,33 @@ impl RecursiveRequest<RecursiveRequestCallbacksFindNodes> {
                  ))
          };
  
@@ -125,7 +175,7 @@ index c2defd32..a412b306 100644
 +            }
          }
  
-+        let mut futs = FuturesUnordered::new();
++        let mut futs = BoundedFuturesUnordered::new(MAX_CONCURRENT_RECURSIVE_REQUESTS);
          let mut successes = 0;
          let mut errors = 0;
  
@@ -138,12 +188,8 @@ index c2defd32..a412b306 100644
  
 -                r = node_rx.recv() => {
 -                    let (id, addr, depth) = r.unwrap();
-+                r = node_rx.recv(), if can_schedule_recursive_request(futs.len()) => {
-+                    let Some((id, addr, depth)) = r else {
-+                        break;
-+                    };
-                     futs.push(request_one(id, addr, depth))
-                 },
+-                    futs.push(request_one(id, addr, depth))
+-                },
 -                f = futs.next() => {
 -                    let f = match f {
 -                        Some(f) => f,
@@ -151,12 +197,17 @@ index c2defd32..a412b306 100644
 -                            // find_node recursion finished.
 -                            break;
 -                        }
--                    };
++                r = node_rx.recv(), if !futs.is_full() => {
++                    let Some((id, addr, depth)) = r else {
++                        break;
+                     };
++                    debug_assert!(futs.try_push(request_one(id, addr, depth)).is_ok());
++                },
 +                Some(f) = futs.next(), if !futs.is_empty() => {
                      if f.is_ok() {
                          successes += 1;
                      } else {
-@@ -338,7 +372,7 @@ impl RecursiveRequest<RecursiveRequestCallbacksFindNodes> {
+@@ -338,7 +417,7 @@ impl RecursiveRequest<RecursiveRequestCallbacksFindNodes> {
  impl RecursiveRequest<RecursiveRequestCallbacksGetPeers> {
      fn request_peers_forever(
          self: &Arc<Self>,
@@ -165,16 +216,48 @@ index c2defd32..a412b306 100644
          is_v4: bool,
      ) -> tokio::task::JoinHandle<()> {
          let this = self.clone();
-@@ -372,7 +406,7 @@ impl RecursiveRequest<RecursiveRequestCallbacksGetPeers> {
-                 let mut futs = FuturesUnordered::new();
+@@ -354,9 +433,7 @@ impl RecursiveRequest<RecursiveRequestCallbacksGetPeers> {
+                         loop {
+                             trace!("iteration {}", iteration);
+                             let sleep = match this.get_peers_root(is_v4) {
+-                                Ok(0) => Duration::from_secs(1),
+-                                Ok(n) if n < 8 => REQUERY_INTERVAL / 8 * (n as u32),
+-                                Ok(_) => REQUERY_INTERVAL,
++                                Ok(status) => root_queue_delay(&status),
+                                 Err(e) => {
+                                     error!("dht: error in get_peers_root(): {e:#}");
+                                     return Err::<(), crate::Error>(e);
+@@ -369,16 +446,16 @@ impl RecursiveRequest<RecursiveRequestCallbacksGetPeers> {
+                 };
+                 tokio::pin!(looper);
+ 
+-                let mut futs = FuturesUnordered::new();
++                let mut futs = BoundedFuturesUnordered::new(MAX_CONCURRENT_RECURSIVE_REQUESTS);
                  loop {
                      tokio::select! {
 -                        addr = node_rx.recv() => {
-+                        addr = node_rx.recv(), if can_schedule_recursive_request(futs.len()) => {
++                        addr = node_rx.recv(), if !futs.is_full() => {
                              let (id, addr, depth) = addr.unwrap();
-                             futs.push(
+-                            futs.push(
++                            debug_assert!(futs.try_push(
                                  this.request_one(id, addr, depth)
-@@ -404,11 +438,11 @@ impl RecursiveRequest<RecursiveRequestCallbacksGetPeers> {
+                                     .map_err(|e| debug!("error: {e:#}"))
+                                     .instrument(debug_span!("addr", addr=addr.to_string()))
+-                            );
++                            ).is_ok());
+                         }
+                         Some(_) = futs.next(), if !futs.is_empty() => {}
+                         r = &mut looper => {
+@@ -390,7 +467,7 @@ impl RecursiveRequest<RecursiveRequestCallbacksGetPeers> {
+         )
+     }
+ 
+-    fn get_peers_root(&self, is_v4: bool) -> crate::Result<usize> {
++    fn get_peers_root(&self, is_v4: bool) -> crate::Result<RootQueueStatus> {
+         let mut count = 0;
+         let table = if is_v4 {
+             &self.dht.routing_table_v4
+@@ -404,14 +481,18 @@ impl RecursiveRequest<RecursiveRequestCallbacksGetPeers> {
              .map(|n| (n.id(), n.addr()))
              .take(8)
          {
@@ -185,13 +268,21 @@ index c2defd32..a412b306 100644
 -                .ok_or(Error::DhtDead)?;
 +            match self.node_tx.try_send((Some(id), addr, 0)) {
 +                Ok(()) => count += 1,
-+                Err(TrySendError::Full(_)) => break,
++                Err(TrySendError::Full(_)) => return Ok(RootQueueStatus::Saturated),
 +                Err(TrySendError::Closed(_)) => return Err(Error::DhtDead),
 +            }
          }
  
-         Ok(count)
-@@ -426,6 +460,7 @@ impl<C: RecursiveRequestCallbacks> RecursiveRequest<C> {
+-        Ok(count)
++        if count == 0 {
++            Ok(RootQueueStatus::Empty)
++        } else {
++            Ok(RootQueueStatus::Queued(count))
++        }
+     }
+ }
+ 
+@@ -426,6 +507,7 @@ impl<C: RecursiveRequestCallbacks> RecursiveRequest<C> {
              self.callbacks.on_request_start(self, id, addr);
          }
  
@@ -199,7 +290,7 @@ index c2defd32..a412b306 100644
          let response = self
              .dht
              .request(self.request.clone(), addr)
-@@ -437,7 +472,7 @@ impl<C: RecursiveRequestCallbacks> RecursiveRequest<C> {
+@@ -437,7 +519,7 @@ impl<C: RecursiveRequestCallbacks> RecursiveRequest<C> {
              self.callbacks.on_request_end(self, id, addr, &response);
          }
  
@@ -208,19 +299,20 @@ index c2defd32..a412b306 100644
              Ok(ResponseOrError::Response(r)) => r,
              Ok(ResponseOrError::Error(e)) => {
                  debug!("error response: {e:?}");
-@@ -451,7 +486,10 @@ impl<C: RecursiveRequestCallbacks> RecursiveRequest<C> {
- 
-         if let Some(peers) = response.values {
-             for peer in peers {
--                self.peer_tx.send(peer.0).ok().ok_or(Error::ReceiverDead)?;
-+                self.peer_tx
-+                    .send(peer.0)
-+                    .await
-+                    .map_err(|_| Error::ReceiverDead)?;
+@@ -449,12 +531,6 @@ impl<C: RecursiveRequestCallbacks> RecursiveRequest<C> {
              }
-         }
+         };
  
-@@ -476,10 +514,13 @@ impl<C: RecursiveRequestCallbacks> RecursiveRequest<C> {
+-        if let Some(peers) = response.values {
+-            for peer in peers {
+-                self.peer_tx.send(peer.0).ok().ok_or(Error::ReceiverDead)?;
+-            }
+-        }
+-
+         let node_it = response
+             .nodes
+             .iter()
+@@ -476,10 +552,25 @@ impl<C: RecursiveRequestCallbacks> RecursiveRequest<C> {
                  should_request, node.id, node.addr, depth, self.max_depth
              );
              if should_request {
@@ -235,10 +327,22 @@ index c2defd32..a412b306 100644
 +                    }
 +                    Err(TrySendError::Closed(_)) => return Err(Error::ReceiverDead),
 +                }
++            }
++        }
++        if let Some(peers) = response.values {
++            for peer in peers {
++                let addr = peer.0;
++                match self.peer_tx.try_send(addr) {
++                    Ok(()) => {}
++                    Err(TrySendError::Full(_)) => {
++                        trace!(%addr, "discovered peer queue is full, dropping peer")
++                    }
++                    Err(TrySendError::Closed(_)) => return Err(Error::ReceiverDead),
++                }
              }
          }
          Ok(())
-@@ -585,7 +626,7 @@ pub struct DhtState {
+@@ -585,7 +676,7 @@ pub struct DhtState {
      // Sending requests to the worker.
      rate_limiter: RateLimiter,
      // This is to send raw messages
@@ -247,7 +351,7 @@ index c2defd32..a412b306 100644
  
      cancellation_token: CancellationToken,
  
-@@ -595,7 +636,7 @@ pub struct DhtState {
+@@ -595,7 +686,7 @@ pub struct DhtState {
  impl DhtState {
      fn new_internal(
          id: Id20,
@@ -256,16 +360,16 @@ index c2defd32..a412b306 100644
          routing_table_v4: Option<RoutingTable>,
          routing_table_v6: Option<RoutingTable>,
          listen_addr: SocketAddr,
-@@ -618,25 +659,35 @@ impl DhtState {
+@@ -618,25 +709,35 @@ impl DhtState {
          }
      }
  
-+    fn try_send_worker(&self, request: WorkerSendRequest) -> crate::Result<bool> {
++    fn try_send_worker(&self, request: WorkerSendRequest) -> crate::Result<()> {
 +        match self.worker_sender.try_send(request) {
-+            Ok(()) => Ok(true),
++            Ok(()) => Ok(()),
 +            Err(TrySendError::Full(_)) => {
 +                debug!("DHT send queue is full, dropping untracked datagram");
-+                Ok(false)
++                Ok(())
 +            }
 +            Err(TrySendError::Closed(_)) => Err(Error::DhtDead),
 +        }
@@ -300,7 +404,7 @@ index c2defd32..a412b306 100644
          match tokio::time::timeout(RESPONSE_TIMEOUT, rx).await {
              Ok(Ok(r)) => r.map(|r| {
                  trace!("received {r:?}");
-@@ -827,14 +878,11 @@ impl DhtState {
+@@ -827,14 +928,11 @@ impl DhtState {
                  self.get_table_for_addr(addr)
                      .write()
                      .mark_last_query(&req.id, now());
@@ -312,7 +416,7 @@ index c2defd32..a412b306 100644
 -                    })
 -                    .ok()
 -                    .ok_or(Error::DhtDead)?;
-+                let _ = self.try_send_worker(WorkerSendRequest {
++                self.try_send_worker(WorkerSendRequest {
 +                    our_tid: None,
 +                    message,
 +                    addr,
@@ -320,7 +424,7 @@ index c2defd32..a412b306 100644
                  Ok(())
              }
              MessageKind::AnnouncePeer(ann) => {
-@@ -852,14 +900,11 @@ impl DhtState {
+@@ -852,14 +950,11 @@ impl DhtState {
                          ..Default::default()
                      }),
                  };
@@ -332,7 +436,7 @@ index c2defd32..a412b306 100644
 -                    })
 -                    .ok()
 -                    .ok_or(Error::DhtDead)?;
-+                let _ = self.try_send_worker(WorkerSendRequest {
++                self.try_send_worker(WorkerSendRequest {
 +                    our_tid: None,
 +                    message,
 +                    addr,
@@ -340,7 +444,7 @@ index c2defd32..a412b306 100644
                  Ok(())
              }
              MessageKind::GetPeersRequest(req) => {
-@@ -885,14 +930,11 @@ impl DhtState {
+@@ -885,14 +980,11 @@ impl DhtState {
                          )),
                      }),
                  };
@@ -352,7 +456,7 @@ index c2defd32..a412b306 100644
 -                    })
 -                    .ok()
 -                    .ok_or(Error::DhtDead)?;
-+                let _ = self.try_send_worker(WorkerSendRequest {
++                self.try_send_worker(WorkerSendRequest {
 +                    our_tid: None,
 +                    message,
 +                    addr,
@@ -360,7 +464,7 @@ index c2defd32..a412b306 100644
                  Ok(())
              }
              MessageKind::FindNodeRequest(req) => {
-@@ -914,14 +956,11 @@ impl DhtState {
+@@ -914,14 +1006,11 @@ impl DhtState {
                          ..Default::default()
                      }),
                  };
@@ -372,7 +476,7 @@ index c2defd32..a412b306 100644
 -                    })
 -                    .ok()
 -                    .ok_or(Error::DhtDead)?;
-+                let _ = self.try_send_worker(WorkerSendRequest {
++                self.try_send_worker(WorkerSendRequest {
 +                    our_tid: None,
 +                    message,
 +                    addr,
@@ -380,22 +484,17 @@ index c2defd32..a412b306 100644
                  Ok(())
              }
              _ => unreachable!(),
-@@ -1018,11 +1057,9 @@ impl DhtWorker {
-     }
+@@ -1019,8 +1108,7 @@ impl DhtWorker {
  
      async fn bootstrap(&self, bootstrap_addrs: &[String]) -> crate::Result<()> {
--        let mut futs = FuturesUnordered::new();
+         let mut futs = FuturesUnordered::new();
 -
 -        for addr in bootstrap_addrs.iter() {
--            futs.push(self.bootstrap_hostname_with_backoff(addr));
--        }
-+        let mut futs = futures::stream::iter(bootstrap_addrs.iter().cloned())
-+            .map(|addr| async move { self.bootstrap_hostname_with_backoff(&addr).await })
-+            .buffer_unordered(MAX_CONCURRENT_BOOTSTRAPS);
++        for addr in bootstrap_addrs {
+             futs.push(self.bootstrap_hostname_with_backoff(addr));
+         }
          let mut successes = 0;
-         while let Some(resp) = futs.next().await {
-             if resp.is_ok() {
-@@ -1036,7 +1073,7 @@ impl DhtWorker {
+@@ -1036,7 +1124,7 @@ impl DhtWorker {
      }
  
      async fn bucket_refresher(&self, is_v4: bool) -> crate::Result<()> {
@@ -404,7 +503,16 @@ index c2defd32..a412b306 100644
  
          let table = if is_v4 {
              &self.dht.routing_table_v4
-@@ -1058,9 +1095,11 @@ impl DhtWorker {
+@@ -1044,7 +1132,7 @@ impl DhtWorker {
+             &self.dht.routing_table_v6
+         };
+ 
+-        let mut futs = FuturesUnordered::new();
++        let mut futs = BoundedFuturesUnordered::new(MAX_CONCURRENT_MAINTENANCE_REQUESTS);
+         let filler = async {
+             let mut interval = tokio::time::interval(INACTIVITY_TIMEOUT);
+             interval.tick().await;
+@@ -1058,9 +1146,11 @@ impl DhtWorker {
                      if now - bucket.leaf.last_refreshed < INACTIVITY_TIMEOUT {
                          continue;
                      }
@@ -418,25 +526,42 @@ index c2defd32..a412b306 100644
                  }
                  trace!("iteration {}, refreshing {} buckets", iteration, found);
                  iteration += 1;
-@@ -1072,7 +1111,7 @@ impl DhtWorker {
+@@ -1072,7 +1162,7 @@ impl DhtWorker {
          loop {
              tokio::select! {
                  _ = &mut filler => {},
 -                random_id = rx.recv() => {
-+                random_id = rx.recv(), if can_schedule_maintenance_request(futs.len()) => {
++                random_id = rx.recv(), if !futs.is_full() => {
                      let random_id = random_id.unwrap();
                      let addrs = table
                          .read()
-@@ -1099,7 +1138,7 @@ impl DhtWorker {
+@@ -1080,11 +1170,11 @@ impl DhtWorker {
+                         .iter()
+                         .map(|n| n.addr())
+                         .take(8).collect::<Vec<_>>();
+-                    futs.push(
++                    debug_assert!(futs.try_push(
+                         RecursiveRequest::find_node_for_routing_table(
+                             self.dht.clone(), random_id, addrs.into_iter()
+                         ).instrument(debug_span!("refresh_bucket"))
+-                    );
++                    ).is_ok());
+                 },
+                 _ = futs.next(), if !futs.is_empty() => {},
+             }
+@@ -1097,9 +1187,9 @@ impl DhtWorker {
+         } else {
+             &self.dht.routing_table_v6
          };
-         let mut futs = FuturesUnordered::new();
+-        let mut futs = FuturesUnordered::new();
++        let mut futs = BoundedFuturesUnordered::new(MAX_CONCURRENT_MAINTENANCE_REQUESTS);
          let mut interval = tokio::time::interval(INACTIVITY_TIMEOUT / 4);
 -        let (tx, mut rx) = unbounded_channel();
 +        let (tx, mut rx) = maintenance_channel();
          let looper = async {
              let mut iteration = 0;
              loop {
-@@ -1111,8 +1150,10 @@ impl DhtWorker {
+@@ -1111,8 +1201,10 @@ impl DhtWorker {
                          node.status(now),
                          NodeStatus::Questionable | NodeStatus::Unknown
                      ) {
@@ -448,16 +573,28 @@ index c2defd32..a412b306 100644
                      }
                  }
                  trace!("iteration {}, pinging {} nodes", iteration, found);
-@@ -1125,7 +1166,7 @@ impl DhtWorker {
+@@ -1125,9 +1217,9 @@ impl DhtWorker {
          loop {
              tokio::select! {
                  _ = &mut looper => {},
 -                r = rx.recv() => {
-+                r = rx.recv(), if can_schedule_maintenance_request(futs.len()) => {
++                r = rx.recv(), if !futs.is_full() => {
                      let (id, addr) = r.unwrap();
-                     futs.push(async move {
+-                    futs.push(async move {
++                    debug_assert!(futs.try_push(async move {
                          table.write().mark_outgoing_request(&id, now());
-@@ -1148,7 +1189,7 @@ impl DhtWorker {
+                         match self.dht.request(Request::Ping, addr).await {
+                             Ok(_) => {
+@@ -1138,7 +1230,7 @@ impl DhtWorker {
+                                 debug!("error: {e:#}");
+                             }
+                         }
+-                    }.instrument(debug_span!("ping", addr=addr.to_string())))
++                    }.instrument(debug_span!("ping", addr=addr.to_string()))).is_ok());
+                 },
+                 _ = futs.next(), if !futs.is_empty() => {},
+             }
+@@ -1148,7 +1240,7 @@ impl DhtWorker {
      async fn framer(
          &self,
          socket: &UdpSocket,
@@ -466,7 +603,7 @@ index c2defd32..a412b306 100644
          output_tx: Sender<(Message<ByteBufOwned>, SocketAddr)>,
      ) -> crate::Result<()> {
          let writer = async {
-@@ -1202,7 +1243,7 @@ impl DhtWorker {
+@@ -1202,7 +1294,7 @@ impl DhtWorker {
  
      async fn start(
          self,
@@ -475,7 +612,7 @@ index c2defd32..a412b306 100644
          bootstrap_addrs: &[String],
      ) -> crate::Result<()> {
          let (out_tx, mut out_rx) = channel(1);
-@@ -1322,7 +1363,7 @@ impl DhtState {
+@@ -1322,7 +1414,7 @@ impl DhtState {
  
              let token = config.cancellation_token.take().unwrap_or_default();
  
@@ -484,14 +621,13 @@ index c2defd32..a412b306 100644
              let state = Arc::new(Self::new_internal(
                  peer_id,
                  in_tx,
-@@ -1375,6 +1416,89 @@ impl DhtState {
+@@ -1375,6 +1467,88 @@ impl DhtState {
      // }
  }
  
 +#[cfg(test)]
 +mod queue_budget_tests {
 +    use super::*;
-+    use futures::FutureExt;
 +
 +    fn worker_request() -> WorkerSendRequest {
 +        WorkerSendRequest {
@@ -526,11 +662,9 @@ index c2defd32..a412b306 100644
 +        for _ in 0..MAX_PENDING_DISCOVERED_PEERS {
 +            peer_tx.try_send(addr).unwrap();
 +        }
-+        let blocked_peer = peer_tx.send(addr);
-+        tokio::pin!(blocked_peer);
-+        assert!(blocked_peer.as_mut().now_or_never().is_none());
++        assert!(matches!(peer_tx.try_send(addr), Err(TrySendError::Full(_))));
 +        assert_eq!(peer_rx.recv().await, Some(addr));
-+        assert!(blocked_peer.await.is_ok());
++        peer_tx.try_send(addr).unwrap();
 +
 +        let (node_tx, mut node_rx) = recursive_node_channel();
 +        for _ in 0..MAX_PENDING_RECURSIVE_NODES {
@@ -543,12 +677,11 @@ index c2defd32..a412b306 100644
 +        assert!(node_rx.recv().await.is_some());
 +        node_tx.try_send((None, addr, 0)).unwrap();
 +
-+        assert!(can_schedule_recursive_request(
-+            MAX_CONCURRENT_RECURSIVE_REQUESTS - 1
-+        ));
-+        assert!(!can_schedule_recursive_request(
-+            MAX_CONCURRENT_RECURSIVE_REQUESTS
-+        ));
++        let recursive = BoundedFuturesUnordered::new(MAX_CONCURRENT_RECURSIVE_REQUESTS);
++        for _ in 0..MAX_CONCURRENT_RECURSIVE_REQUESTS {
++            assert!(recursive.try_push(std::future::pending::<()>()).is_ok());
++        }
++        assert!(recursive.try_push(std::future::pending::<()>()).is_err());
 +
 +        let (maintenance_tx, mut maintenance_rx) = maintenance_channel();
 +        for _ in 0..MAX_PENDING_MAINTENANCE_REQUESTS {
@@ -561,13 +694,16 @@ index c2defd32..a412b306 100644
 +        assert!(maintenance_rx.recv().await.is_some());
 +        maintenance_tx.try_send(Id20::new([0; 20])).unwrap();
 +
-+        assert!(can_schedule_maintenance_request(
-+            MAX_CONCURRENT_MAINTENANCE_REQUESTS - 1
-+        ));
-+        assert!(!can_schedule_maintenance_request(
-+            MAX_CONCURRENT_MAINTENANCE_REQUESTS
-+        ));
-+        assert_eq!(MAX_CONCURRENT_BOOTSTRAPS, 8);
++        let maintenance = BoundedFuturesUnordered::new(MAX_CONCURRENT_MAINTENANCE_REQUESTS);
++        for _ in 0..MAX_CONCURRENT_MAINTENANCE_REQUESTS {
++            assert!(maintenance.try_push(std::future::pending::<()>()).is_ok());
++        }
++        assert!(maintenance.try_push(std::future::pending::<()>()).is_err());
++
++        assert_eq!(
++            root_queue_delay(&RootQueueStatus::Saturated),
++            REQUERY_INTERVAL
++        );
 +    }
 +}
 +
@@ -575,25 +711,32 @@ index c2defd32..a412b306 100644
      fn from_socket_addr(addr: SocketAddr) -> Option<Self>;
  }
 diff --git a/crates/librqbit/src/dht_utils.rs b/crates/librqbit/src/dht_utils.rs
-index f2f35d06..39bcab95 100644
+index f2f35d06..0fa89150 100644
 --- a/crates/librqbit/src/dht_utils.rs
 +++ b/crates/librqbit/src/dht_utils.rs
-@@ -12,6 +12,31 @@ use crate::{
+@@ -1,4 +1,8 @@
+-use std::{collections::HashSet, net::SocketAddr, sync::Arc};
++use std::{
++    collections::{HashSet, VecDeque},
++    net::SocketAddr,
++    sync::Arc,
++};
+ 
+ use anyhow::Context;
+ use buffers::ByteBufOwned;
+@@ -12,6 +16,85 @@ use crate::{
  };
  use librqbit_core::hash_id::Id20;
  
 +const MAX_CONCURRENT_METADATA_PEERS: usize = 128;
++const MAX_PENDING_METADATA_PEERS: usize = 256;
 +const MAX_METADATA_PEER_CANDIDATES: usize = 4096;
 +
 +#[derive(Debug, PartialEq, Eq)]
 +enum CandidateAdmission {
 +    Admitted,
 +    Duplicate,
-+    LimitReached,
-+}
-+
-+fn can_schedule_metadata_peer(active: usize) -> bool {
-+    active < MAX_CONCURRENT_METADATA_PEERS
++    Untracked,
 +}
 +
 +fn admit_metadata_peer(seen: &mut HashSet<SocketAddr>, addr: SocketAddr) -> CandidateAdmission {
@@ -601,24 +744,81 @@ index f2f35d06..39bcab95 100644
 +        return CandidateAdmission::Duplicate;
 +    }
 +    if seen.len() >= MAX_METADATA_PEER_CANDIDATES {
-+        return CandidateAdmission::LimitReached;
++        return CandidateAdmission::Untracked;
 +    }
 +    seen.insert(addr);
 +    CandidateAdmission::Admitted
 +}
 +
++struct MetadataPeerQueues<F> {
++    active: FuturesUnordered<F>,
++    pending: VecDeque<SocketAddr>,
++}
++
++impl<F> MetadataPeerQueues<F> {
++    fn new() -> Self {
++        Self {
++            active: FuturesUnordered::new(),
++            pending: VecDeque::new(),
++        }
++    }
++
++    fn can_accept(&self) -> bool {
++        self.active.len() < MAX_CONCURRENT_METADATA_PEERS
++            || self.pending.len() < MAX_PENDING_METADATA_PEERS
++    }
++
++    fn enqueue<M>(&mut self, addr: SocketAddr, make_future: &M) -> bool
++    where
++        M: Fn(SocketAddr) -> F,
++    {
++        if self.active.len() < MAX_CONCURRENT_METADATA_PEERS {
++            self.active.push(make_future(addr));
++            true
++        } else if self.pending.len() < MAX_PENDING_METADATA_PEERS {
++            self.pending.push_back(addr);
++            true
++        } else {
++            false
++        }
++    }
++
++    fn promote_pending<M>(&mut self, make_future: &M)
++    where
++        M: Fn(SocketAddr) -> F,
++    {
++        while self.active.len() < MAX_CONCURRENT_METADATA_PEERS {
++            let Some(addr) = self.pending.pop_front() else {
++                break;
++            };
++            self.active.push(make_future(addr));
++        }
++    }
++
++    fn is_empty(&self) -> bool {
++        self.active.is_empty() && self.pending.is_empty()
++    }
++
++    async fn next(&mut self) -> Option<F::Output>
++    where
++        F: std::future::Future,
++    {
++        self.active.next().await
++    }
++}
++
  #[derive(Debug)]
  #[allow(clippy::large_enum_variant)]
  pub enum ReadMetainfoResult<Rx> {
-@@ -38,15 +63,14 @@ pub async fn read_metainfo_from_peer_receiver<A: Stream<Item = SocketAddr> + Unp
+@@ -38,15 +121,14 @@ pub async fn read_metainfo_from_peer_receiver<A: Stream<Item = SocketAddr> + Unp
  ) -> ReadMetainfoResult<A> {
      let mut seen = HashSet::<SocketAddr>::new();
      let mut addrs = addrs_stream;
 -
 -    let semaphore = tokio::sync::Semaphore::new(128);
-+    let mut initial_addrs = initial_addrs.into_iter();
++    let mut initial_addrs = VecDeque::from(initial_addrs);
 +    let mut initial_addrs_completed = false;
-+    let mut candidate_limit_reached = false;
++    let mut candidate_limit_logged = false;
  
      let read_info_guarded = |addr| {
 -        let semaphore = &semaphore;
@@ -629,7 +829,7 @@ index f2f35d06..39bcab95 100644
              let ret = peer_info_reader::read_metainfo_from_peer(
                  addr,
                  peer_id,
-@@ -61,22 +85,38 @@ pub async fn read_metainfo_from_peer_receiver<A: Stream<Item = SocketAddr> + Unp
+@@ -61,27 +143,46 @@ pub async fn read_metainfo_from_peer_receiver<A: Stream<Item = SocketAddr> + Unp
              .instrument(debug_span!("read_metainfo_from_peer", ?addr))
              .await
              .with_context(|| format!("error reading metainfo from {addr}"));
@@ -638,73 +838,99 @@ index f2f35d06..39bcab95 100644
          }
      };
  
-     let mut unordered = FuturesUnordered::new();
- 
+-    let mut unordered = FuturesUnordered::new();
+-
 -    for a in initial_addrs {
 -        seen.insert(a);
 -        unordered.push(read_info_guarded(a));
 -    }
--
++    let mut queues = MetadataPeerQueues::new();
+ 
      let mut addrs_completed = false;
  
      loop {
 -        if addrs_completed && unordered.is_empty() {
-+        while !initial_addrs_completed && can_schedule_metadata_peer(unordered.len()) {
-+            let Some(addr) = initial_addrs.next() else {
++        queues.promote_pending(&read_info_guarded);
++
++        while !initial_addrs_completed && queues.can_accept() {
++            let Some(addr) = initial_addrs.pop_front() else {
 +                initial_addrs_completed = true;
 +                break;
 +            };
 +            match admit_metadata_peer(&mut seen, addr) {
-+                CandidateAdmission::Admitted => unordered.push(read_info_guarded(addr)),
++                CandidateAdmission::Admitted => {
++                    debug_assert!(queues.enqueue(addr, &read_info_guarded));
++                }
 +                CandidateAdmission::Duplicate => {}
-+                CandidateAdmission::LimitReached => {
-+                    candidate_limit_reached = true;
-+                    initial_addrs_completed = true;
++                CandidateAdmission::Untracked => {
++                    if !candidate_limit_logged {
++                        debug!(
++                            limit = MAX_METADATA_PEER_CANDIDATES,
++                            "metadata peer deduplication limit reached; continuing without tracking new candidates"
++                        );
++                        candidate_limit_logged = true;
++                    }
++                    debug_assert!(queues.enqueue(addr, &read_info_guarded));
 +                }
 +            }
 +        }
 +
-+        if candidate_limit_reached && unordered.is_empty() {
-+            debug!(
-+                limit = MAX_METADATA_PEER_CANDIDATES,
-+                "metadata peer candidate limit reached"
-+            );
-+            return ReadMetainfoResult::ChannelClosed { seen };
-+        }
-+        if initial_addrs_completed && addrs_completed && unordered.is_empty() {
++        if initial_addrs_completed && addrs_completed && queues.is_empty() {
              return ReadMetainfoResult::ChannelClosed { seen };
          }
  
-@@ -91,11 +131,16 @@ pub async fn read_metainfo_from_peer_receiver<A: Stream<Item = SocketAddr> + Unp
+         tokio::select! {
+-            done = unordered.next(), if !unordered.is_empty() => {
++            done = queues.next(), if !queues.active.is_empty() => {
+                 match done {
+                     Some(Ok((info, info_bytes))) => return ReadMetainfoResult::Found { info, info_bytes, seen, rx: addrs },
+                     Some(Err(e)) => {
+@@ -91,11 +192,26 @@ pub async fn read_metainfo_from_peer_receiver<A: Stream<Item = SocketAddr> + Unp
                  }
              }
  
 -            next_addr = addrs.next(), if !addrs_completed => {
 +            next_addr = addrs.next(), if initial_addrs_completed
 +                && !addrs_completed
-+                && !candidate_limit_reached
-+                && can_schedule_metadata_peer(unordered.len()) => {
++                && queues.can_accept() => {
                  match next_addr {
                      Some(addr) => {
 -                        if seen.insert(addr) {
 -                            unordered.push(read_info_guarded(addr));
 +                        match admit_metadata_peer(&mut seen, addr) {
-+                            CandidateAdmission::Admitted => unordered.push(read_info_guarded(addr)),
++                            CandidateAdmission::Admitted => {
++                                debug_assert!(queues.enqueue(addr, &read_info_guarded));
++                            }
 +                            CandidateAdmission::Duplicate => {}
-+                            CandidateAdmission::LimitReached => candidate_limit_reached = true,
++                            CandidateAdmission::Untracked => {
++                                if !candidate_limit_logged {
++                                    debug!(
++                                        limit = MAX_METADATA_PEER_CANDIDATES,
++                                        "metadata peer deduplication limit reached; continuing without tracking new candidates"
++                                    );
++                                    candidate_limit_logged = true;
++                                }
++                                debug_assert!(queues.enqueue(addr, &read_info_guarded));
++                            }
                          }
                          continue;
                      },
-@@ -121,6 +166,34 @@ mod tests {
+@@ -121,6 +237,40 @@ mod tests {
  
      static LOG_INIT: Once = Once::new();
  
 +    #[test]
-+    fn metadata_peer_budgets_close_at_exact_boundaries() {
-+        assert!(can_schedule_metadata_peer(
-+            MAX_CONCURRENT_METADATA_PEERS - 1
-+        ));
-+        assert!(!can_schedule_metadata_peer(MAX_CONCURRENT_METADATA_PEERS));
++    fn production_metadata_queues_close_at_exact_boundaries() {
++        let mut queues = MetadataPeerQueues::new();
++        let make_future = |_| std::future::pending::<()>();
++        for port in 1..=(MAX_CONCURRENT_METADATA_PEERS + MAX_PENDING_METADATA_PEERS) {
++            let addr = SocketAddr::from(([127, 0, 0, 1], port as u16));
++            assert!(queues.enqueue(addr, &make_future));
++        }
++        assert_eq!(queues.active.len(), MAX_CONCURRENT_METADATA_PEERS);
++        assert_eq!(queues.pending.len(), MAX_PENDING_METADATA_PEERS);
++        assert!(!queues.can_accept());
++        assert!(!queues.enqueue(SocketAddr::from(([127, 0, 0, 2], 1)), &make_future));
 +
 +        let mut seen = HashSet::new();
 +        for port in 1..=MAX_METADATA_PEER_CANDIDATES {
@@ -722,7 +948,7 @@ index f2f35d06..39bcab95 100644
 +        let overflow = SocketAddr::from(([127, 0, 0, 2], 1));
 +        assert_eq!(
 +            admit_metadata_peer(&mut seen, overflow),
-+            CandidateAdmission::LimitReached
++            CandidateAdmission::Untracked
 +        );
 +        assert_eq!(seen.len(), MAX_METADATA_PEER_CANDIDATES);
 +    }
@@ -731,7 +957,7 @@ index f2f35d06..39bcab95 100644
          #[allow(unused_must_use)]
          LOG_INIT.call_once(|| {
 diff --git a/crates/librqbit_lsd/src/lib.rs b/crates/librqbit_lsd/src/lib.rs
-index d66583a1..966d2d48 100644
+index d66583a1..a3de272e 100644
 --- a/crates/librqbit_lsd/src/lib.rs
 +++ b/crates/librqbit_lsd/src/lib.rs
 @@ -14,7 +14,7 @@ use futures::Stream;
@@ -765,7 +991,7 @@ index d66583a1..966d2d48 100644
      port: Option<u16>,
      last_reply_ipv4: RateLimiter,
      last_reply_ipv6: RateLimiter,
-@@ -65,10 +71,27 @@ struct Announce {
+@@ -65,10 +71,43 @@ struct Announce {
  struct LocalServiceDiscoveryInner {
      socket: MulticastUdpSocket,
      cookie: u32,
@@ -774,26 +1000,42 @@ index d66583a1..966d2d48 100644
      receivers: RwLock<HashMap<Id20, Announce>>,
  }
  
-+fn finish_announce(
-+    receivers: &RwLock<HashMap<Id20, Announce>>,
++struct AnnounceLifecycle {
 +    info_hash: Id20,
 +    announce_id: u64,
-+    cancel_token: &CancellationToken,
-+) {
-+    cancel_token.cancel();
-+    let mut receivers = receivers.write();
-+    if receivers
-+        .get(&info_hash)
-+        .is_some_and(|announce| announce.id == announce_id)
-+    {
-+        receivers.remove(&info_hash);
++    cancel_token: CancellationToken,
++}
++
++impl AnnounceLifecycle {
++    fn finish(&self, receivers: &RwLock<HashMap<Id20, Announce>>) {
++        self.cancel_token.cancel();
++        let mut receivers = receivers.write();
++        if receivers
++            .get(&self.info_hash)
++            .is_some_and(|announce| announce.id == self.announce_id)
++        {
++            receivers.remove(&self.info_hash);
++        }
 +    }
++}
++
++fn spawn_announce_task<E: std::fmt::Display + Send + 'static>(
++    lifecycle: &AnnounceLifecycle,
++    port: u16,
++    future: impl std::future::Future<Output = Result<(), E>> + Send + 'static,
++) -> tokio::task::JoinHandle<()> {
++    spawn_with_cancel(
++        debug_span!(parent: None, "lsd-announce", info_hash=?lifecycle.info_hash, port),
++        "lsd-announce",
++        lifecycle.cancel_token.clone(),
++        future,
++    )
 +}
 +
  #[derive(Clone)]
  pub struct LocalServiceDiscovery {
      inner: Arc<LocalServiceDiscoveryInner>,
-@@ -97,6 +120,7 @@ impl LocalServiceDiscovery {
+@@ -97,6 +136,7 @@ impl LocalServiceDiscovery {
              inner: Arc::new(LocalServiceDiscoveryInner {
                  socket,
                  cookie,
@@ -801,7 +1043,7 @@ index d66583a1..966d2d48 100644
                  cancel_token: opts.cancel_token.clone(),
                  receivers: Default::default(),
              }),
-@@ -172,7 +196,9 @@ cookie: {cookie}\r
+@@ -172,7 +212,9 @@ cookie: {cookie}\r
              let mut addr = addr;
              addr.set_port(bts.port);
  
@@ -812,7 +1054,7 @@ index d66583a1..966d2d48 100644
  
              let announce_port = return_if_none!(announce.port);
  
-@@ -237,11 +263,15 @@ cookie: {cookie}\r
+@@ -237,11 +279,18 @@ cookie: {cookie}\r
          // 1. Periodically announce the torrent.
          // 2. Stream back the results from received messages.
  
@@ -820,60 +1062,60 @@ index d66583a1..966d2d48 100644
 +        let (tx, rx) = peer_channel();
 +        let announce_id = self.inner.next_announce_id.fetch_add(1, Ordering::Relaxed);
 +        let cancel_token = self.inner.cancel_token.child_token();
++        let lifecycle = AnnounceLifecycle {
++            info_hash,
++            announce_id,
++            cancel_token,
++        };
  
          struct AddrStream {
-             info_hash: Id20,
+-            info_hash: Id20,
 -            rx: UnboundedReceiver<SocketAddr>,
-+            announce_id: u64,
-+            cancel_token: CancellationToken,
++            lifecycle: AnnounceLifecycle,
 +            rx: Receiver<SocketAddr>,
              lsd: LocalServiceDiscovery,
          }
  
-@@ -258,13 +288,19 @@ cookie: {cookie}\r
+@@ -258,13 +307,14 @@ cookie: {cookie}\r
  
          impl Drop for AddrStream {
              fn drop(&mut self) {
 -                let _ = self.lsd.inner.receivers.write().remove(&self.info_hash);
-+                finish_announce(
-+                    &self.lsd.inner.receivers,
-+                    self.info_hash,
-+                    self.announce_id,
-+                    &self.cancel_token,
-+                );
++                self.lifecycle.finish(&self.lsd.inner.receivers);
              }
          }
  
          self.inner.receivers.write().insert(
              info_hash,
              Announce {
-+                id: announce_id,
++                id: lifecycle.announce_id,
                  tx,
                  port: announce_port,
                  last_reply_ipv4: Default::default(),
-@@ -273,11 +309,10 @@ cookie: {cookie}\r
+@@ -273,18 +323,16 @@ cookie: {cookie}\r
          );
  
          if let Some(announce_port) = announce_port {
 -            let cancel_token = self.inner.cancel_token.child_token();
-             spawn_with_cancel(
-                 debug_span!(parent: None, "lsd-announce", ?info_hash, port=announce_port),
-                 "lsd-announce",
+-            spawn_with_cancel(
+-                debug_span!(parent: None, "lsd-announce", ?info_hash, port=announce_port),
+-                "lsd-announce",
 -                cancel_token,
-+                cancel_token.clone(),
++            spawn_announce_task(
++                &lifecycle,
++                announce_port,
                  self.clone()
                      .task_announce_periodically(info_hash, announce_port),
              );
-@@ -285,6 +320,8 @@ cookie: {cookie}\r
+         }
  
          AddrStream {
-             info_hash,
-+            announce_id,
-+            cancel_token,
+-            info_hash,
++            lifecycle,
              rx,
              lsd: self.clone(),
          }
-@@ -347,3 +384,47 @@ fn try_parse_bt_search<'a: 'h, 'h>(
+@@ -347,3 +395,63 @@ fn try_parse_bt_search<'a: 'h, 'h>(
          _ => anyhow::bail!("expecting BT-SEARCH"),
      }
  }
@@ -892,8 +1134,8 @@ index d66583a1..966d2d48 100644
 +        }
 +    }
 +
-+    #[test]
-+    fn result_queue_and_registration_lifecycle_are_bounded() {
++    #[tokio::test]
++    async fn production_queue_and_announce_lifecycle_are_bounded() {
 +        let addr = SocketAddr::from(([127, 0, 0, 1], 6881));
 +        let (tx, _rx) = peer_channel();
 +        for _ in 0..MAX_PENDING_LSD_PEERS {
@@ -910,14 +1152,30 @@ index d66583a1..966d2d48 100644
 +            .write()
 +            .insert(info_hash, announce(2, tx.clone()));
 +
-+        let stale_token = CancellationToken::new();
-+        finish_announce(&registrations, info_hash, 1, &stale_token);
-+        assert!(stale_token.is_cancelled());
++        let stale = AnnounceLifecycle {
++            info_hash,
++            announce_id: 1,
++            cancel_token: CancellationToken::new(),
++        };
++        stale.finish(&registrations);
++        assert!(stale.cancel_token.is_cancelled());
 +        assert_eq!(registrations.read().get(&info_hash).unwrap().id, 2);
 +
-+        let current_token = CancellationToken::new();
-+        finish_announce(&registrations, info_hash, 2, &current_token);
-+        assert!(current_token.is_cancelled());
++        let current = AnnounceLifecycle {
++            info_hash,
++            announce_id: 2,
++            cancel_token: CancellationToken::new(),
++        };
++        let task = spawn_announce_task(&current, 6881, async {
++            std::future::pending::<()>().await;
++            Ok::<(), std::convert::Infallible>(())
++        });
++        current.finish(&registrations);
++        tokio::time::timeout(Duration::from_secs(1), task)
++            .await
++            .expect("announce task must observe stream cancellation")
++            .unwrap();
++        assert!(current.cancel_token.is_cancelled());
 +        assert!(!registrations.read().contains_key(&info_hash));
 +    }
 +}

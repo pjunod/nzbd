@@ -40,7 +40,7 @@ authorize production wiring.
 | 6. Path and delete safety | **Pass** | The adapter now repeats the portable lexical path invariant before rqbit admission: unnamed payloads, empty/dot/parent components, slash or backslash, absolute/UNC forms, Windows drive prefixes and device aliases, alternate-data-stream and other reserved characters, trailing dot/space aliases, malformed UTF-8, empty multi-file paths, missing/unsafe multi-file roots, metainfo-declared symlinks, exact duplicate paths, file-versus-directory-prefix overlaps, and portable Unicode NFC/simple-case-fold collisions fail with safe nzbd-owned errors. Greek sigma, long-s, and Windows dotless-i aliases are covered without collapsing compatibility-only ligature or width pairs. rqbit's shared `torrent-content` fallback is therefore never used for an unnamed single-file torrent. Magnet input first resolves through rqbit's list-only path, which returns before storage construction; nzbd then applies the same metainfo contract and admits only the validated bytes. A fake BEP 9 peer proves an unsafe resolved path leaves the destination empty, and the real-admission corpus still proves rejection before an escape file exists. The session canonicalizes its output root and preflights every existing payload prefix with no-follow metadata: symlinks fail, prefixes must be directories, and leaves must be regular files while an existing regular leaf remains valid resume input. A Unix test proves a symlink is rejected before storage and its external target remains empty. This is defense in depth, not a claim to close the check/write race. The importer-safe content inventory omits BEP 47 padding entries while raw engine-indexed progress remains available only as diagnostics. Delete-data removes only parsed torrent content; an unrelated sibling survives. Higher layers must still prove persisted delete-root authority, descriptor-relative containment across writes, and empirical filesystem-specific case/normalization behavior in M5/M2. |
 | 7. Public observability | **Fail** | Public stats expose phase, total/progress/upload bytes, file progress, rates, ETA inputs, peer counts, completion, and error. Stable 8.1.1 does not expose per-torrent tracker state, DHT state, or last tracker error. A tested upstream patch now supplies that snapshot, but this gate remains failed until an accepted stable release contains it. “No peers” cannot safely substitute for those facts. |
 | 8. nzbd-authoritative persistence | **Fail** | The contract test proves that `Session::new_with_opts` auto-restores the library record before returning. The persistence module and store injection point are private in 8.1.1, so nzbd cannot filter first. A tested upstream patch now supplies the missing opt-out, but this gate remains failed until an accepted stable release contains it. |
-| 9. Resource, package, and license delta | **Partial** | Measurements are recorded in §4. A blocking cargo-deny 0.20.2 policy passes locally across all features and the locked graph, and its [first Actions run passed](https://github.com/pjunod/nzbd/actions/runs/31064446916) on 2026-08-06 UTC. The repository-wide Supply chain check also freezes the reviewed advisory package/feature sets and sole MPL-2.0 package path without pinning nzbd's own version. Stable 8.1.1 hard-codes 128 live peers per torrent, exposes no session-wide cap, retains an unbounded known-peer set, and leaves the pre-routing incoming-handshake set unbounded; its HTTP tracker path also has no request deadline, buffers the whole response, and accepts a zero announce interval. Established peers can additionally pipeline piece and metadata requests into unbounded scheduler/writer queues. DHT datagrams, recursive nodes, maintenance/bootstraps, delivered peers, and metadata candidates have separate unbounded retained-work paths; current main adds an unbounded LSD result stream. Tested contribution candidates now prove each runtime boundary, but they are not shipped capability. The adapter's input caps cannot close those gaps. The [gate 9 review brief](BITTORRENT_GATE9_REVIEW.md) isolates the remaining human acceptance and resource-control decisions. |
+| 9. Resource, package, and license delta | **Partial** | Measurements are recorded in §4. A blocking cargo-deny 0.20.2 policy passes locally across all features and the locked graph, and its [first Actions run passed](https://github.com/pjunod/nzbd/actions/runs/31064446916) on 2026-08-06 UTC. The repository-wide Supply chain check also freezes the reviewed advisory package/feature sets and sole MPL-2.0 package path without pinning nzbd's own version. Stable 8.1.1 hard-codes 128 live peers per torrent, exposes no session-wide cap, retains an unbounded known-peer set, and leaves the pre-routing incoming-handshake set unbounded; its HTTP tracker path also has no request deadline, buffers the whole response, and accepts a zero announce interval. Established peers can additionally pipeline piece and metadata requests into unbounded scheduler/writer queues. DHT datagrams, recursive nodes, maintenance work, delivered peers, and metadata queues have separate unbounded retained-work paths; current main adds an unbounded LSD result stream. Tested contribution candidates now prove each runtime boundary, but they are not shipped capability. The adapter's input caps cannot close those gaps. The [gate 9 review brief](BITTORRENT_GATE9_REVIEW.md) isolates the remaining human acceptance and resource-control decisions. |
 | 10. One explicit rustls provider | **Pass** | The process starts without a provider, explicitly installs aws-lc, and constructs librqbit’s rustls client without the mixed-provider panic. |
 | 11. v1-only boundary | **Pass** | Stable input uses v1 pieces/`btih`; v2-only and hybrid `.torrent` files and magnets return separate named errors before managed-torrent admission. Magnet classification reads decoded `xt` query parameters rather than searching the whole URI, so version-looking text in a display name or tracker URL cannot create a false v2/hybrid result. The adapter accepts one valid 40-hex or 32-base32 `btih`, rejects missing, malformed, or duplicate v1 topics by name, and rechecks the resolved info dictionary before storage exists. |
 
@@ -262,11 +262,14 @@ slow socket delay draining. Valid BEP 9 metadata requests bypass the scheduler
 and enter that same writer directly. A socket timeout bounds one write's
 lifetime, not the number of queued response records. The contribution kit now
 carries stable and main candidates with one 128-permit response window per
-peer. Each permit follows a piece response through scheduler and writer or a
-metadata response through the writer and is released only after the writer
-drops it. The exact test proves moving work between queues does not reopen the
-window, and an intentional guard bypass makes that test fail. The preliminary
-128 policy and backpressure behavior require human acceptance, and the patch
+peer and advertises that window as BEP 10 `reqq`. Admission is non-blocking: a
+peer that exceeds the advertised outstanding-response window is disconnected,
+so its socket reader never waits behind torrent-global upload throttling. Each
+permit follows a piece response through scheduler and writer or a metadata
+response through the writer and is released only after the socket write
+completes or is cancelled. Production-path admission and blocked-write tests
+fail when those guards are intentionally bypassed. The preliminary 128 policy
+and over-window disconnect behavior require human acceptance, and the patch
 remains unreleased evidence, so gate 9 stays Partial.
 
 The same audit followed discovery work back before live-peer admission. Both
@@ -274,19 +277,25 @@ source lines use unbounded channels for outgoing DHT datagrams, recursive
 nodes, and delivered peers; recursive futures can also grow without a fixed
 active-work limit. Bucket refreshes and questionable-node pings add unbounded
 maintenance channels/future sets, while bootstrap starts every configured
-hostname concurrently. The magnet metadata resolver's semaphore limits active
-I/O but not queued futures or its retained unique-address set. Current main
-adds an unbounded LSD result stream and leaves its periodic announcer alive
+hostname concurrently. That finite configuration fan-out is intentionally
+unchanged because an eight-host concurrency window can let one hostname's
+24-hour retry budget starve later entries. The magnet metadata resolver's
+semaphore limits active I/O but not queued futures or its retained
+unique-address set. Current main adds an unbounded LSD result stream and leaves
+its periodic announcer alive
 after the stream is dropped. The contribution kit now carries stable and main
 candidates with 256-record DHT send, recursive-node, and delivered-peer queues;
 32 active recursive requests per worker; 256 queued and 32 active DHT
-maintenance requests per worker; eight concurrent bootstrap attempts; 128
-active metadata attempts; and 4,096 unique metadata candidates. The main
-candidate also bounds LSD results at 256, ties the announce task to the stream
+maintenance requests per worker; 128 active metadata attempts; 256 pending
+metadata candidates; and a 4,096-entry deduplication set that does not
+terminate discovery. The main candidate also bounds LSD results at 256, ties
+the announce task to the stream
 lifecycle, protects replacement registrations, and keeps protocol replies
-independent of local result saturation. Both
-candidates reuse one DHT response per recursive step instead of issuing the
-same request twice. Exact-boundary proofs pass and deliberate DHT/LSD guard
+independent of local result saturation. Both candidates process recursive
+nodes before best-effort peer delivery, use the
+normal requery delay when the node queue is saturated, and reuse one DHT
+response per recursive step instead of issuing the same request twice.
+Exact-boundary proofs pass and deliberate DHT/LSD guard
 regressions fail. These values and overload policies remain unreleased evidence,
 so gate 9 stays Partial and production discovery remains disabled.
 
@@ -473,7 +482,7 @@ inside its peer metadata reader. An embedding application can reject resolved
 metainfo afterward, but that is too late to enforce nzbd's proposed 10 MiB
 hostile-input allocation limit for magnets.
 
-[`contrib/rqbit/0005-limit-peer-metadata-before-allocation.patch`](../contrib/rqbit/0005-limit-peer-metadata-before-allocation.patch)
+[`contrib/rqbit/0016-limit-peer-metadata-before-allocation.patch`](../contrib/rqbit/0016-limit-peer-metadata-before-allocation.patch)
 targets the exact v8.1.1 commit, and `0006` carries the same change for the
 documented rqbit-main base. They add an optional
 `PeerConnectionOptions::max_metadata_size`, merge it through the existing

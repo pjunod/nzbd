@@ -1,5 +1,5 @@
 diff --git a/crates/dht/src/dht.rs b/crates/dht/src/dht.rs
-index c255e75e..1c3f18da 100644
+index c255e75e..39a72eed 100644
 --- a/crates/dht/src/dht.rs
 +++ b/crates/dht/src/dht.rs
 @@ -39,7 +39,7 @@ use parking_lot::RwLock;
@@ -11,7 +11,7 @@ index c255e75e..1c3f18da 100644
  };
  
  use tokio_util::sync::CancellationToken;
-@@ -64,6 +64,40 @@ pub struct WorkerSendRequest {
+@@ -64,6 +64,83 @@ pub struct WorkerSendRequest {
      addr: SocketAddr,
  }
  
@@ -21,7 +21,6 @@ index c255e75e..1c3f18da 100644
 +const MAX_CONCURRENT_RECURSIVE_REQUESTS: usize = 32;
 +const MAX_PENDING_MAINTENANCE_REQUESTS: usize = 256;
 +const MAX_CONCURRENT_MAINTENANCE_REQUESTS: usize = 32;
-+const MAX_CONCURRENT_BOOTSTRAPS: usize = 8;
 +
 +type RecursiveNode = (Option<Id20>, SocketAddr, usize);
 +
@@ -41,27 +40,78 @@ index c255e75e..1c3f18da 100644
 +    channel(MAX_PENDING_MAINTENANCE_REQUESTS)
 +}
 +
-+fn can_schedule_recursive_request(active: usize) -> bool {
-+    active < MAX_CONCURRENT_RECURSIVE_REQUESTS
++struct BoundedFuturesUnordered<F> {
++    futures: FuturesUnordered<F>,
++    limit: usize,
 +}
 +
-+fn can_schedule_maintenance_request(active: usize) -> bool {
-+    active < MAX_CONCURRENT_MAINTENANCE_REQUESTS
++impl<F> BoundedFuturesUnordered<F> {
++    fn new(limit: usize) -> Self {
++        Self {
++            futures: FuturesUnordered::new(),
++            limit,
++        }
++    }
++
++    fn try_push(&self, future: F) -> Result<(), F> {
++        if self.futures.len() >= self.limit {
++            return Err(future);
++        }
++        self.futures.push(future);
++        Ok(())
++    }
++
++    fn is_empty(&self) -> bool {
++        self.futures.is_empty()
++    }
++
++    fn is_full(&self) -> bool {
++        self.futures.len() >= self.limit
++    }
++
++    async fn next(&mut self) -> Option<F::Output>
++    where
++        F: std::future::Future,
++    {
++        self.futures.next().await
++    }
++}
++
++#[derive(Debug, PartialEq, Eq)]
++enum RootQueueStatus {
++    Empty,
++    Queued(usize),
++    Saturated,
++}
++
++fn root_queue_delay(status: &RootQueueStatus) -> Duration {
++    match status {
++        RootQueueStatus::Empty => Duration::from_secs(1),
++        RootQueueStatus::Queued(n) if *n < 8 => REQUERY_INTERVAL / 8 * (*n as u32),
++        RootQueueStatus::Queued(_) | RootQueueStatus::Saturated => REQUERY_INTERVAL,
++    }
 +}
 +
  #[derive(Debug)]
  struct MaybeUsefulNode {
      id: Id20,
-@@ -144,7 +178,7 @@ impl RecursiveRequestCallbacks for RecursiveRequestCallbacksGetPeers {
+@@ -144,11 +221,13 @@ impl RecursiveRequestCallbacks for RecursiveRequestCallbacksGetPeers {
              port: announce_port,
          });
  
 -        let _ = req.dht.worker_sender.send(WorkerSendRequest {
-+        let _ = req.dht.try_send_worker(WorkerSendRequest {
++        if let Err(error) = req.dht.try_send_worker(WorkerSendRequest {
              our_tid: Some(tid),
              message,
              addr,
-@@ -187,20 +221,20 @@ struct RecursiveRequest<C: RecursiveRequestCallbacks> {
+-        });
++        }) {
++            debug!(?error, "failed to enqueue DHT announce");
++        }
+     }
+ }
+ 
+@@ -187,20 +266,20 @@ struct RecursiveRequest<C: RecursiveRequestCallbacks> {
      request: Request,
      dht: Arc<DhtState>,
      useful_nodes: RwLock<Vec<MaybeUsefulNode>>,
@@ -87,7 +137,7 @@ index c255e75e..1c3f18da 100644
          let rp = Arc::new(RecursiveRequest {
              max_depth: 4,
              info_hash,
-@@ -250,7 +284,7 @@ impl RecursiveRequest<RecursiveRequestCallbacksFindNodes> {
+@@ -250,7 +329,7 @@ impl RecursiveRequest<RecursiveRequestCallbacksFindNodes> {
          target: Id20,
          addrs: impl Iterator<Item = SocketAddr>,
      ) -> anyhow::Result<()> {
@@ -96,7 +146,7 @@ index c255e75e..1c3f18da 100644
          let req = RecursiveRequest {
              max_depth: 4,
              info_hash: target,
-@@ -258,7 +292,7 @@ impl RecursiveRequest<RecursiveRequestCallbacksFindNodes> {
+@@ -258,7 +337,7 @@ impl RecursiveRequest<RecursiveRequestCallbacksFindNodes> {
              dht,
              useful_nodes_limit: 32,
              useful_nodes: RwLock::new(Vec::new()),
@@ -105,7 +155,7 @@ index c255e75e..1c3f18da 100644
              node_tx,
              callbacks: RecursiveRequestCallbacksFindNodes {},
          };
-@@ -276,33 +310,33 @@ impl RecursiveRequest<RecursiveRequestCallbacksFindNodes> {
+@@ -276,33 +355,33 @@ impl RecursiveRequest<RecursiveRequestCallbacksFindNodes> {
                  ))
          };
  
@@ -122,7 +172,7 @@ index c255e75e..1c3f18da 100644
 +            }
          }
  
-+        let mut futs = FuturesUnordered::new();
++        let mut futs = BoundedFuturesUnordered::new(MAX_CONCURRENT_RECURSIVE_REQUESTS);
          let mut successes = 0;
          let mut errors = 0;
  
@@ -135,12 +185,8 @@ index c255e75e..1c3f18da 100644
  
 -                r = node_rx.recv() => {
 -                    let (id, addr, depth) = r.unwrap();
-+                r = node_rx.recv(), if can_schedule_recursive_request(futs.len()) => {
-+                    let Some((id, addr, depth)) = r else {
-+                        break;
-+                    };
-                     futs.push(request_one(id, addr, depth))
-                 },
+-                    futs.push(request_one(id, addr, depth))
+-                },
 -                f = futs.next() => {
 -                    let f = match f {
 -                        Some(f) => f,
@@ -148,12 +194,17 @@ index c255e75e..1c3f18da 100644
 -                            // find_node recursion finished.
 -                            break;
 -                        }
--                    };
++                r = node_rx.recv(), if !futs.is_full() => {
++                    let Some((id, addr, depth)) = r else {
++                        break;
+                     };
++                    debug_assert!(futs.try_push(request_one(id, addr, depth)).is_ok());
++                },
 +                Some(f) = futs.next(), if !futs.is_empty() => {
                      if f.is_ok() {
                          successes += 1;
                      } else {
-@@ -324,7 +358,7 @@ impl RecursiveRequest<RecursiveRequestCallbacksFindNodes> {
+@@ -324,7 +403,7 @@ impl RecursiveRequest<RecursiveRequestCallbacksFindNodes> {
  impl RecursiveRequest<RecursiveRequestCallbacksGetPeers> {
      fn request_peers_forever(
          self: &Arc<Self>,
@@ -162,16 +213,48 @@ index c255e75e..1c3f18da 100644
      ) -> tokio::task::JoinHandle<()> {
          let this = self.clone();
          spawn(
-@@ -356,7 +390,7 @@ impl RecursiveRequest<RecursiveRequestCallbacksGetPeers> {
-                 let mut futs = FuturesUnordered::new();
+@@ -338,9 +417,7 @@ impl RecursiveRequest<RecursiveRequestCallbacksGetPeers> {
+                         loop {
+                             trace!("iteration {}", iteration);
+                             let sleep = match this.get_peers_root() {
+-                                Ok(0) => Duration::from_secs(1),
+-                                Ok(n) if n < 8 => REQUERY_INTERVAL / 8 * (n as u32),
+-                                Ok(_) => REQUERY_INTERVAL,
++                                Ok(status) => root_queue_delay(&status),
+                                 Err(e) => {
+                                     error!("error in get_peers_root(): {e:#}");
+                                     return Err::<(), anyhow::Error>(e);
+@@ -353,16 +430,16 @@ impl RecursiveRequest<RecursiveRequestCallbacksGetPeers> {
+                 };
+                 tokio::pin!(looper);
+ 
+-                let mut futs = FuturesUnordered::new();
++                let mut futs = BoundedFuturesUnordered::new(MAX_CONCURRENT_RECURSIVE_REQUESTS);
                  loop {
                      tokio::select! {
 -                        addr = node_rx.recv() => {
-+                        addr = node_rx.recv(), if can_schedule_recursive_request(futs.len()) => {
++                        addr = node_rx.recv(), if !futs.is_full() => {
                              let (id, addr, depth) = addr.unwrap();
-                             futs.push(
+-                            futs.push(
++                            debug_assert!(futs.try_push(
                                  this.request_one(id, addr, depth)
-@@ -385,8 +419,11 @@ impl RecursiveRequest<RecursiveRequestCallbacksGetPeers> {
+                                     .map_err(|e| debug!("error: {e:#}"))
+                                     .instrument(error_span!("addr", addr=addr.to_string()))
+-                            );
++                            ).is_ok());
+                         }
+                         Some(_) = futs.next(), if !futs.is_empty() => {}
+                         r = &mut looper => {
+@@ -374,7 +451,7 @@ impl RecursiveRequest<RecursiveRequestCallbacksGetPeers> {
+         )
+     }
+ 
+-    fn get_peers_root(&self) -> anyhow::Result<usize> {
++    fn get_peers_root(&self) -> anyhow::Result<RootQueueStatus> {
+         let mut count = 0;
+         for (id, addr) in self
+             .dht
+@@ -385,10 +462,17 @@ impl RecursiveRequest<RecursiveRequestCallbacksGetPeers> {
              .map(|n| (n.id(), n.addr()))
              .take(8)
          {
@@ -179,13 +262,20 @@ index c255e75e..1c3f18da 100644
 -            self.node_tx.send((Some(id), addr, 0))?;
 +            match self.node_tx.try_send((Some(id), addr, 0)) {
 +                Ok(()) => count += 1,
-+                Err(TrySendError::Full(_)) => break,
++                Err(TrySendError::Full(_)) => return Ok(RootQueueStatus::Saturated),
 +                Err(TrySendError::Closed(_)) => bail!("recursive request queue closed"),
 +            }
++        }
++        if count == 0 {
++            Ok(RootQueueStatus::Empty)
++        } else {
++            Ok(RootQueueStatus::Queued(count))
          }
-         Ok(count)
+-        Ok(count)
      }
-@@ -403,6 +440,7 @@ impl<C: RecursiveRequestCallbacks> RecursiveRequest<C> {
+ }
+ 
+@@ -403,6 +487,7 @@ impl<C: RecursiveRequestCallbacks> RecursiveRequest<C> {
              self.callbacks.on_request_start(self, id, addr);
          }
  
@@ -193,7 +283,7 @@ index c255e75e..1c3f18da 100644
          let response = self
              .dht
              .request(self.request.clone(), addr)
-@@ -414,7 +452,7 @@ impl<C: RecursiveRequestCallbacks> RecursiveRequest<C> {
+@@ -414,7 +499,7 @@ impl<C: RecursiveRequestCallbacks> RecursiveRequest<C> {
              self.callbacks.on_request_end(self, id, addr, &response);
          }
  
@@ -202,19 +292,20 @@ index c255e75e..1c3f18da 100644
              Ok(ResponseOrError::Response(r)) => r,
              Ok(ResponseOrError::Error(e)) => bail!("error response: {:?}", e),
              Err(e) => {
-@@ -425,7 +463,10 @@ impl<C: RecursiveRequestCallbacks> RecursiveRequest<C> {
- 
-         if let Some(peers) = response.values {
-             for peer in peers {
--                self.peer_tx.send(SocketAddr::V4(peer.addr))?;
-+                self.peer_tx
-+                    .send(SocketAddr::V4(peer.addr))
-+                    .await
-+                    .context("discovered peer receiver closed")?;
+@@ -423,12 +508,6 @@ impl<C: RecursiveRequestCallbacks> RecursiveRequest<C> {
              }
-         }
+         };
  
-@@ -442,7 +483,13 @@ impl<C: RecursiveRequestCallbacks> RecursiveRequest<C> {
+-        if let Some(peers) = response.values {
+-            for peer in peers {
+-                self.peer_tx.send(SocketAddr::V4(peer.addr))?;
+-            }
+-        }
+-
+         if let Some(nodes) = response.nodes {
+             for node in nodes.nodes {
+                 let addr = SocketAddr::V4(node.addr);
+@@ -442,7 +521,25 @@ impl<C: RecursiveRequestCallbacks> RecursiveRequest<C> {
                      self.max_depth
                  );
                  if should_request {
@@ -226,10 +317,22 @@ index c255e75e..1c3f18da 100644
 +                        }
 +                        Err(TrySendError::Closed(_)) => bail!("recursive request queue closed"),
 +                    }
++                }
++            }
++        }
++        if let Some(peers) = response.values {
++            for peer in peers {
++                let addr = SocketAddr::V4(peer.addr);
++                match self.peer_tx.try_send(addr) {
++                    Ok(()) => {}
++                    Err(TrySendError::Full(_)) => {
++                        trace!(%addr, "discovered peer queue is full, dropping peer")
++                    }
++                    Err(TrySendError::Closed(_)) => bail!("discovered peer receiver closed"),
                  }
              }
          }
-@@ -545,7 +592,7 @@ pub struct DhtState {
+@@ -545,7 +642,7 @@ pub struct DhtState {
      // Sending requests to the worker.
      rate_limiter: RateLimiter,
      // This is to send raw messages
@@ -238,7 +341,7 @@ index c255e75e..1c3f18da 100644
  
      cancellation_token: CancellationToken,
  
-@@ -555,7 +602,7 @@ pub struct DhtState {
+@@ -555,7 +652,7 @@ pub struct DhtState {
  impl DhtState {
      fn new_internal(
          id: Id20,
@@ -247,16 +350,16 @@ index c255e75e..1c3f18da 100644
          routing_table: Option<RoutingTable>,
          listen_addr: SocketAddr,
          peer_store: PeerStore,
-@@ -575,25 +622,35 @@ impl DhtState {
+@@ -575,25 +672,35 @@ impl DhtState {
          }
      }
  
-+    fn try_send_worker(&self, request: WorkerSendRequest) -> anyhow::Result<bool> {
++    fn try_send_worker(&self, request: WorkerSendRequest) -> anyhow::Result<()> {
 +        match self.worker_sender.try_send(request) {
-+            Ok(()) => Ok(true),
++            Ok(()) => Ok(()),
 +            Err(TrySendError::Full(_)) => {
 +                debug!("DHT send queue is full, dropping untracked datagram");
-+                Ok(false)
++                Ok(())
 +            }
 +            Err(TrySendError::Closed(_)) => bail!("DHT worker is closed"),
 +        }
@@ -291,67 +394,65 @@ index c255e75e..1c3f18da 100644
          match tokio::time::timeout(RESPONSE_TIMEOUT, rx).await {
              Ok(Ok(r)) => r.map(|r| {
                  trace!("received {r:?}");
-@@ -735,7 +792,7 @@ impl DhtState {
+@@ -735,7 +842,7 @@ impl DhtState {
                      }),
                  };
                  self.routing_table.write().mark_last_query(&req.id);
 -                self.worker_sender.send(WorkerSendRequest {
-+                let _ = self.try_send_worker(WorkerSendRequest {
++                self.try_send_worker(WorkerSendRequest {
                      our_tid: None,
                      message,
                      addr,
-@@ -755,7 +812,7 @@ impl DhtState {
+@@ -755,7 +862,7 @@ impl DhtState {
                          ..Default::default()
                      }),
                  };
 -                self.worker_sender.send(WorkerSendRequest {
-+                let _ = self.try_send_worker(WorkerSendRequest {
++                self.try_send_worker(WorkerSendRequest {
                      our_tid: None,
                      message,
                      addr,
-@@ -779,7 +836,7 @@ impl DhtState {
+@@ -779,7 +886,7 @@ impl DhtState {
                          )),
                      }),
                  };
 -                self.worker_sender.send(WorkerSendRequest {
-+                let _ = self.try_send_worker(WorkerSendRequest {
++                self.try_send_worker(WorkerSendRequest {
                      our_tid: None,
                      message,
                      addr,
-@@ -799,7 +856,7 @@ impl DhtState {
+@@ -799,7 +906,7 @@ impl DhtState {
                          ..Default::default()
                      }),
                  };
 -                self.worker_sender.send(WorkerSendRequest {
-+                let _ = self.try_send_worker(WorkerSendRequest {
++                self.try_send_worker(WorkerSendRequest {
                      our_tid: None,
                      message,
                      addr,
-@@ -895,11 +952,9 @@ impl DhtWorker {
-     }
+@@ -896,8 +1003,7 @@ impl DhtWorker {
  
      async fn bootstrap(&self, bootstrap_addrs: &[String]) -> anyhow::Result<()> {
--        let mut futs = FuturesUnordered::new();
+         let mut futs = FuturesUnordered::new();
 -
 -        for addr in bootstrap_addrs.iter() {
--            futs.push(self.bootstrap_hostname_with_backoff(addr));
--        }
-+        let mut futs = futures::stream::iter(bootstrap_addrs.iter().cloned())
-+            .map(|addr| async move { self.bootstrap_hostname_with_backoff(&addr).await })
-+            .buffer_unordered(MAX_CONCURRENT_BOOTSTRAPS);
++        for addr in bootstrap_addrs {
+             futs.push(self.bootstrap_hostname_with_backoff(addr));
+         }
          let mut successes = 0;
-         while let Some(resp) = futs.next().await {
-             if resp.is_ok() {
-@@ -913,7 +968,7 @@ impl DhtWorker {
+@@ -913,9 +1019,9 @@ impl DhtWorker {
      }
  
      async fn bucket_refresher(&self) -> anyhow::Result<()> {
 -        let (tx, mut rx) = unbounded_channel();
 +        let (tx, mut rx) = maintenance_channel();
  
-         let mut futs = FuturesUnordered::new();
+-        let mut futs = FuturesUnordered::new();
++        let mut futs = BoundedFuturesUnordered::new(MAX_CONCURRENT_MAINTENANCE_REQUESTS);
          let filler = async {
-@@ -927,9 +982,11 @@ impl DhtWorker {
+             let mut interval = tokio::time::interval(INACTIVITY_TIMEOUT);
+             interval.tick().await;
+@@ -927,9 +1033,11 @@ impl DhtWorker {
                      if bucket.leaf.last_refreshed.elapsed() < INACTIVITY_TIMEOUT {
                          continue;
                      }
@@ -365,25 +466,42 @@ index c255e75e..1c3f18da 100644
                  }
                  trace!("iteration {}, refreshing {} buckets", iteration, found);
                  iteration += 1;
-@@ -941,7 +998,7 @@ impl DhtWorker {
+@@ -941,7 +1049,7 @@ impl DhtWorker {
          loop {
              tokio::select! {
                  _ = &mut filler => {},
 -                random_id = rx.recv() => {
-+                random_id = rx.recv(), if can_schedule_maintenance_request(futs.len()) => {
++                random_id = rx.recv(), if !futs.is_full() => {
                      let random_id = random_id.unwrap();
                      let addrs = self
                          .dht
-@@ -965,7 +1022,7 @@ impl DhtWorker {
+@@ -951,11 +1059,11 @@ impl DhtWorker {
+                         .iter()
+                         .map(|n| n.addr())
+                         .take(8).collect::<Vec<_>>();
+-                    futs.push(
++                    debug_assert!(futs.try_push(
+                         RecursiveRequest::find_node_for_routing_table(
+                             self.dht.clone(), random_id, addrs.into_iter()
+                         ).instrument(error_span!("refresh_bucket"))
+-                    );
++                    ).is_ok());
+                 },
+                 _ = futs.next(), if !futs.is_empty() => {},
+             }
+@@ -963,9 +1071,9 @@ impl DhtWorker {
+     }
+ 
      async fn pinger(&self) -> anyhow::Result<()> {
-         let mut futs = FuturesUnordered::new();
+-        let mut futs = FuturesUnordered::new();
++        let mut futs = BoundedFuturesUnordered::new(MAX_CONCURRENT_MAINTENANCE_REQUESTS);
          let mut interval = tokio::time::interval(INACTIVITY_TIMEOUT / 4);
 -        let (tx, mut rx) = unbounded_channel();
 +        let (tx, mut rx) = maintenance_channel();
          let looper = async {
              let mut iteration = 0;
              loop {
-@@ -977,8 +1034,10 @@ impl DhtWorker {
+@@ -977,8 +1085,10 @@ impl DhtWorker {
                          node.status(now),
                          NodeStatus::Questionable | NodeStatus::Unknown
                      ) {
@@ -395,16 +513,28 @@ index c255e75e..1c3f18da 100644
                      }
                  }
                  trace!("iteration {}, pinging {} nodes", iteration, found);
-@@ -991,7 +1050,7 @@ impl DhtWorker {
+@@ -991,9 +1101,9 @@ impl DhtWorker {
          loop {
              tokio::select! {
                  _ = &mut looper => {},
 -                r = rx.recv() => {
-+                r = rx.recv(), if can_schedule_maintenance_request(futs.len()) => {
++                r = rx.recv(), if !futs.is_full() => {
                      let (id, addr) = r.unwrap();
-                     futs.push(async move {
+-                    futs.push(async move {
++                    debug_assert!(futs.try_push(async move {
                          self.dht.routing_table.write().mark_outgoing_request(&id);
-@@ -1014,7 +1073,7 @@ impl DhtWorker {
+                         match self.dht.request(Request::Ping, addr).await {
+                             Ok(_) => {
+@@ -1004,7 +1114,7 @@ impl DhtWorker {
+                                 debug!("error: {e:#}");
+                             }
+                         }
+-                    }.instrument(error_span!("ping", addr=addr.to_string())))
++                    }.instrument(error_span!("ping", addr=addr.to_string()))).is_ok());
+                 },
+                 _ = futs.next(), if !futs.is_empty() => {},
+             }
+@@ -1014,7 +1124,7 @@ impl DhtWorker {
      async fn framer(
          &self,
          socket: &UdpSocket,
@@ -413,7 +543,7 @@ index c255e75e..1c3f18da 100644
          output_tx: Sender<(Message<ByteBufOwned>, SocketAddr)>,
      ) -> anyhow::Result<()> {
          let writer = async {
-@@ -1076,7 +1135,7 @@ impl DhtWorker {
+@@ -1076,7 +1186,7 @@ impl DhtWorker {
  
      async fn start(
          self,
@@ -422,7 +552,7 @@ index c255e75e..1c3f18da 100644
          bootstrap_addrs: &[String],
      ) -> anyhow::Result<()> {
          let (out_tx, mut out_rx) = channel(1);
-@@ -1179,7 +1238,7 @@ impl DhtState {
+@@ -1179,7 +1289,7 @@ impl DhtState {
  
              let token = config.cancellation_token.take().unwrap_or_default();
  
@@ -431,7 +561,7 @@ index c255e75e..1c3f18da 100644
              let state = Arc::new(Self::new_internal(
                  peer_id,
                  in_tx,
-@@ -1225,3 +1284,86 @@ impl DhtState {
+@@ -1225,3 +1335,85 @@ impl DhtState {
          self.routing_table.read().clone()
      }
  }
@@ -439,7 +569,6 @@ index c255e75e..1c3f18da 100644
 +#[cfg(test)]
 +mod queue_budget_tests {
 +    use super::*;
-+    use futures::FutureExt;
 +
 +    fn worker_request() -> WorkerSendRequest {
 +        WorkerSendRequest {
@@ -474,11 +603,9 @@ index c255e75e..1c3f18da 100644
 +        for _ in 0..MAX_PENDING_DISCOVERED_PEERS {
 +            peer_tx.try_send(addr).unwrap();
 +        }
-+        let blocked_peer = peer_tx.send(addr);
-+        tokio::pin!(blocked_peer);
-+        assert!(blocked_peer.as_mut().now_or_never().is_none());
++        assert!(matches!(peer_tx.try_send(addr), Err(TrySendError::Full(_))));
 +        assert_eq!(peer_rx.recv().await, Some(addr));
-+        assert!(blocked_peer.await.is_ok());
++        peer_tx.try_send(addr).unwrap();
 +
 +        let (node_tx, mut node_rx) = recursive_node_channel();
 +        for _ in 0..MAX_PENDING_RECURSIVE_NODES {
@@ -491,12 +618,11 @@ index c255e75e..1c3f18da 100644
 +        assert!(node_rx.recv().await.is_some());
 +        node_tx.try_send((None, addr, 0)).unwrap();
 +
-+        assert!(can_schedule_recursive_request(
-+            MAX_CONCURRENT_RECURSIVE_REQUESTS - 1
-+        ));
-+        assert!(!can_schedule_recursive_request(
-+            MAX_CONCURRENT_RECURSIVE_REQUESTS
-+        ));
++        let recursive = BoundedFuturesUnordered::new(MAX_CONCURRENT_RECURSIVE_REQUESTS);
++        for _ in 0..MAX_CONCURRENT_RECURSIVE_REQUESTS {
++            assert!(recursive.try_push(std::future::pending::<()>()).is_ok());
++        }
++        assert!(recursive.try_push(std::future::pending::<()>()).is_err());
 +
 +        let (maintenance_tx, mut maintenance_rx) = maintenance_channel();
 +        for _ in 0..MAX_PENDING_MAINTENANCE_REQUESTS {
@@ -509,35 +635,45 @@ index c255e75e..1c3f18da 100644
 +        assert!(maintenance_rx.recv().await.is_some());
 +        maintenance_tx.try_send(Id20::new([0; 20])).unwrap();
 +
-+        assert!(can_schedule_maintenance_request(
-+            MAX_CONCURRENT_MAINTENANCE_REQUESTS - 1
-+        ));
-+        assert!(!can_schedule_maintenance_request(
-+            MAX_CONCURRENT_MAINTENANCE_REQUESTS
-+        ));
-+        assert_eq!(MAX_CONCURRENT_BOOTSTRAPS, 8);
++        let maintenance = BoundedFuturesUnordered::new(MAX_CONCURRENT_MAINTENANCE_REQUESTS);
++        for _ in 0..MAX_CONCURRENT_MAINTENANCE_REQUESTS {
++            assert!(maintenance.try_push(std::future::pending::<()>()).is_ok());
++        }
++        assert!(maintenance.try_push(std::future::pending::<()>()).is_err());
++
++        assert_eq!(
++            root_queue_delay(&RootQueueStatus::Saturated),
++            REQUERY_INTERVAL
++        );
 +    }
 +}
 diff --git a/crates/librqbit/src/dht_utils.rs b/crates/librqbit/src/dht_utils.rs
-index 6e200b12..4455bf44 100644
+index 6e200b12..d9a1871b 100644
 --- a/crates/librqbit/src/dht_utils.rs
 +++ b/crates/librqbit/src/dht_utils.rs
-@@ -12,6 +12,31 @@ use crate::{
+@@ -1,4 +1,8 @@
+-use std::{collections::HashSet, net::SocketAddr, sync::Arc};
++use std::{
++    collections::{HashSet, VecDeque},
++    net::SocketAddr,
++    sync::Arc,
++};
+ 
+ use anyhow::Context;
+ use buffers::ByteBufOwned;
+@@ -12,6 +16,85 @@ use crate::{
  };
  use librqbit_core::hash_id::Id20;
  
 +const MAX_CONCURRENT_METADATA_PEERS: usize = 128;
++const MAX_PENDING_METADATA_PEERS: usize = 256;
 +const MAX_METADATA_PEER_CANDIDATES: usize = 4096;
 +
 +#[derive(Debug, PartialEq, Eq)]
 +enum CandidateAdmission {
 +    Admitted,
 +    Duplicate,
-+    LimitReached,
-+}
-+
-+fn can_schedule_metadata_peer(active: usize) -> bool {
-+    active < MAX_CONCURRENT_METADATA_PEERS
++    Untracked,
 +}
 +
 +fn admit_metadata_peer(seen: &mut HashSet<SocketAddr>, addr: SocketAddr) -> CandidateAdmission {
@@ -545,24 +681,81 @@ index 6e200b12..4455bf44 100644
 +        return CandidateAdmission::Duplicate;
 +    }
 +    if seen.len() >= MAX_METADATA_PEER_CANDIDATES {
-+        return CandidateAdmission::LimitReached;
++        return CandidateAdmission::Untracked;
 +    }
 +    seen.insert(addr);
 +    CandidateAdmission::Admitted
 +}
 +
++struct MetadataPeerQueues<F> {
++    active: FuturesUnordered<F>,
++    pending: VecDeque<SocketAddr>,
++}
++
++impl<F> MetadataPeerQueues<F> {
++    fn new() -> Self {
++        Self {
++            active: FuturesUnordered::new(),
++            pending: VecDeque::new(),
++        }
++    }
++
++    fn can_accept(&self) -> bool {
++        self.active.len() < MAX_CONCURRENT_METADATA_PEERS
++            || self.pending.len() < MAX_PENDING_METADATA_PEERS
++    }
++
++    fn enqueue<M>(&mut self, addr: SocketAddr, make_future: &M) -> bool
++    where
++        M: Fn(SocketAddr) -> F,
++    {
++        if self.active.len() < MAX_CONCURRENT_METADATA_PEERS {
++            self.active.push(make_future(addr));
++            true
++        } else if self.pending.len() < MAX_PENDING_METADATA_PEERS {
++            self.pending.push_back(addr);
++            true
++        } else {
++            false
++        }
++    }
++
++    fn promote_pending<M>(&mut self, make_future: &M)
++    where
++        M: Fn(SocketAddr) -> F,
++    {
++        while self.active.len() < MAX_CONCURRENT_METADATA_PEERS {
++            let Some(addr) = self.pending.pop_front() else {
++                break;
++            };
++            self.active.push(make_future(addr));
++        }
++    }
++
++    fn is_empty(&self) -> bool {
++        self.active.is_empty() && self.pending.is_empty()
++    }
++
++    async fn next(&mut self) -> Option<F::Output>
++    where
++        F: std::future::Future,
++    {
++        self.active.next().await
++    }
++}
++
  #[derive(Debug)]
  #[allow(clippy::large_enum_variant)]
  pub enum ReadMetainfoResult<Rx> {
-@@ -37,14 +62,13 @@ pub async fn read_metainfo_from_peer_receiver<A: Stream<Item = SocketAddr> + Unp
+@@ -37,14 +120,13 @@ pub async fn read_metainfo_from_peer_receiver<A: Stream<Item = SocketAddr> + Unp
  ) -> ReadMetainfoResult<A> {
      let mut seen = HashSet::<SocketAddr>::new();
      let mut addrs = addrs_stream;
 -
 -    let semaphore = tokio::sync::Semaphore::new(128);
-+    let mut initial_addrs = initial_addrs.into_iter();
++    let mut initial_addrs = VecDeque::from(initial_addrs);
 +    let mut initial_addrs_completed = false;
-+    let mut candidate_limit_reached = false;
++    let mut candidate_limit_logged = false;
  
      let read_info_guarded = |addr| {
 -        let semaphore = &semaphore;
@@ -572,7 +765,7 @@ index 6e200b12..4455bf44 100644
              let ret = peer_info_reader::read_metainfo_from_peer(
                  addr,
                  peer_id,
-@@ -56,22 +80,38 @@ pub async fn read_metainfo_from_peer_receiver<A: Stream<Item = SocketAddr> + Unp
+@@ -56,27 +138,46 @@ pub async fn read_metainfo_from_peer_receiver<A: Stream<Item = SocketAddr> + Unp
              .instrument(error_span!("read_metainfo_from_peer", ?addr))
              .await
              .with_context(|| format!("error reading metainfo from {addr}"));
@@ -581,73 +774,99 @@ index 6e200b12..4455bf44 100644
          }
      };
  
-     let mut unordered = FuturesUnordered::new();
- 
+-    let mut unordered = FuturesUnordered::new();
+-
 -    for a in initial_addrs {
 -        seen.insert(a);
 -        unordered.push(read_info_guarded(a));
 -    }
--
++    let mut queues = MetadataPeerQueues::new();
+ 
      let mut addrs_completed = false;
  
      loop {
 -        if addrs_completed && unordered.is_empty() {
-+        while !initial_addrs_completed && can_schedule_metadata_peer(unordered.len()) {
-+            let Some(addr) = initial_addrs.next() else {
++        queues.promote_pending(&read_info_guarded);
++
++        while !initial_addrs_completed && queues.can_accept() {
++            let Some(addr) = initial_addrs.pop_front() else {
 +                initial_addrs_completed = true;
 +                break;
 +            };
 +            match admit_metadata_peer(&mut seen, addr) {
-+                CandidateAdmission::Admitted => unordered.push(read_info_guarded(addr)),
++                CandidateAdmission::Admitted => {
++                    debug_assert!(queues.enqueue(addr, &read_info_guarded));
++                }
 +                CandidateAdmission::Duplicate => {}
-+                CandidateAdmission::LimitReached => {
-+                    candidate_limit_reached = true;
-+                    initial_addrs_completed = true;
++                CandidateAdmission::Untracked => {
++                    if !candidate_limit_logged {
++                        debug!(
++                            limit = MAX_METADATA_PEER_CANDIDATES,
++                            "metadata peer deduplication limit reached; continuing without tracking new candidates"
++                        );
++                        candidate_limit_logged = true;
++                    }
++                    debug_assert!(queues.enqueue(addr, &read_info_guarded));
 +                }
 +            }
 +        }
 +
-+        if candidate_limit_reached && unordered.is_empty() {
-+            debug!(
-+                limit = MAX_METADATA_PEER_CANDIDATES,
-+                "metadata peer candidate limit reached"
-+            );
-+            return ReadMetainfoResult::ChannelClosed { seen };
-+        }
-+        if initial_addrs_completed && addrs_completed && unordered.is_empty() {
++        if initial_addrs_completed && addrs_completed && queues.is_empty() {
              return ReadMetainfoResult::ChannelClosed { seen };
          }
  
-@@ -86,11 +126,16 @@ pub async fn read_metainfo_from_peer_receiver<A: Stream<Item = SocketAddr> + Unp
+         tokio::select! {
+-            done = unordered.next(), if !unordered.is_empty() => {
++            done = queues.next(), if !queues.active.is_empty() => {
+                 match done {
+                     Some(Ok((info, info_bytes))) => return ReadMetainfoResult::Found { info, info_bytes, seen, rx: addrs },
+                     Some(Err(e)) => {
+@@ -86,11 +187,26 @@ pub async fn read_metainfo_from_peer_receiver<A: Stream<Item = SocketAddr> + Unp
                  }
              }
  
 -            next_addr = addrs.next(), if !addrs_completed => {
 +            next_addr = addrs.next(), if initial_addrs_completed
 +                && !addrs_completed
-+                && !candidate_limit_reached
-+                && can_schedule_metadata_peer(unordered.len()) => {
++                && queues.can_accept() => {
                  match next_addr {
                      Some(addr) => {
 -                        if seen.insert(addr) {
 -                            unordered.push(read_info_guarded(addr));
 +                        match admit_metadata_peer(&mut seen, addr) {
-+                            CandidateAdmission::Admitted => unordered.push(read_info_guarded(addr)),
++                            CandidateAdmission::Admitted => {
++                                debug_assert!(queues.enqueue(addr, &read_info_guarded));
++                            }
 +                            CandidateAdmission::Duplicate => {}
-+                            CandidateAdmission::LimitReached => candidate_limit_reached = true,
++                            CandidateAdmission::Untracked => {
++                                if !candidate_limit_logged {
++                                    debug!(
++                                        limit = MAX_METADATA_PEER_CANDIDATES,
++                                        "metadata peer deduplication limit reached; continuing without tracking new candidates"
++                                    );
++                                    candidate_limit_logged = true;
++                                }
++                                debug_assert!(queues.enqueue(addr, &read_info_guarded));
++                            }
                          }
                          continue;
                      },
-@@ -116,6 +161,34 @@ mod tests {
+@@ -116,6 +232,40 @@ mod tests {
  
      static LOG_INIT: Once = Once::new();
  
 +    #[test]
-+    fn metadata_peer_budgets_close_at_exact_boundaries() {
-+        assert!(can_schedule_metadata_peer(
-+            MAX_CONCURRENT_METADATA_PEERS - 1
-+        ));
-+        assert!(!can_schedule_metadata_peer(MAX_CONCURRENT_METADATA_PEERS));
++    fn production_metadata_queues_close_at_exact_boundaries() {
++        let mut queues = MetadataPeerQueues::new();
++        let make_future = |_| std::future::pending::<()>();
++        for port in 1..=(MAX_CONCURRENT_METADATA_PEERS + MAX_PENDING_METADATA_PEERS) {
++            let addr = SocketAddr::from(([127, 0, 0, 1], port as u16));
++            assert!(queues.enqueue(addr, &make_future));
++        }
++        assert_eq!(queues.active.len(), MAX_CONCURRENT_METADATA_PEERS);
++        assert_eq!(queues.pending.len(), MAX_PENDING_METADATA_PEERS);
++        assert!(!queues.can_accept());
++        assert!(!queues.enqueue(SocketAddr::from(([127, 0, 0, 2], 1)), &make_future));
 +
 +        let mut seen = HashSet::new();
 +        for port in 1..=MAX_METADATA_PEER_CANDIDATES {
@@ -665,7 +884,7 @@ index 6e200b12..4455bf44 100644
 +        let overflow = SocketAddr::from(([127, 0, 0, 2], 1));
 +        assert_eq!(
 +            admit_metadata_peer(&mut seen, overflow),
-+            CandidateAdmission::LimitReached
++            CandidateAdmission::Untracked
 +        );
 +        assert_eq!(seen.len(), MAX_METADATA_PEER_CANDIDATES);
 +    }

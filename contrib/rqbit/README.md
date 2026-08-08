@@ -46,8 +46,8 @@ Before posting any draft:
    boundary; tracker, live-peer, retained-peer, and pending-handshake budgets
    change distinct runtime resource policies; the peer-response budget bounds
    remote work after a live connection is established; the discovery-pressure
-   budget bounds DHT/LSD foreground, maintenance, and bootstrap work plus
-   metadata candidates before peer admission.
+   budget bounds DHT/LSD foreground and maintenance work plus metadata queues
+   before peer admission.
 
 ## 2. Contribution map — stable evidence and current-main submissions
 
@@ -60,8 +60,8 @@ Before posting any draft:
 | Bounded incomplete incoming handshakes | [`0009`](0009-bound-pending-incoming-handshakes.patch) | Native configurable 256-check boundary; no patch | [review note](PENDING_HANDSHAKE_BUDGET.md) |
 | Per-torrent and shared-session retained-peer budgets | [`0010`](0010-bound-known-peer-records.patch) | [`0011`](0011-bound-known-peer-records-main.patch) | [PR draft](KNOWN_PEER_BUDGET_PR.md) |
 | Bounded per-peer payload and metadata response backlog | [`0012`](0012-bound-peer-response-backlog.patch) | [`0013`](0013-bound-peer-response-backlog-main.patch) | [PR draft](PEER_RESPONSE_BUDGET_PR.md) |
-| Bounded DHT, metadata-resolution, maintenance, bootstrap, and LSD pressure | [`0014`](0014-bound-discovery-pressure.patch) | [`0015`](0015-bound-discovery-pressure-main.patch) | [PR draft](DISCOVERY_PRESSURE_BUDGET_PR.md) |
-| Bound BEP 9 metadata before allocation | [`0005`](0005-limit-peer-metadata-before-allocation.patch) | [`0006`](0006-limit-peer-metadata-before-allocation-main.patch) | [PR draft](METADATA_SIZE_LIMIT_PR.md) |
+| Bounded DHT, metadata-resolution, maintenance, and LSD pressure | [`0014`](0014-bound-discovery-pressure.patch) | [`0015`](0015-bound-discovery-pressure-main.patch) | [PR draft](DISCOVERY_PRESSURE_BUDGET_PR.md) |
+| Bound BEP 9 metadata before allocation | [`0016`](0016-limit-peer-metadata-before-allocation.patch) | [`0017`](0017-limit-peer-metadata-before-allocation-main.patch) | [PR draft](METADATA_SIZE_LIMIT_PR.md) |
 
 The stable patches preserve the exact experiments behind nzbd's M0 report.
 The main patches are the contribution candidates. Do not submit the stable
@@ -100,12 +100,12 @@ backports upstream unless the maintainer explicitly asks for an 8.x backport.
    its option names, permit lifetime, cleanup behavior, and preliminary
    1,024/4,096 policy.
 10. Submit the independent peer-response candidate only after human review of
-    its 128-response window, backpressure policy, and permit lifetime across
-    both scheduler and writer queues.
+    its advertised 128-response window, over-window disconnect policy, and
+    permit lifetime across both scheduler and writer queues.
 11. Submit the discovery-pressure candidate only after human review of its
-    DHT/LSD overload policy, foreground and maintenance concurrency, bootstrap
-    fan-out, metadata candidate ceiling, and the current-main-only LSD
-    lifecycle change.
+    DHT/LSD overload policy, foreground and maintenance concurrency, metadata
+    active/pending queues and deduplication ceiling, and the current-main-only
+    LSD lifecycle change.
 12. After both required APIs, the allocation ceiling, and all accepted resource
     controls ship, pin that stable release in nzbd and rerun all eleven M0
     gates on native macOS, Linux glibc/musl, and Windows.
@@ -124,6 +124,14 @@ name begins with `blocking:` or `drift:`: stable failures block the PR, while
 current-main drift remains visible but non-blocking because upstream can move
 independently between nzbd changes. Pushes and the weekly schedule require
 every leg.
+
+The main patch artifacts are authored from the pinned SHA below. CI's
+`drift:` leg deliberately clones the current `main` tip, records that checkout
+in the job log, and tests a direct or three-way apply; it is a moving
+compatibility alarm, not reproducible base evidence. The `blocking:` v8.1.1
+leg remains exact. The workflow points every verifier at the cached rqbit
+target directory, and the peer-response and discovery-pressure verifiers now
+compile the complete upstream workspace after their focused proofs.
 
 ```bash
 rqbit_tree=/tmp/rqbit-upstream-main
@@ -188,8 +196,8 @@ stable-only backport separate from every main submission.
   bound. A remote peer can pipeline piece and metadata requests through the
   scheduler and writer faster than those stages drain.
 - Do not treat bounded live or retained peers as bounds on discovery work.
-  DHT datagrams, recursive nodes, maintenance/bootstraps, delivered peers,
-  metadata candidates, and current-main LSD streams exist before or beside
-  those admission permits.
+  DHT datagrams, recursive nodes, maintenance work, delivered peers, metadata
+  queues, and current-main LSD streams exist before or beside those admission
+  permits. Configured bootstrap fan-out remains a separate startup policy.
 - Do not enable nzbd config, admission, listeners, trackers, DHT, or payload
   I/O from this kit. M2 remains blocked until a stable release passes M0.

@@ -47,25 +47,31 @@ remove a newer registration for the same info hash.
   best-effort and are dropped when the queue is full, because awaiting them in
   the receive path would stop reading the socket.
 - Bound each recursive-node queue at 256 records and run at most 32 recursive
-  requests per lookup worker. Newly discovered nodes are best-effort under
+  requests per lookup worker. The production future-window type itself rejects
+  a 33rd active request, so deleting a select-loop polling guard cannot reopen
+  the retained-work bound. Newly discovered nodes are best-effort under
   saturation; DHT traversal already tolerates packet loss and periodic root
-  queries retry from the routing table.
+  queries retry from the routing table. A saturated recursive queue uses the
+  normal requery interval rather than being mistaken for an empty table and
+  sorted once per second.
 - Bound bucket-refresh and questionable-node ping queues at 256 records and
-  their active work at 32 requests per worker. Bound concurrent bootstrap
-  hostname attempts at eight. This closes the maintenance and startup paths
-  instead of limiting only foreground peer discovery.
-- Bound the delivered-peer queue at 256 records and await downstream capacity.
-  This applies real backpressure between recursive responses and the consumer
-  instead of moving the backlog into another queue.
+  their active work at 32 requests per worker using the same structural
+  future-window type. Bootstrap fan-out is intentionally unchanged: the input
+  is a finite configured list, while an eight-host `buffer_unordered` window
+  can let one hostname's 24-hour retry budget starve every later hostname.
+- Bound the delivered-peer queue at 256 records and make delivery best-effort.
+  Recursive node traversal is processed first, so a slow metadata consumer
+  cannot stall the DHT recursion that could discover replacement peers.
 - Reuse each recursive request's response for callbacks and traversal. The
   previous control flow sent the same request a second time after processing
   the first response's callback, doubling DHT traffic and discarding half the
   returned peer/node data.
 - Replace the metadata resolver's semaphore-plus-unbounded-futures shape with
-  at most 128 structurally active futures and at most 4,096 retained unique
-  candidates. Reaching the candidate ceiling stops polling discovery, finishes
-  active attempts, logs the limit, and returns the existing exhausted-input
-  result. No public enum variant is added.
+  at most 128 structurally active futures plus 256 pending peer addresses.
+  Continue polling while pending capacity exists. Retain at most 4,096 unique
+  addresses for deduplication, but continue trying later untracked candidates
+  after that memory ceiling; reaching it is never reported as an exhausted or
+  closed discovery stream.
 - On current main, bound each LSD result stream at 256 peers. A full or closed
   local queue drops that peer result but does not suppress the protocol reply.
   Each stream owns and cancels its periodic-task token, and a monotonic
@@ -79,48 +85,49 @@ budgets, if any, should be caller-controlled.
 ### Tests
 
 The DHT proof fills the 256-record datagram, peer, recursive-node, and
-maintenance queues, verifies the next operation blocks or reports full as
-designed, drains one record, and verifies capacity reopens. It also pins both
-31/32 active-work boundaries and the eight-bootstrap limit.
+maintenance queues, verifies the next operation reports full, drains one
+record, and verifies capacity reopens. It fills the actual recursive and
+maintenance future-window types to 32 and proves the 33rd future is rejected.
+It also proves a saturated root queue receives the normal requery delay.
 
-The metadata proof admits exactly 4,096 unique peers, preserves duplicate
-classification at the limit, rejects the next unique address, and pins the
-127/128 active-work boundary.
+The metadata proof fills the production resolver queues to 128 active and 256
+pending peers and proves the next retained candidate is rejected. It also
+admits exactly 4,096 tracked peers, preserves duplicate classification at the
+limit, and classifies the next unique address as untracked rather than
+terminal.
 
 The current-main LSD proof fills exactly 256 results and rejects the next. It
-then proves a stale stream teardown cancels its own task without removing a
-newer registration, while current-stream teardown cancels and removes its own
-registration.
+then uses the production spawn/lifecycle helper to prove a stale stream
+teardown does not remove a newer registration and current-stream teardown both
+cancels its spawned task and removes its own registration.
 
 All affected crate suites and `cargo check --workspace` pass on exact rqbit
 8.1.1 and the documented current-main source line.
 
 ### Negative controls
 
-The DHT proof was run after intentionally changing the recursive admission
-comparison from `< 32` to `<= 32`. It failed at the exact full-window
-assertion:
+The DHT proof is run after intentionally bypassing the production future
+window. The exact production-type assertion must fail:
 
 ```text
-assertion failed: !can_schedule_recursive_request(MAX_CONCURRENT_RECURSIVE_REQUESTS)
+assertion failed: recursive.try_push(std::future::pending::<()>()).is_err()
 ```
 
-The same proof was run after independently changing the maintenance admission
-comparison from `< 32` to `<= 32`. It failed at its full-window assertion:
+The metadata proof is independently run after bypassing the production pending
+queue limit. Its exact next-candidate assertion must fail:
 
 ```text
-assertion failed: !can_schedule_maintenance_request(MAX_CONCURRENT_MAINTENANCE_REQUESTS)
+assertion failed: !queues.enqueue(...)
 ```
 
-The LSD proof was separately run after intentionally removing the registration
-ID comparison. The stale-stream check failed because the replacement had been
-deleted:
+The LSD proof is separately run after detaching the spawned task from the
+stream lifecycle token. The task-cancellation timeout must fail:
 
 ```text
-called `Option::unwrap()` on a `None` value
+announce task must observe stream cancellation: Elapsed(())
 ```
 
-Neither mutation is retained.
+None of the mutations is retained.
 
 ### Verification
 
@@ -129,9 +136,9 @@ cargo fmt --all -- --check
 cargo test -p librqbit-dht --lib \
   dht::queue_budget_tests::queue_budgets_close_at_exact_boundaries -- --exact
 cargo test -p librqbit --lib \
-  dht_utils::tests::metadata_peer_budgets_close_at_exact_boundaries -- --exact
+  dht_utils::tests::production_metadata_queues_close_at_exact_boundaries -- --exact
 cargo test -p librqbit-lsd --lib \
-  queue_budget_tests::result_queue_and_registration_lifecycle_are_bounded \
+  queue_budget_tests::production_queue_and_announce_lifecycle_are_bounded \
   -- --exact
 cargo check --workspace
 ```
@@ -149,18 +156,18 @@ describe the final human review.
 
 - Confirm 256 outgoing datagrams, 256 pending nodes, 256 delivered peers, and
   32 active recursive requests are appropriate per lookup/address-family
-  budgets. Separately confirm 256 queued and 32 active maintenance requests
-  plus eight concurrent bootstrap attempts.
+  budgets. Separately confirm 256 queued and 32 active maintenance requests.
 - Confirm best-effort drop is appropriate for UDP replies, untracked announce
-  messages, and excess recursive nodes, while locally initiated requests and
-  delivered peers should await capacity.
+  messages, excess recursive nodes, and delivered peers, while locally
+  initiated DHT requests should await reserved capacity.
 - Confirm reserving worker capacity before in-flight registration is the
   correct cancellation boundary.
-- Decide whether the 128 active metadata attempts and 4,096 retained candidate
-  ceiling should remain fixed, become options, or derive from another peer
-  policy.
-- Confirm exhausting the candidate ceiling should preserve the existing public
-  exhausted-input result rather than introduce a breaking enum variant.
+- Decide whether 128 active metadata attempts, 256 pending candidates, and the
+  4,096-entry deduplication ceiling should remain fixed, become options, or
+  derive from another peer policy.
+- Confirm candidates discovered after the deduplication ceiling should still
+  be attempted without being retained, rather than producing a false
+  exhausted-input result.
 - On current main, confirm LSD should continue replying when its local result
   queue is saturated and should drop only the local peer observation.
 - Verify stream replacement and drop behavior for two simultaneous LSD

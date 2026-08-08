@@ -89,12 +89,15 @@ requests enter an unbounded upload-scheduler channel and then an unbounded
 per-peer writer; valid BEP 9 metadata requests enter the writer directly. A
 rate limit or socket timeout slows draining but does not cap the number of
 queued records. The contribution kit proves one candidate 128-permit response
-window on both source lines. The permit follows a piece response across both
-queues and a metadata response through the writer, and is released only after
-the writer drops the item. The exact test remains blocked when work moves
-between queues, reopens after a writer drop, and fails under an intentional
-guard bypass. Until an accepted stable release enforces a reviewer-approved
-window and backpressure policy, established peer traffic remains unauthorized.
+window on both source lines and advertises it as BEP 10 `reqq`. Admission is
+non-blocking: a peer that exceeds the advertised outstanding-response window
+is disconnected rather than parking its socket reader behind torrent-global
+upload throttling. The permit follows a piece response across both queues and
+a metadata response through the writer, and is released only after the socket
+write completes or is cancelled. Production-path admission and blocked-write
+tests fail under intentional guard/lifetime bypasses. Until an accepted stable
+release enforces a reviewer-approved window and overload policy, established
+peer traffic remains unauthorized.
 
 Discovery has its own retained-work chain before a peer becomes live. Stable
 8.1.1 and the pinned rqbit-main snapshot use unbounded channels for outgoing
@@ -102,13 +105,16 @@ DHT datagrams, recursive nodes, and delivered peers, and can grow the active
 recursive future set without a fixed ceiling. Magnet metadata resolution uses
 a 128-permit semaphore around I/O but can retain an unbounded future queue and
 unique-address set before those permits. DHT maintenance uses unbounded
-refresher/pinger channels and active future sets, and bootstrap starts every
-configured hostname at once. Current main adds an unbounded LSD result channel
+refresher/pinger channels and active future sets. Bootstrap starts every
+configured hostname, but that finite configuration fan-out is intentionally
+unchanged: an eight-host window can let one hostname's 24-hour retry budget
+starve all later entries. Current main adds an unbounded LSD result channel
 whose periodic announce task survives result-stream drop. The
 contribution kit now proves candidate 256-record DHT send, recursive-node,
 delivered-peer, DHT-maintenance, and LSD queues; 32 active recursive and 32
-active maintenance requests per worker; eight concurrent bootstraps; 128
-active metadata attempts; and 4,096 retained metadata candidates. It also
+active maintenance requests per worker; 128 active metadata attempts; 256
+pending metadata candidates; and a 4,096-entry metadata deduplication set that
+does not terminate discovery. It also
 cancels LSD work with its owning stream, protects replacement registrations,
 and removes an existing duplicate DHT request per recursive step. These fixed
 values and UDP drop/backpressure choices are preliminary review evidence, not
@@ -232,13 +238,14 @@ Gate 9 may move from Partial to Pass only if a reviewer accepts all of these:
     bound remote-triggered piece and metadata responses across the upload
     scheduler and socket writer. The prepared 128-permit candidate and its
     failing negative control are evidence for review, not shipped capability.
-    A reviewer must accept or revise the window and backpressure behavior.
+    A reviewer must accept or revise the advertised window and over-window
+    disconnect behavior.
 11. **Discovery-pressure budgets.** An accepted stable engine must bound DHT
     datagrams, recursive work, delivered peers, and retained metadata
     candidates. Any stable line that includes LSD must also tie its bounded
     result stream and announce task to one lifecycle. The prepared
-    256-record queue, 32-request worker, eight-bootstrap, 128-attempt, and
-    4,096-candidate limits, UDP overload policy, exact-boundary proofs, and
+    256-record queue, 32-request worker, 128-active/256-pending metadata, and
+    4,096-entry deduplication limits, UDP overload policy, exact-boundary proofs, and
     failing negative controls are evidence for review, not shipped capability.
     A reviewer must accept or revise each boundary.
 

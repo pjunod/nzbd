@@ -53,6 +53,22 @@ fi
 readonly dht_source="$work_dir/rqbit/crates/dht/src/dht.rs"
 readonly metadata_source="$work_dir/rqbit/crates/librqbit/src/dht_utils.rs"
 
+extract_rust_item() {
+  local signature="$1"
+  local source="$2"
+  awk -v signature="$signature" '
+    index($0, signature) { printing = 1 }
+    printing {
+      print
+      opens = gsub(/{/, "{")
+      closes = gsub(/}/, "}")
+      depth += opens - closes
+      if (opens > 0) { saw_body = 1 }
+      if (saw_body && depth == 0) { exit }
+    }
+  ' "$source"
+}
+
 for invariant in \
   'MAX_PENDING_DHT_SENDS: usize = 256' \
   'MAX_PENDING_DISCOVERED_PEERS: usize = 256' \
@@ -60,8 +76,9 @@ for invariant in \
   'MAX_CONCURRENT_RECURSIVE_REQUESTS: usize = 32' \
   'MAX_PENDING_MAINTENANCE_REQUESTS: usize = 256' \
   'MAX_CONCURRENT_MAINTENANCE_REQUESTS: usize = 32' \
-  'MAX_CONCURRENT_BOOTSTRAPS: usize = 8' \
-  'buffer_unordered(MAX_CONCURRENT_BOOTSTRAPS)' \
+  'struct BoundedFuturesUnordered' \
+  'RootQueueStatus::Saturated' \
+  'fn try_send_worker(&self, request: WorkerSendRequest)' \
   '.reserve()' \
   'queue_budgets_close_at_exact_boundaries'
 do
@@ -71,17 +88,34 @@ do
   fi
 done
 
+for removed_invariant in 'MAX_CONCURRENT_BOOTSTRAPS' 'buffer_unordered('; do
+  if grep -Fq "$removed_invariant" "$dht_source"; then
+    echo "discovery-pressure patch retains the starvation-prone bootstrap cap: $removed_invariant" >&2
+    exit 1
+  fi
+done
+
 if grep -Fq 'unbounded_channel' "$dht_source"; then
   echo "DHT source still contains an unbounded channel" >&2
   exit 1
 fi
 
-request_one_source="$(
-  sed -n '/    async fn request_one(/,/    fn mark_node_error/p' "$dht_source"
-)"
+request_one_source="$(extract_rust_item 'async fn request_one(' "$dht_source")"
 readonly request_one_source
 if [[ "$(grep -Fc '.request(' <<<"$request_one_source")" -ne 1 ]]; then
   echo "recursive request_one must issue exactly one DHT request" >&2
+  exit 1
+fi
+for invariant in '.node_tx.try_send(' '.peer_tx.try_send('; do
+  if ! grep -Fq "$invariant" <<<"$request_one_source"; then
+    echo "recursive request_one is missing non-blocking production traversal: $invariant" >&2
+    exit 1
+  fi
+done
+
+readonly bounded_window_source="$(extract_rust_item 'struct BoundedFuturesUnordered' "$dht_source")"
+if [[ -z "$bounded_window_source" ]]; then
+  echo "bounded future window type could not be extracted" >&2
   exit 1
 fi
 if ! grep -Fq 'Send once: callbacks and traversal must consume the same response.' \
@@ -92,8 +126,11 @@ fi
 
 for invariant in \
   'MAX_CONCURRENT_METADATA_PEERS: usize = 128' \
+  'MAX_PENDING_METADATA_PEERS: usize = 256' \
   'MAX_METADATA_PEER_CANDIDATES: usize = 4096' \
-  'metadata_peer_budgets_close_at_exact_boundaries'
+  'struct MetadataPeerQueues' \
+  'CandidateAdmission::Untracked' \
+  'production_metadata_queues_close_at_exact_boundaries'
 do
   if ! grep -Fq "$invariant" "$metadata_source"; then
     echo "discovery-pressure patch is missing metadata invariant: $invariant" >&2
@@ -105,9 +142,10 @@ if [[ "$source_variant" == "main" ]]; then
   readonly lsd_source="$work_dir/rqbit/crates/librqbit_lsd/src/lib.rs"
   for invariant in \
     'MAX_PENDING_LSD_PEERS: usize = 256' \
-    'announce.id == announce_id' \
-    'cancel_token.cancel()' \
-    'result_queue_and_registration_lifecycle_are_bounded'
+    'struct AnnounceLifecycle' \
+    'spawn_announce_task(' \
+    'self.cancel_token.cancel()' \
+    'production_queue_and_announce_lifecycle_are_bounded'
   do
     if ! grep -Fq "$invariant" "$lsd_source"; then
       echo "discovery-pressure patch is missing LSD invariant: $invariant" >&2
@@ -121,7 +159,7 @@ fi
   cargo fmt --all -- --check
 
   readonly dht_test='dht::queue_budget_tests::queue_budgets_close_at_exact_boundaries'
-  readonly metadata_test='dht_utils::tests::metadata_peer_budgets_close_at_exact_boundaries'
+  readonly metadata_test='dht_utils::tests::production_metadata_queues_close_at_exact_boundaries'
 
   dht_test_list="$(cargo test -p librqbit-dht --lib -- --list)"
   readonly dht_test_list
@@ -141,7 +179,7 @@ fi
   cargo test -p librqbit --lib "$metadata_test" -- --exact --nocapture
 
   if [[ "$source_variant" == "main" ]]; then
-    readonly lsd_test='queue_budget_tests::result_queue_and_registration_lifecycle_are_bounded'
+    readonly lsd_test='queue_budget_tests::production_queue_and_announce_lifecycle_are_bounded'
     lsd_test_list="$(cargo test -p librqbit-lsd --lib -- --list)"
     readonly lsd_test_list
     if ! grep -Fxq "$lsd_test: test" <<<"$lsd_test_list"; then
@@ -150,4 +188,5 @@ fi
     fi
     cargo test -p librqbit-lsd --lib "$lsd_test" -- --exact --nocapture
   fi
+  cargo check --workspace
 )
