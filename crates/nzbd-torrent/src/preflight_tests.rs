@@ -213,33 +213,6 @@ impl MutationOutcomes {
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
-enum FilesystemNameBehavior {
-    Aliased,
-    Distinct,
-}
-
-fn probe_filesystem_name_behavior(
-    root: &std::path::Path,
-    left: &str,
-    right: &str,
-) -> FilesystemNameBehavior {
-    std::fs::create_dir(root.join(left)).unwrap();
-    let behavior = match std::fs::create_dir(root.join(right)) {
-        Ok(()) => FilesystemNameBehavior::Distinct,
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            FilesystemNameBehavior::Aliased
-        }
-        Err(error) => panic!("filesystem probe could not create {right:?} after {left:?}: {error}"),
-    };
-    let expected_entries = match behavior {
-        FilesystemNameBehavior::Aliased => 1,
-        FilesystemNameBehavior::Distinct => 2,
-    };
-    assert_eq!(std::fs::read_dir(root).unwrap().count(), expected_entries);
-    behavior
-}
-
 fn assert_preflight_does_not_panic(case: &str, bytes: &[u8], outcomes: &mut MutationOutcomes) {
     let result = catch_unwind(AssertUnwindSafe(|| {
         validate_metainfo_contract(bytes, false)
@@ -951,6 +924,8 @@ fn adapter_rejects_canonically_equivalent_unicode_path_collisions() {
         ("ΣΑΣ.mkv", "σας.mkv"),
         ("ſong.mkv", "song.mkv"),
         ("ı.mkv", "i.mkv"),
+        ("ﬁle.mkv", "file.mkv"),
+        ("ß.mkv", "SS.mkv"),
     ] {
         let left_path: &[&[u8]] = &[b"disc", left.as_bytes()];
         let right_path: &[&[u8]] = &[b"disc", right.as_bytes()];
@@ -961,28 +936,14 @@ fn adapter_rejects_canonically_equivalent_unicode_path_collisions() {
         ));
     }
 
-    for (left, right) in [("ﬁle.mkv", "file.mkv"), ("Ｆ.mkv", "f.mkv")] {
-        let left_path: &[&[u8]] = &[b"disc", left.as_bytes()];
-        let right_path: &[&[u8]] = &[b"disc", right.as_bytes()];
-        let distinct = metainfo(&multi_file_info_many(b"release", &[left_path, right_path]));
-        assert!(validate_metainfo_contract(&distinct, false).is_ok());
-    }
+    let left_path: &[&[u8]] = &[b"disc", "Ｆ.mkv".as_bytes()];
+    let right_path: &[&[u8]] = &[b"disc", b"f.mkv"];
+    let distinct = metainfo(&multi_file_info_many(b"release", &[left_path, right_path]));
+    assert!(validate_metainfo_contract(&distinct, false).is_ok());
 }
 
 #[test]
-fn filesystem_probe_records_aliasing_and_adapter_rejects_both_name_pairs() {
-    let case_root = tempfile::tempdir().unwrap();
-    let case_behavior = probe_filesystem_name_behavior(case_root.path(), "CaseProbe", "caseprobe");
-
-    let unicode_root = tempfile::tempdir().unwrap();
-    let unicode_behavior =
-        probe_filesystem_name_behavior(unicode_root.path(), "Caf\u{e9}Probe", "Cafe\u{301}Probe");
-
-    println!(
-        "filesystem name probe: os={} case={case_behavior:?} unicode_nfc_nfd={unicode_behavior:?}",
-        std::env::consts::OS
-    );
-
+fn adapter_rejects_case_and_nfc_alias_pairs_before_storage() {
     let upper_case_path: &[&[u8]] = &[b"CaseProbe"];
     let lower_case_path: &[&[u8]] = &[b"caseprobe"];
     let case_collision = metainfo(&multi_file_info_many(

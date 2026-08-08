@@ -1185,14 +1185,19 @@ canonicalizes the session output root and rejects every payload prefix that is
 an existing symlink before rqbit constructs storage; a Unix test proves the
 external target stays empty. The
 [first native filesystem-probe run](https://github.com/pjunod/nzbd/actions/runs/31240896567)
-passed on 2026-08-08 UTC: the hosted Linux volume distinguished both the
-ASCII-case and Unicode NFC/NFD pairs, macOS aliased both pairs, and Windows
-aliased case but distinguished NFC/NFD. The portable adapter rejected both
-pairs on every runner regardless of that behavior. These observations cover
-the hosted runner volumes, not every operator mount. The preflight remains
-defense in depth and does not close the check/write race. Descriptor-relative
-containment and persisted delete-root authority remain M5/M2 work, and no
-production path is wired.
+passed on 2026-08-08 UTC for pairs the adapter already rejects: the hosted
+Linux volume distinguished both the ASCII-case and Unicode NFC/NFD pairs,
+macOS aliased both pairs, and Windows aliased case but distinguished NFC/NFD.
+Review-directed probing added compatibility-ligature, compatibility-width, and
+full-case-fold pairs that the adapter then admitted. Default macOS storage
+aliased the ligature and full-fold pairs, so the portable collision key now
+rejects them with Unicode full case folding; the width pair remains admitted
+and must stay distinct in every native job.
+These observations cover hosted temporary volumes, not every operator payload
+mount. The preflight remains defense in depth and does not close the check/write
+race. Descriptor-relative containment, persisted delete-root authority, and
+empirical filesystem-specific behavior across supported operator payload mounts
+remain M5/M2 work; no production path is wired.
 
 The Windows name restrictions are deliberately unconditional. `?`, `:`, and
 device basenames such as `aux.c` are legal on Linux, but accepting them would
@@ -2014,9 +2019,11 @@ becomes reachable.
   lowercase-collision rejection run as socket-free unit tests before
   real-admission path tests. The session root is canonicalized, and an
   existing-symlink integration case must leave its external target untouched;
-  the native matrix records hosted filesystem case and Unicode NFC/NFD aliasing
-  and proves the adapter rejects both pairs regardless of the observed result.
-  Descriptor-relative containment remains an M5 probe.
+  a dedicated native test target records hosted filesystem case, Unicode
+  NFC/NFD, compatibility-ligature, and full-fold aliasing. It requires the
+  compatibility-width pair still admitted by the adapter to remain distinct.
+  Descriptor-relative containment and filesystem-specific behavior on
+  supported operator payload mounts remain M5 probes.
 - Metainfo preflight: a deterministic mutation corpus runs in ordinary CI and
   pins exact accepted/rejected counts for v1, v2-only, and hybrid seeds; a
   validator replaced by `Ok(())` therefore fails rather than turning the

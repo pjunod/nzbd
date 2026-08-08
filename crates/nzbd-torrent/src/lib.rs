@@ -1145,22 +1145,17 @@ fn validate_metainfo_paths_with_limits<BufType: AsRef<[u8]>>(
 
 fn portable_collision_key(component: &str) -> String {
     let case_mapper = icu_casemap::CaseMapper::new();
-    // Windows' invariant path comparison also aliases dotless i with ASCII I.
-    // Simple case folding deliberately preserves dotless i, so keep this one
-    // additional conservative portability mapping explicit. Simple folding
-    // also avoids collapsing compatibility-only ligatures and width variants.
-    let windows_folded = component
+    // Full folding covers aliases observed on default case-insensitive macOS
+    // storage, including sharp-s/SS and compatibility ligature expansions.
+    // It deliberately leaves compatibility width variants distinct. Windows'
+    // invariant path comparison additionally aliases dotless i with ASCII I,
+    // so keep that conservative portability mapping explicit.
+    let fully_folded = case_mapper.fold_string(component);
+    let windows_folded = fully_folded
         .chars()
         .map(|character| match character {
             '\u{0131}' => 'i',
-            _ => {
-                let folded = case_mapper.simple_fold(character);
-                if folded == '\u{0131}' {
-                    'i'
-                } else {
-                    folded
-                }
-            }
+            _ => character,
         })
         .collect::<String>();
     icu_normalizer::ComposingNormalizer::new_nfc()
