@@ -91,6 +91,11 @@ jobs:
           key: bittorrent-m0-${{ matrix.target }}
       - name: Run the isolated adapter suite
         run: cargo test --locked -p nzbd-torrent --target ${{ matrix.target }}
+      - name: Record host filesystem name behavior
+        run: >-
+          cargo test --locked -p nzbd-torrent --target ${{ matrix.target }}
+          preflight_tests::filesystem_probe_records_aliasing_and_adapter_rejects_both_name_pairs
+          -- --exact --nocapture
 
   musl:
     name: ${{ matrix.name }} (Rust 1.85)

@@ -1183,10 +1183,13 @@ the stable engine's internal metadata allocation: rqbit may allocate up to
 magnet wiring still needs a reviewed pre-allocation answer. The adapter now
 canonicalizes the session output root and rejects every payload prefix that is
 an existing symlink before rqbit constructs storage; a Unix test proves the
-external target stays empty. That preflight is defense in depth and does not
-close the check/write race. Descriptor-relative containment, filesystem-specific
-Unicode normalization/case rules, and persisted delete-root authority remain
-M5/M2 work, and no production path is wired.
+external target stays empty. A native Linux, macOS, and Windows probe records
+whether each hosted runner filesystem aliases or distinguishes ASCII-case and
+Unicode NFC/NFD name pairs, then proves the portable adapter rejects both pairs
+either way. These observations cover the hosted runner volumes, not every
+operator mount. The preflight remains defense in depth and does not close the
+check/write race. Descriptor-relative containment and persisted delete-root
+authority remain M5/M2 work, and no production path is wired.
 
 The Windows name restrictions are deliberately unconditional. `?`, `:`, and
 device basenames such as `aux.c` are legal on Linux, but accepting them would
@@ -2008,8 +2011,9 @@ becomes reachable.
   lowercase-collision rejection run as socket-free unit tests before
   real-admission path tests. The session root is canonicalized, and an
   existing-symlink integration case must leave its external target untouched;
-  descriptor-relative containment and filesystem-specific Unicode
-  normalization remain M5 probes.
+  the native matrix records hosted filesystem case and Unicode NFC/NFD aliasing
+  and proves the adapter rejects both pairs regardless of the observed result.
+  Descriptor-relative containment remains an M5 probe.
 - Metainfo preflight: a deterministic mutation corpus runs in ordinary CI and
   pins exact accepted/rejected counts for v1, v2-only, and hybrid seeds; a
   validator replaced by `Ok(())` therefore fails rather than turning the
