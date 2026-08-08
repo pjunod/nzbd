@@ -649,6 +649,10 @@ fn setup_unwritable_config_offers_copyable_toml() {
         .args(["run", "--config"])
         .arg(&cfg_path)
         .args(["--bind", &addr])
+        // First-run mode boots with Config::default() until setup writes the
+        // real file. Keep that default state under this test's tempdir rather
+        // than touching the invoking user's ~/downloads tree.
+        .env("HOME", tmp.path())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -819,6 +823,10 @@ fn first_run_setup_wizard_writes_config_and_reloads() {
         .args(["run", "--config"])
         .arg(&cfg_path)
         .args(["--bind", &api_addr])
+        // First-run mode boots with Config::default() until setup writes the
+        // real file. Keep that default state under this test's tempdir rather
+        // than touching the invoking user's ~/downloads tree.
+        .env("HOME", tmp.path())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
