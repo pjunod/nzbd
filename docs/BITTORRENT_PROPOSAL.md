@@ -1192,7 +1192,11 @@ Review-directed probing added compatibility-ligature, compatibility-width, and
 full-case-fold pairs that the adapter then admitted. Default macOS storage
 aliased the ligature and full-fold pairs, so the portable collision key now
 rejects them with Unicode full case folding; the width pair remains admitted
-and must stay distinct in every native job.
+and must stay distinct in every native job. The
+[review-correction native run](https://github.com/pjunod/nzbd/actions/runs/31264422471)
+passed on 2026-08-08 UTC: Linux distinguished every pair; macOS aliased case,
+NFC/NFD, ligature, and full-fold pairs but distinguished width; and Windows
+aliased case but distinguished NFC/NFD, ligature, full-fold, and width pairs.
 These observations cover hosted temporary volumes, not every operator payload
 mount. The preflight remains defense in depth and does not close the check/write
 race. Descriptor-relative containment, persisted delete-root authority, and
