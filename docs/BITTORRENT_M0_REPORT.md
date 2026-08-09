@@ -79,6 +79,12 @@ code. The daemon does not depend on it. The boundary currently provides:
   three payload integrity scans at once, while the dormant session explicitly
   serializes that disk-heavy work. This is an initialization-I/O guard, not the
   future shared active-download scheduler or a runtime peer cap;
+- one DHT-disabled session pressure probe that admits 100 distinct one-byte
+  torrents within 30 seconds, keeps an exact 10-active/90-paused mix, and
+  requires session shutdown within 10 seconds. The torrents have no trackers
+  or initial peers, so the test exercises adapter and engine bookkeeping
+  without public discovery or payload transfer. A passing wall-clock deadline
+  is a regression guard, not a memory or throughput measurement;
 - explicit peer lifetimes: the dormant session pins stable 8.1.1's effective
   10-second connect and read/write timeouts and 120-second keepalive interval;
   per-add options inherit this reviewed session policy instead of introducing
@@ -176,6 +182,9 @@ The isolated suite covers:
 - centralized proposal limits for raw metainfo, magnet length, file count, one
   path component, one projected relative path, and aggregate projected path
   bytes, with exact boundary and first-excess tests;
+- one session retaining 100 distinct torrents at once, split into ten
+  live-but-peerless and ninety paused handles, with bounded admission and
+  shutdown deadlines and no tracker, DHT, initial-peer, or payload traffic;
 - deterministic, socket-free preflight mutations covering every truncation and
   bounded single-byte replacement, deletion, and insertion around valid v1,
   v2-only, and hybrid seeds, with exact accepted/rejected outcome counts plus

@@ -2024,10 +2024,15 @@ pull-request smoke, and weekly five-minute campaign. The main workspace suite
 also accepts a valid magnet URI at the exact 16 KiB product limit and a valid
 v1 document at the exact 10 MiB default metainfo ceiling, naming the first
 excess byte for each. It accepts a valid 100,000-file v1 inventory below the
-metainfo ceiling and names file 100,001 as the first rejected inventory. This
-is useful continuous coverage and three functional resource limits, not M5
-completion: crash-free bounded runs and functional limits do not establish
-peak-memory exhaustion resistance, filesystem containment, or sustained
+metainfo ceiling and names file 100,001 as the first rejected inventory. A
+DHT-disabled session probe also retains 100 distinct torrents at once, with an
+exact ten live-but-peerless and ninety paused mix, and fails if admission takes
+more than 30 seconds or shutdown takes more than 10 seconds. Its sources have
+no trackers or initial peers, so it starts no public discovery or payload
+transfer. This is useful continuous coverage and a wall-clock regression
+guard, not M5 completion: crash-free bounded runs, functional limits, and a
+deadline on shared CI do not establish peak-memory exhaustion resistance,
+filesystem containment, production shutdown orchestration, or sustained
 fuzzing adequacy.
 
 ### 15.8 M6 — cluster torrent leases (separate approval)
@@ -2120,6 +2125,11 @@ becomes reachable.
 - Scheduler: mixed priorities/protocols, force semantics, stalled-slot yield
   and later reacquisition, slot release on readiness, seeding excluded from
   download slots.
+- Session pressure: retain 100 distinct torrents in one DHT-disabled session,
+  require an exact ten-active/ninety-paused mix, and fail when admission or
+  shutdown exceeds the documented 30-second or 10-second deadline. Keep every
+  source trackerless and peerless so this remains bookkeeping evidence rather
+  than a public-network or throughput test.
 - Redaction: adapter engine/stat errors prove magnet, tracker/query/proxy,
   secret-assignment, embedded JSON/query assignments, private-tracker
   `torrent_pass`/`authkey`, API keys, signatures, session identifiers,
