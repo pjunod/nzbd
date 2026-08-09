@@ -19,6 +19,11 @@ The implementation therefore stops at the isolated `nzbd-torrent` boundary
 and queue schema-version groundwork. No config switch, API, daemon dependency,
 peer listener, or production torrent admission path has been added.
 
+The [pre-release operations review](BITTORRENT_RELEASE_REVIEW.md) collects the
+current traffic, port, path, seeding, deletion, evidence, and sign-off contract
+without presenting any of those proposed settings as usable production
+behavior.
+
 A later hostile-input review found a third stable-engine prerequisite outside
 the two failed ownership/observability gates: magnet metadata is allocated up
 to rqbit's fixed 32 MiB ceiling before nzbd can apply its proposed 10 MiB
@@ -79,6 +84,15 @@ code. The daemon does not depend on it. The boundary currently provides:
   three payload integrity scans at once, while the dormant session explicitly
   serializes that disk-heavy work. This is an initialization-I/O guard, not the
   future shared active-download scheduler or a runtime peer cap;
+- one DHT-disabled session pressure probe that admits 100 distinct one-byte
+  torrents within 30 seconds, keeps an exact 10-active/90-paused mix, and
+  requires session shutdown within 10 seconds. The torrents have no trackers
+  or initial peers, so the test exercises adapter and engine bookkeeping
+  without public discovery or payload transfer. A passing wall-clock deadline
+  is a regression guard, not a memory or throughput measurement. The
+  [first native evidence run](https://github.com/pjunod/nzbd/actions/runs/31330178035)
+  passed the isolated adapter suite on 2026-08-09 UTC for Linux x86_64 GNU,
+  Linux x86_64 musl, Linux aarch64 musl, macOS aarch64, and Windows x86_64;
 - explicit peer lifetimes: the dormant session pins stable 8.1.1's effective
   10-second connect and read/write timeouts and 120-second keepalive interval;
   per-add options inherit this reviewed session policy instead of introducing
@@ -176,6 +190,9 @@ The isolated suite covers:
 - centralized proposal limits for raw metainfo, magnet length, file count, one
   path component, one projected relative path, and aggregate projected path
   bytes, with exact boundary and first-excess tests;
+- one session retaining 100 distinct torrents at once, split into ten
+  live-but-peerless and ninety paused handles, with bounded admission and
+  shutdown deadlines and no tracker, DHT, initial-peer, or payload traffic;
 - deterministic, socket-free preflight mutations covering every truncation and
   bounded single-byte replacement, deletion, and insertion around valid v1,
   v2-only, and hybrid seeds, with exact accepted/rejected outcome counts plus
@@ -700,6 +717,8 @@ make fuzz-metainfo
 make fuzz-metainfo FUZZ_SECONDS=300
 make fuzz-magnet
 make fuzz-magnet FUZZ_SECONDS=300
+make gate
+make gate-fuzz
 
 # Linux only; requires passwordless sudo, iptables/ip6tables, and tcpdump.
 scripts/check-private-discovery-leaks.sh
@@ -715,6 +734,16 @@ scripts/check-rqbit-metadata-size-limit-patch.sh /path/to/rqbit
 scripts/check-rqbit-peer-response-budget-patch.sh /path/to/rqbit
 scripts/check-rqbit-discovery-pressure-patch.sh /path/to/rqbit
 ```
+
+`make gate` is the deterministic local release entry point: formatting,
+strict lint, the whole workspace suite, Rust 1.85 checking, the dormant
+adapter dependency boundary, the absence of `nzbd-torrent` and every
+`librqbit*` package from the production daemon's normal dependency graph,
+reviewed dependency exceptions, and committed fuzz seed contracts. The
+`make gate-fuzz` target runs that gate first and then both bounded 20,000-case
+libFuzzer campaigns by default. It requires the pinned nightly toolchain and
+cargo-fuzz used by the BitTorrent fuzz workflow. The scheduled five-minute
+campaigns remain separate CI evidence.
 
 The Rust 1.85 check must select both the 1.85 Cargo and `rustc`; this host also
 has a newer Homebrew compiler on `PATH`. The native platform matrix should run

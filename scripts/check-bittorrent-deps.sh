@@ -6,6 +6,7 @@ set -euo pipefail
 # before any adapter code or peer test starts.
 bt_normal_tree="$(cargo tree --locked -p nzbd-torrent -e normal --target all --prefix none)"
 bt_feature_tree="$(cargo tree --locked -p nzbd-torrent -e features -i librqbit)"
+daemon_normal_tree="$(cargo tree --locked -p nzbd -e normal --target all --prefix none)"
 
 bt_librqbit_versions="$(grep -E '^librqbit v' <<<"$bt_normal_tree" | sort -u || true)"
 if [[ "$bt_librqbit_versions" != "librqbit v8.1.1" ]]; then
@@ -30,4 +31,11 @@ if grep -Eq '^(openssl|openssl-sys|native-tls) v' <<<"$bt_normal_tree"; then
   exit 1
 fi
 
-echo 'BitTorrent dependency policy: librqbit 8.1.1, rust-tls only, no OpenSSL'
+daemon_torrent_packages="$(grep -E '^(nzbd-torrent|librqbit)' <<<"$daemon_normal_tree" | sort -u || true)"
+if [[ -n "$daemon_torrent_packages" ]]; then
+  echo 'BitTorrent M0 is a no-go: the production daemon dependency graph contains:' >&2
+  echo "$daemon_torrent_packages" >&2
+  exit 1
+fi
+
+echo 'BitTorrent dependency policy: librqbit 8.1.1, rust-tls only, no OpenSSL; daemon graph remains dormant'
