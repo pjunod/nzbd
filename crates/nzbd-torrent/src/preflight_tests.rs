@@ -742,6 +742,8 @@ fn magnet_preflight_names_format_version_and_proxy_failures() {
 
     for magnet in [
         "https://example.test/file.torrent".to_owned(),
+        format!("magnet://host?xt=urn:btih:{hex}"),
+        format!("magnet:/path?xt=urn:btih:{hex}"),
         "magnet:?dn=missing-topic".to_owned(),
         "magnet:?xt=urn:btih:short".to_owned(),
         format!("magnet:?xt=urn:btih:{}", "Z".repeat(40)),

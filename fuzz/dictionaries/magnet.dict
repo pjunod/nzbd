@@ -1,4 +1,5 @@
 scheme="magnet:?"
+authority="magnet://"
 v1="xt=urn:btih:"
 v2="xt=urn:btmh:1220"
 tracker="&tr="

@@ -155,7 +155,10 @@ fuzz-test: fuzz-deps ## Verify the committed BitTorrent fuzz seed classes
 	$(CARGO) test --manifest-path fuzz/Cargo.toml --locked
 
 .PHONY: fuzz-metainfo
-fuzz-metainfo: fuzz-test ## Coverage-guided BitTorrent metainfo preflight smoke
+fuzz-metainfo: fuzz-test fuzz-metainfo-run ## Coverage-guided BitTorrent metainfo preflight smoke
+
+.PHONY: fuzz-metainfo-run
+fuzz-metainfo-run:
 	mkdir -p fuzz/corpus/metainfo_preflight
 	cd fuzz && PATH="$(RUSTUP_PATH_PREFIX)$$PATH" $(CARGO) +$(FUZZ_TOOLCHAIN) \
 		fuzz run $(if $(strip $(FUZZ_TARGET)),--target $(FUZZ_TARGET),) \
@@ -165,7 +168,10 @@ fuzz-metainfo: fuzz-test ## Coverage-guided BitTorrent metainfo preflight smoke
 		-max_len=$(FUZZ_MAX_LEN) -dict=dictionaries/metainfo.dict
 
 .PHONY: fuzz-magnet
-fuzz-magnet: fuzz-test ## Coverage-guided BitTorrent magnet preflight smoke
+fuzz-magnet: fuzz-test fuzz-magnet-run ## Coverage-guided BitTorrent magnet preflight smoke
+
+.PHONY: fuzz-magnet-run
+fuzz-magnet-run:
 	mkdir -p fuzz/corpus/magnet_preflight
 	cd fuzz && PATH="$(RUSTUP_PATH_PREFIX)$$PATH" $(CARGO) +$(FUZZ_TOOLCHAIN) \
 		fuzz run $(if $(strip $(FUZZ_TARGET)),--target $(FUZZ_TARGET),) \

@@ -6,6 +6,7 @@ const V2_ONLY: &str = include_str!("../seeds/magnet_preflight/v2-only.magnet");
 const HYBRID: &str = include_str!("../seeds/magnet_preflight/hybrid.magnet");
 const SELECT_ONLY: &str = include_str!("../seeds/magnet_preflight/select-only.magnet");
 const PROXY_UDP: &str = include_str!("../seeds/magnet_preflight/proxy-udp.magnet");
+const AUTHORITY: &str = include_str!("../seeds/magnet_preflight/authority.magnet");
 
 #[test]
 fn reviewed_magnet_seeds_reach_the_named_preflight_classes() {
@@ -14,9 +15,11 @@ fn reviewed_magnet_seeds_reach_the_named_preflight_classes() {
         Ok(magnet) if magnet == VALID_V1
     ));
 
-    let normalized = fuzz_magnet_preflight(LOWERCASE_BASE32, false).unwrap();
-    assert!(normalized.contains(&"A".repeat(32)));
-    assert!(!normalized.contains(&"a".repeat(32)));
+    let normalized = fuzz_magnet_preflight(LOWERCASE_BASE32.trim_end(), false).unwrap();
+    assert_eq!(
+        normalized,
+        format!("magnet:?xt=urn%3Abtih%3A{}", "A".repeat(32))
+    );
 
     assert!(matches!(
         fuzz_magnet_preflight(V2_ONLY, false),
@@ -30,6 +33,11 @@ fn reviewed_magnet_seeds_reach_the_named_preflight_classes() {
         fuzz_magnet_preflight(SELECT_ONLY, false),
         Err(TorrentError::InvalidMagnet(message))
             if message == "select-only parameters are not supported"
+    ));
+    assert!(matches!(
+        fuzz_magnet_preflight(AUTHORITY, false),
+        Err(TorrentError::InvalidMagnet(message))
+            if message == "expected a magnet URI without an authority or path"
     ));
     assert!(fuzz_magnet_preflight(PROXY_UDP, false).is_ok());
     assert!(matches!(

@@ -2017,7 +2017,7 @@ reviewer can verify public traffic, ports, paths, seed policy, and deletion
 from docs without reading code.
 
 **Current groundwork:** adapter-owned metadata-only file admission and magnet
-preflight have separate feature-gated libFuzzer targets. Nine metainfo and six
+preflight have separate feature-gated libFuzzer targets. Nine metainfo and seven
 magnet seed classes are reviewed and contract checked, separate from each
 target's ignored evolving corpus; each target has its own dictionary, bounded
 pull-request smoke, and weekly five-minute campaign. The main workspace suite
@@ -2066,9 +2066,11 @@ becomes reachable.
   privacy-unknown magnet input is rejected before an explicit peer is
   contacted, and the paired DHT-disabled case proves a private magnet can
   still resolve through that explicit peer. A separate libFuzzer target passes
-  valid UTF-8 to the exact preflight in normal and proxy modes. Its six
+  valid UTF-8 to the exact preflight in normal and proxy modes. Its seven
   contract-checked seeds cover valid v1, lowercase-base32 normalization,
-  v2-only, hybrid, eager-selection rejection, and proxy+UDP-tracker rejection.
+  v2-only, hybrid, authority-form rejection, eager-selection rejection, and
+  proxy+UDP-tracker rejection. Every accepted normalized URI is also parsed by
+  rqbit inside the target, so preflight/parser divergence becomes a reproducer.
   Pull requests run 20,000 cases and the weekly job runs for five minutes;
   generated input is capped at 32 KiB, failing reproducers are uploaded, and
   the evolved corpus is not retained. An adjacent contract passes a valid URI
