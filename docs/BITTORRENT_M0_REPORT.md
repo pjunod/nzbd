@@ -93,6 +93,12 @@ code. The daemon does not depend on it. The boundary currently provides:
   [first native evidence run](https://github.com/pjunod/nzbd/actions/runs/31330178035)
   passed the isolated adapter suite on 2026-08-09 UTC for Linux x86_64 GNU,
   Linux x86_64 musl, Linux aarch64 musl, macOS aarch64, and Windows x86_64;
+- one optimized-process memory probe repeats that exact trackerless, peerless
+  100-torrent mix and samples resident memory before session construction,
+  after construction, and after every ten admissions. It fails above a
+  preliminary 192 MiB growth ceiling on each native runner. This is a sampled
+  retained-memory regression guard, not an allocator peak, active-swarm, or
+  exhaustion-resistance claim;
 - explicit peer lifetimes: the dormant session pins stable 8.1.1's effective
   10-second connect and read/write timeouts and 120-second keepalive interval;
   per-add options inherit this reviewed session policy instead of introducing

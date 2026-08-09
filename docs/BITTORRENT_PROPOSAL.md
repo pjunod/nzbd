@@ -2152,6 +2152,13 @@ becomes reachable.
   shutdown exceeds the documented 30-second or 10-second deadline. Keep every
   source trackerless and peerless so this remains bookkeeping evidence rather
   than a public-network or throughput test.
+- Session memory pressure: run the same trackerless, peerless 100-torrent mix
+  in an optimized process, sample resident memory before session construction,
+  after construction, and after every ten admissions, and fail if sampled
+  growth exceeds the preliminary 192 MiB regression ceiling. Record every
+  native platform separately. This catches large retained-memory regressions;
+  periodic working-set samples do not prove the true allocation peak, active
+  swarm behavior, or exhaustion resistance.
 - Redaction: adapter engine/stat errors prove magnet, tracker/query/proxy,
   secret-assignment, embedded JSON/query assignments, private-tracker
   `torrent_pass`/`authkey`, API keys, signatures, session identifiers,
