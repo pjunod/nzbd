@@ -215,10 +215,14 @@ private-multiple-tracker, and unsafe-path outcomes; their named contracts are
 checked before every campaign. The reviewed seeds live separately from the
 ignored evolving corpus. The target uses a bencode dictionary, caps generated
 inputs at 1 MiB, and runs 20,000 cases on relevant pull requests plus a
-five-minute weekly campaign. Exact product boundaries, including the 10 MiB
-metainfo limit, remain deterministic unit tests. The CI campaign does not
-persist its evolved corpus, prove path writes, or complete M5's symlink,
-mounted-filesystem, sustained-campaign, and resource-exhaustion work.
+five-minute weekly campaign. The main workspace test suite requires a valid v1
+document at exactly the 10 MiB default metainfo ceiling to pass and the first
+excess byte to fail by the named size boundary. It also constructs a valid
+100,000-file v1 inventory below that independent ceiling and requires it to
+pass, then requires file 100,001 to fail by the named file-count boundary. The
+CI campaign does not persist its evolved corpus, prove a peak-memory ceiling
+or path writes, or complete M5's symlink, mounted-filesystem,
+sustained-campaign, and broader resource-exhaustion work.
 
 The two-stage magnet guard closes the storage-ordering gap, not the allocation
 gap inside stable rqbit: its metadata reader may allocate up to 32 MiB before

@@ -1986,10 +1986,14 @@ from docs without reading code.
 libFuzzer target with nine committed and contract-checked seed classes across
 version, tracker, privacy, path, and multifile behavior, a bencode dictionary,
 a bounded pull-request smoke, and a weekly five-minute campaign. The reviewed
-seeds are separate from the ignored evolving corpus. This is useful continuous
-coverage growth, not M5 completion:
-crash-free bounded runs do not establish exhaustion resistance, filesystem
-containment, or sustained fuzzing adequacy.
+seeds are separate from the ignored evolving corpus. The main workspace suite
+accepts a valid v1 document at the exact 10 MiB default metainfo ceiling and
+names the first excess byte, accepts a valid 100,000-file v1 inventory below
+that ceiling, and names file 100,001 as the first rejected inventory. This is
+useful continuous coverage and two functional resource limits, not M5
+completion: crash-free bounded runs and functional limits do not establish
+peak-memory exhaustion resistance, filesystem containment, or sustained
+fuzzing adequacy.
 
 ### 15.8 M6 — cluster torrent leases (separate approval)
 
@@ -2057,9 +2061,13 @@ becomes reachable.
   Pull requests run 20,000 cases and the weekly job runs for five minutes,
   with failing reproducers uploaded. Reviewed seeds are kept apart from the
   ignored evolving corpus. The campaign caps generated input at 1 MiB and does
-  not retain an evolved corpus; sustained
-  coverage-guided fuzzing and the exact M5 resource/filesystem probes remain a
-  release gate.
+  not retain an evolved corpus. Main-workspace contracts accept a valid v1
+  document at the exact 10 MiB default and prove the first excess byte fails by
+  name; they separately construct a valid 100,000-file v1 inventory under that
+  ceiling and prove the first excess file fails by name. They deliberately do
+  not infer a stable peak-memory budget from shared CI runners. Sustained
+  coverage-guided fuzzing and the remaining M5 resource/filesystem probes
+  remain a release gate.
 - State projection: every `TorrentPhase` maps to the expected native and
   qBittorrent status, with units/sentinel values pinned.
 - Seed policy: add/category/global precedence, ratio precision, time across
