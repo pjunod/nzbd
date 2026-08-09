@@ -348,8 +348,8 @@ mod tests {
 
     #[cfg(not(target_os = "android"))]
     use rcgen::{
-        BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair,
-        KeyUsagePurpose,
+        BasicConstraints, CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose,
+        IsCa, KeyPair, KeyUsagePurpose,
     };
     #[cfg(not(target_os = "android"))]
     use rustls::pki_types::PrivatePkcs8KeyDer;
@@ -369,6 +369,9 @@ mod tests {
         install_process_crypto_provider().expect("install aws-lc provider");
 
         let mut ca_params = CertificateParams::new(Vec::new()).expect("CA params");
+        let mut ca_name = DistinguishedName::new();
+        ca_name.push(DnType::CommonName, "nzbd test root CA");
+        ca_params.distinguished_name = ca_name;
         ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
         ca_params.key_usages = vec![
             KeyUsagePurpose::DigitalSignature,
@@ -378,18 +381,37 @@ mod tests {
         let ca_key = KeyPair::generate().expect("CA key");
         let ca = ca_params.self_signed(&ca_key).expect("self-signed CA");
 
+        let mut intermediate_params =
+            CertificateParams::new(Vec::new()).expect("intermediate params");
+        let mut intermediate_name = DistinguishedName::new();
+        intermediate_name.push(DnType::CommonName, "nzbd test intermediate CA");
+        intermediate_params.distinguished_name = intermediate_name;
+        intermediate_params.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
+        intermediate_params.key_usages = vec![
+            KeyUsagePurpose::DigitalSignature,
+            KeyUsagePurpose::KeyCertSign,
+            KeyUsagePurpose::CrlSign,
+        ];
+        let intermediate_key = KeyPair::generate().expect("intermediate key");
+        let intermediate = intermediate_params
+            .signed_by(&intermediate_key, &ca, &ca_key)
+            .expect("root-signed intermediate");
+
         let mut leaf_params =
             CertificateParams::new(vec!["localhost".into()]).expect("leaf params");
+        let mut leaf_name = DistinguishedName::new();
+        leaf_name.push(DnType::CommonName, "localhost");
+        leaf_params.distinguished_name = leaf_name;
         leaf_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
         let leaf_key = KeyPair::generate().expect("leaf key");
         let leaf = leaf_params
-            .signed_by(&leaf_key, &ca, &ca_key)
-            .expect("CA-signed leaf");
+            .signed_by(&leaf_key, &intermediate, &intermediate_key)
+            .expect("intermediate-signed leaf");
 
         let server_config = rustls::ServerConfig::builder()
             .with_no_client_auth()
             .with_single_cert(
-                vec![leaf.der().clone()],
+                vec![leaf.der().clone(), intermediate.der().clone()],
                 PrivatePkcs8KeyDer::from(leaf_key.serialize_der()).into(),
             )
             .expect("TLS server config");
