@@ -151,12 +151,18 @@ fn build_source_client(
     limits: TorrentSourceFetchLimits,
     tls_config: ClientConfig,
 ) -> Result<Client, reqwest::Error> {
+    source_client_builder(limits, tls_config).build()
+}
+
+fn source_client_builder(
+    limits: TorrentSourceFetchLimits,
+    tls_config: ClientConfig,
+) -> reqwest::ClientBuilder {
     Client::builder()
         .no_proxy()
         .use_preconfigured_tls(tls_config)
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(limits.connect_timeout)
-        .build()
 }
 
 async fn fetch_redirect_chain(
@@ -373,7 +379,7 @@ mod tests {
         let ca = ca_params.self_signed(&ca_key).expect("self-signed CA");
 
         let mut leaf_params =
-            CertificateParams::new(vec!["127.0.0.1".into()]).expect("leaf params");
+            CertificateParams::new(vec!["localhost".into()]).expect("leaf params");
         leaf_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
         let leaf_key = KeyPair::generate().expect("leaf key");
         let leaf = leaf_params
@@ -426,8 +432,13 @@ mod tests {
         let tls_config = tls_config_with_verifier(provider, Arc::new(verifier))
             .expect("platform-verifier TLS config");
         let limits = TorrentSourceFetchLimits::default();
-        let client = build_source_client(limits, tls_config).expect("source client");
-        let source_url = Url::parse(&format!("https://127.0.0.1:{}/source", address.port()))
+        let client = source_client_builder(limits, tls_config)
+            // Keep the certificate name realistic while making the loopback
+            // address family deterministic on every native runner.
+            .resolve("localhost", address)
+            .build()
+            .expect("source client");
+        let source_url = Url::parse(&format!("https://localhost:{}/source", address.port()))
             .expect("HTTPS source URL");
 
         let bytes = fetch_redirect_chain(&client, source_url, None, limits, false)
