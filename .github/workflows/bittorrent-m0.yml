@@ -95,6 +95,10 @@ jobs:
         run: >-
           cargo run --locked -p nzbd-torrent --release
           --target ${{ matrix.target }} --example m0_session_pressure_memory
+      - name: Bound sampled 100,000-file preflight resident-memory growth
+        run: >-
+          cargo run --locked -p nzbd-torrent --release --features fuzzing
+          --target ${{ matrix.target }} --example m0_metainfo_pressure_memory
       - name: Record host filesystem name behavior
         run: >-
           cargo test --locked -p nzbd-torrent --target ${{ matrix.target }}
@@ -131,3 +135,7 @@ jobs:
         run: >-
           cargo run --locked -p nzbd-torrent --release
           --target ${{ matrix.target }} --example m0_session_pressure_memory
+      - name: Bound sampled 100,000-file preflight resident-memory growth
+        run: >-
+          cargo run --locked -p nzbd-torrent --release --features fuzzing
+          --target ${{ matrix.target }} --example m0_metainfo_pressure_memory

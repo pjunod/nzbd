@@ -99,6 +99,12 @@ code. The daemon does not depend on it. The boundary currently provides:
   preliminary 192 MiB growth ceiling on each native runner. This is a sampled
   retained-memory regression guard, not an allocator peak, active-swarm, or
   exhaustion-resistance claim;
+- a second optimized-process probe constructs and validates the accepted
+  100,000-file inventory while sampling resident memory before fixture
+  construction, after construction, and after validation. It fails above a
+  preliminary 256 MiB growth ceiling on each native runner. This is retained
+  memory evidence, not the parser's transient allocation peak or a concurrent
+  hostile-submission test;
 - explicit peer lifetimes: the dormant session pins stable 8.1.1's effective
   10-second connect and read/write timeouts and 120-second keepalive interval;
   per-add options inherit this reviewed session policy instead of introducing

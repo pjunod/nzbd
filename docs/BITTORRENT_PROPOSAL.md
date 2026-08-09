@@ -2159,6 +2159,13 @@ becomes reachable.
   native platform separately. This catches large retained-memory regressions;
   periodic working-set samples do not prove the true allocation peak, active
   swarm behavior, or exhaustion resistance.
+- Metainfo memory pressure: construct and validate the accepted 100,000-file
+  inventory in an optimized process, sample resident memory before fixture
+  construction, after construction, and after validation, and fail if sampled
+  growth exceeds the preliminary 256 MiB regression ceiling. Record every
+  native platform separately. This catches large retained-memory regressions;
+  three working-set samples do not prove the parser's transient allocation
+  peak or resistance to concurrent hostile submissions.
 - Redaction: adapter engine/stat errors prove magnet, tracker/query/proxy,
   secret-assignment, embedded JSON/query assignments, private-tracker
   `torrent_pass`/`authkey`, API keys, signatures, session identifiers,
