@@ -53,7 +53,6 @@ fi
 
 cargo metadata \
   --locked \
-  --offline \
   --manifest-path fuzz/Cargo.toml \
   --format-version 1 >/dev/null
 
