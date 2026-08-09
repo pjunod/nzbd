@@ -84,7 +84,10 @@ code. The daemon does not depend on it. The boundary currently provides:
   requires session shutdown within 10 seconds. The torrents have no trackers
   or initial peers, so the test exercises adapter and engine bookkeeping
   without public discovery or payload transfer. A passing wall-clock deadline
-  is a regression guard, not a memory or throughput measurement;
+  is a regression guard, not a memory or throughput measurement. The
+  [first native evidence run](https://github.com/pjunod/nzbd/actions/runs/31330178035)
+  passed the isolated adapter suite on 2026-08-09 UTC for Linux x86_64 GNU,
+  Linux x86_64 musl, Linux aarch64 musl, macOS aarch64, and Windows x86_64;
 - explicit peer lifetimes: the dormant session pins stable 8.1.1's effective
   10-second connect and read/write timeouts and 120-second keepalive interval;
   per-add options inherit this reviewed session policy instead of introducing

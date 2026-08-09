@@ -2029,11 +2029,14 @@ DHT-disabled session probe also retains 100 distinct torrents at once, with an
 exact ten live-but-peerless and ninety paused mix, and fails if admission takes
 more than 30 seconds or shutdown takes more than 10 seconds. Its sources have
 no trackers or initial peers, so it starts no public discovery or payload
-transfer. This is useful continuous coverage and a wall-clock regression
-guard, not M5 completion: crash-free bounded runs, functional limits, and a
-deadline on shared CI do not establish peak-memory exhaustion resistance,
-filesystem containment, production shutdown orchestration, or sustained
-fuzzing adequacy.
+transfer. The
+[first native evidence run](https://github.com/pjunod/nzbd/actions/runs/31330178035)
+passed the isolated adapter suite on 2026-08-09 UTC across Linux x86_64 GNU,
+Linux x86_64 musl, Linux aarch64 musl, macOS aarch64, and Windows x86_64. This
+is useful continuous coverage and a wall-clock regression guard, not M5
+completion: crash-free bounded runs, functional limits, and a deadline on
+shared CI do not establish peak-memory exhaustion resistance, filesystem
+containment, production shutdown orchestration, or sustained fuzzing adequacy.
 
 ### 15.8 M6 — cluster torrent leases (separate approval)
 
