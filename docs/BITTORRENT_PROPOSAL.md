@@ -1471,10 +1471,15 @@ remain review evidence rather than shipped capability. Projected paths include
 the multi-file root and platform separator bytes, so the accounting bounds the
 paths later passed to storage rather than only the raw bencode component
 payloads. Exact-limit tests pass and the first excess byte or file returns a
-stable named error. Error
-truncation is UTF-8 safe and ends with an explicit marker. The 1–100 MiB
-metainfo configuration range, redirects, and fetched-body streaming remain
-API/source-fetch work; no production input is wired by these constants.
+stable named error. Error truncation is UTF-8 safe and ends with an explicit
+marker. The dormant source-fetch boundary now validates the 1–100 MiB fetch
+range, follows at most five manually checked redirects, and enforces the
+selected limit while the body streams. The other dormant admission paths
+still use the 10 MiB default. Daemon integration must carry one configured
+limit through both fetching and later engine admission; a successful fetch
+must never return bytes that the next boundary rejects only because it used a
+different limit. Daemon configuration and API plumbing remain future work; no
+production input is wired by these constants or helpers.
 The dormant managed-admission helper accepts preflighted metainfo bytes only;
 it cannot receive rqbit's URL variant. Authenticated HTTP(S) fetching remains
 an nzbd-owned boundary because stable rqbit buffers the response before nzbd
@@ -1585,9 +1590,9 @@ URL userinfo/path/query data, recognized inline, colon-delimited, JSON-style,
 whitespace-separated, and arrow-delimited secret assignments, multi-token
 authorization and cookie values, peer addresses, absolute paths, and control
 characters, then applies the 2 KiB display bound.
-The later source-fetch and daemon boundaries must keep applying the same
-invariant to their own errors rather than treating this adapter guard as a
-replacement.
+The dormant source-fetch helper applies an origin-only error contract. The
+later daemon boundary must keep that invariant rather than treating either
+adapter guard as a replacement for job/API redaction.
 
 ### 11.4 Source fetching
 
@@ -1601,10 +1606,34 @@ send short-lived indexer URLs. Fetch with:
 - no cookies persisted after the fetch;
 - redirect target revalidated on every hop.
 
+The dormant adapter implements that fetch contract without exposing it through
+the daemon. It defaults to a 10 MiB body, five redirects, a 10-second connect
+timeout, and a 30-second end-to-end timeout spanning the redirect chain and
+body. URL basic-auth credentials are decoded once, survive only same-origin
+redirects, and are stripped on every cross-origin hop; credentials supplied by
+a redirect target are ignored. Redirects are manual, ambient proxy environment
+variables are disabled, the client has no cookie store, and TLS uses the
+process-wide aws-lc provider plus `rustls-platform-verifier` so operator-added
+OS trust roots continue to work for private indexers. Declared and streamed
+body sizes fail at the first excess byte, and returned bytes must pass the same
+metainfo, geometry, path, privacy, and tracker preflight used before engine
+admission. The fetch helper accepts a 1–100 MiB limit, but the other dormant
+admission helpers still use the 10 MiB default; production wiring must carry
+one configured value through both boundaries. Loopback tests cover both
+redirect sides, status and timeout redaction, the exact five-hop boundary,
+cookie non-replay, private-CA HTTPS, header and mutation-discriminating
+chunked-body ceilings, and proxy-unsafe tracker rejection. This is a dormant
+seam only: it creates no API route, queue job, engine session, listener,
+discovery traffic, or payload I/O.
+
 Private/LAN indexers are a legitimate deployment, so an unconditional
 private-IP ban would break the intended workflow. Authentication is the
 authority boundary. The UI warns that accepting a URL lets an authenticated
-client make the daemon connect outbound.
+client make the daemon connect outbound. That authority also includes every
+manually validated redirect target: a trusted or compromised indexer can pivot
+the daemon's blind GET to an internal or link-local address. The response still
+must parse as admitted metainfo and errors expose only the target origin, but
+those guards do not remove the outbound-request risk.
 
 ### 11.5 Deletion is resolved, bounded, and idempotent
 
@@ -1649,16 +1678,21 @@ whose prefix merely resembles the configured root. The existing job
 - Keep the adapter's deterministic preflight mutation corpus in ordinary CI:
   every truncation plus bounded byte replacement, deletion, and insertion
   around v1, v2-only, and hybrid seeds, with structural-limit invariants. It
-  complements rather than replaces the M5 coverage-guided target. The isolated
-  `cargo-fuzz` crate pins its two test-only additions against the reviewed
-  product lock, checks that every committed seed reaches its named outcome,
-  calls the complete adapter-owned metadata-only file-admission wrapper across
-  all proxy/DHT combinations without sessions or I/O, and runs a 20,000-case
-  pull-request smoke plus a five-minute weekly campaign. Reviewed seeds remain
-  separate from the ignored evolving corpus.
-  Its 1 MiB campaign cap keeps CI bounded; deterministic tests retain the exact
-  10 MiB product boundary. Exercise path rejection through real engine
-  admission even if upstream also fuzzes bencode; M5 still owns
+  complements rather than replaces the M5 coverage-guided targets. The
+  isolated `cargo-fuzz` crate pins its two test-only additions against the
+  reviewed product lock, checks that every reviewed seed reaches its named
+  outcome, and keeps those seeds separate from each target's ignored evolving
+  corpus. The metainfo target calls the complete adapter-owned metadata-only
+  file-admission wrapper across all proxy/DHT combinations without sessions or
+  I/O; its nine reviewed seed classes cover version, tracker, privacy, path,
+  and multifile behavior. Its 1 MiB campaign cap keeps CI bounded while main
+  workspace tests retain the exact 10 MiB product boundary. The magnet target
+  passes valid UTF-8 to both normal and proxy preflight from valid-v1,
+  lowercase-base32, v2-only, hybrid, eager-selection, and proxy+UDP-tracker
+  seeds. Its 32 KiB campaign cap permits generated inputs to cross the exact
+  16 KiB product limit. Each target runs a 20,000-case pull-request smoke and a
+  separate five-minute weekly campaign. Exercise path rejection through real
+  engine admission even if upstream also fuzzes bencode; M5 still owns
   sustained campaigns, corpus retention, symlink, mounted-filesystem, and
   normalized case-collision probes.
 
@@ -1982,14 +2016,19 @@ passes; Linux glibc/musl, macOS, Windows, Docker, and MSRV artifacts build; the
 reviewer can verify public traffic, ports, paths, seed policy, and deletion
 from docs without reading code.
 
-**Current groundwork:** metadata-only file admission has a feature-gated
-libFuzzer target with nine committed and contract-checked seed classes across
-version, tracker, privacy, path, and multifile behavior, a bencode dictionary,
-a bounded pull-request smoke, and a weekly five-minute campaign. The reviewed
-seeds are separate from the ignored evolving corpus. This is useful continuous
-coverage growth, not M5 completion:
-crash-free bounded runs do not establish exhaustion resistance, filesystem
-containment, or sustained fuzzing adequacy.
+**Current groundwork:** adapter-owned metadata-only file admission and magnet
+preflight have separate feature-gated libFuzzer targets. Nine metainfo and seven
+magnet seed classes are reviewed and contract checked, separate from each
+target's ignored evolving corpus; each target has its own dictionary, bounded
+pull-request smoke, and weekly five-minute campaign. The main workspace suite
+also accepts a valid magnet URI at the exact 16 KiB product limit and a valid
+v1 document at the exact 10 MiB default metainfo ceiling, naming the first
+excess byte for each. It accepts a valid 100,000-file v1 inventory below the
+metainfo ceiling and names file 100,001 as the first rejected inventory. This
+is useful continuous coverage and three functional resource limits, not M5
+completion: crash-free bounded runs and functional limits do not establish
+peak-memory exhaustion resistance, filesystem containment, or sustained
+fuzzing adequacy.
 
 ### 15.8 M6 — cluster torrent leases (separate approval)
 
@@ -2026,7 +2065,17 @@ becomes reachable.
   mode before any payload storage exists. A DHT-enabled-session case proves
   privacy-unknown magnet input is rejected before an explicit peer is
   contacted, and the paired DHT-disabled case proves a private magnet can
-  still resolve through that explicit peer.
+  still resolve through that explicit peer. A separate libFuzzer target passes
+  valid UTF-8 to the exact preflight in normal and proxy modes. Its seven
+  contract-checked seeds cover valid v1, lowercase-base32 normalization,
+  v2-only, hybrid, authority-form rejection, eager-selection rejection, and
+  proxy+UDP-tracker rejection. Every accepted normalized URI is also parsed by
+  rqbit inside the target, so preflight/parser divergence becomes a reproducer.
+  Pull requests run 20,000 cases and the weekly job runs for five minutes;
+  generated input is capped at 32 KiB, failing reproducers are uploaded, and
+  the evolved corpus is not retained. An adjacent contract passes a valid URI
+  at exactly the 16 KiB product limit through the full preflight and requires
+  the first excess byte to fail by name.
 - Private metainfo discovery: a known-private `.torrent` is rejected before
   engine admission when session DHT is live; the same one-tracker metainfo is
   accepted by policy when DHT is disabled.
@@ -2057,9 +2106,13 @@ becomes reachable.
   Pull requests run 20,000 cases and the weekly job runs for five minutes,
   with failing reproducers uploaded. Reviewed seeds are kept apart from the
   ignored evolving corpus. The campaign caps generated input at 1 MiB and does
-  not retain an evolved corpus; sustained
-  coverage-guided fuzzing and the exact M5 resource/filesystem probes remain a
-  release gate.
+  not retain an evolved corpus. Main-workspace contracts accept a valid v1
+  document at the exact 10 MiB default and prove the first excess byte fails by
+  name; they separately construct a valid 100,000-file v1 inventory under that
+  ceiling and prove the first excess file fails by name. They deliberately do
+  not infer a stable peak-memory budget from shared CI runners. Sustained
+  coverage-guided fuzzing and the remaining M5 resource/filesystem probes
+  remain a release gate.
 - State projection: every `TorrentPhase` maps to the expected native and
   qBittorrent status, with units/sentinel values pinned.
 - Seed policy: add/category/global precedence, ratio precision, time across

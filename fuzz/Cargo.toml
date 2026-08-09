@@ -8,6 +8,7 @@ edition = "2021"
 cargo-fuzz = true
 
 [dependencies]
+librqbit = { workspace = true }
 libfuzzer-sys = "=0.4.13"
 nzbd-torrent = { path = "../crates/nzbd-torrent", features = ["fuzzing"] }
 
@@ -18,5 +19,15 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "magnet_preflight"
+path = "fuzz_targets/magnet_preflight.rs"
+test = false
+doc = false
+bench = false
+
 [workspace]
 members = ["."]
+
+[workspace.dependencies]
+librqbit = { version = "=8.1.1", default-features = false, features = ["rust-tls"] }

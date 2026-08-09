@@ -13,7 +13,7 @@ const PRIVATE_TWO_TRACKERS_V1: &[u8] =
 const UNSAFE_PATH_V1: &[u8] = include_bytes!("../seeds/metainfo_preflight/unsafe-path-v1.torrent");
 
 #[test]
-fn committed_seeds_reach_the_named_preflight_classes() {
+fn reviewed_seeds_reach_the_named_preflight_classes() {
     assert!(matches!(
         fuzz_metainfo_preflight(VALID_V1, false),
         Ok(false)
