@@ -125,6 +125,7 @@ NZBGet configuration and prints a mapping report.
 | [docs/BITTORRENT_PROPOSAL.md](docs/BITTORRENT_PROPOSAL.md) | Proposed first-class BitTorrent backend: engine choice, queue/storage contracts, *arr compatibility, security, rollout, and review decisions |
 | [docs/BITTORRENT_M0_REPORT.md](docs/BITTORRENT_M0_REPORT.md) | BitTorrent engine spike: passing data-path evidence, measurements, and the API gaps blocking daemon integration |
 | [docs/BITTORRENT_GATE9_REVIEW.md](docs/BITTORRENT_GATE9_REVIEW.md) | Reviewer decision brief for the BitTorrent resource, dependency, license, and three constrained advisory exceptions |
+| [docs/BITTORRENT_RELEASE_REVIEW.md](docs/BITTORRENT_RELEASE_REVIEW.md) | Pre-release operations review: current no-go, public traffic, ports, paths, seeding, deletion, evidence, and sign-off conditions |
 | [docs/BITTORRENT_M1B_REPORT.md](docs/BITTORRENT_M1B_REPORT.md) | Dormant protocol-neutral queue/backend seam: schema 3, shared scheduling, coalesced progress, and the production-networking guard |
 | [docs/INTEGRATION.md](docs/INTEGRATION.md) | Every seam with monarr and plurx: what each does, where you watch it, and the command that proves it |
 | [docs/INTEGRATION_PLAN.md](docs/INTEGRATION_PLAN.md) | The event/cursor contract consumers build against, and how it was built |

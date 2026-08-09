@@ -2027,6 +2027,14 @@ seed contracts.
 toolchain and cargo-fuzz used by CI; weekly five-minute campaigns remain
 separate evidence rather than silently extending every local gate.
 
+The checked-in
+[pre-release operations review](BITTORRENT_RELEASE_REVIEW.md) gives reviewers
+one short surface for public traffic, ports, paths, seeding, deletion, current
+evidence, and stop conditions. Its policy check intentionally pins the present
+no-go state: gates 7 and 8 remain failed and gate 9 remains Partial. Updating
+that check requires the same reviewed gate-state change as this proposal and
+the M0 report; it cannot be bypassed to expose production wiring.
+
 **Current groundwork:** adapter-owned metadata-only file admission and magnet
 preflight have separate feature-gated libFuzzer targets. Nine metainfo and seven
 magnet seed classes are reviewed and contract checked, separate from each
