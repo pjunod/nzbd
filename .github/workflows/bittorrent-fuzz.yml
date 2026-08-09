@@ -30,9 +30,9 @@ env:
 
 jobs:
   metainfo-preflight:
-    name: metainfo preflight (libFuzzer)
+    name: input preflight (libFuzzer)
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@master
@@ -49,14 +49,28 @@ jobs:
       - name: Check fuzz harness formatting
         run: cargo +nightly-2026-08-01 fmt --manifest-path fuzz/Cargo.toml -- --check
 
+      - name: Verify reviewed fuzz seeds and dependencies
+        run: make fuzz-test
+
       - name: Run bounded pull-request fuzzing
         if: github.event_name != 'schedule'
-        run: make fuzz-metainfo FUZZ_TARGET=x86_64-unknown-linux-gnu
+        run: make fuzz-metainfo-run FUZZ_TARGET=x86_64-unknown-linux-gnu
+
+      - name: Run bounded pull-request magnet fuzzing
+        if: github.event_name != 'schedule'
+        run: make fuzz-magnet-run FUZZ_TARGET=x86_64-unknown-linux-gnu
 
       - name: Run scheduled five-minute fuzzing
         if: github.event_name == 'schedule'
         run: >-
-          make fuzz-metainfo
+          make fuzz-metainfo-run
+          FUZZ_TARGET=x86_64-unknown-linux-gnu
+          FUZZ_SECONDS=300
+
+      - name: Run scheduled five-minute magnet fuzzing
+        if: github.event_name == 'schedule'
+        run: >-
+          make fuzz-magnet-run
           FUZZ_TARGET=x86_64-unknown-linux-gnu
           FUZZ_SECONDS=300
 
@@ -64,6 +78,8 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: metainfo-preflight-reproducer
-          path: fuzz/artifacts/metainfo_preflight/
+          name: input-preflight-reproducers
+          path: |
+            fuzz/artifacts/metainfo_preflight/
+            fuzz/artifacts/magnet_preflight/
           if-no-files-found: ignore

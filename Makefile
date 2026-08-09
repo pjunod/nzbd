@@ -18,6 +18,7 @@ FUZZ_TOOLCHAIN ?= nightly-2026-08-01
 FUZZ_TARGET ?=
 FUZZ_RUNS ?= 20000
 FUZZ_MAX_LEN ?= 1048576
+FUZZ_MAGNET_MAX_LEN ?= 32768
 FUZZ_SECONDS ?=
 UNAME_S := $(shell uname -s)
 # Build identity for container builds. The Docker context excludes .git
@@ -154,7 +155,10 @@ fuzz-test: fuzz-deps ## Verify the committed BitTorrent fuzz seed classes
 	$(CARGO) test --manifest-path fuzz/Cargo.toml --locked
 
 .PHONY: fuzz-metainfo
-fuzz-metainfo: fuzz-test ## Coverage-guided BitTorrent metainfo preflight smoke
+fuzz-metainfo: fuzz-test fuzz-metainfo-run ## Coverage-guided BitTorrent metainfo preflight smoke
+
+.PHONY: fuzz-metainfo-run
+fuzz-metainfo-run:
 	mkdir -p fuzz/corpus/metainfo_preflight
 	cd fuzz && PATH="$(RUSTUP_PATH_PREFIX)$$PATH" $(CARGO) +$(FUZZ_TOOLCHAIN) \
 		fuzz run $(if $(strip $(FUZZ_TARGET)),--target $(FUZZ_TARGET),) \
@@ -162,6 +166,19 @@ fuzz-metainfo: fuzz-test ## Coverage-guided BitTorrent metainfo preflight smoke
 		corpus/metainfo_preflight seeds/metainfo_preflight -- \
 		$(if $(strip $(FUZZ_SECONDS)),-max_total_time=$(FUZZ_SECONDS),-runs=$(FUZZ_RUNS)) \
 		-max_len=$(FUZZ_MAX_LEN) -dict=dictionaries/metainfo.dict
+
+.PHONY: fuzz-magnet
+fuzz-magnet: fuzz-test fuzz-magnet-run ## Coverage-guided BitTorrent magnet preflight smoke
+
+.PHONY: fuzz-magnet-run
+fuzz-magnet-run:
+	mkdir -p fuzz/corpus/magnet_preflight
+	cd fuzz && PATH="$(RUSTUP_PATH_PREFIX)$$PATH" $(CARGO) +$(FUZZ_TOOLCHAIN) \
+		fuzz run $(if $(strip $(FUZZ_TARGET)),--target $(FUZZ_TARGET),) \
+		magnet_preflight \
+		corpus/magnet_preflight seeds/magnet_preflight -- \
+		$(if $(strip $(FUZZ_SECONDS)),-max_total_time=$(FUZZ_SECONDS),-runs=$(FUZZ_RUNS)) \
+		-max_len=$(FUZZ_MAGNET_MAX_LEN) -dict=dictionaries/magnet.dict
 
 .PHONY: check
 check: fmt-check lint test msrv ## Core Rust gates (run before pushing)

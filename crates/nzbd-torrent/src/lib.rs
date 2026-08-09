@@ -894,6 +894,16 @@ pub fn fuzz_metainfo_preflight(bytes: &[u8], proxy_enabled: bool) -> Result<bool
     validate_metainfo_contract(bytes, proxy_enabled)
 }
 
+/// Exercise the exact magnet preflight used before engine parsing.
+///
+/// This surface exists only for the out-of-workspace fuzz harness. It starts
+/// no session and performs no network or filesystem I/O.
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub fn fuzz_magnet_preflight(magnet: &str, proxy_enabled: bool) -> Result<String, TorrentError> {
+    validate_magnet_contract(magnet, proxy_enabled)
+}
+
 /// Exercise the complete metadata-only file-admission preflight.
 ///
 /// This includes the private-torrent/DHT relationship but deliberately stops

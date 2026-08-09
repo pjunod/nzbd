@@ -1649,16 +1649,21 @@ whose prefix merely resembles the configured root. The existing job
 - Keep the adapter's deterministic preflight mutation corpus in ordinary CI:
   every truncation plus bounded byte replacement, deletion, and insertion
   around v1, v2-only, and hybrid seeds, with structural-limit invariants. It
-  complements rather than replaces the M5 coverage-guided target. The isolated
-  `cargo-fuzz` crate pins its two test-only additions against the reviewed
-  product lock, checks that every committed seed reaches its named outcome,
-  calls the complete adapter-owned metadata-only file-admission wrapper across
-  all proxy/DHT combinations without sessions or I/O, and runs a 20,000-case
-  pull-request smoke plus a five-minute weekly campaign. Reviewed seeds remain
-  separate from the ignored evolving corpus.
-  Its 1 MiB campaign cap keeps CI bounded; deterministic tests retain the exact
-  10 MiB product boundary. Exercise path rejection through real engine
-  admission even if upstream also fuzzes bencode; M5 still owns
+  complements rather than replaces the M5 coverage-guided targets. The
+  isolated `cargo-fuzz` crate pins its two test-only additions against the
+  reviewed product lock, checks that every reviewed seed reaches its named
+  outcome, and keeps those seeds separate from each target's ignored evolving
+  corpus. The metainfo target calls the complete adapter-owned metadata-only
+  file-admission wrapper across all proxy/DHT combinations without sessions or
+  I/O; its nine reviewed seed classes cover version, tracker, privacy, path,
+  and multifile behavior. Its 1 MiB campaign cap keeps CI bounded while main
+  workspace tests retain the exact 10 MiB product boundary. The magnet target
+  passes valid UTF-8 to both normal and proxy preflight from valid-v1,
+  lowercase-base32, v2-only, hybrid, eager-selection, and proxy+UDP-tracker
+  seeds. Its 32 KiB campaign cap permits generated inputs to cross the exact
+  16 KiB product limit. Each target runs a 20,000-case pull-request smoke and a
+  separate five-minute weekly campaign. Exercise path rejection through real
+  engine admission even if upstream also fuzzes bencode; M5 still owns
   sustained campaigns, corpus retention, symlink, mounted-filesystem, and
   normalized case-collision probes.
 
@@ -1982,15 +1987,16 @@ passes; Linux glibc/musl, macOS, Windows, Docker, and MSRV artifacts build; the
 reviewer can verify public traffic, ports, paths, seed policy, and deletion
 from docs without reading code.
 
-**Current groundwork:** metadata-only file admission has a feature-gated
-libFuzzer target with nine committed and contract-checked seed classes across
-version, tracker, privacy, path, and multifile behavior, a bencode dictionary,
-a bounded pull-request smoke, and a weekly five-minute campaign. The reviewed
-seeds are separate from the ignored evolving corpus. The main workspace suite
-accepts a valid v1 document at the exact 10 MiB default metainfo ceiling and
-names the first excess byte, accepts a valid 100,000-file v1 inventory below
-that ceiling, and names file 100,001 as the first rejected inventory. This is
-useful continuous coverage and two functional resource limits, not M5
+**Current groundwork:** adapter-owned metadata-only file admission and magnet
+preflight have separate feature-gated libFuzzer targets. Nine metainfo and seven
+magnet seed classes are reviewed and contract checked, separate from each
+target's ignored evolving corpus; each target has its own dictionary, bounded
+pull-request smoke, and weekly five-minute campaign. The main workspace suite
+also accepts a valid magnet URI at the exact 16 KiB product limit and a valid
+v1 document at the exact 10 MiB default metainfo ceiling, naming the first
+excess byte for each. It accepts a valid 100,000-file v1 inventory below the
+metainfo ceiling and names file 100,001 as the first rejected inventory. This
+is useful continuous coverage and three functional resource limits, not M5
 completion: crash-free bounded runs and functional limits do not establish
 peak-memory exhaustion resistance, filesystem containment, or sustained
 fuzzing adequacy.
@@ -2030,7 +2036,17 @@ becomes reachable.
   mode before any payload storage exists. A DHT-enabled-session case proves
   privacy-unknown magnet input is rejected before an explicit peer is
   contacted, and the paired DHT-disabled case proves a private magnet can
-  still resolve through that explicit peer.
+  still resolve through that explicit peer. A separate libFuzzer target passes
+  valid UTF-8 to the exact preflight in normal and proxy modes. Its seven
+  contract-checked seeds cover valid v1, lowercase-base32 normalization,
+  v2-only, hybrid, authority-form rejection, eager-selection rejection, and
+  proxy+UDP-tracker rejection. Every accepted normalized URI is also parsed by
+  rqbit inside the target, so preflight/parser divergence becomes a reproducer.
+  Pull requests run 20,000 cases and the weekly job runs for five minutes;
+  generated input is capped at 32 KiB, failing reproducers are uploaded, and
+  the evolved corpus is not retained. An adjacent contract passes a valid URI
+  at exactly the 16 KiB product limit through the full preflight and requires
+  the first excess byte to fail by name.
 - Private metainfo discovery: a known-private `.torrent` is rejected before
   engine admission when session DHT is live; the same one-tracker metainfo is
   accepted by policy when DHT is disabled.

@@ -1,0 +1,8 @@
+scheme="magnet:?"
+authority="magnet://"
+v1="xt=urn:btih:"
+v2="xt=urn:btmh:1220"
+tracker="&tr="
+select="&so="
+udp="udp%3A%2F%2F"
+https="https%3A%2F%2F"

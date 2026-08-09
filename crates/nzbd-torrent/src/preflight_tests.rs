@@ -724,6 +724,8 @@ fn magnet_preflight_names_format_version_and_proxy_failures() {
 
     for magnet in [
         "https://example.test/file.torrent".to_owned(),
+        format!("magnet://host?xt=urn:btih:{hex}"),
+        format!("magnet:/path?xt=urn:btih:{hex}"),
         "magnet:?dn=missing-topic".to_owned(),
         "magnet:?xt=urn:btih:short".to_owned(),
         format!("magnet:?xt=urn:btih:{}", "Z".repeat(40)),
@@ -1118,5 +1120,24 @@ fn exact_default_metainfo_size_is_accepted_and_first_excess_is_named() {
         Err(TorrentError::MetainfoTooLarge { size, limit })
             if size == DEFAULT_MAX_METAINFO_BYTES + 1
                 && limit == DEFAULT_MAX_METAINFO_BYTES
+    ));
+}
+
+#[test]
+fn exact_magnet_uri_limit_is_accepted_and_first_excess_is_named() {
+    const VALID_V1_PREFIX: &str =
+        "magnet:?xt=urn:btih:0000000000000000000000000000000000000000&dn=";
+
+    let mut at_limit = String::from(VALID_V1_PREFIX);
+    at_limit.push_str(&"a".repeat(MAX_MAGNET_URI_BYTES - at_limit.len()));
+    assert_eq!(at_limit.len(), MAX_MAGNET_URI_BYTES);
+    assert!(validate_magnet_contract(&at_limit, false).is_ok());
+
+    let mut over_limit = at_limit;
+    over_limit.push('a');
+    assert!(matches!(
+        validate_magnet_contract(&over_limit, false),
+        Err(TorrentError::MagnetTooLong { size, limit })
+            if size == MAX_MAGNET_URI_BYTES + 1 && limit == MAX_MAGNET_URI_BYTES
     ));
 }

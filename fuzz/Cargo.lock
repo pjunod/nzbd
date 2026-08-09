@@ -1497,6 +1497,7 @@ name = "nzbd-torrent-fuzz"
 version = "0.0.0"
 dependencies = [
  "libfuzzer-sys",
+ "librqbit",
  "nzbd-torrent",
 ]
 
