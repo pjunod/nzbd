@@ -46,7 +46,7 @@ endif
 help: ## List all targets
 	@awk 'BEGIN {FS = ":.*##"} \
 		/^##@/ {printf "\n\033[1m%s\033[0m\n", substr($$0, 5); next} \
-		/^[a-zA-Z0-9_.-]+:.*##/ {printf "  \033[36m%-16s\033[0m %s\n", $$1, $$2}' \
+		/^[a-zA-Z0-9_.-]+:.*##/ {printf "  \033[36m%-20s\033[0m %s\n", $$1, $$2}' \
 		$(MAKEFILE_LIST)
 
 ##@ Toolchain & setup
@@ -135,7 +135,7 @@ lint: ## Clippy across all targets with warnings denied (CI gate)
 
 .PHONY: msrv
 msrv: ## Type-check on the minimum supported Rust (1.85)
-	$(CARGO) +$(MSRV) check --workspace --all-targets
+	$(RUSTUP) run $(MSRV) $(CARGO) check --workspace --all-targets
 
 .PHONY: coverage
 coverage: ## Line-coverage summary (needs cargo-llvm-cov; `make toolchain` installs it)
@@ -180,9 +180,28 @@ fuzz-magnet-run:
 		$(if $(strip $(FUZZ_SECONDS)),-max_total_time=$(FUZZ_SECONDS),-runs=$(FUZZ_RUNS)) \
 		-max_len=$(FUZZ_MAGNET_MAX_LEN) -dict=dictionaries/magnet.dict
 
+.PHONY: bittorrent-policy
+bittorrent-policy: ## Verify the dormant adapter and reviewed dependency boundaries
+	scripts/check-bittorrent-deps.sh
+	scripts/check-reviewed-dependency-exceptions.sh
+
 .PHONY: check
 check: fmt-check lint test msrv ## Core Rust gates (run before pushing)
 	@echo "OK - all local gates passed"
+
+.PHONY: gate
+gate: ## Deterministic release gate: core checks + BitTorrent policy + fuzz contracts
+	$(MAKE) check
+	$(MAKE) bittorrent-policy
+	$(MAKE) fuzz-test
+	@echo "OK - deterministic release gate passed"
+
+.PHONY: gate-fuzz
+gate-fuzz: ## Release gate plus both bounded BitTorrent libFuzzer campaigns
+	$(MAKE) gate
+	$(MAKE) fuzz-metainfo-run
+	$(MAKE) fuzz-magnet-run
+	@echo "OK - deterministic and bounded fuzz release gates passed"
 
 ##@ Housekeeping
 

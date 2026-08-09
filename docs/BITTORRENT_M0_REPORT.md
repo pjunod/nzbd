@@ -712,6 +712,8 @@ make fuzz-metainfo
 make fuzz-metainfo FUZZ_SECONDS=300
 make fuzz-magnet
 make fuzz-magnet FUZZ_SECONDS=300
+make gate
+make gate-fuzz
 
 # Linux only; requires passwordless sudo, iptables/ip6tables, and tcpdump.
 scripts/check-private-discovery-leaks.sh
@@ -727,6 +729,14 @@ scripts/check-rqbit-metadata-size-limit-patch.sh /path/to/rqbit
 scripts/check-rqbit-peer-response-budget-patch.sh /path/to/rqbit
 scripts/check-rqbit-discovery-pressure-patch.sh /path/to/rqbit
 ```
+
+`make gate` is the deterministic local release entry point: formatting,
+strict lint, the whole workspace suite, Rust 1.85 checking, the dormant
+adapter dependency boundary, reviewed dependency exceptions, and committed
+fuzz seed contracts. `make gate-fuzz` runs that gate first and then both
+bounded 20,000-case libFuzzer campaigns by default. It requires the pinned
+nightly toolchain and cargo-fuzz used by the BitTorrent fuzz workflow. The
+scheduled five-minute campaigns remain separate CI evidence.
 
 The Rust 1.85 check must select both the 1.85 Cargo and `rustc`; this host also
 has a newer Homebrew compiler on `PATH`. The native platform matrix should run

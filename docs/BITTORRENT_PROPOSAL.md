@@ -2016,6 +2016,15 @@ passes; Linux glibc/musl, macOS, Windows, Docker, and MSRV artifacts build; the
 reviewer can verify public traffic, ports, paths, seed policy, and deletion
 from docs without reading code.
 
+The checked-in release entry points separate deterministic proof from bounded
+coverage-guided work. `make gate` runs formatting, strict lint, the whole
+workspace suite, Rust 1.85 checking, the dormant adapter dependency policy,
+reviewed dependency exceptions, and the committed fuzz seed contracts.
+`make gate-fuzz` first runs that deterministic gate and then both default
+20,000-case libFuzzer campaigns. The latter requires the pinned nightly
+toolchain and cargo-fuzz used by CI; weekly five-minute campaigns remain
+separate evidence rather than silently extending every local gate.
+
 **Current groundwork:** adapter-owned metadata-only file admission and magnet
 preflight have separate feature-gated libFuzzer targets. Nine metainfo and seven
 magnet seed classes are reviewed and contract checked, separate from each
