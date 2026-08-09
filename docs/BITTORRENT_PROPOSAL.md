@@ -2032,7 +2032,13 @@ becomes reachable.
   mode before any payload storage exists. A DHT-enabled-session case proves
   privacy-unknown magnet input is rejected before an explicit peer is
   contacted, and the paired DHT-disabled case proves a private magnet can
-  still resolve through that explicit peer.
+  still resolve through that explicit peer. A separate libFuzzer target passes
+  valid UTF-8 to the exact preflight in normal and proxy modes. Its six
+  contract-checked seeds cover valid v1, lowercase-base32 normalization,
+  v2-only, hybrid, eager-selection rejection, and proxy+UDP-tracker rejection.
+  Pull requests run 20,000 cases and the weekly job runs for five minutes;
+  generated input is capped at 32 KiB, failing reproducers are uploaded, and
+  the evolved corpus is not retained.
 - Private metainfo discovery: a known-private `.torrent` is rejected before
   engine admission when session DHT is live; the same one-tracker metainfo is
   accepted by policy when DHT is disabled.
