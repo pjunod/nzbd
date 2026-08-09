@@ -172,7 +172,7 @@ relying on one local host:
 | Native 100-torrent admission/shutdown pressure | [2026-08-09 matrix run](https://github.com/pjunod/nzbd/actions/runs/31330178035) |
 | Private DHT/LSD packet capture | [2026-08-06 capture run](https://github.com/pjunod/nzbd/actions/runs/31128106994) |
 | Cross-platform filesystem behavior | [2026-08-08 probe run](https://github.com/pjunod/nzbd/actions/runs/31240896567) and [review correction](https://github.com/pjunod/nzbd/actions/runs/31264422471) |
-| Deterministic release gate and daemon isolation | [2026-08-09 release-gate run](https://github.com/pjunod/nzbd/actions/runs/31331872561) |
+| Native adapter matrix and daemon isolation | [2026-08-09 M0 run](https://github.com/pjunod/nzbd/actions/runs/31331872561) |
 
 These links are evidence snapshots, not evergreen approval. The reviewed
 commit must have its own green required checks.
