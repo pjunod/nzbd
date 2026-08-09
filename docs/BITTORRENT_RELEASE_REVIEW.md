@@ -102,6 +102,13 @@ names, and portable Unicode/case aliases before storage construction. The
 hosted native probes describe their temporary filesystems; they do not prove
 descriptor-relative containment or every filesystem used by operators.
 
+The isolated fault harness can inject storage exhaustion after one successful
+piece write and proves that stable rqbit contains the failure to one incomplete
+torrent while the same session completes a normal control transfer. Stable
+rqbit reports that torrent as `Error`, not the proposed disk-paused state. The
+harness has no daemon API or enforcing multi-root guard, so it does not prove
+operator-visible ENOSPC behavior or authorize production wiring.
+
 **Reviewer acceptance:** supported deployment examples must exercise the
 actual bind mounts or volumes, case/normalization behavior, low-space guard,
 symlink race boundary, import path, and restart authority. Until that matrix

@@ -105,6 +105,19 @@ code. The daemon does not depend on it. The boundary currently provides:
   preliminary 256 MiB growth ceiling on each native runner. This is retained
   memory evidence, not the parser's transient allocation peak or a concurrent
   hostile-submission test;
+- a feature-gated local-swarm probe injects `ErrorKind::StorageFull` through
+  rqbit's public storage factory after one successful 16 KiB piece write. The
+  affected 256 KiB torrent must become `Error`, remain incomplete, retain a
+  display-safe fault fact, and answer stats within one second. A separate
+  64 KiB torrent must then download through normal filesystem storage in the
+  same engine session, and both sessions must stop within ten seconds. Normal
+  adapter admission still forces `storage_factory: None`; the injection seam
+  is absent unless the `m0-probes` feature is selected. This proves stable
+  engine fault containment and a usable future interception point, not the
+  proposal's production behavior: there is no daemon disk-guard latch, API
+  responsiveness proof, new-request pause, or continued-upload proof, and
+  stable rqbit currently reports the affected torrent as an error rather than
+  a paused download;
 - explicit peer lifetimes: the dormant session pins stable 8.1.1's effective
   10-second connect and read/write timeouts and 120-second keepalive interval;
   per-add options inherit this reviewed session policy instead of introducing

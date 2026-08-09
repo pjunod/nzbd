@@ -2063,6 +2063,18 @@ deadline on shared CI do not establish peak-memory exhaustion resistance,
 filesystem containment, production shutdown orchestration, or sustained
 fuzzing adequacy.
 
+A feature-gated local-swarm probe now injects a real `StorageFull` error after
+one successful 16 KiB piece write. It requires the 256 KiB target torrent to
+remain incomplete with a visible fault, then downloads a separate 64 KiB
+control torrent through normal storage in the same session and enforces
+shutdown deadlines. The normal adapter path still forbids custom storage. This
+pins the stable engine seam and current containment behavior, but deliberately
+does not call the §14 ENOSPC row green: rqbit transitions the affected torrent
+to `Error`, while M2 must latch nzbd's multi-root disk guard, stop new piece
+requests, expose the limiting root, and choose the documented pause/upload
+fallback. No daemon API or production torrent writer exists to prove those
+outcomes yet.
+
 ### 15.8 M6 — cluster torrent leases (separate approval)
 
 **Work:** implement §12 only after single-node field data exists · lease kind ·

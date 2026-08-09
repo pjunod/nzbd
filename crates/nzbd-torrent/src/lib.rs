@@ -646,6 +646,27 @@ impl TorrentSession {
         self.add_validated_metainfo(bytes.into(), config).await
     }
 
+    /// Admit validated metainfo through a caller-supplied storage factory.
+    ///
+    /// This exists only for the isolated M0 fault-injection harness. Normal
+    /// builds cannot select custom storage, and the production admission path
+    /// above continues to force `storage_factory: None`.
+    #[cfg(feature = "m0-probes")]
+    pub async fn add_metainfo_with_storage_for_m0(
+        &self,
+        bytes: Vec<u8>,
+        mut config: TorrentAddConfig,
+        storage_factory: librqbit::storage::BoxStorageFactory,
+    ) -> Result<TorrentHandle, TorrentError> {
+        normalize_initial_peers(&mut config.initial_peers)?;
+        validate_metainfo_admission(&bytes, self.proxy_enabled, self.dht_enabled)?;
+        validate_existing_filesystem_paths(&bytes, &self.output_root)?;
+        let mut options = managed_add_options(config);
+        options.storage_factory = Some(storage_factory);
+        self.add_validated_metainfo_with_options(bytes.into(), options)
+            .await
+    }
+
     pub async fn add_magnet(
         &self,
         magnet: String,
@@ -689,7 +710,15 @@ impl TorrentSession {
         bytes: bytes::Bytes,
         config: TorrentAddConfig,
     ) -> Result<TorrentHandle, TorrentError> {
-        let options = managed_add_options(config);
+        self.add_validated_metainfo_with_options(bytes, managed_add_options(config))
+            .await
+    }
+
+    async fn add_validated_metainfo_with_options(
+        &self,
+        bytes: bytes::Bytes,
+        options: AddTorrentOptions,
+    ) -> Result<TorrentHandle, TorrentError> {
         let handle = self
             .inner
             // Keep rqbit's URL variant outside managed admission. Its stable
