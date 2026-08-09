@@ -922,10 +922,11 @@ fn validate_metainfo_contract_with_limit(
     Ok(true)
 }
 
-/// Exercise the exact metadata-only preflight used before engine admission.
+/// Exercise the metadata contract stage shared by file and resolved-magnet admission.
 ///
 /// This surface exists only for the out-of-workspace fuzz harness. It starts
-/// no session and performs no network or filesystem I/O.
+/// no session and performs no network or filesystem I/O. File admission adds
+/// the private-torrent/DHT check and filesystem checks after this stage.
 #[cfg(feature = "fuzzing")]
 #[doc(hidden)]
 pub fn fuzz_metainfo_preflight(bytes: &[u8], proxy_enabled: bool) -> Result<bool, TorrentError> {
@@ -940,6 +941,20 @@ pub fn fuzz_metainfo_preflight(bytes: &[u8], proxy_enabled: bool) -> Result<bool
 #[doc(hidden)]
 pub fn fuzz_magnet_preflight(magnet: &str, proxy_enabled: bool) -> Result<String, TorrentError> {
     validate_magnet_contract(magnet, proxy_enabled)
+}
+
+/// Exercise the complete metadata-only file-admission preflight.
+///
+/// This includes the private-torrent/DHT relationship but deliberately stops
+/// before filesystem inspection, session creation, or network I/O.
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub fn fuzz_metainfo_admission(
+    bytes: &[u8],
+    proxy_enabled: bool,
+    dht_enabled: bool,
+) -> Result<(), TorrentError> {
+    validate_metainfo_admission(bytes, proxy_enabled, dht_enabled)
 }
 
 fn validate_metainfo_admission(

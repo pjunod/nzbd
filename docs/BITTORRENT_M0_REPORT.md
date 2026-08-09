@@ -217,26 +217,27 @@ used by LSD.
 
 The bounded mutation corpus is a fast ordinary-test regression layer, not a
 claim of coverage-guided fuzzing completeness. Two separate, feature-gated
-`cargo-fuzz` targets now call the exact adapter-owned metainfo and magnet
-preflights without creating a session or touching the network or filesystem.
-The metainfo target runs in normal and proxy modes from committed v1,
-private-v1, v2-only, and hybrid seeds, uses a bencode dictionary, and caps
-generated input at 1 MiB. The magnet target runs every valid UTF-8 input in
-normal and proxy modes from committed valid-v1, lowercase-base32, v2-only,
-hybrid, eager-selection, and proxy+UDP-tracker seeds, uses a URI dictionary,
-and caps generated input at 32 KiB so campaigns can cross the exact 16 KiB
-product limit. Every committed seed has a deterministic named-outcome
-contract. The same suite passes a valid magnet at exactly the 16 KiB product
-limit through the full preflight and requires the first excess byte to fail by
-the named size boundary. Each target runs 20,000 cases on relevant pull
-requests and a separate five-minute weekly campaign. The isolated test crate
-also requires a valid v1 document at exactly the 10 MiB default metainfo
-ceiling to pass and the first excess byte to fail by the named size boundary.
-It constructs a valid 100,000-file v1 inventory below that independent ceiling
-and requires it to pass, then requires file 100,001 to fail by the named
-file-count boundary. CI does not persist either evolved corpus, prove a
-peak-memory ceiling or path writes, or complete M5's symlink,
-mounted-filesystem, sustained-campaign, and broader resource-exhaustion work.
+`cargo-fuzz` targets exercise the adapter-owned complete metadata-only file
+admission wrapper and exact magnet preflight without creating a session or
+touching the network or filesystem. The metainfo target runs across all
+proxy/DHT combinations. Its nine reviewed seeds cover valid v1, private v1,
+v2-only, hybrid, UDP tracker, announce-list, multifile,
+private-multiple-tracker, and unsafe-path outcomes. The magnet target runs
+every valid UTF-8 input in normal and proxy modes from reviewed valid-v1,
+lowercase-base32, v2-only, hybrid, eager-selection, and proxy+UDP-tracker
+seeds. Every reviewed seed has a deterministic named-outcome contract and
+lives separately from its target's ignored evolving corpus. The targets use
+bencode and URI dictionaries and cap generated input at 1 MiB and 32 KiB,
+respectively; the latter permits campaigns to cross the exact 16 KiB magnet
+limit. Each target runs 20,000 cases on relevant pull requests and a separate
+five-minute weekly campaign. The main workspace suite passes a valid magnet at
+exactly 16 KiB and a valid v1 document at exactly the 10 MiB default metainfo
+ceiling, then requires the first excess byte to fail by the respective named
+size boundary. It also accepts a valid 100,000-file v1 inventory below the
+metainfo ceiling and requires file 100,001 to fail by the named file-count
+boundary. CI does not persist either evolved corpus, prove a peak-memory
+ceiling or path writes, or complete M5's symlink, mounted-filesystem,
+sustained-campaign, and broader resource-exhaustion work.
 
 The two-stage magnet guard closes the storage-ordering gap, not the allocation
 gap inside stable rqbit: its metadata reader may allocate up to 32 MiB before

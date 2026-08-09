@@ -1,14 +1,14 @@
 use nzbd_torrent::{fuzz_magnet_preflight, TorrentError};
 
-const VALID_V1: &str = include_str!("../corpus/magnet_preflight/valid-v1.magnet");
-const LOWERCASE_BASE32: &str = include_str!("../corpus/magnet_preflight/lowercase-base32.magnet");
-const V2_ONLY: &str = include_str!("../corpus/magnet_preflight/v2-only.magnet");
-const HYBRID: &str = include_str!("../corpus/magnet_preflight/hybrid.magnet");
-const SELECT_ONLY: &str = include_str!("../corpus/magnet_preflight/select-only.magnet");
-const PROXY_UDP: &str = include_str!("../corpus/magnet_preflight/proxy-udp.magnet");
+const VALID_V1: &str = include_str!("../seeds/magnet_preflight/valid-v1.magnet");
+const LOWERCASE_BASE32: &str = include_str!("../seeds/magnet_preflight/lowercase-base32.magnet");
+const V2_ONLY: &str = include_str!("../seeds/magnet_preflight/v2-only.magnet");
+const HYBRID: &str = include_str!("../seeds/magnet_preflight/hybrid.magnet");
+const SELECT_ONLY: &str = include_str!("../seeds/magnet_preflight/select-only.magnet");
+const PROXY_UDP: &str = include_str!("../seeds/magnet_preflight/proxy-udp.magnet");
 
 #[test]
-fn committed_magnet_seeds_reach_the_named_preflight_classes() {
+fn reviewed_magnet_seeds_reach_the_named_preflight_classes() {
     assert!(matches!(
         fuzz_magnet_preflight(VALID_V1, false),
         Ok(magnet) if magnet == VALID_V1

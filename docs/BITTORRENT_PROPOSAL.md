@@ -1667,19 +1667,21 @@ whose prefix merely resembles the configured root. The existing job
   around v1, v2-only, and hybrid seeds, with structural-limit invariants. It
   complements rather than replaces the M5 coverage-guided targets. The
   isolated `cargo-fuzz` crate pins its two test-only additions against the
-  reviewed product lock, checks that every committed seed reaches its named
-  outcome, and calls the exact adapter-owned metainfo and magnet preflights
-  without sessions or I/O. The metainfo target starts from v1, private-v1,
-  v2-only, and hybrid bencode seeds; its 1 MiB campaign cap keeps CI bounded
-  while deterministic tests retain the exact 10 MiB product boundary. The
-  magnet target passes valid UTF-8 to both normal and proxy preflight from
-  valid-v1, lowercase-base32, v2-only, hybrid, eager-selection, and
-  proxy+UDP-tracker seeds. Its 32 KiB campaign cap permits generated inputs to
-  cross the exact 16 KiB product limit. Each target runs a 20,000-case
-  pull-request smoke and a separate five-minute weekly campaign. Exercise path
-  rejection through real engine admission even if upstream also fuzzes
-  bencode; M5 still owns sustained campaigns, corpus retention, symlink,
-  mounted-filesystem, and normalized case-collision probes.
+  reviewed product lock, checks that every reviewed seed reaches its named
+  outcome, and keeps those seeds separate from each target's ignored evolving
+  corpus. The metainfo target calls the complete adapter-owned metadata-only
+  file-admission wrapper across all proxy/DHT combinations without sessions or
+  I/O; its nine reviewed seed classes cover version, tracker, privacy, path,
+  and multifile behavior. Its 1 MiB campaign cap keeps CI bounded while main
+  workspace tests retain the exact 10 MiB product boundary. The magnet target
+  passes valid UTF-8 to both normal and proxy preflight from valid-v1,
+  lowercase-base32, v2-only, hybrid, eager-selection, and proxy+UDP-tracker
+  seeds. Its 32 KiB campaign cap permits generated inputs to cross the exact
+  16 KiB product limit. Each target runs a 20,000-case pull-request smoke and a
+  separate five-minute weekly campaign. Exercise path rejection through real
+  engine admission even if upstream also fuzzes bencode; M5 still owns
+  sustained campaigns, corpus retention, symlink, mounted-filesystem, and
+  normalized case-collision probes.
 
 ---
 
@@ -2001,18 +2003,19 @@ passes; Linux glibc/musl, macOS, Windows, Docker, and MSRV artifacts build; the
 reviewer can verify public traffic, ports, paths, seed policy, and deletion
 from docs without reading code.
 
-**Current groundwork:** the adapter-owned input preflight has feature-gated
-libFuzzer targets for metainfo bytes and valid-UTF-8 magnet strings. Four
-metainfo and six magnet seed classes are committed and contract checked; each
-target has its own dictionary, bounded pull-request smoke, and separate weekly
-five-minute campaign. The isolated contract suite also accepts a valid magnet
-URI at the exact 16 KiB product limit and a valid v1 document at the exact
-10 MiB default metainfo ceiling, naming the first excess byte for each. It
-accepts a valid 100,000-file v1 inventory below the metainfo ceiling and names
-file 100,001 as the first rejected inventory. This is useful continuous
-coverage and three concrete resource boundaries, not M5 completion:
-crash-free bounded runs and functional limits do not establish peak-memory
-exhaustion resistance, filesystem containment, or sustained fuzzing adequacy.
+**Current groundwork:** adapter-owned metadata-only file admission and magnet
+preflight have separate feature-gated libFuzzer targets. Nine metainfo and six
+magnet seed classes are reviewed and contract checked, separate from each
+target's ignored evolving corpus; each target has its own dictionary, bounded
+pull-request smoke, and weekly five-minute campaign. The main workspace suite
+also accepts a valid magnet URI at the exact 16 KiB product limit and a valid
+v1 document at the exact 10 MiB default metainfo ceiling, naming the first
+excess byte for each. It accepts a valid 100,000-file v1 inventory below the
+metainfo ceiling and names file 100,001 as the first rejected inventory. This
+is useful continuous coverage and three functional resource limits, not M5
+completion: crash-free bounded runs and functional limits do not establish
+peak-memory exhaustion resistance, filesystem containment, or sustained
+fuzzing adequacy.
 
 ### 15.8 M6 — cluster torrent leases (separate approval)
 
@@ -2082,17 +2085,19 @@ becomes reachable.
   validator replaced by `Ok(())` therefore fails rather than turning the
   corpus into a no-panic-only test. Checked v1 payload/piece/hash geometry
   prevents zero-divide, length-wrap, and inconsistent hash-table input from
-  reaching rqbit. A separate libFuzzer target exercises the exact preflight in
-  normal and proxy modes from v1, private-v1, v2-only, and hybrid seeds. Pull
-  requests run 20,000 cases and the weekly job runs for five minutes, with
-  failing reproducers uploaded. The campaign is metadata-only, caps generated
-  input at 1 MiB, and does not retain an evolved corpus. An adjacent isolated
-  contract accepts a valid v1 document at the exact 10 MiB default and proves
-  the first excess byte fails by name. It separately constructs a valid
-  100,000-file v1 inventory under that ceiling and proves the first excess file
-  fails by name. It deliberately does not infer a stable peak-memory budget
-  from shared CI runners. Sustained coverage-guided fuzzing and the remaining
-  M5 resource/filesystem probes remain a release gate.
+  reaching rqbit. A separate libFuzzer target exercises the complete
+  metadata-only file-admission wrapper across all proxy/DHT combinations from
+  nine contract-checked version, tracker, privacy, path, and multifile seeds.
+  Pull requests run 20,000 cases and the weekly job runs for five minutes,
+  with failing reproducers uploaded. Reviewed seeds are kept apart from the
+  ignored evolving corpus. The campaign caps generated input at 1 MiB and does
+  not retain an evolved corpus. Main-workspace contracts accept a valid v1
+  document at the exact 10 MiB default and prove the first excess byte fails by
+  name; they separately construct a valid 100,000-file v1 inventory under that
+  ceiling and prove the first excess file fails by name. They deliberately do
+  not infer a stable peak-memory budget from shared CI runners. Sustained
+  coverage-guided fuzzing and the remaining M5 resource/filesystem probes
+  remain a release gate.
 - State projection: every `TorrentPhase` maps to the expected native and
   qBittorrent status, with units/sentinel values pinned.
 - Seed policy: add/category/global precedence, ratio precision, time across
