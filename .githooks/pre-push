@@ -1,5 +1,6 @@
 #!/usr/bin/env sh
-# The full gate before anything leaves the machine — mirrors CI exactly.
+# The core Rust gate before anything leaves the machine. Specialized CI
+# workflows add platform, fuzz, supply-chain, and integration checks.
 # Enable once per clone with:
 #   git config core.hooksPath .githooks
 set -e

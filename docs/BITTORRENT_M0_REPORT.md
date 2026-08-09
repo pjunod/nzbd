@@ -207,14 +207,17 @@ used by LSD.
 
 The bounded mutation corpus is a fast ordinary-test regression layer, not a
 claim of coverage-guided fuzzing completeness. A separate, feature-gated
-`cargo-fuzz` target now calls that same adapter-owned preflight in normal and
-proxy modes without creating a session or touching the network or filesystem.
-It starts from committed v1, private-v1, v2-only, and hybrid seeds whose named
-outcomes are checked before every campaign, uses a bencode dictionary, caps
-generated inputs at 1 MiB, and runs 20,000 cases on relevant pull requests
-plus a five-minute weekly campaign. Exact product boundaries, including the
-10 MiB metainfo limit, remain deterministic unit tests. The CI campaign does
-not persist its evolved corpus, prove path writes, or complete M5's symlink,
+`cargo-fuzz` target calls the adapter-owned complete metadata-only file
+admission wrapper across all proxy/DHT combinations without creating a session
+or touching the network or filesystem. Nine committed seeds cover valid v1,
+private v1, v2-only, hybrid, UDP tracker, announce-list, multifile,
+private-multiple-tracker, and unsafe-path outcomes; their named contracts are
+checked before every campaign. The reviewed seeds live separately from the
+ignored evolving corpus. The target uses a bencode dictionary, caps generated
+inputs at 1 MiB, and runs 20,000 cases on relevant pull requests plus a
+five-minute weekly campaign. Exact product boundaries, including the 10 MiB
+metainfo limit, remain deterministic unit tests. The CI campaign does not
+persist its evolved corpus, prove path writes, or complete M5's symlink,
 mounted-filesystem, sustained-campaign, and resource-exhaustion work.
 
 The two-stage magnet guard closes the storage-ordering gap, not the allocation

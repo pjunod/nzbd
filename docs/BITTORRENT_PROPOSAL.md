@@ -1652,8 +1652,10 @@ whose prefix merely resembles the configured root. The existing job
   complements rather than replaces the M5 coverage-guided target. The isolated
   `cargo-fuzz` crate pins its two test-only additions against the reviewed
   product lock, checks that every committed seed reaches its named outcome,
-  calls the exact adapter-owned metadata preflight without sessions or I/O,
-  and runs a 20,000-case pull-request smoke plus a five-minute weekly campaign.
+  calls the complete adapter-owned metadata-only file-admission wrapper across
+  all proxy/DHT combinations without sessions or I/O, and runs a 20,000-case
+  pull-request smoke plus a five-minute weekly campaign. Reviewed seeds remain
+  separate from the ignored evolving corpus.
   Its 1 MiB campaign cap keeps CI bounded; deterministic tests retain the exact
   10 MiB product boundary. Exercise path rejection through real engine
   admission even if upstream also fuzzes bencode; M5 still owns
@@ -1980,10 +1982,12 @@ passes; Linux glibc/musl, macOS, Windows, Docker, and MSRV artifacts build; the
 reviewer can verify public traffic, ports, paths, seed policy, and deletion
 from docs without reading code.
 
-**Current groundwork:** the metadata-only preflight has a feature-gated
-libFuzzer target with four committed and contract-checked seed classes, a
-bencode dictionary, a bounded pull-request smoke, and a weekly five-minute
-campaign. This is useful continuous coverage growth, not M5 completion:
+**Current groundwork:** metadata-only file admission has a feature-gated
+libFuzzer target with nine committed and contract-checked seed classes across
+version, tracker, privacy, path, and multifile behavior, a bencode dictionary,
+a bounded pull-request smoke, and a weekly five-minute campaign. The reviewed
+seeds are separate from the ignored evolving corpus. This is useful continuous
+coverage growth, not M5 completion:
 crash-free bounded runs do not establish exhaustion resistance, filesystem
 containment, or sustained fuzzing adequacy.
 
@@ -2047,11 +2051,13 @@ becomes reachable.
   validator replaced by `Ok(())` therefore fails rather than turning the
   corpus into a no-panic-only test. Checked v1 payload/piece/hash geometry
   prevents zero-divide, length-wrap, and inconsistent hash-table input from
-  reaching rqbit. A separate libFuzzer target exercises the exact preflight in
-  normal and proxy modes from v1, private-v1, v2-only, and hybrid seeds. Pull
-  requests run 20,000 cases and the weekly job runs for five minutes, with
-  failing reproducers uploaded. The campaign is metadata-only, caps generated
-  input at 1 MiB, and does not retain an evolved corpus; sustained
+  reaching rqbit. A separate libFuzzer target exercises the complete
+  metadata-only file-admission wrapper across all proxy/DHT combinations from
+  nine contract-checked version, tracker, privacy, path, and multifile seeds.
+  Pull requests run 20,000 cases and the weekly job runs for five minutes,
+  with failing reproducers uploaded. Reviewed seeds are kept apart from the
+  ignored evolving corpus. The campaign caps generated input at 1 MiB and does
+  not retain an evolved corpus; sustained
   coverage-guided fuzzing and the exact M5 resource/filesystem probes remain a
   release gate.
 - State projection: every `TorrentPhase` maps to the expected native and
