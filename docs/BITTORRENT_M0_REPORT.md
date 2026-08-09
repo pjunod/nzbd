@@ -85,8 +85,14 @@ code. The daemon does not depend on it. The boundary currently provides:
   another override;
 - bytes-only managed admission: the private engine handoff accepts only
   metainfo bytes that already passed nzbd preflight. Stable rqbit's URL variant
-  cannot bypass nzbd's future source-fetch size, redirect, timeout, or
-  redaction policy through this helper;
+  cannot bypass nzbd's source-fetch size, redirect, timeout, or redaction
+  policy through this helper. A separate dormant HTTP(S) helper follows at
+  most five manually validated redirects, strips authentication across origin
+  changes, ignores ambient proxy variables, retains no cookies, uses the
+  process-wide aws-lc provider with OS trust roots, bounds declared and
+  streamed bodies, applies one end-to-end timeout, and returns only
+  preflighted bytes. Its private-CA loopback and oversized chunked-body tests
+  pin the TLS and while-streaming properties directly;
 - named v2-only and hybrid rejection for both metainfo and magnets;
 - fail-closed HTTP/HTTPS/UDP tracker URL validation for metainfo and magnets,
   with at most 64 unique non-empty trackers and 2 KiB per decoded URL, plus
@@ -107,7 +113,8 @@ code. The daemon does not depend on it. The boundary currently provides:
 
 The crate forbids unsafe code. It is intentionally not a complete production
 backend: there is no queue owner channel, durable torrent record, config/API,
-URL fetcher, watch folder, seed policy, or session lifecycle in the daemon.
+URL-fetch route, watch folder, seed policy, or session lifecycle in the daemon.
+The source-fetch helper is not reachable from production daemon input.
 
 The dependency graph also required a production-daemon TLS correction outside
 the isolated crate: `crates/nzbd/src/main.rs` and `crates/nzbd/src/tls.rs`
@@ -148,6 +155,12 @@ The isolated suite covers:
   alternate assignment separators;
 - engine/stat error redaction and UTF-8-safe 2 KiB truncation with an explicit
   marker;
+- authenticated HTTP source handling that preserves credentials only across
+  same-origin redirects, strips them across origin changes, does not replay
+  response cookies, exposes only origins in errors, rejects non-HTTP targets,
+  accepts exactly five redirects and rejects the sixth, bounds both declared
+  and chunked bodies, enforces one end-to-end timeout, and preflights the
+  returned metainfo before it leaves the helper;
 - one-tracker private-torrent discovery and multi-tracker rejection;
 - a positive-control PEX peer that public torrents contact and private torrents
   ignore; the canary address is available only through the peer-wire message;
@@ -587,9 +600,11 @@ by rustls. Three exact advisory exceptions remain:
   port forwarding false. A production gate must remove both exceptions or
   keep UPnP unavailable.
 - [`RUSTSEC-2026-0009`](https://rustsec.org/advisories/RUSTSEC-2026-0009)
-  affects `time`'s RFC 2822 parser. rcgen compiles `time` without its parsing
-  feature, so the vulnerable parser is absent. The fixed `time 0.3.47` raises
-  its MSRV to Rust 1.88, while nzbd's verified floor is Rust 1.85.
+  affects `time`'s RFC 2822 parser. The daemon's TLS tests and the torrent
+  adapter's private-CA test reach it through rcgen, which compiles `time`
+  without its parsing feature, so the vulnerable parser is absent. The fixed
+  `time 0.3.47` raises its MSRV to Rust 1.88, while nzbd's verified floor is
+  Rust 1.85.
 
 [`supply-chain.yml`](../.github/workflows/supply-chain.yml) pins
 `cargo-deny-action` to an immutable revision and runs separate blocking policy
