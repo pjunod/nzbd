@@ -3,15 +3,22 @@
 # Fresh clone, get productive:
 #   make setup      # install the toolchain, PP tools and git hooks
 #   make run        # build + run the daemon (first-run setup UI on :6789)
-#   make check      # everything CI enforces: fmt + clippy + tests + MSRV
+#   make check      # core Rust gates: fmt + clippy + tests + MSRV
 #
 # Run `make` (or `make help`) to list every target.
 
 CARGO   ?= cargo
+RUSTUP  ?= rustup
+RUSTUP_PATH_PREFIX ?= $(if $(shell command -v $(RUSTUP)),$(dir $(shell command -v $(RUSTUP))):,)
 # The daemon binary package (cargo -p nzbd).
 DAEMON  := nzbd
 # Minimum supported Rust (keep in sync with Cargo.toml rust-version).
 MSRV    := 1.85
+FUZZ_TOOLCHAIN ?= nightly-2026-08-01
+FUZZ_TARGET ?=
+FUZZ_RUNS ?= 20000
+FUZZ_MAX_LEN ?= 1048576
+FUZZ_SECONDS ?=
 UNAME_S := $(shell uname -s)
 # Build identity for container builds. The Docker context excludes .git
 # (see .dockerignore), so an image cannot derive its own commit — it has
@@ -138,8 +145,26 @@ coverage-html: ## Full HTML coverage report under target/llvm-cov/html/
 	$(CARGO) llvm-cov --workspace --html
 	@echo "report: target/llvm-cov/html/index.html"
 
+.PHONY: fuzz-deps
+fuzz-deps: ## Verify the isolated BitTorrent fuzz dependency graph
+	scripts/check-bittorrent-fuzz-deps.sh
+
+.PHONY: fuzz-test
+fuzz-test: fuzz-deps ## Verify the committed BitTorrent fuzz seed classes
+	$(CARGO) test --manifest-path fuzz/Cargo.toml --locked
+
+.PHONY: fuzz-metainfo
+fuzz-metainfo: fuzz-test ## Coverage-guided BitTorrent metainfo preflight smoke
+	mkdir -p fuzz/corpus/metainfo_preflight
+	cd fuzz && PATH="$(RUSTUP_PATH_PREFIX)$$PATH" $(CARGO) +$(FUZZ_TOOLCHAIN) \
+		fuzz run $(if $(strip $(FUZZ_TARGET)),--target $(FUZZ_TARGET),) \
+		metainfo_preflight \
+		corpus/metainfo_preflight seeds/metainfo_preflight -- \
+		$(if $(strip $(FUZZ_SECONDS)),-max_total_time=$(FUZZ_SECONDS),-runs=$(FUZZ_RUNS)) \
+		-max_len=$(FUZZ_MAX_LEN) -dict=dictionaries/metainfo.dict
+
 .PHONY: check
-check: fmt-check lint test msrv ## Everything CI enforces, in one shot (run before pushing)
+check: fmt-check lint test msrv ## Core Rust gates (run before pushing)
 	@echo "OK - all local gates passed"
 
 ##@ Housekeeping

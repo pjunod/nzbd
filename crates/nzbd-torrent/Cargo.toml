@@ -8,6 +8,9 @@ license.workspace = true
 repository.workspace = true
 publish = false
 
+[features]
+fuzzing = []
+
 [dependencies]
 bytes = { workspace = true }
 icu_normalizer = { workspace = true }
