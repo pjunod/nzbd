@@ -212,13 +212,14 @@ proxy modes without creating a session or touching the network or filesystem.
 It starts from committed v1, private-v1, v2-only, and hybrid seeds whose named
 outcomes are checked before every campaign, uses a bencode dictionary, caps
 generated inputs at 1 MiB, and runs 20,000 cases on relevant pull requests
-plus a five-minute weekly campaign. The same isolated test crate constructs a
-valid 100,000-file v1 inventory below the 10 MiB default metainfo ceiling and
-requires it to pass, then requires file 100,001 to fail by the named file-count
-boundary. Exact product boundaries remain deterministic tests. The CI campaign
-does not persist its evolved corpus, prove a peak-memory ceiling or path writes,
-or complete M5's symlink, mounted-filesystem, sustained-campaign, and broader
-resource-exhaustion work.
+plus a five-minute weekly campaign. The same isolated test crate requires a
+valid v1 document at exactly the 10 MiB default metainfo ceiling to pass and
+the first excess byte to fail by the named size boundary. It also constructs a
+valid 100,000-file v1 inventory below that independent ceiling and requires it
+to pass, then requires file 100,001 to fail by the named file-count boundary.
+The CI campaign does not persist its evolved corpus, prove a peak-memory
+ceiling or path writes, or complete M5's symlink, mounted-filesystem,
+sustained-campaign, and broader resource-exhaustion work.
 
 The two-stage magnet guard closes the storage-ordering gap, not the allocation
 gap inside stable rqbit: its metadata reader may allocate up to 32 MiB before
