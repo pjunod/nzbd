@@ -579,9 +579,16 @@ fn proposal_admission_constants_and_input_boundaries_are_pinned() {
     assert_eq!(MAX_TRACKERS_PER_TORRENT, 64);
     assert_eq!(MAX_TRACKER_URL_BYTES, 2 * 1024);
 
-    assert!(validate_metainfo_size(DEFAULT_MAX_METAINFO_BYTES).is_ok());
+    assert!(validate_metainfo_size_with_limit(
+        DEFAULT_MAX_METAINFO_BYTES,
+        DEFAULT_MAX_METAINFO_BYTES
+    )
+    .is_ok());
     assert!(matches!(
-        validate_metainfo_size(DEFAULT_MAX_METAINFO_BYTES + 1),
+        validate_metainfo_size_with_limit(
+            DEFAULT_MAX_METAINFO_BYTES + 1,
+            DEFAULT_MAX_METAINFO_BYTES
+        ),
         Err(TorrentError::MetainfoTooLarge { .. })
     ));
     assert!(validate_magnet_size(MAX_MAGNET_URI_BYTES).is_ok());

@@ -2147,6 +2147,8 @@ dependencies = [
  "icu_casemap",
  "icu_normalizer",
  "librqbit",
+ "percent-encoding",
+ "reqwest",
  "rustls",
  "sha1",
  "tempfile",

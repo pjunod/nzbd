@@ -85,8 +85,11 @@ code. The daemon does not depend on it. The boundary currently provides:
   another override;
 - bytes-only managed admission: the private engine handoff accepts only
   metainfo bytes that already passed nzbd preflight. Stable rqbit's URL variant
-  cannot bypass nzbd's future source-fetch size, redirect, timeout, or
-  redaction policy through this helper;
+  cannot bypass nzbd's source-fetch size, redirect, timeout, or redaction
+  policy through this helper. A separate dormant HTTP(S) helper follows at
+  most five manually validated redirects, strips authentication across origin
+  changes, retains no cookies, bounds declared and streamed bodies, applies one
+  end-to-end timeout, and returns only preflighted bytes;
 - named v2-only and hybrid rejection for both metainfo and magnets;
 - fail-closed HTTP/HTTPS/UDP tracker URL validation for metainfo and magnets,
   with at most 64 unique non-empty trackers and 2 KiB per decoded URL, plus
@@ -107,7 +110,8 @@ code. The daemon does not depend on it. The boundary currently provides:
 
 The crate forbids unsafe code. It is intentionally not a complete production
 backend: there is no queue owner channel, durable torrent record, config/API,
-URL fetcher, watch folder, seed policy, or session lifecycle in the daemon.
+URL-fetch route, watch folder, seed policy, or session lifecycle in the daemon.
+The source-fetch helper is not reachable from production daemon input.
 
 The dependency graph also required a production-daemon TLS correction outside
 the isolated crate: `crates/nzbd/src/main.rs` and `crates/nzbd/src/tls.rs`
@@ -148,6 +152,12 @@ The isolated suite covers:
   alternate assignment separators;
 - engine/stat error redaction and UTF-8-safe 2 KiB truncation with an explicit
   marker;
+- authenticated HTTP source handling that preserves credentials only across
+  same-origin redirects, strips them across origin changes, does not replay
+  response cookies, exposes only origins in errors, rejects non-HTTP targets,
+  accepts exactly five redirects and rejects the sixth, bounds both declared
+  and chunked bodies, enforces one end-to-end timeout, and preflights the
+  returned metainfo before it leaves the helper;
 - one-tracker private-torrent discovery and multi-tracker rejection;
 - a positive-control PEX peer that public torrents contact and private torrents
   ignore; the canary address is available only through the peer-wire message;

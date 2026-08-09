@@ -1472,9 +1472,11 @@ the multi-file root and platform separator bytes, so the accounting bounds the
 paths later passed to storage rather than only the raw bencode component
 payloads. Exact-limit tests pass and the first excess byte or file returns a
 stable named error. Error
-truncation is UTF-8 safe and ends with an explicit marker. The 1–100 MiB
-metainfo configuration range, redirects, and fetched-body streaming remain
-API/source-fetch work; no production input is wired by these constants.
+truncation is UTF-8 safe and ends with an explicit marker. The dormant
+source-fetch boundary now validates the 1–100 MiB metainfo range, follows at
+most five manually checked redirects, and enforces the selected limit while
+the body streams. Daemon configuration and API plumbing remain future work; no
+production input is wired by these constants or helpers.
 The dormant managed-admission helper accepts preflighted metainfo bytes only;
 it cannot receive rqbit's URL variant. Authenticated HTTP(S) fetching remains
 an nzbd-owned boundary because stable rqbit buffers the response before nzbd
@@ -1585,9 +1587,9 @@ URL userinfo/path/query data, recognized inline, colon-delimited, JSON-style,
 whitespace-separated, and arrow-delimited secret assignments, multi-token
 authorization and cookie values, peer addresses, absolute paths, and control
 characters, then applies the 2 KiB display bound.
-The later source-fetch and daemon boundaries must keep applying the same
-invariant to their own errors rather than treating this adapter guard as a
-replacement.
+The dormant source-fetch helper applies an origin-only error contract. The
+later daemon boundary must keep that invariant rather than treating either
+adapter guard as a replacement for job/API redaction.
 
 ### 11.4 Source fetching
 
@@ -1600,6 +1602,20 @@ send short-lived indexer URLs. Fetch with:
 - credentials/query redacted before any error crosses into a job;
 - no cookies persisted after the fetch;
 - redirect target revalidated on every hop.
+
+The dormant adapter implements that fetch contract without exposing it through
+the daemon. It defaults to a 10 MiB body, five redirects, a 10-second connect
+timeout, and a 30-second end-to-end timeout spanning the redirect chain and
+body. URL basic-auth credentials are decoded once, survive only same-origin
+redirects, and are stripped on every cross-origin hop; credentials supplied by
+a redirect target are ignored. Redirects are manual, the client has no cookie
+store, declared and streamed body sizes fail at the first excess byte, and
+returned bytes must pass the same metainfo, geometry, path, privacy, and
+tracker preflight used before engine admission. Loopback tests cover both
+redirect sides, status and timeout redaction, the exact five-hop boundary,
+cookie non-replay, header and chunked-body ceilings, and proxy-unsafe tracker
+rejection. This is a dormant seam only: it creates no API route, queue job,
+engine session, listener, discovery traffic, or payload I/O.
 
 Private/LAN indexers are a legitimate deployment, so an unconditional
 private-IP ban would break the intended workflow. Authentication is the

@@ -16,8 +16,11 @@ bytes = { workspace = true }
 icu_normalizer = { workspace = true }
 icu_casemap = { workspace = true }
 librqbit = { workspace = true }
+percent-encoding = { workspace = true }
+reqwest = { workspace = true }
 rustls = { workspace = true }
 thiserror = { workspace = true }
+tokio = { workspace = true }
 url = { workspace = true }
 
 [dev-dependencies]

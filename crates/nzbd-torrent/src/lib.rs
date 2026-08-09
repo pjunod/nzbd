@@ -6,6 +6,10 @@
 
 #![forbid(unsafe_code)]
 
+mod source_fetch;
+
+pub use source_fetch::{fetch_torrent_source, TorrentSourceFetchLimits};
+
 use librqbit::api::TorrentIdOrHash;
 use librqbit::{
     AddTorrent, AddTorrentOptions, AddTorrentResponse, ManagedTorrent, PeerConnectionOptions,
@@ -24,6 +28,16 @@ use std::time::Duration;
 pub const ENGINE_VERSION: &str = "8.1.1";
 /// Default raw or fetched `.torrent` admission limit from proposal §10.3.
 pub const DEFAULT_MAX_METAINFO_BYTES: usize = 10 * 1024 * 1024;
+/// Minimum configurable raw or fetched `.torrent` admission limit.
+pub const MIN_CONFIGURED_MAX_METAINFO_BYTES: usize = 1024 * 1024;
+/// Maximum configurable raw or fetched `.torrent` admission limit.
+pub const MAX_CONFIGURED_MAX_METAINFO_BYTES: usize = 100 * 1024 * 1024;
+/// Maximum HTTP redirects followed while fetching a `.torrent` source.
+pub const MAX_TORRENT_SOURCE_REDIRECTS: usize = 5;
+/// Default timeout for establishing a torrent-source HTTP connection.
+pub const DEFAULT_TORRENT_SOURCE_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Default end-to-end timeout for a torrent-source HTTP fetch.
+pub const DEFAULT_TORRENT_SOURCE_TOTAL_TIMEOUT: Duration = Duration::from_secs(30);
 /// Maximum magnet URI length from proposal §10.3.
 pub const MAX_MAGNET_URI_BYTES: usize = 16 * 1024;
 /// Maximum number of payload files described by one torrent.
@@ -119,6 +133,23 @@ pub enum TorrentError {
     UnsafeMetainfoPath(&'static str),
     #[error("torrent metainfo is too large ({size} bytes; maximum {limit})")]
     MetainfoTooLarge { size: usize, limit: usize },
+    #[error("invalid torrent source URL: {0}")]
+    InvalidTorrentSource(&'static str),
+    #[error("invalid torrent source limits: {0}")]
+    InvalidTorrentSourceLimits(&'static str),
+    #[error("torrent source request failed for {origin}")]
+    TorrentSourceRequestFailed { origin: String },
+    #[error("torrent source request timed out for {origin}")]
+    TorrentSourceTimeout { origin: String },
+    #[error("torrent source returned HTTP {status} from {origin}")]
+    TorrentSourceHttpStatus { status: u16, origin: String },
+    #[error("torrent source exceeded the redirect limit ({limit})")]
+    TooManyTorrentSourceRedirects { limit: usize },
+    #[error("torrent source returned an invalid redirect from {origin}: {reason}")]
+    InvalidTorrentSourceRedirect {
+        origin: String,
+        reason: &'static str,
+    },
     #[error("magnet URI is too long ({size} bytes; maximum {limit})")]
     MagnetTooLong { size: usize, limit: usize },
     #[error("torrent contains too many files ({count}; maximum {limit})")]
@@ -852,7 +883,15 @@ fn valid_initial_peer(peer: SocketAddr) -> bool {
 }
 
 fn validate_metainfo_contract(bytes: &[u8], proxy_enabled: bool) -> Result<bool, TorrentError> {
-    validate_metainfo_size(bytes.len())?;
+    validate_metainfo_contract_with_limit(bytes, proxy_enabled, DEFAULT_MAX_METAINFO_BYTES)
+}
+
+fn validate_metainfo_contract_with_limit(
+    bytes: &[u8],
+    proxy_enabled: bool,
+    max_metainfo_bytes: usize,
+) -> Result<bool, TorrentError> {
+    validate_metainfo_size_with_limit(bytes.len(), max_metainfo_bytes)?;
     validate_metainfo_version(bytes)?;
     let metainfo =
         librqbit::torrent_from_bytes::<librqbit::ByteBuf<'_>>(bytes).map_err(engine_error)?;
@@ -1183,12 +1222,9 @@ fn portable_collision_key(component: &str) -> String {
         .into_owned()
 }
 
-fn validate_metainfo_size(size: usize) -> Result<(), TorrentError> {
-    if size > DEFAULT_MAX_METAINFO_BYTES {
-        return Err(TorrentError::MetainfoTooLarge {
-            size,
-            limit: DEFAULT_MAX_METAINFO_BYTES,
-        });
+fn validate_metainfo_size_with_limit(size: usize, limit: usize) -> Result<(), TorrentError> {
+    if size > limit {
+        return Err(TorrentError::MetainfoTooLarge { size, limit });
     }
     Ok(())
 }
