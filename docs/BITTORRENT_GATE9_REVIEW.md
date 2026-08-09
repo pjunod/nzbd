@@ -131,7 +131,7 @@ or version fails the blocking policy job.
 |---|---|---|---|
 | [RUSTSEC-2026-0194](https://rustsec.org/advisories/RUSTSEC-2026-0194.html) | `quick-xml 0.37.5` | Attribute iteration can consume quadratic CPU on hostile XML | The only normal path is `librqbit-upnp 1.0.0`; the adapter has no UPnP input and always passes `enable_upnp_port_forwarding: false`. |
 | [RUSTSEC-2026-0195](https://rustsec.org/advisories/RUSTSEC-2026-0195.html) | `quick-xml 0.37.5` | `NsReader` can allocate unbounded namespace state on hostile XML | Same compiled-but-disabled UPnP path. UPnP remains unavailable until the affected dependency is removed or patched. |
-| [RUSTSEC-2026-0009](https://rustsec.org/advisories/RUSTSEC-2026-0009.html) | `time 0.3.41` | RFC 2822 parsing can exhaust the stack | The workspace reaches `time` only through `rcgen`/`yasna`; Cargo's resolved feature graph contains `alloc` and `std`, not `parsing`. |
+| [RUSTSEC-2026-0009](https://rustsec.org/advisories/RUSTSEC-2026-0009.html) | `time 0.3.41` | RFC 2822 parsing can exhaust the stack | The daemon's TLS tests and the torrent adapter's private-CA test reach `time` only through `rcgen`/`yasna`; Cargo's resolved feature graph contains `alloc` and `std`, not `parsing`. |
 
 The distinction matters: `quick-xml` is still compiled, so the exception is
 not proof the crate is safe. It is acceptable only while nzbd cannot construct

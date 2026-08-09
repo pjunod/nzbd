@@ -85,8 +85,14 @@ code. The daemon does not depend on it. The boundary currently provides:
   another override;
 - bytes-only managed admission: the private engine handoff accepts only
   metainfo bytes that already passed nzbd preflight. Stable rqbit's URL variant
-  cannot bypass nzbd's future source-fetch size, redirect, timeout, or
-  redaction policy through this helper;
+  cannot bypass nzbd's source-fetch size, redirect, timeout, or redaction
+  policy through this helper. A separate dormant HTTP(S) helper follows at
+  most five manually validated redirects, strips authentication across origin
+  changes, ignores ambient proxy variables, retains no cookies, uses the
+  process-wide aws-lc provider with OS trust roots, bounds declared and
+  streamed bodies, applies one end-to-end timeout, and returns only
+  preflighted bytes. Its private-CA loopback and oversized chunked-body tests
+  pin the TLS and while-streaming properties directly;
 - named v2-only and hybrid rejection for both metainfo and magnets;
 - fail-closed HTTP/HTTPS/UDP tracker URL validation for metainfo and magnets,
   with at most 64 unique non-empty trackers and 2 KiB per decoded URL, plus
@@ -107,7 +113,8 @@ code. The daemon does not depend on it. The boundary currently provides:
 
 The crate forbids unsafe code. It is intentionally not a complete production
 backend: there is no queue owner channel, durable torrent record, config/API,
-URL fetcher, watch folder, seed policy, or session lifecycle in the daemon.
+URL-fetch route, watch folder, seed policy, or session lifecycle in the daemon.
+The source-fetch helper is not reachable from production daemon input.
 
 The dependency graph also required a production-daemon TLS correction outside
 the isolated crate: `crates/nzbd/src/main.rs` and `crates/nzbd/src/tls.rs`
@@ -148,6 +155,12 @@ The isolated suite covers:
   alternate assignment separators;
 - engine/stat error redaction and UTF-8-safe 2 KiB truncation with an explicit
   marker;
+- authenticated HTTP source handling that preserves credentials only across
+  same-origin redirects, strips them across origin changes, does not replay
+  response cookies, exposes only origins in errors, rejects non-HTTP targets,
+  accepts exactly five redirects and rejects the sixth, bounds both declared
+  and chunked bodies, enforces one end-to-end timeout, and preflights the
+  returned metainfo before it leaves the helper;
 - one-tracker private-torrent discovery and multi-tracker rejection;
 - a positive-control PEX peer that public torrents contact and private torrents
   ignore; the canary address is available only through the peer-wire message;
@@ -206,19 +219,28 @@ not only redirected DHT traffic, for the private binary hash and the ASCII hash
 used by LSD.
 
 The bounded mutation corpus is a fast ordinary-test regression layer, not a
-claim of coverage-guided fuzzing completeness. A separate, feature-gated
-`cargo-fuzz` target calls the adapter-owned complete metadata-only file
-admission wrapper across all proxy/DHT combinations without creating a session
-or touching the network or filesystem. Nine committed seeds cover valid v1,
-private v1, v2-only, hybrid, UDP tracker, announce-list, multifile,
-private-multiple-tracker, and unsafe-path outcomes; their named contracts are
-checked before every campaign. The reviewed seeds live separately from the
-ignored evolving corpus. The target uses a bencode dictionary, caps generated
-inputs at 1 MiB, and runs 20,000 cases on relevant pull requests plus a
-five-minute weekly campaign. Exact product boundaries, including the 10 MiB
-metainfo limit, remain deterministic unit tests. The CI campaign does not
-persist its evolved corpus, prove path writes, or complete M5's symlink,
-mounted-filesystem, sustained-campaign, and resource-exhaustion work.
+claim of coverage-guided fuzzing completeness. Two separate, feature-gated
+`cargo-fuzz` targets exercise the adapter-owned complete metadata-only file
+admission wrapper and exact magnet preflight without creating a session or
+touching the network or filesystem. The metainfo target runs across all
+proxy/DHT combinations. Its nine reviewed seeds cover valid v1, private v1,
+v2-only, hybrid, UDP tracker, announce-list, multifile,
+private-multiple-tracker, and unsafe-path outcomes. The magnet target runs
+every valid UTF-8 input in normal and proxy modes from reviewed valid-v1,
+lowercase-base32, v2-only, hybrid, eager-selection, and proxy+UDP-tracker
+seeds. Every reviewed seed has a deterministic named-outcome contract and
+lives separately from its target's ignored evolving corpus. The targets use
+bencode and URI dictionaries and cap generated input at 1 MiB and 32 KiB,
+respectively; the latter permits campaigns to cross the exact 16 KiB magnet
+limit. Each target runs 20,000 cases on relevant pull requests and a separate
+five-minute weekly campaign. The main workspace suite passes a valid magnet at
+exactly 16 KiB and a valid v1 document at exactly the 10 MiB default metainfo
+ceiling, then requires the first excess byte to fail by the respective named
+size boundary. It also accepts a valid 100,000-file v1 inventory below the
+metainfo ceiling and requires file 100,001 to fail by the named file-count
+boundary. CI does not persist either evolved corpus, prove a peak-memory
+ceiling or path writes, or complete M5's symlink, mounted-filesystem,
+sustained-campaign, and broader resource-exhaustion work.
 
 The two-stage magnet guard closes the storage-ordering gap, not the allocation
 gap inside stable rqbit: its metadata reader may allocate up to 32 MiB before
@@ -578,9 +600,11 @@ by rustls. Three exact advisory exceptions remain:
   port forwarding false. A production gate must remove both exceptions or
   keep UPnP unavailable.
 - [`RUSTSEC-2026-0009`](https://rustsec.org/advisories/RUSTSEC-2026-0009)
-  affects `time`'s RFC 2822 parser. rcgen compiles `time` without its parsing
-  feature, so the vulnerable parser is absent. The fixed `time 0.3.47` raises
-  its MSRV to Rust 1.88, while nzbd's verified floor is Rust 1.85.
+  affects `time`'s RFC 2822 parser. The daemon's TLS tests and the torrent
+  adapter's private-CA test reach it through rcgen, which compiles `time`
+  without its parsing feature, so the vulnerable parser is absent. The fixed
+  `time 0.3.47` raises its MSRV to Rust 1.88, while nzbd's verified floor is
+  Rust 1.85.
 
 [`supply-chain.yml`](../.github/workflows/supply-chain.yml) pins
 `cargo-deny-action` to an immutable revision and runs separate blocking policy
@@ -674,6 +698,8 @@ cargo check -p nzbd-torrent
 make fuzz-test
 make fuzz-metainfo
 make fuzz-metainfo FUZZ_SECONDS=300
+make fuzz-magnet
+make fuzz-magnet FUZZ_SECONDS=300
 
 # Linux only; requires passwordless sudo, iptables/ip6tables, and tcpdump.
 scripts/check-private-discovery-leaks.sh

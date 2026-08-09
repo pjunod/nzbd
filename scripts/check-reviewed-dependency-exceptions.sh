@@ -110,6 +110,7 @@ time_tree="$(
 time_packages="$(package_set <<<"$time_tree")"
 expected_time_packages="$(LC_ALL=C sort <<'EOF'
 nzbd (workspace)
+nzbd-torrent (workspace)
 rcgen v0.13.2
 time v0.3.41
 yasna v0.5.2
