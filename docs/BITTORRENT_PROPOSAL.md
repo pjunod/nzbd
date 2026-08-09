@@ -1983,9 +1983,12 @@ from docs without reading code.
 **Current groundwork:** the metadata-only preflight has a feature-gated
 libFuzzer target with four committed and contract-checked seed classes, a
 bencode dictionary, a bounded pull-request smoke, and a weekly five-minute
-campaign. This is useful continuous coverage growth, not M5 completion:
-crash-free bounded runs do not establish exhaustion resistance, filesystem
-containment, or sustained fuzzing adequacy.
+campaign. Its isolated contract suite also exercises a valid 100,000-file v1
+inventory below the default metainfo-size ceiling and names file 100,001 as
+the first rejected input. This is useful continuous coverage and a concrete
+resource boundary, not M5 completion: crash-free bounded runs and one
+functional limit do not establish peak-memory exhaustion resistance,
+filesystem containment, or sustained fuzzing adequacy.
 
 ### 15.8 M6 — cluster torrent leases (separate approval)
 
@@ -2051,9 +2054,12 @@ becomes reachable.
   normal and proxy modes from v1, private-v1, v2-only, and hybrid seeds. Pull
   requests run 20,000 cases and the weekly job runs for five minutes, with
   failing reproducers uploaded. The campaign is metadata-only, caps generated
-  input at 1 MiB, and does not retain an evolved corpus; sustained
-  coverage-guided fuzzing and the exact M5 resource/filesystem probes remain a
-  release gate.
+  input at 1 MiB, and does not retain an evolved corpus. An adjacent isolated
+  contract constructs a valid 100,000-file v1 inventory under the 10 MiB
+  default and proves the first excess file fails by name; it deliberately does
+  not infer a stable peak-memory budget from shared CI runners. Sustained
+  coverage-guided fuzzing and the remaining M5 resource/filesystem probes
+  remain a release gate.
 - State projection: every `TorrentPhase` maps to the expected native and
   qBittorrent status, with units/sentinel values pinned.
 - Seed policy: add/category/global precedence, ratio precision, time across
