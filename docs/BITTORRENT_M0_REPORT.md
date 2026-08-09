@@ -600,9 +600,11 @@ by rustls. Three exact advisory exceptions remain:
   port forwarding false. A production gate must remove both exceptions or
   keep UPnP unavailable.
 - [`RUSTSEC-2026-0009`](https://rustsec.org/advisories/RUSTSEC-2026-0009)
-  affects `time`'s RFC 2822 parser. rcgen compiles `time` without its parsing
-  feature, so the vulnerable parser is absent. The fixed `time 0.3.47` raises
-  its MSRV to Rust 1.88, while nzbd's verified floor is Rust 1.85.
+  affects `time`'s RFC 2822 parser. The daemon's TLS tests and the torrent
+  adapter's private-CA test reach it through rcgen, which compiles `time`
+  without its parsing feature, so the vulnerable parser is absent. The fixed
+  `time 0.3.47` raises its MSRV to Rust 1.88, while nzbd's verified floor is
+  Rust 1.85.
 
 [`supply-chain.yml`](../.github/workflows/supply-chain.yml) pins
 `cargo-deny-action` to an immutable revision and runs separate blocking policy
