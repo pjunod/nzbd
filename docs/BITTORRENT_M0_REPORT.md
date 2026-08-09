@@ -591,6 +591,30 @@ intentionally does not link the blocked adapter.
 | New package/version identities in the workspace lockfile | 178 |
 | OpenSSL dynamic link | none; only CoreFoundation, libiconv, and libSystem were listed on this host |
 
+The
+[first cross-platform sampled-memory run](https://github.com/pjunod/nzbd/actions/runs/31334930456)
+passed both optimized probes on 2026-08-09 UTC. Values are process resident
+set samples in bytes; the time column is admission plus shutdown for the
+session probe and validation for the metainfo probe.
+
+| Platform | Probe | Baseline RSS | Maximum sampled RSS | Sampled growth | Time |
+|---|---|---:|---:|---:|---:|
+| Linux aarch64 musl | 100-torrent session | 1,724,416 | 6,676,480 | 4,952,064 | 47 ms + 1,001 ms |
+| Linux aarch64 musl | 100,000-file preflight | 741,376 | 4,587,520 | 3,846,144 | 86 ms |
+| Linux x86_64 GNU | 100-torrent session | 4,694,016 | 10,379,264 | 5,685,248 | 79 ms + 1,001 ms |
+| Linux x86_64 GNU | 100,000-file preflight | 2,621,440 | 18,014,208 | 15,392,768 | 86 ms |
+| Linux x86_64 musl | 100-torrent session | 4,915,200 | 10,002,432 | 5,087,232 | 67 ms + 1,001 ms |
+| Linux x86_64 musl | 100,000-file preflight | 843,776 | 4,694,016 | 3,850,240 | 86 ms |
+| macOS aarch64 | 100-torrent session | 6,979,584 | 11,190,272 | 4,210,688 | 32 ms + 1,002 ms |
+| macOS aarch64 | 100,000-file preflight | 6,012,928 | 33,374,208 | 27,361,280 | 56 ms |
+| Windows x86_64 MSVC | 100-torrent session | 8,339,456 | 11,243,520 | 2,904,064 | 1,941 ms + 1,002 ms |
+| Windows x86_64 MSVC | 100,000-file preflight | 4,694,016 | 8,433,664 | 3,739,648 | 105 ms |
+
+All session growth results stayed below 5.5 MiB and all metainfo growth
+results stayed below 27 MiB, far under the preliminary 192 MiB and 256 MiB
+regression ceilings. The wide platform spread is why these remain
+platform-specific sampled-growth guards, not portable peak-memory promises.
+
 The 2026-08-07 review remediation refreshed these measurements after adding
 `icu_casemap 2.1.1` and `icu_casemap_data 2.1.1` for Unicode simple case
 folding. The change added two package identities, 36,400 binary bytes, and

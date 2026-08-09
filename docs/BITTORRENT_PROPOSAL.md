@@ -2051,11 +2051,17 @@ no trackers or initial peers, so it starts no public discovery or payload
 transfer. The
 [first native evidence run](https://github.com/pjunod/nzbd/actions/runs/31330178035)
 passed the isolated adapter suite on 2026-08-09 UTC across Linux x86_64 GNU,
-Linux x86_64 musl, Linux aarch64 musl, macOS aarch64, and Windows x86_64. This
-is useful continuous coverage and a wall-clock regression guard, not M5
-completion: crash-free bounded runs, functional limits, and a deadline on
-shared CI do not establish peak-memory exhaustion resistance, filesystem
-containment, production shutdown orchestration, or sustained fuzzing adequacy.
+Linux x86_64 musl, Linux aarch64 musl, macOS aarch64, and Windows x86_64. The
+[first sampled-memory run](https://github.com/pjunod/nzbd/actions/runs/31334930456)
+passed the same five targets on 2026-08-09 UTC: 100-torrent sampled RSS growth
+ranged from 2,904,064 to 5,685,248 bytes, and 100,000-file preflight growth
+ranged from 3,739,648 to 27,361,280 bytes. Exact baselines, maxima, and timings
+are recorded in the M0 report. This is useful continuous coverage plus
+wall-clock and retained-memory regression evidence, not M5 completion:
+crash-free bounded runs, functional limits, periodic RSS samples, and a
+deadline on shared CI do not establish peak-memory exhaustion resistance,
+filesystem containment, production shutdown orchestration, or sustained
+fuzzing adequacy.
 
 ### 15.8 M6 — cluster torrent leases (separate approval)
 
