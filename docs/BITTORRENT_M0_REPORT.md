@@ -117,7 +117,15 @@ code. The daemon does not depend on it. The boundary currently provides:
   proposal's production behavior: there is no daemon disk-guard latch, API
   responsiveness proof, new-request pause, or continued-upload proof, and
   stable rqbit currently reports the affected torrent as an error rather than
-  a paused download;
+  a paused download. The
+  [first native storage-fault run](https://github.com/pjunod/nzbd/actions/runs/31336230666)
+  passed on 2026-08-09 UTC across Linux x86_64 GNU, Linux x86_64 musl, Linux
+  aarch64 musl, macOS aarch64, and Windows x86_64. Every runner stopped after
+  one successful write and 16,384 persisted bytes, observed `StorageFull` on
+  the second write, reported the affected torrent as incomplete and `Error`,
+  returned stats in 0 ms, and completed the independent 65,536-byte control
+  torrent. Fault detection took 30–52 ms and the control transfer took 1–82
+  ms on the hosted runners;
 - explicit peer lifetimes: the dormant session pins stable 8.1.1's effective
   10-second connect and read/write timeouts and 120-second keepalive interval;
   per-add options inherit this reviewed session policy instead of introducing

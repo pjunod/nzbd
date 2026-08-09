@@ -2073,7 +2073,12 @@ does not call the §14 ENOSPC row green: rqbit transitions the affected torrent
 to `Error`, while M2 must latch nzbd's multi-root disk guard, stop new piece
 requests, expose the limiting root, and choose the documented pause/upload
 fallback. No daemon API or production torrent writer exists to prove those
-outcomes yet.
+outcomes yet. The
+[first native storage-fault run](https://github.com/pjunod/nzbd/actions/runs/31336230666)
+passed on 2026-08-09 UTC across all five supported native targets. Each runner
+observed exactly one successful 16,384-byte write before `StorageFull`, kept
+the target incomplete in `Error`, returned stats immediately, and completed
+the independent 65,536-byte control transfer.
 
 ### 15.8 M6 — cluster torrent leases (separate approval)
 
