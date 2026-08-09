@@ -1989,13 +1989,14 @@ from docs without reading code.
 libFuzzer targets for metainfo bytes and valid-UTF-8 magnet strings. Four
 metainfo and six magnet seed classes are committed and contract checked; each
 target has its own dictionary, bounded pull-request smoke, and separate weekly
-five-minute campaign. The isolated contract suite also accepts a valid v1
-document at the exact 10 MiB default metainfo ceiling and names the first
-excess byte, accepts a valid 100,000-file v1 inventory below that ceiling, and
-names file 100,001 as the first rejected inventory. This is useful continuous
-coverage and two concrete resource boundaries, not M5 completion: crash-free
-bounded runs and functional limits do not establish peak-memory exhaustion
-resistance, filesystem containment, or sustained fuzzing adequacy.
+five-minute campaign. The isolated contract suite also accepts a valid magnet
+URI at the exact 16 KiB product limit and a valid v1 document at the exact
+10 MiB default metainfo ceiling, naming the first excess byte for each. It
+accepts a valid 100,000-file v1 inventory below the metainfo ceiling and names
+file 100,001 as the first rejected inventory. This is useful continuous
+coverage and three concrete resource boundaries, not M5 completion:
+crash-free bounded runs and functional limits do not establish peak-memory
+exhaustion resistance, filesystem containment, or sustained fuzzing adequacy.
 
 ### 15.8 M6 — cluster torrent leases (separate approval)
 
@@ -2038,7 +2039,9 @@ becomes reachable.
   v2-only, hybrid, eager-selection rejection, and proxy+UDP-tracker rejection.
   Pull requests run 20,000 cases and the weekly job runs for five minutes;
   generated input is capped at 32 KiB, failing reproducers are uploaded, and
-  the evolved corpus is not retained.
+  the evolved corpus is not retained. An adjacent contract passes a valid URI
+  at exactly the 16 KiB product limit through the full preflight and requires
+  the first excess byte to fail by name.
 - Private metainfo discovery: a known-private `.torrent` is rejected before
   engine admission when session DHT is live; the same one-tracker metainfo is
   accepted by policy when DHT is disabled.

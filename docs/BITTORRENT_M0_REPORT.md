@@ -216,15 +216,17 @@ normal and proxy modes from committed valid-v1, lowercase-base32, v2-only,
 hybrid, eager-selection, and proxy+UDP-tracker seeds, uses a URI dictionary,
 and caps generated input at 32 KiB so campaigns can cross the exact 16 KiB
 product limit. Every committed seed has a deterministic named-outcome
-contract. Each target runs 20,000 cases on relevant pull requests and a
-separate five-minute weekly campaign. The same isolated test crate requires a
-valid v1 document at exactly the 10 MiB default metainfo ceiling to pass and
-the first excess byte to fail by the named size boundary. It also constructs a
-valid 100,000-file v1 inventory below that independent ceiling and requires it
-to pass, then requires file 100,001 to fail by the named file-count boundary.
-CI does not persist either evolved corpus, prove a peak-memory ceiling or
-path writes, or complete M5's symlink, mounted-filesystem, sustained-campaign,
-and broader resource-exhaustion work.
+contract. The same suite passes a valid magnet at exactly the 16 KiB product
+limit through the full preflight and requires the first excess byte to fail by
+the named size boundary. Each target runs 20,000 cases on relevant pull
+requests and a separate five-minute weekly campaign. The isolated test crate
+also requires a valid v1 document at exactly the 10 MiB default metainfo
+ceiling to pass and the first excess byte to fail by the named size boundary.
+It constructs a valid 100,000-file v1 inventory below that independent ceiling
+and requires it to pass, then requires file 100,001 to fail by the named
+file-count boundary. CI does not persist either evolved corpus, prove a
+peak-memory ceiling or path writes, or complete M5's symlink,
+mounted-filesystem, sustained-campaign, and broader resource-exhaustion work.
 
 The two-stage magnet guard closes the storage-ordering gap, not the allocation
 gap inside stable rqbit: its metadata reader may allocate up to 32 MiB before
