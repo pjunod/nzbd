@@ -2,8 +2,8 @@
 
 **Status:** review incorporated; M0 no-go; M1b merged; M2 blocked ·
 **Decision:** ADR-19, production engine blocked; neutral queue seam authorized ·
-**Written:** 2026-08-05 · **Revised:** 2026-08-07 ·
-**Verified against:** `d8d7ca4` ·
+**Written:** 2026-08-05 · **Revised:** 2026-08-08 ·
+**Verified against:** `14f152b` ·
 **Scope:** architecture, contracts, milestones, and review questions; no
 production BitTorrent path is authorized before the gates below pass
 
@@ -1649,9 +1649,16 @@ whose prefix merely resembles the configured root. The existing job
 - Keep the adapter's deterministic preflight mutation corpus in ordinary CI:
   every truncation plus bounded byte replacement, deletion, and insertion
   around v1, v2-only, and hybrid seeds, with structural-limit invariants. It
-  complements rather than replaces an M5 coverage-guided fuzz target. Exercise
-  path rejection through real engine admission even if upstream also fuzzes
-  bencode; M5 still owns symlink and normalized case-collision probes.
+  complements rather than replaces the M5 coverage-guided target. The isolated
+  `cargo-fuzz` crate pins its two test-only additions against the reviewed
+  product lock, checks that every committed seed reaches its named outcome,
+  calls the exact adapter-owned metadata preflight without sessions or I/O,
+  and runs a 20,000-case pull-request smoke plus a five-minute weekly campaign.
+  Its 1 MiB campaign cap keeps CI bounded; deterministic tests retain the exact
+  10 MiB product boundary. Exercise path rejection through real engine
+  admission even if upstream also fuzzes bencode; M5 still owns
+  sustained campaigns, corpus retention, symlink, mounted-filesystem, and
+  normalized case-collision probes.
 
 ---
 
@@ -1973,6 +1980,13 @@ passes; Linux glibc/musl, macOS, Windows, Docker, and MSRV artifacts build; the
 reviewer can verify public traffic, ports, paths, seed policy, and deletion
 from docs without reading code.
 
+**Current groundwork:** the metadata-only preflight has a feature-gated
+libFuzzer target with four committed and contract-checked seed classes, a
+bencode dictionary, a bounded pull-request smoke, and a weekly five-minute
+campaign. This is useful continuous coverage growth, not M5 completion:
+crash-free bounded runs do not establish exhaustion resistance, filesystem
+containment, or sustained fuzzing adequacy.
+
 ### 15.8 M6 — cluster torrent leases (separate approval)
 
 **Work:** implement §12 only after single-node field data exists · lease kind ·
@@ -2033,7 +2047,13 @@ becomes reachable.
   validator replaced by `Ok(())` therefore fails rather than turning the
   corpus into a no-panic-only test. Checked v1 payload/piece/hash geometry
   prevents zero-divide, length-wrap, and inconsistent hash-table input from
-  reaching rqbit; coverage-guided fuzzing remains an M5 release gate.
+  reaching rqbit. A separate libFuzzer target exercises the exact preflight in
+  normal and proxy modes from v1, private-v1, v2-only, and hybrid seeds. Pull
+  requests run 20,000 cases and the weekly job runs for five minutes, with
+  failing reproducers uploaded. The campaign is metadata-only, caps generated
+  input at 1 MiB, and does not retain an evolved corpus; sustained
+  coverage-guided fuzzing and the exact M5 resource/filesystem probes remain a
+  release gate.
 - State projection: every `TorrentPhase` maps to the expected native and
   qBittorrent status, with units/sentinel values pinned.
 - Seed policy: add/category/global precedence, ratio precision, time across

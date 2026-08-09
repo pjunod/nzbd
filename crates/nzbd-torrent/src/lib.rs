@@ -883,6 +883,16 @@ fn validate_metainfo_contract(bytes: &[u8], proxy_enabled: bool) -> Result<bool,
     Ok(true)
 }
 
+/// Exercise the exact metadata-only preflight used before engine admission.
+///
+/// This surface exists only for the out-of-workspace fuzz harness. It starts
+/// no session and performs no network or filesystem I/O.
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub fn fuzz_metainfo_preflight(bytes: &[u8], proxy_enabled: bool) -> Result<bool, TorrentError> {
+    validate_metainfo_contract(bytes, proxy_enabled)
+}
+
 fn validate_metainfo_admission(
     bytes: &[u8],
     proxy_enabled: bool,
