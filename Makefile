@@ -155,6 +155,7 @@ fuzz-test: fuzz-deps ## Verify the committed BitTorrent fuzz seed classes
 
 .PHONY: fuzz-metainfo
 fuzz-metainfo: fuzz-test ## Coverage-guided BitTorrent metainfo preflight smoke
+	mkdir -p fuzz/corpus/metainfo_preflight
 	cd fuzz && PATH="$(RUSTUP_PATH_PREFIX)$$PATH" $(CARGO) +$(FUZZ_TOOLCHAIN) \
 		fuzz run $(if $(strip $(FUZZ_TARGET)),--target $(FUZZ_TARGET),) \
 		metainfo_preflight \
