@@ -15,6 +15,7 @@ DAEMON  := nzbd
 # Minimum supported Rust (keep in sync with Cargo.toml rust-version).
 MSRV    := 1.85
 FUZZ_TOOLCHAIN ?= nightly-2026-08-01
+FUZZ_TARGET ?=
 FUZZ_RUNS ?= 20000
 FUZZ_MAX_LEN ?= 1048576
 FUZZ_SECONDS ?=
@@ -155,7 +156,8 @@ fuzz-test: fuzz-deps ## Verify the committed BitTorrent fuzz seed classes
 .PHONY: fuzz-metainfo
 fuzz-metainfo: fuzz-test ## Coverage-guided BitTorrent metainfo preflight smoke
 	cd fuzz && PATH="$(RUSTUP_BIN_DIR):$$PATH" $(CARGO) +$(FUZZ_TOOLCHAIN) \
-		fuzz run metainfo_preflight \
+		fuzz run $(if $(strip $(FUZZ_TARGET)),--target $(FUZZ_TARGET),) \
+		metainfo_preflight \
 		corpus/metainfo_preflight -- \
 		$(if $(strip $(FUZZ_SECONDS)),-max_total_time=$(FUZZ_SECONDS),-runs=$(FUZZ_RUNS)) \
 		-max_len=$(FUZZ_MAX_LEN) -dict=dictionaries/metainfo.dict

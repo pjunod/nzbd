@@ -51,11 +51,14 @@ jobs:
 
       - name: Run bounded pull-request fuzzing
         if: github.event_name != 'schedule'
-        run: make fuzz-metainfo
+        run: make fuzz-metainfo FUZZ_TARGET=x86_64-unknown-linux-gnu
 
       - name: Run scheduled five-minute fuzzing
         if: github.event_name == 'schedule'
-        run: make fuzz-metainfo FUZZ_SECONDS=300
+        run: >-
+          make fuzz-metainfo
+          FUZZ_TARGET=x86_64-unknown-linux-gnu
+          FUZZ_SECONDS=300
 
       - name: Upload reproducer on failure
         if: failure()
