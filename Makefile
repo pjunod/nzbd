@@ -181,7 +181,7 @@ fuzz-magnet-run:
 		-max_len=$(FUZZ_MAGNET_MAX_LEN) -dict=dictionaries/magnet.dict
 
 .PHONY: bittorrent-policy
-bittorrent-policy: ## Verify the dormant adapter and reviewed dependency boundaries
+bittorrent-policy: ## Verify adapter dependencies, daemon isolation, and reviewed exceptions
 	scripts/check-bittorrent-deps.sh
 	scripts/check-reviewed-dependency-exceptions.sh
 

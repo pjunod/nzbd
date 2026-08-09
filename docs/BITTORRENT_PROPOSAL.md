@@ -2019,7 +2019,9 @@ from docs without reading code.
 The checked-in release entry points separate deterministic proof from bounded
 coverage-guided work. `make gate` runs formatting, strict lint, the whole
 workspace suite, Rust 1.85 checking, the dormant adapter dependency policy,
-reviewed dependency exceptions, and the committed fuzz seed contracts.
+the production daemon's continued isolation from `nzbd-torrent` and every
+`librqbit*` package, reviewed dependency exceptions, and the committed fuzz
+seed contracts.
 `make gate-fuzz` first runs that deterministic gate and then both default
 20,000-case libFuzzer campaigns. The latter requires the pinned nightly
 toolchain and cargo-fuzz used by CI; weekly five-minute campaigns remain

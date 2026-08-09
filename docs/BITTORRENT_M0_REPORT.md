@@ -732,11 +732,13 @@ scripts/check-rqbit-discovery-pressure-patch.sh /path/to/rqbit
 
 `make gate` is the deterministic local release entry point: formatting,
 strict lint, the whole workspace suite, Rust 1.85 checking, the dormant
-adapter dependency boundary, reviewed dependency exceptions, and committed
-fuzz seed contracts. `make gate-fuzz` runs that gate first and then both
-bounded 20,000-case libFuzzer campaigns by default. It requires the pinned
-nightly toolchain and cargo-fuzz used by the BitTorrent fuzz workflow. The
-scheduled five-minute campaigns remain separate CI evidence.
+adapter dependency boundary, the absence of `nzbd-torrent` and every
+`librqbit*` package from the production daemon's normal dependency graph,
+reviewed dependency exceptions, and committed fuzz seed contracts. The
+`make gate-fuzz` target runs that gate first and then both bounded 20,000-case
+libFuzzer campaigns by default. It requires the pinned nightly toolchain and
+cargo-fuzz used by the BitTorrent fuzz workflow. The scheduled five-minute
+campaigns remain separate CI evidence.
 
 The Rust 1.85 check must select both the 1.85 Cargo and `rustc`; this host also
 has a newer Homebrew compiler on `PATH`. The native platform matrix should run
