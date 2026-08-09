@@ -150,7 +150,7 @@ fuzz-deps: ## Verify the isolated BitTorrent fuzz dependency graph
 	scripts/check-bittorrent-fuzz-deps.sh
 
 .PHONY: fuzz-test
-fuzz-test: fuzz-deps ## Verify the BitTorrent fuzz seed and resource contracts
+fuzz-test: fuzz-deps ## Verify the committed BitTorrent fuzz seed classes
 	$(CARGO) test --manifest-path fuzz/Cargo.toml --locked
 
 .PHONY: fuzz-metainfo
