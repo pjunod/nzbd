@@ -1471,11 +1471,14 @@ remain review evidence rather than shipped capability. Projected paths include
 the multi-file root and platform separator bytes, so the accounting bounds the
 paths later passed to storage rather than only the raw bencode component
 payloads. Exact-limit tests pass and the first excess byte or file returns a
-stable named error. Error
-truncation is UTF-8 safe and ends with an explicit marker. The dormant
-source-fetch boundary now validates the 1–100 MiB metainfo range, follows at
-most five manually checked redirects, and enforces the selected limit while
-the body streams. Daemon configuration and API plumbing remain future work; no
+stable named error. Error truncation is UTF-8 safe and ends with an explicit
+marker. The dormant source-fetch boundary now validates the 1–100 MiB fetch
+range, follows at most five manually checked redirects, and enforces the
+selected limit while the body streams. The other dormant admission paths
+still use the 10 MiB default. Daemon integration must carry one configured
+limit through both fetching and later engine admission; a successful fetch
+must never return bytes that the next boundary rejects only because it used a
+different limit. Daemon configuration and API plumbing remain future work; no
 production input is wired by these constants or helpers.
 The dormant managed-admission helper accepts preflighted metainfo bytes only;
 it cannot receive rqbit's URL variant. Authenticated HTTP(S) fetching remains
@@ -1608,19 +1611,29 @@ the daemon. It defaults to a 10 MiB body, five redirects, a 10-second connect
 timeout, and a 30-second end-to-end timeout spanning the redirect chain and
 body. URL basic-auth credentials are decoded once, survive only same-origin
 redirects, and are stripped on every cross-origin hop; credentials supplied by
-a redirect target are ignored. Redirects are manual, the client has no cookie
-store, declared and streamed body sizes fail at the first excess byte, and
-returned bytes must pass the same metainfo, geometry, path, privacy, and
-tracker preflight used before engine admission. Loopback tests cover both
+a redirect target are ignored. Redirects are manual, ambient proxy environment
+variables are disabled, the client has no cookie store, and TLS uses the
+process-wide aws-lc provider plus `rustls-platform-verifier` so operator-added
+OS trust roots continue to work for private indexers. Declared and streamed
+body sizes fail at the first excess byte, and returned bytes must pass the same
+metainfo, geometry, path, privacy, and tracker preflight used before engine
+admission. The fetch helper accepts a 1–100 MiB limit, but the other dormant
+admission helpers still use the 10 MiB default; production wiring must carry
+one configured value through both boundaries. Loopback tests cover both
 redirect sides, status and timeout redaction, the exact five-hop boundary,
-cookie non-replay, header and chunked-body ceilings, and proxy-unsafe tracker
-rejection. This is a dormant seam only: it creates no API route, queue job,
-engine session, listener, discovery traffic, or payload I/O.
+cookie non-replay, private-CA HTTPS, header and mutation-discriminating
+chunked-body ceilings, and proxy-unsafe tracker rejection. This is a dormant
+seam only: it creates no API route, queue job, engine session, listener,
+discovery traffic, or payload I/O.
 
 Private/LAN indexers are a legitimate deployment, so an unconditional
 private-IP ban would break the intended workflow. Authentication is the
 authority boundary. The UI warns that accepting a URL lets an authenticated
-client make the daemon connect outbound.
+client make the daemon connect outbound. That authority also includes every
+manually validated redirect target: a trusted or compromised indexer can pivot
+the daemon's blind GET to an internal or link-local address. The response still
+must parse as admitted metainfo and errors expose only the target origin, but
+those guards do not remove the outbound-request risk.
 
 ### 11.5 Deletion is resolved, bounded, and idempotent
 

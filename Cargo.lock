@@ -2148,12 +2148,15 @@ dependencies = [
  "icu_normalizer",
  "librqbit",
  "percent-encoding",
+ "rcgen",
  "reqwest",
  "rustls",
+ "rustls-platform-verifier",
  "sha1",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-rustls",
  "url",
 ]
 

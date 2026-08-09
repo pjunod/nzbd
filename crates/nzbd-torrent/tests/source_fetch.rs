@@ -328,7 +328,11 @@ async fn content_length_and_streaming_enforce_the_first_excess_byte() {
     ));
     header_server.await.expect("header server task");
 
-    let body = vec![b'x'; excessive];
+    // Keep this body materially larger than the limit so the assertion below
+    // distinguishes streaming enforcement from the post-buffering preflight.
+    // A mutant that removes the streaming guard reports the full 4 MiB body.
+    let streamed_total = MIN_CONFIGURED_MAX_METAINFO_BYTES * 4;
+    let body = vec![b'x'; streamed_total];
     let (stream_address, stream_server) =
         spawn_server(vec![ResponseSpec::immediate(chunked_response(&body))]).await;
     let error = fetch_torrent_source(&source_url(stream_address, "/stream"), limits, false)
@@ -337,7 +341,9 @@ async fn content_length_and_streaming_enforce_the_first_excess_byte() {
     assert!(matches!(
         error,
         TorrentError::MetainfoTooLarge { size, limit }
-            if size == excessive && limit == MIN_CONFIGURED_MAX_METAINFO_BYTES
+            if size > MIN_CONFIGURED_MAX_METAINFO_BYTES
+                && size <= MIN_CONFIGURED_MAX_METAINFO_BYTES + 64 * 1024
+                && limit == MIN_CONFIGURED_MAX_METAINFO_BYTES
     ));
     stream_server.await.expect("stream server task");
 }

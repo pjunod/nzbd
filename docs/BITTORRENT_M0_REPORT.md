@@ -88,8 +88,11 @@ code. The daemon does not depend on it. The boundary currently provides:
   cannot bypass nzbd's source-fetch size, redirect, timeout, or redaction
   policy through this helper. A separate dormant HTTP(S) helper follows at
   most five manually validated redirects, strips authentication across origin
-  changes, retains no cookies, bounds declared and streamed bodies, applies one
-  end-to-end timeout, and returns only preflighted bytes;
+  changes, ignores ambient proxy variables, retains no cookies, uses the
+  process-wide aws-lc provider with OS trust roots, bounds declared and
+  streamed bodies, applies one end-to-end timeout, and returns only
+  preflighted bytes. Its private-CA loopback and oversized chunked-body tests
+  pin the TLS and while-streaming properties directly;
 - named v2-only and hybrid rejection for both metainfo and magnets;
 - fail-closed HTTP/HTTPS/UDP tracker URL validation for metainfo and magnets,
   with at most 64 unique non-empty trackers and 2 KiB per decoded URL, plus

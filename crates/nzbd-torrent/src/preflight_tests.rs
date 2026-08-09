@@ -570,6 +570,17 @@ fn parsed_info(bytes: &[u8]) -> librqbit::TorrentMetaV1<librqbit::ByteBuf<'_>> {
 #[test]
 fn proposal_admission_constants_and_input_boundaries_are_pinned() {
     assert_eq!(DEFAULT_MAX_METAINFO_BYTES, 10 * 1024 * 1024);
+    assert_eq!(MIN_CONFIGURED_MAX_METAINFO_BYTES, 1024 * 1024);
+    assert_eq!(MAX_CONFIGURED_MAX_METAINFO_BYTES, 100 * 1024 * 1024);
+    assert_eq!(MAX_TORRENT_SOURCE_REDIRECTS, 5);
+    assert_eq!(
+        DEFAULT_TORRENT_SOURCE_CONNECT_TIMEOUT,
+        Duration::from_secs(10)
+    );
+    assert_eq!(
+        DEFAULT_TORRENT_SOURCE_TOTAL_TIMEOUT,
+        Duration::from_secs(30)
+    );
     assert_eq!(MAX_MAGNET_URI_BYTES, 16 * 1024);
     assert_eq!(MAX_TORRENT_FILES, 100_000);
     assert_eq!(MAX_TORRENT_RELATIVE_PATH_BYTES, 4 * 1024);

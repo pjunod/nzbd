@@ -1,6 +1,10 @@
 use percent_encoding::percent_decode;
 use reqwest::header::LOCATION;
 use reqwest::{Client, StatusCode};
+use rustls::client::danger::ServerCertVerifier;
+use rustls::{ClientConfig, ConfigBuilder};
+use rustls_platform_verifier::Verifier;
+use std::sync::Arc;
 use std::time::Duration;
 use url::Url;
 
@@ -94,13 +98,15 @@ pub async fn fetch_torrent_source(
     let timeout_origin = safe_origin(&source_url);
 
     install_process_crypto_provider()?;
-    let client = Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .connect_timeout(limits.connect_timeout)
-        .build()
-        .map_err(|_| TorrentError::TorrentSourceRequestFailed {
+    let tls_config =
+        platform_tls_config().map_err(|_| TorrentError::TorrentSourceRequestFailed {
             origin: timeout_origin.clone(),
         })?;
+    let client = build_source_client(limits, tls_config).map_err(|_| {
+        TorrentError::TorrentSourceRequestFailed {
+            origin: timeout_origin.clone(),
+        }
+    })?;
 
     match tokio::time::timeout(
         limits.total_timeout,
@@ -119,6 +125,38 @@ pub async fn fetch_torrent_source(
             origin: timeout_origin,
         }),
     }
+}
+
+fn platform_tls_config() -> Result<ClientConfig, rustls::Error> {
+    let provider = rustls::crypto::CryptoProvider::get_default()
+        .cloned()
+        .ok_or_else(|| rustls::Error::General("process crypto provider is not installed".into()))?;
+    let verifier = Verifier::new(provider.clone())?;
+    tls_config_with_verifier(provider, Arc::new(verifier))
+}
+
+fn tls_config_with_verifier(
+    provider: Arc<rustls::crypto::CryptoProvider>,
+    verifier: Arc<dyn ServerCertVerifier>,
+) -> Result<ClientConfig, rustls::Error> {
+    let builder: ConfigBuilder<ClientConfig, rustls::WantsVerifier> =
+        ClientConfig::builder_with_provider(provider).with_safe_default_protocol_versions()?;
+    Ok(builder
+        .dangerous()
+        .with_custom_certificate_verifier(verifier)
+        .with_no_client_auth())
+}
+
+fn build_source_client(
+    limits: TorrentSourceFetchLimits,
+    tls_config: ClientConfig,
+) -> Result<Client, reqwest::Error> {
+    Client::builder()
+        .no_proxy()
+        .use_preconfigured_tls(tls_config)
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(limits.connect_timeout)
+        .build()
 }
 
 async fn fetch_redirect_chain(
@@ -301,6 +339,103 @@ fn is_followed_redirect(status: StatusCode) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(not(target_os = "android"))]
+    use rcgen::{
+        BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair,
+        KeyUsagePurpose,
+    };
+    #[cfg(not(target_os = "android"))]
+    use rustls::pki_types::PrivatePkcs8KeyDer;
+    #[cfg(not(target_os = "android"))]
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    #[cfg(not(target_os = "android"))]
+    use tokio::net::TcpListener;
+    #[cfg(not(target_os = "android"))]
+    use tokio_rustls::TlsAcceptor;
+
+    const VALID_METAINFO: &[u8] =
+        b"d4:infod6:lengthi1e4:name1:a12:piece lengthi1e6:pieces20:aaaaaaaaaaaaaaaaaaaaee";
+
+    #[cfg(not(target_os = "android"))]
+    #[tokio::test]
+    async fn preconfigured_platform_verifier_accepts_a_private_ca_loopback() {
+        install_process_crypto_provider().expect("install aws-lc provider");
+
+        let mut ca_params = CertificateParams::new(Vec::new()).expect("CA params");
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        ca_params.key_usages = vec![
+            KeyUsagePurpose::DigitalSignature,
+            KeyUsagePurpose::KeyCertSign,
+            KeyUsagePurpose::CrlSign,
+        ];
+        let ca_key = KeyPair::generate().expect("CA key");
+        let ca = ca_params.self_signed(&ca_key).expect("self-signed CA");
+
+        let mut leaf_params =
+            CertificateParams::new(vec!["localhost".into()]).expect("leaf params");
+        leaf_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+        let leaf_key = KeyPair::generate().expect("leaf key");
+        let leaf = leaf_params
+            .signed_by(&leaf_key, &ca, &ca_key)
+            .expect("CA-signed leaf");
+
+        let server_config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![leaf.der().clone()],
+                PrivatePkcs8KeyDer::from(leaf_key.serialize_der()).into(),
+            )
+            .expect("TLS server config");
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind TLS loopback");
+        let address = listener.local_addr().expect("TLS loopback address");
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept TLS client");
+            let mut stream = TlsAcceptor::from(Arc::new(server_config))
+                .accept(stream)
+                .await
+                .expect("complete TLS handshake");
+            let mut request = Vec::new();
+            let mut buffer = [0u8; 1024];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let read = stream.read(&mut buffer).await.expect("read HTTPS request");
+                assert_ne!(read, 0, "client closed before sending request headers");
+                request.extend_from_slice(&buffer[..read]);
+            }
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                VALID_METAINFO.len()
+            );
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("write HTTPS response headers");
+            stream
+                .write_all(VALID_METAINFO)
+                .await
+                .expect("write HTTPS metainfo");
+        });
+
+        let provider = rustls::crypto::CryptoProvider::get_default()
+            .cloned()
+            .expect("installed crypto provider");
+        let verifier = Verifier::new_with_extra_roots([ca.der().clone()], provider.clone())
+            .expect("platform verifier with private CA");
+        let tls_config = tls_config_with_verifier(provider, Arc::new(verifier))
+            .expect("platform-verifier TLS config");
+        let limits = TorrentSourceFetchLimits::default();
+        let client = build_source_client(limits, tls_config).expect("source client");
+        let source_url = Url::parse(&format!("https://localhost:{}/source", address.port()))
+            .expect("HTTPS source URL");
+
+        let bytes = fetch_redirect_chain(&client, source_url, None, limits, false)
+            .await
+            .expect("private-CA HTTPS fetch");
+        assert_eq!(bytes, VALID_METAINFO);
+        server.await.expect("TLS server task");
+    }
 
     #[test]
     fn configured_metainfo_limits_accept_the_exact_range() {
