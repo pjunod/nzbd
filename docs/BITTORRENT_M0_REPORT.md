@@ -19,6 +19,11 @@ The implementation therefore stops at the isolated `nzbd-torrent` boundary
 and queue schema-version groundwork. No config switch, API, daemon dependency,
 peer listener, or production torrent admission path has been added.
 
+The [pre-release operations review](BITTORRENT_RELEASE_REVIEW.md) collects the
+current traffic, port, path, seeding, deletion, evidence, and sign-off contract
+without presenting any of those proposed settings as usable production
+behavior.
+
 A later hostile-input review found a third stable-engine prerequisite outside
 the two failed ownership/observability gates: magnet metadata is allocated up
 to rqbit's fixed 32 MiB ceiling before nzbd can apply its proposed 10 MiB

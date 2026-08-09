@@ -31,6 +31,8 @@ jobs:
           key: reviewed-dependency-exceptions
       - name: Freeze reviewed package, feature, license, and advisory sets
         run: scripts/check-reviewed-dependency-exceptions.sh
+      - name: Keep the BitTorrent release review aligned with the no-go gates
+        run: scripts/check-bittorrent-release-review.sh
 
   policy:
     name: licenses, bans, and sources

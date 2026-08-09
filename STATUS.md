@@ -27,7 +27,7 @@ actions
 | 3c — compat C2 + XML-RPC + golden tests | ✅ complete | `fe6d2be` |
 | 4 — Web UI + ecosystem | ✅ complete | `77b7660` |
 | 5 — Beyond parity (+ C3) | 🔶 adaptive pipelining done; rest scoped | this commit |
-| BT — BitTorrent backend | 🔶 proposal and Fable review reconciled; M0 data path passes, upstream contribution kit prepared, daemon wiring blocked on two unreleased engine APIs and a pre-allocation metadata ceiling | [proposal](docs/BITTORRENT_PROPOSAL.md), [M0 report](docs/BITTORRENT_M0_REPORT.md), [rqbit contribution kit](contrib/rqbit/README.md) |
+| BT — BitTorrent backend | 🔶 proposal and Fable review reconciled; M0 data path passes, M5 pressure/release-review groundwork is executable, upstream contribution kit prepared, daemon wiring blocked on two unreleased engine APIs and a pre-allocation metadata ceiling | [proposal](docs/BITTORRENT_PROPOSAL.md), [M0 report](docs/BITTORRENT_M0_REPORT.md), [release review](docs/BITTORRENT_RELEASE_REVIEW.md), [rqbit contribution kit](contrib/rqbit/README.md) |
 
 ---
 
@@ -94,6 +94,7 @@ actions
 
 ## Docs ✅
 
+- ✅ BitTorrent M5 pressure and release-review groundwork (2026-08-09): one DHT-disabled session retains 100 real engine torrents in an exact 10-active/90-paused mix with admission and shutdown deadlines; `make gate` deterministically combines formatting, strict lint, whole-workspace tests, Rust 1.85, daemon isolation, dependency review, and fuzz seed contracts; and the checked operations review makes public traffic, ports, paths, seeding, deletion, evidence, and stop conditions independently reviewable. The drift guard pins the honest no-go state: M0 gates 7 and 8 remain failed, gate 9 remains Partial, and production wiring remains disabled
 - ✅ BitTorrent error secret redaction (2026-08-07): the adapter's 2 KiB display-safe error boundary now redacts secret values written as `key=value`, `key:value`, `key: value`, `key = value`, or JSON-like assignments. Regression coverage includes proxy passwords, auth tokens, cookies, URLs, peers, paths, and control characters; production wiring remains disabled
 - ✅ BitTorrent multi-token secret redaction (2026-08-07): the adapter now keeps redaction active across authorization schemes, cookie/digest continuations, and `=>`, `:=`, or `->` assignment separators, preventing header credentials or arrow-delimited secrets from reappearing in the remaining error text. Non-secret context remains visible and the 2 KiB bound is unchanged; production wiring remains disabled
 - ✅ BitTorrent review remediation (2026-08-07): the consolidated adapter branch redacts secrets after any earlier key in a token, before URL rewriting, and recognizes private-tracker/API/signature/session credential names; proxy `Debug` never prints its raw URL. Known-private metainfo now fails before admission when session DHT is live. Portable collision keys use Unicode simple case folding plus NFC and the Windows dotless-i alias, lowercase base32 magnets are normalized for rqbit, the mutation corpus pins exact dispositions, and encoded-byte path limits have multibyte boundaries. Windows-invalid names remain an intentional all-platform rejection because silent renaming would break seeding and cross-platform restore; production wiring remains disabled
