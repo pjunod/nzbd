@@ -19,6 +19,11 @@ The implementation therefore stops at the isolated `nzbd-torrent` boundary
 and queue schema-version groundwork. No config switch, API, daemon dependency,
 peer listener, or production torrent admission path has been added.
 
+The [pre-release operations review](BITTORRENT_RELEASE_REVIEW.md) collects the
+current traffic, port, path, seeding, deletion, evidence, and sign-off contract
+without presenting any of those proposed settings as usable production
+behavior.
+
 A later hostile-input review found a third stable-engine prerequisite outside
 the two failed ownership/observability gates: magnet metadata is allocated up
 to rqbit's fixed 32 MiB ceiling before nzbd can apply its proposed 10 MiB
@@ -712,6 +717,8 @@ make fuzz-metainfo
 make fuzz-metainfo FUZZ_SECONDS=300
 make fuzz-magnet
 make fuzz-magnet FUZZ_SECONDS=300
+make gate
+make gate-fuzz
 
 # Linux only; requires passwordless sudo, iptables/ip6tables, and tcpdump.
 scripts/check-private-discovery-leaks.sh
@@ -727,6 +734,16 @@ scripts/check-rqbit-metadata-size-limit-patch.sh /path/to/rqbit
 scripts/check-rqbit-peer-response-budget-patch.sh /path/to/rqbit
 scripts/check-rqbit-discovery-pressure-patch.sh /path/to/rqbit
 ```
+
+`make gate` is the deterministic local release entry point: formatting,
+strict lint, the whole workspace suite, Rust 1.85 checking, the dormant
+adapter dependency boundary, the absence of `nzbd-torrent` and every
+`librqbit*` package from the production daemon's normal dependency graph,
+reviewed dependency exceptions, and committed fuzz seed contracts. The
+`make gate-fuzz` target runs that gate first and then both bounded 20,000-case
+libFuzzer campaigns by default. It requires the pinned nightly toolchain and
+cargo-fuzz used by the BitTorrent fuzz workflow. The scheduled five-minute
+campaigns remain separate CI evidence.
 
 The Rust 1.85 check must select both the 1.85 Cargo and `rustc`; this host also
 has a newer Homebrew compiler on `PATH`. The native platform matrix should run
