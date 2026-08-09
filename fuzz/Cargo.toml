@@ -18,5 +18,12 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "magnet_preflight"
+path = "fuzz_targets/magnet_preflight.rs"
+test = false
+doc = false
+bench = false
+
 [workspace]
 members = ["."]

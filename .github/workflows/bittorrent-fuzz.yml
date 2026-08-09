@@ -30,9 +30,9 @@ env:
 
 jobs:
   metainfo-preflight:
-    name: metainfo preflight (libFuzzer)
+    name: input preflight (libFuzzer)
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@master
@@ -53,6 +53,10 @@ jobs:
         if: github.event_name != 'schedule'
         run: make fuzz-metainfo FUZZ_TARGET=x86_64-unknown-linux-gnu
 
+      - name: Run bounded pull-request magnet fuzzing
+        if: github.event_name != 'schedule'
+        run: make fuzz-magnet FUZZ_TARGET=x86_64-unknown-linux-gnu
+
       - name: Run scheduled five-minute fuzzing
         if: github.event_name == 'schedule'
         run: >-
@@ -60,10 +64,19 @@ jobs:
           FUZZ_TARGET=x86_64-unknown-linux-gnu
           FUZZ_SECONDS=300
 
+      - name: Run scheduled five-minute magnet fuzzing
+        if: github.event_name == 'schedule'
+        run: >-
+          make fuzz-magnet
+          FUZZ_TARGET=x86_64-unknown-linux-gnu
+          FUZZ_SECONDS=300
+
       - name: Upload reproducer on failure
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: metainfo-preflight-reproducer
-          path: fuzz/artifacts/metainfo_preflight/
+          name: input-preflight-reproducers
+          path: |
+            fuzz/artifacts/metainfo_preflight/
+            fuzz/artifacts/magnet_preflight/
           if-no-files-found: ignore

@@ -1649,16 +1649,21 @@ whose prefix merely resembles the configured root. The existing job
 - Keep the adapter's deterministic preflight mutation corpus in ordinary CI:
   every truncation plus bounded byte replacement, deletion, and insertion
   around v1, v2-only, and hybrid seeds, with structural-limit invariants. It
-  complements rather than replaces the M5 coverage-guided target. The isolated
-  `cargo-fuzz` crate pins its two test-only additions against the reviewed
-  product lock, checks that every committed seed reaches its named outcome,
-  calls the exact adapter-owned metadata preflight without sessions or I/O,
-  and runs a 20,000-case pull-request smoke plus a five-minute weekly campaign.
-  Its 1 MiB campaign cap keeps CI bounded; deterministic tests retain the exact
-  10 MiB product boundary. Exercise path rejection through real engine
-  admission even if upstream also fuzzes bencode; M5 still owns
-  sustained campaigns, corpus retention, symlink, mounted-filesystem, and
-  normalized case-collision probes.
+  complements rather than replaces the M5 coverage-guided targets. The
+  isolated `cargo-fuzz` crate pins its two test-only additions against the
+  reviewed product lock, checks that every committed seed reaches its named
+  outcome, and calls the exact adapter-owned metainfo and magnet preflights
+  without sessions or I/O. The metainfo target starts from v1, private-v1,
+  v2-only, and hybrid bencode seeds; its 1 MiB campaign cap keeps CI bounded
+  while deterministic tests retain the exact 10 MiB product boundary. The
+  magnet target passes valid UTF-8 to both normal and proxy preflight from
+  valid-v1, lowercase-base32, v2-only, hybrid, eager-selection, and
+  proxy+UDP-tracker seeds. Its 32 KiB campaign cap permits generated inputs to
+  cross the exact 16 KiB product limit. Each target runs a 20,000-case
+  pull-request smoke and a separate five-minute weekly campaign. Exercise path
+  rejection through real engine admission even if upstream also fuzzes
+  bencode; M5 still owns sustained campaigns, corpus retention, symlink,
+  mounted-filesystem, and normalized case-collision probes.
 
 ---
 
@@ -1980,16 +1985,17 @@ passes; Linux glibc/musl, macOS, Windows, Docker, and MSRV artifacts build; the
 reviewer can verify public traffic, ports, paths, seed policy, and deletion
 from docs without reading code.
 
-**Current groundwork:** the metadata-only preflight has a feature-gated
-libFuzzer target with four committed and contract-checked seed classes, a
-bencode dictionary, a bounded pull-request smoke, and a weekly five-minute
-campaign. Its isolated contract suite also accepts a valid v1 document at the
-exact 10 MiB default metainfo ceiling and names the first excess byte, accepts
-a valid 100,000-file v1 inventory below that ceiling, and names file 100,001 as
-the first rejected inventory. This is useful continuous coverage and two
-concrete resource boundaries, not M5 completion: crash-free bounded runs and
-functional limits do not establish peak-memory exhaustion resistance,
-filesystem containment, or sustained fuzzing adequacy.
+**Current groundwork:** the adapter-owned input preflight has feature-gated
+libFuzzer targets for metainfo bytes and valid-UTF-8 magnet strings. Four
+metainfo and six magnet seed classes are committed and contract checked; each
+target has its own dictionary, bounded pull-request smoke, and separate weekly
+five-minute campaign. The isolated contract suite also accepts a valid v1
+document at the exact 10 MiB default metainfo ceiling and names the first
+excess byte, accepts a valid 100,000-file v1 inventory below that ceiling, and
+names file 100,001 as the first rejected inventory. This is useful continuous
+coverage and two concrete resource boundaries, not M5 completion: crash-free
+bounded runs and functional limits do not establish peak-memory exhaustion
+resistance, filesystem containment, or sustained fuzzing adequacy.
 
 ### 15.8 M6 — cluster torrent leases (separate approval)
 

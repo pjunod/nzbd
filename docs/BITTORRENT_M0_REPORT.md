@@ -206,20 +206,26 @@ not only redirected DHT traffic, for the private binary hash and the ASCII hash
 used by LSD.
 
 The bounded mutation corpus is a fast ordinary-test regression layer, not a
-claim of coverage-guided fuzzing completeness. A separate, feature-gated
-`cargo-fuzz` target now calls that same adapter-owned preflight in normal and
-proxy modes without creating a session or touching the network or filesystem.
-It starts from committed v1, private-v1, v2-only, and hybrid seeds whose named
-outcomes are checked before every campaign, uses a bencode dictionary, caps
-generated inputs at 1 MiB, and runs 20,000 cases on relevant pull requests
-plus a five-minute weekly campaign. The same isolated test crate requires a
+claim of coverage-guided fuzzing completeness. Two separate, feature-gated
+`cargo-fuzz` targets now call the exact adapter-owned metainfo and magnet
+preflights without creating a session or touching the network or filesystem.
+The metainfo target runs in normal and proxy modes from committed v1,
+private-v1, v2-only, and hybrid seeds, uses a bencode dictionary, and caps
+generated input at 1 MiB. The magnet target runs every valid UTF-8 input in
+normal and proxy modes from committed valid-v1, lowercase-base32, v2-only,
+hybrid, eager-selection, and proxy+UDP-tracker seeds, uses a URI dictionary,
+and caps generated input at 32 KiB so campaigns can cross the exact 16 KiB
+product limit. Every committed seed has a deterministic named-outcome
+contract. Each target runs 20,000 cases on relevant pull requests and a
+separate five-minute weekly campaign. The same isolated test crate requires a
 valid v1 document at exactly the 10 MiB default metainfo ceiling to pass and
 the first excess byte to fail by the named size boundary. It also constructs a
 valid 100,000-file v1 inventory below that independent ceiling and requires it
 to pass, then requires file 100,001 to fail by the named file-count boundary.
-The CI campaign does not persist its evolved corpus, prove a peak-memory
-ceiling or path writes, or complete M5's symlink, mounted-filesystem,
-sustained-campaign, and broader resource-exhaustion work.
+CI does not
+persist either evolved corpus, prove a peak-memory ceiling or path writes, or
+complete M5's symlink, mounted-filesystem, sustained-campaign, and broader
+resource-exhaustion work.
 
 The two-stage magnet guard closes the storage-ordering gap, not the allocation
 gap inside stable rqbit: its metadata reader may allocate up to 32 MiB before
@@ -675,6 +681,8 @@ cargo check -p nzbd-torrent
 make fuzz-test
 make fuzz-metainfo
 make fuzz-metainfo FUZZ_SECONDS=300
+make fuzz-magnet
+make fuzz-magnet FUZZ_SECONDS=300
 
 # Linux only; requires passwordless sudo, iptables/ip6tables, and tcpdump.
 scripts/check-private-discovery-leaks.sh

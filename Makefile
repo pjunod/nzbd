@@ -18,6 +18,7 @@ FUZZ_TOOLCHAIN ?= nightly-2026-08-01
 FUZZ_TARGET ?=
 FUZZ_RUNS ?= 20000
 FUZZ_MAX_LEN ?= 1048576
+FUZZ_MAGNET_MAX_LEN ?= 32768
 FUZZ_SECONDS ?=
 UNAME_S := $(shell uname -s)
 # Build identity for container builds. The Docker context excludes .git
@@ -161,6 +162,15 @@ fuzz-metainfo: fuzz-test ## Coverage-guided BitTorrent metainfo preflight smoke
 		corpus/metainfo_preflight -- \
 		$(if $(strip $(FUZZ_SECONDS)),-max_total_time=$(FUZZ_SECONDS),-runs=$(FUZZ_RUNS)) \
 		-max_len=$(FUZZ_MAX_LEN) -dict=dictionaries/metainfo.dict
+
+.PHONY: fuzz-magnet
+fuzz-magnet: fuzz-test ## Coverage-guided BitTorrent magnet preflight smoke
+	cd fuzz && PATH="$(RUSTUP_BIN_DIR):$$PATH" $(CARGO) +$(FUZZ_TOOLCHAIN) \
+		fuzz run $(if $(strip $(FUZZ_TARGET)),--target $(FUZZ_TARGET),) \
+		magnet_preflight \
+		corpus/magnet_preflight -- \
+		$(if $(strip $(FUZZ_SECONDS)),-max_total_time=$(FUZZ_SECONDS),-runs=$(FUZZ_RUNS)) \
+		-max_len=$(FUZZ_MAGNET_MAX_LEN) -dict=dictionaries/magnet.dict
 
 .PHONY: check
 check: fmt-check lint test msrv ## Everything CI enforces, in one shot (run before pushing)
