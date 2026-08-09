@@ -3,13 +3,13 @@
 # Fresh clone, get productive:
 #   make setup      # install the toolchain, PP tools and git hooks
 #   make run        # build + run the daemon (first-run setup UI on :6789)
-#   make check      # everything CI enforces: fmt + clippy + tests + MSRV
+#   make check      # core Rust gates: fmt + clippy + tests + MSRV
 #
 # Run `make` (or `make help`) to list every target.
 
 CARGO   ?= cargo
 RUSTUP  ?= rustup
-RUSTUP_BIN_DIR ?= $(dir $(shell command -v $(RUSTUP)))
+RUSTUP_PATH_PREFIX ?= $(if $(shell command -v $(RUSTUP)),$(dir $(shell command -v $(RUSTUP))):,)
 # The daemon binary package (cargo -p nzbd).
 DAEMON  := nzbd
 # Minimum supported Rust (keep in sync with Cargo.toml rust-version).
@@ -155,15 +155,15 @@ fuzz-test: fuzz-deps ## Verify the BitTorrent fuzz seed and resource contracts
 
 .PHONY: fuzz-metainfo
 fuzz-metainfo: fuzz-test ## Coverage-guided BitTorrent metainfo preflight smoke
-	cd fuzz && PATH="$(RUSTUP_BIN_DIR):$$PATH" $(CARGO) +$(FUZZ_TOOLCHAIN) \
+	cd fuzz && PATH="$(RUSTUP_PATH_PREFIX)$$PATH" $(CARGO) +$(FUZZ_TOOLCHAIN) \
 		fuzz run $(if $(strip $(FUZZ_TARGET)),--target $(FUZZ_TARGET),) \
 		metainfo_preflight \
-		corpus/metainfo_preflight -- \
+		corpus/metainfo_preflight seeds/metainfo_preflight -- \
 		$(if $(strip $(FUZZ_SECONDS)),-max_total_time=$(FUZZ_SECONDS),-runs=$(FUZZ_RUNS)) \
 		-max_len=$(FUZZ_MAX_LEN) -dict=dictionaries/metainfo.dict
 
 .PHONY: check
-check: fmt-check lint test msrv ## Everything CI enforces, in one shot (run before pushing)
+check: fmt-check lint test msrv ## Core Rust gates (run before pushing)
 	@echo "OK - all local gates passed"
 
 ##@ Housekeeping
