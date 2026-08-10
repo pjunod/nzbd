@@ -110,8 +110,8 @@ code. The daemon does not depend on it. The boundary currently provides:
   measurement. This is retained memory evidence, not the parser's transient
   allocation peak or a concurrent hostile-submission test;
 - an ignored, crate-private local-swarm unit probe injects
-  `ErrorKind::StorageFull` from `pwrite_all` after one successful 16 KiB piece
-  write. The affected 256 KiB torrent must become `Error`, remain incomplete,
+  `ErrorKind::StorageFull` from `pwrite_all` after one 16 KiB write call returns
+  successfully. The affected 256 KiB torrent must become `Error`, remain incomplete,
   retain a display-safe fault fact, and answer an independently scheduled
   stats request within one second. Before the fault is admitted, a separate
   64 MiB torrent must already be live with nonzero incomplete progress through
@@ -646,24 +646,26 @@ platform spread is why these remain
 platform-specific sampled-growth guards, not portable peak-memory promises.
 
 The
-[pre-determinism review-correction storage-fault run](https://github.com/pjunod/nzbd/actions/runs/31344311581)
-passed the behavioral probe on all five native targets on 2026-08-10 UTC
-before the review-mandated rate limit, listener handoff removal, and exact-test
-execution guard were added. Every target injected `StorageFull` on the second
-write after one 16,384-byte write returned successfully from the filesystem,
-kept the faulted 262,144-byte torrent incomplete in `Error` with zero engine progress,
+[hardened storage-fault run](https://github.com/pjunod/nzbd/actions/runs/31345445318)
+passed the behavioral probe and its fail-closed discovery guard on all five
+native targets on 2026-08-10 UTC. Every target injected `StorageFull` on the
+second write after one 16,384-byte write call returned successfully, kept the
+faulted 262,144-byte torrent incomplete in `Error` with zero engine progress,
 and preserved exactly two write attempts and one successful write after the
-already-live 67,108,864-byte control torrent completed. The response deadline
+already-live 67,108,864-byte control torrent completed. The control was still
+incomplete at the fault boundary on every target. The response deadline
 measures the independently scheduled stats reply rather than synchronous lock
-acquisition on the test task.
+acquisition on the test task. The shared runner also proved that it discovered
+and executed exactly the one ignored test, after a discriminating negative
+control demonstrated that the discovery guard rejects a non-matching line.
 
 | Platform | Fault transition | Stats response | Control progress at fault | Control completion |
 |---|---:|---:|---:|---:|
-| Linux aarch64 musl | 51 ms | 0 ms | 29,769,728 bytes | 175 ms |
-| Linux x86_64 GNU | 52 ms | 0 ms | 26,918,912 bytes | 186 ms |
-| Linux x86_64 musl | 25 ms | 0 ms | 11,272,192 bytes | 201 ms |
-| macOS aarch64 | 25 ms | 0 ms | 23,003,136 bytes | 98 ms |
-| Windows x86_64 MSVC | 31 ms | 0 ms | 16,384 bytes | 513 ms |
+| Linux aarch64 musl | 52 ms | 0 ms | 8,847,360 bytes | 7,098 ms |
+| Linux x86_64 GNU | 77 ms | 0 ms | 8,962,048 bytes | 7,097 ms |
+| Linux x86_64 musl | 52 ms | 0 ms | 8,814,592 bytes | 7,098 ms |
+| macOS aarch64 | 26 ms | 0 ms | 8,323,072 bytes | 7,020 ms |
+| Windows x86_64 MSVC | 29 ms | 0 ms | 16,384 bytes | 7,315 ms |
 
 This evidence remains deliberately narrow: it proves the injected write-time
 path and an already-active sibling's containment, not durable persistence of

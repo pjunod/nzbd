@@ -2085,17 +2085,18 @@ pause/upload fallback. No daemon API or production torrent writer exists to
 prove those outcomes yet.
 
 The
-[pre-determinism review-correction native run](https://github.com/pjunod/nzbd/actions/runs/31344311581)
-passed the behavioral probe on Linux x86_64 GNU, Linux x86_64 musl, Linux
-aarch64 musl, macOS aarch64, and Windows x86_64 on 2026-08-10 UTC before the
-harness gained its deterministic rate limit, listener handoff removal, and exact-test
-execution guard. Each target injected
-the fault on write attempt two after one 16,384-byte filesystem-accepted write,
-returned the independently scheduled fault stats inside one second, kept the
-already-live control active at the boundary, completed all 67,108,864 control
-bytes, and reasserted unchanged fault state and write accounting afterward.
-That historical run does not broaden the proof beyond the limitations above;
-the hardened harness requires its own replacement native evidence.
+[hardened native run](https://github.com/pjunod/nzbd/actions/runs/31345445318)
+passed the behavioral probe and its fail-closed exact-test discovery guard on
+Linux x86_64 GNU, Linux x86_64 musl, Linux aarch64 musl, macOS aarch64, and
+Windows x86_64 on 2026-08-10 UTC. Each target injected the fault on write
+attempt two after one 16,384-byte write call returned successfully, returned
+the independently scheduled fault stats inside one second, kept the
+already-live control active and incomplete at the boundary, completed all
+67,108,864 control bytes under the deterministic seed cap, and reasserted
+unchanged fault state and write accounting afterward. The runner first proved
+that its discovery guard rejects a benchmark-classified non-test line and then
+required discovery and execution of exactly the one ignored proof test. This
+evidence does not broaden the proof beyond the limitations above.
 
 ### 15.8 M6 — cluster torrent leases (separate approval)
 
