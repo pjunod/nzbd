@@ -641,6 +641,29 @@ without permitting the previous order-of-magnitude regressions. The wide
 platform spread is why these remain
 platform-specific sampled-growth guards, not portable peak-memory promises.
 
+The
+[review-correction storage-fault run](https://github.com/pjunod/nzbd/actions/runs/31344311581)
+passed the ignored crate-private probe on all five native targets on
+2026-08-10 UTC. Every target injected `StorageFull` on the second write after
+one 16,384-byte write returned successfully from the filesystem, kept the
+faulted 262,144-byte torrent incomplete in `Error` with zero engine progress,
+and preserved exactly two write attempts and one successful write after the
+already-live 67,108,864-byte control torrent completed. The response deadline
+measures the independently scheduled stats reply rather than synchronous lock
+acquisition on the test task.
+
+| Platform | Fault transition | Stats response | Control progress at fault | Control completion |
+|---|---:|---:|---:|---:|
+| Linux aarch64 musl | 51 ms | 0 ms | 29,769,728 bytes | 175 ms |
+| Linux x86_64 GNU | 52 ms | 0 ms | 26,918,912 bytes | 186 ms |
+| Linux x86_64 musl | 25 ms | 0 ms | 11,272,192 bytes | 201 ms |
+| macOS aarch64 | 25 ms | 0 ms | 23,003,136 bytes | 98 ms |
+| Windows x86_64 MSVC | 31 ms | 0 ms | 16,384 bytes | 513 ms |
+
+This evidence remains deliberately narrow: it proves the injected write-time
+path and an already-active sibling's containment, not durable persistence of
+the accepted chunk or initialization-time `ensure_file_length` behavior.
+
 The 2026-08-07 review remediation refreshed these measurements after adding
 `icu_casemap 2.1.1` and `icu_casemap_data 2.1.1` for Unicode simple case
 folding. The change added two package identities, 36,400 binary bytes, and

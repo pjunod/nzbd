@@ -2081,6 +2081,16 @@ piece requests, expose the limiting root, and choose the documented
 pause/upload fallback. No daemon API or production torrent writer exists to
 prove those outcomes yet.
 
+The
+[review-correction native run](https://github.com/pjunod/nzbd/actions/runs/31344311581)
+passed this exact probe on Linux x86_64 GNU, Linux x86_64 musl, Linux aarch64
+musl, macOS aarch64, and Windows x86_64 on 2026-08-10 UTC. Each target injected
+the fault on write attempt two after one 16,384-byte filesystem-accepted write,
+returned the independently scheduled fault stats inside one second, kept the
+already-live control active at the boundary, completed all 67,108,864 control
+bytes, and reasserted unchanged fault state and write accounting afterward.
+That run does not broaden the proof beyond the limitations above.
+
 ### 15.8 M6 — cluster torrent leases (separate approval)
 
 **Work:** implement §12 only after single-node field data exists · lease kind ·
