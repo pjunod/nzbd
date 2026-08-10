@@ -101,8 +101,10 @@ jobs:
           --target ${{ matrix.target }} --example m0_metainfo_pressure_memory
       - name: Inject a storage-full fault and prove session isolation
         run: >-
-          cargo run --locked -p nzbd-torrent --release --features m0-probes
-          --target ${{ matrix.target }} --example m0_storage_full
+          cargo test --locked -p nzbd-torrent --release
+          --target ${{ matrix.target }} --lib
+          m0_storage_full_probe::storage_full_write_is_torrent_scoped
+          -- --exact --ignored --nocapture
       - name: Record host filesystem name behavior
         run: >-
           cargo test --locked -p nzbd-torrent --target ${{ matrix.target }}
@@ -145,5 +147,7 @@ jobs:
           --target ${{ matrix.target }} --example m0_metainfo_pressure_memory
       - name: Inject a storage-full fault and prove session isolation
         run: >-
-          cargo run --locked -p nzbd-torrent --release --features m0-probes
-          --target ${{ matrix.target }} --example m0_storage_full
+          cargo test --locked -p nzbd-torrent --release
+          --target ${{ matrix.target }} --lib
+          m0_storage_full_probe::storage_full_write_is_torrent_scoped
+          -- --exact --ignored --nocapture

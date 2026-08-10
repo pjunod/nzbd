@@ -1,8 +1,11 @@
+use super::{
+    TorrentAddConfig, TorrentHandle, TorrentPhase, TorrentSession, TorrentSessionConfig,
+    TorrentStats,
+};
 use anyhow::Result;
 use librqbit::storage::filesystem::FilesystemStorageFactory;
 use librqbit::storage::{BoxStorageFactory, StorageFactory, StorageFactoryExt, TorrentStorage};
 use librqbit::{ManagedTorrentShared, TorrentMetadata};
-use nzbd_torrent::{TorrentAddConfig, TorrentPhase, TorrentSession, TorrentSessionConfig};
 use sha1::{Digest, Sha1};
 use std::error::Error;
 use std::io;
@@ -10,17 +13,20 @@ use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener};
 use std::ops::Range;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc;
 use std::sync::Arc;
+use std::thread;
 use std::time::{Duration, Instant};
 
 const FAULT_FILE_NAME: &str = "storage-full.bin";
 const CONTROL_FILE_NAME: &str = "storage-control.bin";
 const PIECE_LENGTH: usize = 16 * 1024;
 const FAULT_PAYLOAD_BYTES: usize = 256 * 1024;
-const CONTROL_PAYLOAD_BYTES: usize = 64 * 1024;
+const CONTROL_PAYLOAD_BYTES: usize = 64 * 1024 * 1024;
 const FAULT_DEADLINE: Duration = Duration::from_secs(20);
-const CONTROL_DEADLINE: Duration = Duration::from_secs(20);
+const CONTROL_DEADLINE: Duration = Duration::from_secs(30);
 const SHUTDOWN_DEADLINE: Duration = Duration::from_secs(10);
+const STATS_DEADLINE: Duration = Duration::from_secs(1);
 const INJECTED_ERROR: &str = "injected M0 storage-full fault";
 
 #[derive(Clone)]
@@ -158,8 +164,27 @@ async fn stop_with_deadline(session: TorrentSession, name: &str) -> Result<(), B
     Ok(())
 }
 
-#[tokio::main(flavor = "multi_thread", worker_threads = 4)]
-async fn main() -> Result<(), Box<dyn Error>> {
+fn stats_with_deadline(
+    handle: &TorrentHandle,
+    name: &str,
+) -> Result<(TorrentStats, Duration), Box<dyn Error>> {
+    let (sender, receiver) = mpsc::sync_channel(1);
+    let handle = handle.clone();
+    let started = Instant::now();
+    thread::spawn(move || {
+        let _ = sender.send(handle.stats());
+    });
+    let stats = receiver.recv_timeout(STATS_DEADLINE).map_err(|error| {
+        io::Error::other(format!(
+            "{name} stats did not return within one second: {error}"
+        ))
+    })?;
+    Ok((stats, started.elapsed()))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "native M0 storage-fault probe; run explicitly"]
+async fn storage_full_write_is_torrent_scoped() -> Result<(), Box<dyn Error>> {
     let fault_payload = payload(FAULT_PAYLOAD_BYTES, 7);
     let control_payload = payload(CONTROL_PAYLOAD_BYTES, 19);
     let fault_metainfo = metainfo(&fault_payload, FAULT_FILE_NAME);
@@ -207,6 +232,39 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let download_root = tempfile::tempdir()?;
     let downloader =
         TorrentSession::start(download_root.path().to_path_buf(), Default::default()).await?;
+
+    let control_started = Instant::now();
+    let control = downloader
+        .add_metainfo(
+            control_metainfo,
+            TorrentAddConfig {
+                overwrite: true,
+                initial_peers: vec![peer],
+                ..Default::default()
+            },
+        )
+        .await?;
+    let control_before_fault = tokio::time::timeout(CONTROL_DEADLINE, async {
+        loop {
+            let (stats, _) = stats_with_deadline(&control, "control torrent")?;
+            if stats.phase == TorrentPhase::Live
+                && stats.progress_bytes > 0
+                && stats.progress_bytes < stats.total_bytes
+            {
+                break Ok::<_, Box<dyn Error>>(stats);
+            }
+            if stats.finished || stats.phase == TorrentPhase::Error {
+                break Err(io::Error::other(format!(
+                    "control torrent did not expose an in-flight state: {stats:?}"
+                ))
+                .into());
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .map_err(|_| io::Error::other("control torrent was not in flight within 30 seconds"))??;
+
     let write_attempts = Arc::new(AtomicUsize::new(0));
     let successful_bytes = Arc::new(AtomicUsize::new(0));
     let fault = downloader
@@ -227,10 +285,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .await?;
 
     let fault_started = Instant::now();
-    tokio::time::timeout(FAULT_DEADLINE, async {
+    let (fault_stats, stats_elapsed) = tokio::time::timeout(FAULT_DEADLINE, async {
         loop {
-            if fault.stats().phase == TorrentPhase::Error {
-                break;
+            if write_attempts.load(Ordering::SeqCst) >= 2 {
+                let (stats, stats_elapsed) = stats_with_deadline(&fault, "faulted torrent")?;
+                if stats.phase == TorrentPhase::Error {
+                    break Ok::<_, Box<dyn Error>>((stats, stats_elapsed));
+                }
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
@@ -238,18 +299,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
     .await
     .map_err(|_| {
         io::Error::other("injected storage-full fault was not visible within 20 seconds")
-    })?;
+    })??;
     let fault_elapsed = fault_started.elapsed();
-    let stats_started = Instant::now();
-    let fault_stats = fault.stats();
-    let stats_elapsed = stats_started.elapsed();
     if fault_stats.finished
         || fault_stats.progress_bytes >= fault_stats.total_bytes
         || fault_stats
             .error
             .as_deref()
             .is_none_or(|error| !error.contains(INJECTED_ERROR))
-        || write_attempts.load(Ordering::SeqCst) < 2
+        || write_attempts.load(Ordering::SeqCst) != 2
         || successful_bytes.load(Ordering::SeqCst) != PIECE_LENGTH
     {
         return Err(io::Error::other(format!(
@@ -259,36 +317,49 @@ async fn main() -> Result<(), Box<dyn Error>> {
         ))
         .into());
     }
-    if stats_elapsed > Duration::from_secs(1) {
-        return Err(io::Error::other("faulted torrent stats took more than one second").into());
-    }
     if std::fs::read(download_root.path().join(FAULT_FILE_NAME))? == fault_payload {
         return Err(io::Error::other("faulted payload was incorrectly complete").into());
     }
 
-    let control_started = Instant::now();
-    let control = downloader
-        .add_metainfo(
-            control_metainfo,
-            TorrentAddConfig {
-                overwrite: true,
-                initial_peers: vec![peer],
-                ..Default::default()
-            },
-        )
-        .await?;
+    let (control_at_fault, _) = stats_with_deadline(&control, "control torrent at fault")?;
+    if control_at_fault.phase != TorrentPhase::Live
+        || control_at_fault.finished
+        || control_at_fault.progress_bytes == 0
+        || control_at_fault.progress_bytes >= control_at_fault.total_bytes
+    {
+        return Err(io::Error::other(format!(
+            "control torrent was not still in flight at the fault boundary: before={control_before_fault:?}, at_fault={control_at_fault:?}"
+        ))
+        .into());
+    }
+
     tokio::time::timeout(CONTROL_DEADLINE, control.wait_until_completed())
         .await
-        .map_err(|_| io::Error::other("same-session control download exceeded 20 seconds"))??;
+        .map_err(|_| io::Error::other("same-session control download exceeded 30 seconds"))??;
     let control_elapsed = control_started.elapsed();
     if std::fs::read(download_root.path().join(CONTROL_FILE_NAME))? != control_payload {
         return Err(io::Error::other("same-session control payload did not match").into());
     }
 
+    let (fault_after_control, _) = stats_with_deadline(&fault, "faulted torrent after control")?;
+    if fault_after_control.phase != TorrentPhase::Error
+        || fault_after_control.progress_bytes != fault_stats.progress_bytes
+        || fault_after_control.error != fault_stats.error
+        || write_attempts.load(Ordering::SeqCst) != 2
+        || successful_bytes.load(Ordering::SeqCst) != PIECE_LENGTH
+    {
+        return Err(io::Error::other(format!(
+            "faulted torrent changed while the control completed: before={fault_stats:?}, after={fault_after_control:?}, write_attempts={}, successful_bytes={}",
+            write_attempts.load(Ordering::SeqCst),
+            successful_bytes.load(Ordering::SeqCst)
+        ))
+        .into());
+    }
+
     stop_with_deadline(downloader, "downloader").await?;
     stop_with_deadline(seeder, "seeder").await?;
     println!(
-        "bittorrent_storage_full fault_kind=StorageFull successful_writes=1 successful_bytes={} write_attempts={} fault_phase={:?} fault_progress_bytes={} fault_total_bytes={} fault_ms={} stats_ms={} control_bytes={} control_ms={}",
+        "bittorrent_storage_full injected_fault_kind=StorageFull successful_writes=1 filesystem_accepted_bytes={} write_attempts={} fault_phase={:?} fault_progress_bytes={} fault_total_bytes={} fault_ms={} stats_ms={} control_progress_at_fault={} control_bytes={} control_ms={}",
         successful_bytes.load(Ordering::SeqCst),
         write_attempts.load(Ordering::SeqCst),
         fault_stats.phase,
@@ -296,6 +367,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         fault_stats.total_bytes,
         fault_elapsed.as_millis(),
         stats_elapsed.as_millis(),
+        control_at_fault.progress_bytes,
         control_payload.len(),
         control_elapsed.as_millis()
     );

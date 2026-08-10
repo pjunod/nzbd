@@ -8,6 +8,9 @@
 
 mod source_fetch;
 
+#[cfg(test)]
+mod m0_storage_full_probe;
+
 pub use source_fetch::{fetch_torrent_source, TorrentSourceFetchLimits};
 
 use librqbit::api::TorrentIdOrHash;
@@ -646,13 +649,11 @@ impl TorrentSession {
         self.add_validated_metainfo(bytes.into(), config).await
     }
 
-    /// Admit validated metainfo through a caller-supplied storage factory.
-    ///
-    /// This exists only for the isolated M0 fault-injection harness. Normal
-    /// builds cannot select custom storage, and the production admission path
-    /// above continues to force `storage_factory: None`.
-    #[cfg(feature = "m0-probes")]
-    pub async fn add_metainfo_with_storage_for_m0(
+    /// Admit validated metainfo through a caller-supplied storage factory for
+    /// the crate-private M0 fault-injection unit probe. This method is absent
+    /// from every non-test build.
+    #[cfg(test)]
+    async fn add_metainfo_with_storage_for_m0(
         &self,
         bytes: Vec<u8>,
         mut config: TorrentAddConfig,

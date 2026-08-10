@@ -102,12 +102,14 @@ names, and portable Unicode/case aliases before storage construction. The
 hosted native probes describe their temporary filesystems; they do not prove
 descriptor-relative containment or every filesystem used by operators.
 
-The isolated fault harness can inject storage exhaustion after one successful
-piece write and proves that stable rqbit contains the failure to one incomplete
-torrent while the same session completes a normal control transfer. Stable
-rqbit reports that torrent as `Error`, not the proposed disk-paused state. The
-harness has no daemon API or enforcing multi-root guard, so it does not prove
-operator-visible ENOSPC behavior or authorize production wiring.
+The isolated crate-private fault harness can inject write-time storage
+exhaustion after one successful piece write. An already-live filesystem-backed
+control must remain live across that boundary and complete without changing
+the faulted torrent's state or write accounting. Stable rqbit reports the
+faulted torrent as `Error`, not the proposed disk-paused state. The harness
+does not exercise initialization-time file-sizing failure and has no daemon API
+or enforcing multi-root guard, so it does not prove general or operator-visible
+ENOSPC behavior and does not authorize production wiring.
 
 **Reviewer acceptance:** supported deployment examples must exercise the
 actual bind mounts or volumes, case/normalization behavior, low-space guard,
@@ -177,7 +179,6 @@ relying on one local host:
 | Evidence | Last recorded proof |
 |---|---|
 | Native 100-torrent admission/shutdown pressure | [2026-08-09 matrix run](https://github.com/pjunod/nzbd/actions/runs/31330178035) |
-| Native storage-full injection and session isolation | [2026-08-09 matrix run](https://github.com/pjunod/nzbd/actions/runs/31336230666) |
 | Private DHT/LSD packet capture | [2026-08-06 capture run](https://github.com/pjunod/nzbd/actions/runs/31128106994) |
 | Cross-platform filesystem behavior | [2026-08-08 probe run](https://github.com/pjunod/nzbd/actions/runs/31240896567) and [review correction](https://github.com/pjunod/nzbd/actions/runs/31264422471) |
 | Native adapter matrix and daemon isolation | [2026-08-09 M0 run](https://github.com/pjunod/nzbd/actions/runs/31331872561) |

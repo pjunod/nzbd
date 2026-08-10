@@ -105,27 +105,24 @@ code. The daemon does not depend on it. The boundary currently provides:
   preliminary 256 MiB growth ceiling on each native runner. This is retained
   memory evidence, not the parser's transient allocation peak or a concurrent
   hostile-submission test;
-- a feature-gated local-swarm probe injects `ErrorKind::StorageFull` through
-  rqbit's public storage factory after one successful 16 KiB piece write. The
-  affected 256 KiB torrent must become `Error`, remain incomplete, retain a
-  display-safe fault fact, and answer stats within one second. A separate
-  64 KiB torrent must then download through normal filesystem storage in the
-  same engine session, and both sessions must stop within ten seconds. Normal
-  adapter admission still forces `storage_factory: None`; the injection seam
-  is absent unless the `m0-probes` feature is selected. This proves stable
-  engine fault containment and a usable future interception point, not the
-  proposal's production behavior: there is no daemon disk-guard latch, API
-  responsiveness proof, new-request pause, or continued-upload proof, and
-  stable rqbit currently reports the affected torrent as an error rather than
-  a paused download. The
-  [first native storage-fault run](https://github.com/pjunod/nzbd/actions/runs/31336230666)
-  passed on 2026-08-09 UTC across Linux x86_64 GNU, Linux x86_64 musl, Linux
-  aarch64 musl, macOS aarch64, and Windows x86_64. Every runner stopped after
-  one successful write and 16,384 persisted bytes, observed `StorageFull` on
-  the second write, reported the affected torrent as incomplete and `Error`,
-  returned stats in 0 ms, and completed the independent 65,536-byte control
-  torrent. Fault detection took 30–52 ms and the control transfer took 1–82
-  ms on the hosted runners;
+- an ignored, crate-private local-swarm unit probe injects
+  `ErrorKind::StorageFull` from `pwrite_all` after one successful 16 KiB piece
+  write. The affected 256 KiB torrent must become `Error`, remain incomplete,
+  retain a display-safe fault fact, and answer an independently scheduled
+  stats request within one second. Before the fault is admitted, a separate
+  64 MiB torrent must already be live with nonzero incomplete progress through
+  normal filesystem storage; it must remain live at the fault boundary and
+  then complete in the same engine session. The fault state and exact write
+  accounting must remain unchanged afterward, and both sessions must stop
+  within ten seconds. The custom-storage helper is compiled only into crate
+  unit tests and is absent from every non-test build; normal admission still
+  forces `storage_factory: None`. This proves containment of an injected
+  write-time fault and a future interception point, not general ENOSPC
+  behavior. In particular it does not exercise initialization-time
+  `ensure_file_length` failure, and that stable-engine path remains explicit
+  M2 work. There is no daemon disk-guard latch, API responsiveness proof,
+  new-request pause, or continued-upload proof, and stable rqbit currently
+  reports the affected torrent as an error rather than a paused download;
 - explicit peer lifetimes: the dormant session pins stable 8.1.1's effective
   10-second connect and read/write timeouts and 120-second keepalive interval;
   per-add options inherit this reviewed session policy instead of introducing

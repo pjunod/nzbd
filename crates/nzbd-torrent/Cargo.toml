@@ -10,12 +10,6 @@ publish = false
 
 [features]
 fuzzing = []
-m0-probes = []
-
-[[example]]
-name = "m0_storage_full"
-path = "examples/m0_storage_full.rs"
-required-features = ["m0-probes"]
 
 [[example]]
 name = "m0_metainfo_pressure_memory"
