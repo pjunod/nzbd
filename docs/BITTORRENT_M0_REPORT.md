@@ -116,13 +116,17 @@ code. The daemon does not depend on it. The boundary currently provides:
   stats request within one second. Before the fault is admitted, a separate
   64 MiB torrent must already be live with nonzero incomplete progress through
   normal filesystem storage; it must remain live at the fault boundary and
-  then complete in the same engine session. The fault state and exact write
-  accounting must remain unchanged afterward, and both sessions must stop
-  within ten seconds. The custom-storage helper is compiled only into crate
-  unit tests and is absent from every non-test build; normal admission still
-  forces `storage_factory: None`. This proves containment of an injected
-  write-time fault and a future interception point, not general ENOSPC
-  behavior. In particular it does not exercise initialization-time
+  then complete in the same engine session. The seeder's aggregate upload is
+  capped at 8 MiB/s so the boundary assertion does not depend on loopback or
+  filesystem speed, and rqbit selects its own listen port from a test-only
+  multi-port range rather than inheriting a bind/drop/rebind race. The fault
+  state and exact write accounting must remain unchanged afterward, and both
+  sessions must stop within ten seconds. The custom-storage and broad-listen
+  helpers are compiled only into crate unit tests and are absent from every
+  non-test build; normal admission still forces `storage_factory: None` and
+  requires one explicit non-zero listen port. This proves containment of an
+  injected write-time fault and a future interception point, not general
+  ENOSPC behavior. In particular it does not exercise initialization-time
   `ensure_file_length` failure, and that stable-engine path remains explicit
   M2 work. There is no daemon disk-guard latch, API responsiveness proof,
   new-request pause, or continued-upload proof, and stable rqbit currently
@@ -642,11 +646,12 @@ platform spread is why these remain
 platform-specific sampled-growth guards, not portable peak-memory promises.
 
 The
-[review-correction storage-fault run](https://github.com/pjunod/nzbd/actions/runs/31344311581)
-passed the ignored crate-private probe on all five native targets on
-2026-08-10 UTC. Every target injected `StorageFull` on the second write after
-one 16,384-byte write returned successfully from the filesystem, kept the
-faulted 262,144-byte torrent incomplete in `Error` with zero engine progress,
+[pre-determinism review-correction storage-fault run](https://github.com/pjunod/nzbd/actions/runs/31344311581)
+passed the behavioral probe on all five native targets on 2026-08-10 UTC
+before the review-mandated rate limit, listener handoff removal, and exact-test
+execution guard were added. Every target injected `StorageFull` on the second
+write after one 16,384-byte write returned successfully from the filesystem,
+kept the faulted 262,144-byte torrent incomplete in `Error` with zero engine progress,
 and preserved exactly two write attempts and one successful write after the
 already-live 67,108,864-byte control torrent completed. The response deadline
 measures the independently scheduled stats reply rather than synchronous lock

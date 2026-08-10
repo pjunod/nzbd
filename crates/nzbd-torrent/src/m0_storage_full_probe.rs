@@ -1,7 +1,4 @@
-use super::{
-    TorrentAddConfig, TorrentHandle, TorrentPhase, TorrentSession, TorrentSessionConfig,
-    TorrentStats,
-};
+use super::{TorrentAddConfig, TorrentHandle, TorrentPhase, TorrentSession, TorrentStats};
 use anyhow::Result;
 use librqbit::storage::filesystem::FilesystemStorageFactory;
 use librqbit::storage::{BoxStorageFactory, StorageFactory, StorageFactoryExt, TorrentStorage};
@@ -9,8 +6,8 @@ use librqbit::{ManagedTorrentShared, TorrentMetadata};
 use sha1::{Digest, Sha1};
 use std::error::Error;
 use std::io;
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener};
-use std::ops::Range;
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::num::NonZeroU32;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
@@ -23,6 +20,8 @@ const CONTROL_FILE_NAME: &str = "storage-control.bin";
 const PIECE_LENGTH: usize = 16 * 1024;
 const FAULT_PAYLOAD_BYTES: usize = 256 * 1024;
 const CONTROL_PAYLOAD_BYTES: usize = 64 * 1024 * 1024;
+const CONTROL_UPLOAD_LIMIT_BPS: u32 = 8 * 1024 * 1024;
+const TEST_LISTEN_PORT_START: u16 = 49_152;
 const FAULT_DEADLINE: Duration = Duration::from_secs(20);
 const CONTROL_DEADLINE: Duration = Duration::from_secs(30);
 const SHUTDOWN_DEADLINE: Duration = Duration::from_secs(10);
@@ -142,21 +141,6 @@ fn metainfo(payload: &[u8], filename: &str) -> Vec<u8> {
     torrent
 }
 
-fn free_port_range() -> Range<u16> {
-    loop {
-        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-            .expect("bind a temporary loopback listener");
-        let port = listener
-            .local_addr()
-            .expect("read the temporary listener address")
-            .port();
-        drop(listener);
-        if port < u16::MAX {
-            return port..port + 1;
-        }
-    }
-}
-
 async fn stop_with_deadline(session: TorrentSession, name: &str) -> Result<(), Box<dyn Error>> {
     tokio::time::timeout(SHUTDOWN_DEADLINE, session.stop())
         .await
@@ -193,16 +177,15 @@ async fn storage_full_write_is_torrent_scoped() -> Result<(), Box<dyn Error>> {
     let seed_root = tempfile::tempdir()?;
     std::fs::write(seed_root.path().join(FAULT_FILE_NAME), &fault_payload)?;
     std::fs::write(seed_root.path().join(CONTROL_FILE_NAME), &control_payload)?;
-    let listen_ports = free_port_range();
-    let seeder_port = listen_ports.start;
-    let seeder = TorrentSession::start(
+    let seeder = TorrentSession::start_with_listen_range_for_m0(
         seed_root.path().to_path_buf(),
-        TorrentSessionConfig {
-            listen_port_range: Some(listen_ports),
-            ..Default::default()
-        },
+        TEST_LISTEN_PORT_START..u16::MAX,
     )
     .await?;
+    let seeder_port = seeder
+        .tcp_listen_port()
+        .ok_or_else(|| io::Error::other("M0 seeder did not expose its selected listen port"))?;
+    seeder.set_upload_limit_bps(NonZeroU32::new(CONTROL_UPLOAD_LIMIT_BPS));
     let fault_seed = seeder
         .add_metainfo(
             fault_metainfo.clone(),

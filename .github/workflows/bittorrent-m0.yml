@@ -11,6 +11,7 @@ on:
       - crates/nzbd/src/tls.rs
       - scripts/check-bittorrent-deps.sh
       - scripts/check-private-discovery-leaks.sh
+      - scripts/check-bittorrent-storage-full-probe.sh
       - .github/workflows/bittorrent-m0.yml
   pull_request:
     paths:
@@ -21,6 +22,7 @@ on:
       - crates/nzbd/src/tls.rs
       - scripts/check-bittorrent-deps.sh
       - scripts/check-private-discovery-leaks.sh
+      - scripts/check-bittorrent-storage-full-probe.sh
       - .github/workflows/bittorrent-m0.yml
   workflow_dispatch:
 
@@ -100,11 +102,8 @@ jobs:
           cargo run --locked -p nzbd-torrent --release --features fuzzing
           --target ${{ matrix.target }} --example m0_metainfo_pressure_memory
       - name: Inject a storage-full fault and prove session isolation
-        run: >-
-          cargo test --locked -p nzbd-torrent --release
-          --target ${{ matrix.target }} --lib
-          m0_storage_full_probe::storage_full_write_is_torrent_scoped
-          -- --exact --ignored --nocapture
+        shell: bash
+        run: scripts/check-bittorrent-storage-full-probe.sh "${{ matrix.target }}"
       - name: Record host filesystem name behavior
         run: >-
           cargo test --locked -p nzbd-torrent --target ${{ matrix.target }}
@@ -146,8 +145,5 @@ jobs:
           cargo run --locked -p nzbd-torrent --release --features fuzzing
           --target ${{ matrix.target }} --example m0_metainfo_pressure_memory
       - name: Inject a storage-full fault and prove session isolation
-        run: >-
-          cargo test --locked -p nzbd-torrent --release
-          --target ${{ matrix.target }} --lib
-          m0_storage_full_probe::storage_full_write_is_torrent_scoped
-          -- --exact --ignored --nocapture
+        shell: bash
+        run: scripts/check-bittorrent-storage-full-probe.sh "${{ matrix.target }}"

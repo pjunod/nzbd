@@ -2071,25 +2071,31 @@ faulted 256 KiB torrent, it requires a separate 64 MiB filesystem-backed
 control torrent to be live with nonzero incomplete progress. The target must
 then remain incomplete in `Error` with an independently bounded stats response
 while the already-active control remains live, completes, and leaves the
-fault state and write accounting unchanged. The custom-storage helper is
-absent from non-test builds, and the normal adapter path still forbids custom
-storage. This pins a write-time engine seam and current containment behavior,
-but deliberately does not call the §14 ENOSPC row green: initialization-time
-`ensure_file_length` failure remains unproved, rqbit transitions the affected
+fault state and write accounting unchanged. The seeder is capped at 8 MiB/s
+so the fault boundary cannot race the control's completion, and rqbit binds
+directly from a test-only multi-port range so no temporary-listener handoff is
+involved. The custom-storage and broad-listen helpers are absent from non-test
+builds; the normal adapter still forbids custom storage and accepts only one
+explicit non-zero listen port. This pins a write-time engine seam and current
+containment behavior, but deliberately does not call the §14 ENOSPC row green:
+initialization-time `ensure_file_length` failure remains unproved, rqbit transitions the affected
 torrent to `Error`, and M2 must latch nzbd's multi-root disk guard, stop new
 piece requests, expose the limiting root, and choose the documented
 pause/upload fallback. No daemon API or production torrent writer exists to
 prove those outcomes yet.
 
 The
-[review-correction native run](https://github.com/pjunod/nzbd/actions/runs/31344311581)
-passed this exact probe on Linux x86_64 GNU, Linux x86_64 musl, Linux aarch64
-musl, macOS aarch64, and Windows x86_64 on 2026-08-10 UTC. Each target injected
+[pre-determinism review-correction native run](https://github.com/pjunod/nzbd/actions/runs/31344311581)
+passed the behavioral probe on Linux x86_64 GNU, Linux x86_64 musl, Linux
+aarch64 musl, macOS aarch64, and Windows x86_64 on 2026-08-10 UTC before the
+harness gained its deterministic rate limit, listener handoff removal, and exact-test
+execution guard. Each target injected
 the fault on write attempt two after one 16,384-byte filesystem-accepted write,
 returned the independently scheduled fault stats inside one second, kept the
 already-live control active at the boundary, completed all 67,108,864 control
 bytes, and reasserted unchanged fault state and write accounting afterward.
-That run does not broaden the proof beyond the limitations above.
+That historical run does not broaden the proof beyond the limitations above;
+the hardened harness requires its own replacement native evidence.
 
 ### 15.8 M6 — cluster torrent leases (separate approval)
 
