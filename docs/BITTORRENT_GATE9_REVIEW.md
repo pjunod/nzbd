@@ -28,8 +28,8 @@ The isolated M0 adapter measured the following in one macOS 26.6 arm64 run:
 |---|---:|---|
 | Unstripped optimized `m0_idle` harness | 10,111,360 bytes (9.64 MiB) | Is this binary delta acceptable for the single-binary release? |
 | Maximum resident set for one idle session | 8,814,592 bytes (8.41 MiB) | Is this idle memory cost acceptable before real swarm load? |
-| Sampled growth for 100 dormant torrents | 2,904,064–5,685,248 bytes across five native targets | Are the preliminary 32 MiB guard and sampled-growth method acceptable until active-swarm tests exist? |
-| Sampled growth for 100,000-file preflight | 3,739,648–27,361,280 bytes across five native targets | Are the preliminary 64 MiB guard and sampled-growth method acceptable until concurrent hostile-input tests exist? |
+| Sampled growth for 100 initialized dormant torrents | 2,936,832–6,156,288 bytes across five native targets | Are the preliminary 32 MiB guard and sampled-growth method acceptable until active-swarm tests exist? |
+| Sampled growth for 100,000-file preflight | 3,764,224–27,344,896 bytes across five native targets | Are the preliminary 64 MiB guard and sampled-growth method acceptable until concurrent hostile-input tests exist? |
 | Normal `nzbd-torrent` dependency closure | 222 package/version identities | Is the maintenance and audit surface acceptable? |
 | New workspace lockfile identities | 178 package/version identities | Is the dependency expansion proportionate to not implementing BitTorrent ourselves? |
 
@@ -40,7 +40,7 @@ has the same size or resident set. The exact cross-platform baselines, maxima,
 growth, and timings are in the
 [M0 report](BITTORRENT_M0_REPORT.md#4-measurements-and-dependency-review),
 backed by the
-[successful 2026-08-09 UTC run](https://github.com/pjunod/nzbd/actions/runs/31334930456).
+[successful review-correction run on 2026-08-10 UTC](https://github.com/pjunod/nzbd/actions/runs/31344145707).
 
 The proposed `max_peers_per_torrent = 80` and `max_peers_total = 400` are not
 implemented by stable 8.1.1. Stable hard-codes 128 live peer permits per
