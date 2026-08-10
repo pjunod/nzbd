@@ -4,10 +4,12 @@ use nzbd_torrent::{fuzz_metainfo_preflight, MAX_TORRENT_FILES};
 use std::error::Error;
 use std::io;
 use std::time::{Duration, Instant};
-use support::{observe_rss, sampled_rss_bytes};
+use support::{
+    enforce_rss_growth_ceiling, observe_rss, sampled_rss_bytes, verify_rss_growth_ceiling_guard,
+};
 
 const PREFLIGHT_DEADLINE: Duration = Duration::from_secs(30);
-const RSS_GROWTH_CEILING_BYTES: u64 = 256 * 1024 * 1024;
+const RSS_GROWTH_CEILING_BYTES: u64 = 64 * 1024 * 1024;
 
 fn bencode_bytes(output: &mut Vec<u8>, bytes: &[u8]) {
     output.extend_from_slice(bytes.len().to_string().as_bytes());
@@ -30,6 +32,7 @@ fn metainfo_with_file_count(file_count: usize) -> Vec<u8> {
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
+    verify_rss_growth_ceiling_guard("100,000-file preflight", RSS_GROWTH_CEILING_BYTES)?;
     let baseline_rss_bytes = sampled_rss_bytes()?;
     let mut max_sampled_rss_bytes = baseline_rss_bytes;
 
@@ -47,12 +50,11 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
 
     let sampled_rss_growth_bytes = max_sampled_rss_bytes.saturating_sub(baseline_rss_bytes);
-    if sampled_rss_growth_bytes > RSS_GROWTH_CEILING_BYTES {
-        return Err(io::Error::other(format!(
-            "sampled RSS growth {sampled_rss_growth_bytes} exceeded the {RSS_GROWTH_CEILING_BYTES}-byte regression ceiling"
-        ))
-        .into());
-    }
+    enforce_rss_growth_ceiling(
+        "100,000-file preflight",
+        sampled_rss_growth_bytes,
+        RSS_GROWTH_CEILING_BYTES,
+    )?;
 
     println!(
         "bittorrent_metainfo_pressure_memory files={MAX_TORRENT_FILES} metainfo_bytes={} baseline_rss_bytes={baseline_rss_bytes} fixture_rss_bytes={fixture_rss_bytes} validated_rss_bytes={validated_rss_bytes} max_sampled_rss_bytes={max_sampled_rss_bytes} sampled_rss_growth_bytes={sampled_rss_growth_bytes} ceiling_bytes={RSS_GROWTH_CEILING_BYTES} preflight_ms={}",

@@ -95,16 +95,20 @@ code. The daemon does not depend on it. The boundary currently provides:
   Linux x86_64 musl, Linux aarch64 musl, macOS aarch64, and Windows x86_64;
 - one optimized-process memory probe repeats that exact trackerless, peerless
   100-torrent mix and samples resident memory before session construction,
-  after construction, and after every ten admissions. It fails above a
-  preliminary 192 MiB growth ceiling on each native runner. This is a sampled
-  retained-memory regression guard, not an allocator peak, active-swarm, or
-  exhaustion-resistance claim;
+  after construction, after every ten admissions, and after all handles have
+  completed initialization into the exact 10-live/90-paused state. It fails
+  above a preliminary 32 MiB growth ceiling on each native runner. The probe
+  first proves exact-ceiling acceptance and first-byte-excess rejection
+  through the same guard used for the measurement. This is a sampled retained-
+  memory regression guard, not an allocator peak, active-swarm, or exhaustion-
+  resistance claim;
 - a second optimized-process probe constructs and validates the accepted
   100,000-file inventory while sampling resident memory before fixture
   construction, after construction, and after validation. It fails above a
-  preliminary 256 MiB growth ceiling on each native runner. This is retained
-  memory evidence, not the parser's transient allocation peak or a concurrent
-  hostile-submission test;
+  preliminary 64 MiB growth ceiling on each native runner. The same guard's
+  exact-ceiling and first-byte-excess negative control runs before the
+  measurement. This is retained memory evidence, not the parser's transient
+  allocation peak or a concurrent hostile-submission test;
 - an ignored, crate-private local-swarm unit probe injects
   `ErrorKind::StorageFull` from `pwrite_all` after one successful 16 KiB piece
   write. The affected 256 KiB torrent must become `Error`, remain incomplete,
@@ -629,8 +633,10 @@ session probe and validation for the metainfo probe.
 | Windows x86_64 MSVC | 100,000-file preflight | 4,694,016 | 8,433,664 | 3,739,648 | 105 ms |
 
 All session growth results stayed below 5.5 MiB and all metainfo growth
-results stayed below 27 MiB, far under the preliminary 192 MiB and 256 MiB
-regression ceilings. The wide platform spread is why these remain
+results stayed below 27 MiB, below the preliminary 32 MiB and 64 MiB
+regression ceilings. Those ceilings retain headroom for hosted-runner noise
+without permitting the previous order-of-magnitude regressions. The wide
+platform spread is why these remain
 platform-specific sampled-growth guards, not portable peak-memory promises.
 
 The 2026-08-07 review remediation refreshed these measurements after adding

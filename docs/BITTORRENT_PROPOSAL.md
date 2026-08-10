@@ -2176,18 +2176,22 @@ becomes reachable.
   than a public-network or throughput test.
 - Session memory pressure: run the same trackerless, peerless 100-torrent mix
   in an optimized process, sample resident memory before session construction,
-  after construction, and after every ten admissions, and fail if sampled
-  growth exceeds the preliminary 192 MiB regression ceiling. Record every
-  native platform separately. This catches large retained-memory regressions;
-  periodic working-set samples do not prove the true allocation peak, active
-  swarm behavior, or exhaustion resistance.
+  after construction, after every ten admissions, and after all handles have
+  initialized into the exact 10-live/90-paused state; fail if sampled growth
+  exceeds the preliminary 32 MiB regression ceiling. Record every native
+  platform separately, and exercise exact-ceiling acceptance plus first-byte-
+  excess rejection through the same guard before measuring. This catches large
+  retained-memory regressions; periodic working-set samples do not prove the
+  true allocation peak, active swarm behavior, or exhaustion resistance.
 - Metainfo memory pressure: construct and validate the accepted 100,000-file
   inventory in an optimized process, sample resident memory before fixture
   construction, after construction, and after validation, and fail if sampled
-  growth exceeds the preliminary 256 MiB regression ceiling. Record every
-  native platform separately. This catches large retained-memory regressions;
-  three working-set samples do not prove the parser's transient allocation
-  peak or resistance to concurrent hostile submissions.
+  growth exceeds the preliminary 64 MiB regression ceiling. Record every
+  native platform separately, and exercise exact-ceiling acceptance plus
+  first-byte-excess rejection through the same guard before measuring. This
+  catches large retained-memory regressions; three working-set samples do not
+  prove the parser's transient allocation peak or resistance to concurrent
+  hostile submissions.
 - Redaction: adapter engine/stat errors prove magnet, tracker/query/proxy,
   secret-assignment, embedded JSON/query assignments, private-tracker
   `torrent_pass`/`authkey`, API keys, signatures, session identifiers,
