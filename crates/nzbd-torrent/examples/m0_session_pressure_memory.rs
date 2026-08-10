@@ -1,19 +1,21 @@
 mod support;
 
-use nzbd_torrent::{TorrentAddConfig, TorrentSession, TorrentSessionConfig};
+use nzbd_torrent::{TorrentAddConfig, TorrentPhase, TorrentSession, TorrentSessionConfig};
 use sha1::{Digest, Sha1};
 use std::collections::HashSet;
 use std::error::Error;
 use std::io;
 use std::time::{Duration, Instant};
-use support::{observe_rss, sampled_rss_bytes};
+use support::{
+    enforce_rss_growth_ceiling, observe_rss, sampled_rss_bytes, verify_rss_growth_ceiling_guard,
+};
 
 const REGISTERED_TORRENTS: usize = 100;
 const ACTIVE_TORRENTS: usize = 10;
 const ADMISSION_DEADLINE: Duration = Duration::from_secs(30);
 const SHUTDOWN_DEADLINE: Duration = Duration::from_secs(10);
 const PIECE_LENGTH: usize = 16 * 1024;
-const RSS_GROWTH_CEILING_BYTES: u64 = 192 * 1024 * 1024;
+const RSS_GROWTH_CEILING_BYTES: u64 = 32 * 1024 * 1024;
 
 fn bencode_bytes(output: &mut Vec<u8>, bytes: &[u8]) {
     output.extend_from_slice(bytes.len().to_string().as_bytes());
@@ -45,6 +47,7 @@ fn one_byte_metainfo(index: usize) -> Vec<u8> {
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() -> Result<(), Box<dyn Error>> {
+    verify_rss_growth_ceiling_guard("100-torrent session", RSS_GROWTH_CEILING_BYTES)?;
     let baseline_rss_bytes = sampled_rss_bytes()?;
     let mut max_sampled_rss_bytes = baseline_rss_bytes;
     let root = tempfile::tempdir()?;
@@ -71,6 +74,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 observe_rss(&mut max_sampled_rss_bytes)?;
             }
         }
+        for handle in &handles {
+            handle.wait_until_initialized().await?;
+        }
+        observe_rss(&mut max_sampled_rss_bytes)?;
         Ok::<_, Box<dyn Error>>(handles)
     })
     .await
@@ -84,7 +91,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
             .collect::<HashSet<_>>()
             .len()
             != REGISTERED_TORRENTS
-        || handles.iter().filter(|handle| !handle.is_paused()).count() != ACTIVE_TORRENTS
+        || handles[..ACTIVE_TORRENTS]
+            .iter()
+            .any(|handle| handle.stats().phase != TorrentPhase::Live)
+        || handles[ACTIVE_TORRENTS..]
+            .iter()
+            .any(|handle| handle.stats().phase != TorrentPhase::Paused)
         || !handles.iter().all(|handle| handle.stats().total_bytes == 1)
     {
         return Err(
@@ -93,12 +105,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }
 
     let sampled_rss_growth_bytes = max_sampled_rss_bytes.saturating_sub(baseline_rss_bytes);
-    if sampled_rss_growth_bytes > RSS_GROWTH_CEILING_BYTES {
-        return Err(io::Error::other(format!(
-            "sampled RSS growth {sampled_rss_growth_bytes} exceeded the {RSS_GROWTH_CEILING_BYTES}-byte regression ceiling"
-        ))
-        .into());
-    }
+    enforce_rss_growth_ceiling(
+        "100-torrent session",
+        sampled_rss_growth_bytes,
+        RSS_GROWTH_CEILING_BYTES,
+    )?;
 
     let shutdown_started = Instant::now();
     tokio::time::timeout(SHUTDOWN_DEADLINE, session.stop())

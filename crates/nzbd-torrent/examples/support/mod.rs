@@ -48,3 +48,34 @@ pub fn observe_rss(max_sampled_rss_bytes: &mut u64) -> Result<u64, Box<dyn Error
     *max_sampled_rss_bytes = (*max_sampled_rss_bytes).max(sampled_rss_bytes);
     Ok(sampled_rss_bytes)
 }
+
+pub fn enforce_rss_growth_ceiling(
+    probe: &str,
+    sampled_rss_growth_bytes: u64,
+    ceiling_bytes: u64,
+) -> Result<(), Box<dyn Error>> {
+    if sampled_rss_growth_bytes > ceiling_bytes {
+        return Err(io::Error::other(format!(
+            "{probe} sampled RSS growth {sampled_rss_growth_bytes} exceeded the {ceiling_bytes}-byte regression ceiling"
+        ))
+        .into());
+    }
+    Ok(())
+}
+
+pub fn verify_rss_growth_ceiling_guard(
+    probe: &str,
+    ceiling_bytes: u64,
+) -> Result<(), Box<dyn Error>> {
+    enforce_rss_growth_ceiling(probe, ceiling_bytes, ceiling_bytes)?;
+    let first_excess_byte = ceiling_bytes
+        .checked_add(1)
+        .ok_or_else(|| io::Error::other("RSS ceiling negative control overflowed"))?;
+    if enforce_rss_growth_ceiling(probe, first_excess_byte, ceiling_bytes).is_ok() {
+        return Err(io::Error::other(format!(
+            "{probe} RSS ceiling negative control accepted the first excess byte"
+        ))
+        .into());
+    }
+    Ok(())
+}
