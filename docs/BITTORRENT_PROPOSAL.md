@@ -2051,11 +2051,19 @@ no trackers or initial peers, so it starts no public discovery or payload
 transfer. The
 [first native evidence run](https://github.com/pjunod/nzbd/actions/runs/31330178035)
 passed the isolated adapter suite on 2026-08-09 UTC across Linux x86_64 GNU,
-Linux x86_64 musl, Linux aarch64 musl, macOS aarch64, and Windows x86_64. This
-is useful continuous coverage and a wall-clock regression guard, not M5
-completion: crash-free bounded runs, functional limits, and a deadline on
-shared CI do not establish peak-memory exhaustion resistance, filesystem
-containment, production shutdown orchestration, or sustained fuzzing adequacy.
+Linux x86_64 musl, Linux aarch64 musl, macOS aarch64, and Windows x86_64. The
+[review-correction sampled-memory run](https://github.com/pjunod/nzbd/actions/runs/31344145707)
+passed the same five targets on 2026-08-10 UTC after every handle was awaited
+to its initialized phase and the discriminating ceiling controls were added:
+100-torrent sampled RSS growth ranged from 2,936,832 to 6,156,288 bytes, and
+100,000-file preflight growth ranged from 3,764,224 to 27,344,896 bytes. Exact
+baselines, maxima, and timings are recorded in the M0 report. This is useful
+continuous coverage plus
+wall-clock and retained-memory regression evidence, not M5 completion:
+crash-free bounded runs, functional limits, periodic RSS samples, and a
+deadline on shared CI do not establish peak-memory exhaustion resistance,
+filesystem containment, production shutdown orchestration, or sustained
+fuzzing adequacy.
 
 ### 15.8 M6 — cluster torrent leases (separate approval)
 
@@ -2152,6 +2160,24 @@ becomes reachable.
   shutdown exceeds the documented 30-second or 10-second deadline. Keep every
   source trackerless and peerless so this remains bookkeeping evidence rather
   than a public-network or throughput test.
+- Session memory pressure: run the same trackerless, peerless 100-torrent mix
+  in an optimized process, sample resident memory before session construction,
+  after construction, after every ten admissions, and after all handles have
+  initialized into the exact 10-live/90-paused state; fail if sampled growth
+  exceeds the preliminary 32 MiB regression ceiling. Record every native
+  platform separately, and exercise exact-ceiling acceptance plus first-byte-
+  excess rejection through the same guard before measuring. This catches large
+  retained-memory regressions; periodic working-set samples do not prove the
+  true allocation peak, active swarm behavior, or exhaustion resistance.
+- Metainfo memory pressure: construct and validate the accepted 100,000-file
+  inventory in an optimized process, sample resident memory before fixture
+  construction, after construction, and after validation, and fail if sampled
+  growth exceeds the preliminary 64 MiB regression ceiling. Record every
+  native platform separately, and exercise exact-ceiling acceptance plus
+  first-byte-excess rejection through the same guard before measuring. This
+  catches large retained-memory regressions; three working-set samples do not
+  prove the parser's transient allocation peak or resistance to concurrent
+  hostile submissions.
 - Redaction: adapter engine/stat errors prove magnet, tracker/query/proxy,
   secret-assignment, embedded JSON/query assignments, private-tracker
   `torrent_pass`/`authkey`, API keys, signatures, session identifiers,

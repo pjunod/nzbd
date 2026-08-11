@@ -11,6 +11,11 @@ publish = false
 [features]
 fuzzing = []
 
+[[example]]
+name = "m0_metainfo_pressure_memory"
+path = "examples/m0_metainfo_pressure_memory.rs"
+required-features = ["fuzzing"]
+
 [dependencies]
 bytes = { workspace = true }
 icu_normalizer = { workspace = true }

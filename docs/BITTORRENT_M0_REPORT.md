@@ -93,6 +93,22 @@ code. The daemon does not depend on it. The boundary currently provides:
   [first native evidence run](https://github.com/pjunod/nzbd/actions/runs/31330178035)
   passed the isolated adapter suite on 2026-08-09 UTC for Linux x86_64 GNU,
   Linux x86_64 musl, Linux aarch64 musl, macOS aarch64, and Windows x86_64;
+- one optimized-process memory probe repeats that exact trackerless, peerless
+  100-torrent mix and samples resident memory before session construction,
+  after construction, after every ten admissions, and after all handles have
+  completed initialization into the exact 10-live/90-paused state. It fails
+  above a preliminary 32 MiB growth ceiling on each native runner. The probe
+  first proves exact-ceiling acceptance and first-byte-excess rejection
+  through the same guard used for the measurement. This is a sampled retained-
+  memory regression guard, not an allocator peak, active-swarm, or exhaustion-
+  resistance claim;
+- a second optimized-process probe constructs and validates the accepted
+  100,000-file inventory while sampling resident memory before fixture
+  construction, after construction, and after validation. It fails above a
+  preliminary 64 MiB growth ceiling on each native runner. The same guard's
+  exact-ceiling and first-byte-excess negative control runs before the
+  measurement. This is retained memory evidence, not the parser's transient
+  allocation peak or a concurrent hostile-submission test;
 - explicit peer lifetimes: the dormant session pins stable 8.1.1's effective
   10-second connect and read/write timeouts and 120-second keepalive interval;
   per-add options inherit this reviewed session policy instead of introducing
@@ -578,6 +594,34 @@ intentionally does not link the blocked adapter.
 | Normal dependency closure of `nzbd-torrent` | 222 unique package/version identities |
 | New package/version identities in the workspace lockfile | 178 |
 | OpenSSL dynamic link | none; only CoreFoundation, libiconv, and libSystem were listed on this host |
+
+The
+[review-correction cross-platform sampled-memory run](https://github.com/pjunod/nzbd/actions/runs/31344145707)
+passed both optimized probes on 2026-08-10 UTC after the probes began awaiting
+every session handle's initialized phase, added discriminating ceiling
+controls, and narrowed the preliminary ceilings. Values are process resident
+set samples in bytes; the time column is admission plus shutdown for the
+session probe and validation for the metainfo probe.
+
+| Platform | Probe | Baseline RSS | Maximum sampled RSS | Sampled growth | Time |
+|---|---|---:|---:|---:|---:|
+| Linux aarch64 musl | 100-torrent session | 1,789,952 | 6,717,440 | 4,927,488 | 51 ms + 1,002 ms |
+| Linux aarch64 musl | 100,000-file preflight | 745,472 | 4,591,616 | 3,846,144 | 85 ms |
+| Linux x86_64 GNU | 100-torrent session | 4,845,568 | 11,001,856 | 6,156,288 | 40 ms + 1,001 ms |
+| Linux x86_64 GNU | 100,000-file preflight | 2,793,472 | 18,137,088 | 15,343,616 | 63 ms |
+| Linux x86_64 musl | 100-torrent session | 4,919,296 | 9,838,592 | 4,919,296 | 94 ms + 1,001 ms |
+| Linux x86_64 musl | 100,000-file preflight | 831,488 | 4,812,800 | 3,981,312 | 116 ms |
+| macOS aarch64 | 100-torrent session | 6,946,816 | 11,010,048 | 4,063,232 | 32 ms + 1,003 ms |
+| macOS aarch64 | 100,000-file preflight | 5,980,160 | 33,325,056 | 27,344,896 | 62 ms |
+| Windows x86_64 MSVC | 100-torrent session | 8,306,688 | 11,243,520 | 2,936,832 | 2,713 ms + 1,007 ms |
+| Windows x86_64 MSVC | 100,000-file preflight | 4,694,016 | 8,458,240 | 3,764,224 | 137 ms |
+
+All session growth results stayed below 6 MiB and all metainfo growth
+results stayed below 27 MiB, below the preliminary 32 MiB and 64 MiB
+regression ceilings. Those ceilings retain headroom for hosted-runner noise
+without permitting the previous order-of-magnitude regressions. The wide
+platform spread is why these remain
+platform-specific sampled-growth guards, not portable peak-memory promises.
 
 The 2026-08-07 review remediation refreshed these measurements after adding
 `icu_casemap 2.1.1` and `icu_casemap_data 2.1.1` for Unicode simple case
