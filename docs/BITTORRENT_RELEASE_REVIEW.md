@@ -102,6 +102,17 @@ names, and portable Unicode/case aliases before storage construction. The
 hosted native probes describe their temporary filesystems; they do not prove
 descriptor-relative containment or every filesystem used by operators.
 
+The isolated crate-private fault harness can inject write-time storage
+exhaustion after one successful piece write. An already-live filesystem-backed
+control must remain live across that boundary and complete without changing
+the faulted torrent's state or write accounting. The test-only seeder is
+rate-limited and lets rqbit bind the first available port directly, avoiding
+speed-dependent and temporary-port handoff races. Stable rqbit reports the
+faulted torrent as `Error`, not the proposed disk-paused state. The harness
+does not exercise initialization-time file-sizing failure and has no daemon API
+or enforcing multi-root guard, so it does not prove general or operator-visible
+ENOSPC behavior and does not authorize production wiring.
+
 **Reviewer acceptance:** supported deployment examples must exercise the
 actual bind mounts or volumes, case/normalization behavior, low-space guard,
 symlink race boundary, import path, and restart authority. Until that matrix
@@ -173,6 +184,7 @@ relying on one local host:
 | Private DHT/LSD packet capture | [2026-08-06 capture run](https://github.com/pjunod/nzbd/actions/runs/31128106994) |
 | Cross-platform filesystem behavior | [2026-08-08 probe run](https://github.com/pjunod/nzbd/actions/runs/31240896567) and [review correction](https://github.com/pjunod/nzbd/actions/runs/31264422471) |
 | Native adapter matrix and daemon isolation | [2026-08-09 M0 run](https://github.com/pjunod/nzbd/actions/runs/31331872561) |
+| Write-time storage-fault containment | [2026-08-10 hardened five-platform run](https://github.com/pjunod/nzbd/actions/runs/31345445318) |
 
 These links are evidence snapshots, not evergreen approval. The reviewed
 commit must have its own green required checks.

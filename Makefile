@@ -182,6 +182,7 @@ fuzz-magnet-run:
 
 .PHONY: bittorrent-policy
 bittorrent-policy: ## Verify adapter, daemon, review-doc, and dependency policies
+	bash -n scripts/check-bittorrent-storage-full-probe.sh
 	scripts/check-bittorrent-deps.sh
 	scripts/check-bittorrent-release-review.sh
 	scripts/check-reviewed-dependency-exceptions.sh

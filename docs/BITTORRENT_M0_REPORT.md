@@ -109,6 +109,28 @@ code. The daemon does not depend on it. The boundary currently provides:
   exact-ceiling and first-byte-excess negative control runs before the
   measurement. This is retained memory evidence, not the parser's transient
   allocation peak or a concurrent hostile-submission test;
+- an ignored, crate-private local-swarm unit probe injects
+  `ErrorKind::StorageFull` from `pwrite_all` after one 16 KiB write call returns
+  successfully. The affected 256 KiB torrent must become `Error`, remain incomplete,
+  retain a display-safe fault fact, and answer an independently scheduled
+  stats request within one second. Before the fault is admitted, a separate
+  64 MiB torrent must already be live with nonzero incomplete progress through
+  normal filesystem storage; it must remain live at the fault boundary and
+  then complete in the same engine session. The seeder's aggregate upload is
+  capped at 8 MiB/s so the boundary assertion does not depend on loopback or
+  filesystem speed, and rqbit selects its own listen port from a test-only
+  multi-port range rather than inheriting a bind/drop/rebind race. The fault
+  state and exact write accounting must remain unchanged afterward, and both
+  sessions must stop within ten seconds. The custom-storage and broad-listen
+  helpers are compiled only into crate unit tests and are absent from every
+  non-test build; normal admission still forces `storage_factory: None` and
+  requires one explicit non-zero listen port. This proves containment of an
+  injected write-time fault and a future interception point, not general
+  ENOSPC behavior. In particular it does not exercise initialization-time
+  `ensure_file_length` failure, and that stable-engine path remains explicit
+  M2 work. There is no daemon disk-guard latch, API responsiveness proof,
+  new-request pause, or continued-upload proof, and stable rqbit currently
+  reports the affected torrent as an error rather than a paused download;
 - explicit peer lifetimes: the dormant session pins stable 8.1.1's effective
   10-second connect and read/write timeouts and 120-second keepalive interval;
   per-add options inherit this reviewed session policy instead of introducing
@@ -622,6 +644,32 @@ regression ceilings. Those ceilings retain headroom for hosted-runner noise
 without permitting the previous order-of-magnitude regressions. The wide
 platform spread is why these remain
 platform-specific sampled-growth guards, not portable peak-memory promises.
+
+The
+[hardened storage-fault run](https://github.com/pjunod/nzbd/actions/runs/31345445318)
+passed the behavioral probe and its fail-closed discovery guard on all five
+native targets on 2026-08-10 UTC. Every target injected `StorageFull` on the
+second write after one 16,384-byte write call returned successfully, kept the
+faulted 262,144-byte torrent incomplete in `Error` with zero engine progress,
+and preserved exactly two write attempts and one successful write after the
+already-live 67,108,864-byte control torrent completed. The control was still
+incomplete at the fault boundary on every target. The response deadline
+measures the independently scheduled stats reply rather than synchronous lock
+acquisition on the test task. The shared runner also proved that it discovered
+and executed exactly the one ignored test, after a discriminating negative
+control demonstrated that the discovery guard rejects a non-matching line.
+
+| Platform | Fault transition | Stats response | Control progress at fault | Control completion |
+|---|---:|---:|---:|---:|
+| Linux aarch64 musl | 52 ms | 0 ms | 8,847,360 bytes | 7,098 ms |
+| Linux x86_64 GNU | 77 ms | 0 ms | 8,962,048 bytes | 7,097 ms |
+| Linux x86_64 musl | 52 ms | 0 ms | 8,814,592 bytes | 7,098 ms |
+| macOS aarch64 | 26 ms | 0 ms | 8,323,072 bytes | 7,020 ms |
+| Windows x86_64 MSVC | 29 ms | 0 ms | 16,384 bytes | 7,315 ms |
+
+This evidence remains deliberately narrow: it proves the injected write-time
+path and an already-active sibling's containment, not durable persistence of
+the accepted chunk or initialization-time `ensure_file_length` behavior.
 
 The 2026-08-07 review remediation refreshed these measurements after adding
 `icu_casemap 2.1.1` and `icu_casemap_data 2.1.1` for Unicode simple case
