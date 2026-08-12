@@ -2143,6 +2143,7 @@ dependencies = [
 name = "nzbd-torrent"
 version = "0.2.0"
 dependencies = [
+ "anyhow",
  "bytes",
  "icu_casemap",
  "icu_normalizer",
