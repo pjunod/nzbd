@@ -1,15 +1,15 @@
 # rqbit contribution kit — upstream required APIs and resource budgets without weakening nzbd
 
 **Status:** ready for human review, not submitted · **Upstream base:**
-`4e5f94cbcf1d57ec500885c77cf1e24d70232d89` · **Verified:** 2026-08-07
+`4e5f94cbcf1d57ec500885c77cf1e24d70232d89` · **Verified:** 2026-08-13
 
 Companion to
 [BITTORRENT_M0_REPORT.md](../../docs/BITTORRENT_M0_REPORT.md) (why nzbd is
 blocked) — this directory is the submission package for the two rqbit APIs,
-the pre-allocation magnet-metadata ceiling, tracker request controls,
-live/retained-peer budgets, pre-routing handshake boundaries, and established
-peer-response plus discovery-pipeline backlog controls that must be accepted
-and released before nzbd starts M2.
+the pre-allocation magnet-metadata ceiling, file-sizing error propagation,
+tracker request controls, live/retained-peer budgets, pre-routing handshake
+boundaries, and established peer-response plus discovery-pipeline backlog
+controls that must be accepted and released before nzbd starts M2.
 
 Read and review this kit in order. Submit the discovery-health design issue
 before its implementation, because that patch crosses three rqbit crates and
@@ -43,11 +43,12 @@ Before posting any draft:
 5. Keep independent contributions separate. Restore changes session
    admission; discovery health changes DHT, tracker, and public snapshot
    contracts; the metadata ceiling changes the peer handshake's allocation
-   boundary; tracker, live-peer, retained-peer, and pending-handshake budgets
-   change distinct runtime resource policies; the peer-response budget bounds
-   remote work after a live connection is established; the discovery-pressure
-   budget bounds DHT/LSD foreground and maintenance work plus metadata queues
-   before peer admission.
+   boundary; file-sizing propagation changes initialization failure semantics;
+   tracker, live-peer, retained-peer, and pending-handshake budgets change
+   distinct runtime resource policies; the peer-response budget bounds remote
+   work after a live connection is established; the discovery-pressure budget
+   bounds DHT/LSD foreground and maintenance work plus metadata queues before
+   peer admission.
 
 ## 2. Contribution map — stable evidence and current-main submissions
 
@@ -62,6 +63,7 @@ Before posting any draft:
 | Bounded per-peer payload and metadata response backlog | [`0012`](0012-bound-peer-response-backlog.patch) | [`0013`](0013-bound-peer-response-backlog-main.patch) | [PR draft](PEER_RESPONSE_BUDGET_PR.md) |
 | Bounded DHT, metadata-resolution, maintenance, and LSD pressure | [`0014`](0014-bound-discovery-pressure.patch) | [`0015`](0015-bound-discovery-pressure-main.patch) | [PR draft](DISCOVERY_PRESSURE_BUDGET_PR.md) |
 | Bound BEP 9 metadata before allocation | [`0016`](0016-limit-peer-metadata-before-allocation.patch) | [`0017`](0017-limit-peer-metadata-before-allocation-main.patch) | [PR draft](METADATA_SIZE_LIMIT_PR.md) |
+| Propagate selected-file sizing failures out of initialization | [`0018`](0018-propagate-file-sizing-errors.patch) | [`0019`](0019-propagate-file-sizing-errors-main.patch) | [PR draft](FILE_SIZING_ERROR_PR.md) |
 
 The stable patches preserve the exact experiments behind nzbd's M0 report.
 The main patches are the contribution candidates. Do not submit the stable
@@ -80,39 +82,46 @@ backports upstream unless the maintainer explicitly asks for an 8.x backport.
    [metadata-size PR](METADATA_SIZE_LIMIT_PR.md). Its default remains 32 MiB,
    while an embedding caller can reject a smaller configured ceiling before
    rqbit allocates or requests peer metadata.
-4. Reconcile maintainer feedback on the discovery-health states, crate
+4. Submit the independent
+   [file-sizing error PR](FILE_SIZING_ERROR_PR.md). It preserves selected-file
+   and padding behavior but makes `ensure_file_length` failures stop
+   initialization instead of remaining warning-log-only. Its current-main
+   variant also distinguishes typed checksum cancellation from real I/O
+   failure when pause overlaps initialization.
+5. Reconcile maintainer feedback on the discovery-health states, crate
    boundary, and snapshot shape.
-5. Rework and submit `0004` only after the design direction is accepted. A
+6. Rework and submit `0004` only after the design direction is accepted. A
    smaller upstream implementation is preferable if it preserves honest
    per-torrent DHT/tracker state and credential-safe failures.
-6. Submit the independent tracker request-budget candidate only after human
+7. Submit the independent tracker request-budget candidate only after human
    review of its 30-second request deadline, 1 MiB response cap, and 60-second
    minimum unforced announce interval. The floor deliberately delays a
    legitimate 10-second tracker request to 60 seconds; it is a policy tradeoff,
    not just an implementation bound, and does not depend on either public API.
-7. Submit the independent session peer-budget candidate only after human
+8. Submit the independent session peer-budget candidate only after human
    review of the public option name, aggregate counting boundary, and permit
    acquisition order. It does not depend on the tracker request controls.
-8. Review the independent pending-handshake boundary. Do not submit `0009` to
+9. Review the independent pending-handshake boundary. Do not submit `0009` to
    rqbit main, which already has the configurable equivalent. Use the patch
    only if the maintainer explicitly requests an 8.x backport.
-9. Submit the independent retained-peer candidate only after human review of
+10. Submit the independent retained-peer candidate only after human review of
    its option names, permit lifetime, cleanup behavior, and preliminary
    1,024/4,096 policy.
-10. Submit the independent peer-response candidate only after human review of
+11. Submit the independent peer-response candidate only after human review of
     its advertised 128-response window, over-window disconnect policy, and
     permit lifetime across both scheduler and writer queues.
-11. Submit the discovery-pressure candidate only after human review of its
+12. Submit the discovery-pressure candidate only after human review of its
     DHT/LSD overload policy, foreground and maintenance concurrency, metadata
     active/pending queues and deduplication ceiling, and the current-main-only
     LSD lifecycle change.
-12. After both required APIs, the allocation ceiling, and all accepted resource
-    controls ship, pin that stable release in nzbd and rerun all eleven M0
-    gates on native macOS, Linux glibc/musl, and Windows.
-13. Run the Linux packet-capture private-mode harness and obtain reviewer
+13. After both required APIs, the allocation ceiling, file-sizing error
+    propagation, and all accepted resource controls ship, pin that stable
+    release in nzbd and rerun all eleven M0 gates on native macOS, Linux
+    glibc/musl, and Windows.
+14. Run the Linux packet-capture private-mode harness and obtain reviewer
     acceptance of the resource, package, license, and advisory dispositions.
     A gate rerun cannot discharge those review decisions by itself.
-14. Only the complete M0 path can authorize M2.
+15. Only the complete M0 path can authorize M2.
 
 ## 4. Reproduction — verify all candidates against rqbit main
 
@@ -129,7 +138,9 @@ The main patch artifacts are authored from the pinned SHA below. CI's
 `drift:` leg deliberately clones the current `main` tip, records that checkout
 in the job log, and tests a direct or three-way apply; it is a moving
 compatibility alarm, not reproducible base evidence. The `blocking:` v8.1.1
-leg remains exact. The workflow points every verifier at the cached rqbit
+leg remains exact. File-sizing propagation additionally runs its documented
+main SHA as a blocking pull-request leg because its pause-race fix is
+main-specific and has no stable equivalent. The workflow points every verifier at the cached rqbit
 target directory, and the peer-response and discovery-pressure verifiers now
 compile the complete upstream workspace after their focused proofs.
 
@@ -147,6 +158,7 @@ scripts/check-rqbit-known-peer-budget-patch.sh "$rqbit_tree"         # Format + 
 scripts/check-rqbit-metadata-size-limit-patch.sh "$rqbit_tree"       # Format + pre-allocation limit test.
 scripts/check-rqbit-peer-response-budget-patch.sh "$rqbit_tree"      # Format + scheduler/writer lifetime proof.
 scripts/check-rqbit-discovery-pressure-patch.sh "$rqbit_tree"        # Format + DHT/metadata/LSD queue proofs.
+scripts/check-rqbit-file-sizing-error-patch.sh "$rqbit_tree"         # Format + sizing and pause-race proofs.
 ```
 
 For submission, apply only the matching main patch to a fresh branch and run
@@ -164,12 +176,12 @@ git -C "$rqbit_tree" apply "$PWD/contrib/rqbit/0002-allow-persistence-without-au
 )
 ```
 
-Use separate fresh branches for discovery health, the metadata ceiling, the
-tracker request budget, the session peer budget, the retained-peer budget, and
-the peer-response and discovery-pressure budgets. Do not stack the upstream
-submissions: the contracts solve different problems, and independent history
-lets rqbit accept, revise, or reject each one without dragging the others
-through review. There is no current-main patch for the
+Use separate fresh branches for discovery health, the metadata ceiling,
+file-sizing error propagation, the tracker request budget, the session peer
+budget, the retained-peer budget, and the peer-response and discovery-pressure
+budgets. Do not stack the upstream submissions: the contracts solve different
+problems, and independent history lets rqbit accept, revise, or reject each one
+without dragging the others through review. There is no current-main patch for the
 pending-handshake boundary because rqbit main already implements it; keep the
 stable-only backport separate from every main submission.
 

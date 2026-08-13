@@ -597,7 +597,7 @@ metainfo afterward, but that is too late to enforce nzbd's proposed 10 MiB
 hostile-input allocation limit for magnets.
 
 [`contrib/rqbit/0016-limit-peer-metadata-before-allocation.patch`](../contrib/rqbit/0016-limit-peer-metadata-before-allocation.patch)
-targets the exact v8.1.1 commit, and `0006` carries the same change for the
+targets the exact v8.1.1 commit, and `0017` carries the same change for the
 documented rqbit-main base. They add an optional
 `PeerConnectionOptions::max_metadata_size`, merge it through the existing
 session/per-add peer-option path, retain 32 MiB when it is unset, and reject
@@ -612,6 +612,46 @@ relevant changes and weekly for upstream drift. This is a tested contribution
 artifact awaiting human review, not a production dependency: nzbd still pins
 unmodified 8.1.1 and must not admit magnets until an accepted stable release
 exposes an equivalent pre-allocation limit.
+
+### 3.6 The file-sizing error fix is ready, not released
+
+The five-platform storage witness proves stable rqbit 8.1.1 treats an
+`ensure_file_length` failure as warning-log-only and continues initialization.
+That behavior is not usable as nzbd's ENOSPC control contract.
+
+[`contrib/rqbit/0018-propagate-file-sizing-errors.patch`](../contrib/rqbit/0018-propagate-file-sizing-errors.patch)
+targets the exact v8.1.1 commit, and `0019` carries the equivalent current-main
+candidate. Both extract the selected-file sizing loop into a fallible helper,
+preserve selection and padding behavior, attach the file name and requested
+length as error context, and return the first storage failure through the
+existing initialization state transition.
+
+Current rqbit main also treats any initialization error as a successful pause
+when a pause request overlaps the check. The `0019` candidate replaces the
+checksum loop's string-only cancellation with a typed marker and suppresses
+only that marker. Its focused race classifier proves an injected storage error
+remains non-suppressible while the pause flag is set, while genuine checksum
+cancellation is suppressed only with that flag.
+
+The exact unit proof supplies a storage implementation that returns injected
+`StorageFull` for file 0 at 262,144 bytes. It requires one call and an error
+chain that retains the file name, byte count, and cause. A sensitivity mutation
+inside the helper made the test fail because `unwrap_err()` received `Ok(())`;
+restoring propagation made it pass. Because that focused test calls the helper
+directly, the verifier separately pins each source line's blocking
+initialization call through its trailing `?`. A mutation that discarded the
+helper result at that boundary left the unit test green but failed this
+structural assertion. The verifier also requires the exact test in Cargo's
+list, requires an exact one-test pass summary for every applicable test, pins
+the current-main pause classifier at the real error branch, checks formatting,
+and compiles the Rust-TLS library. Pull requests have blocking exact-stable and
+documented-main-base legs plus an advisory moving-main drift leg; pushes and
+the weekly schedule require all three.
+
+This is contribution evidence awaiting human review, upstream acceptance, and
+a stable release. nzbd still pins unmodified rqbit 8.1.1; the daemon has no
+torrent storage policy; the M2 storage-full row remains blocked; and production
+wiring remains disabled.
 
 ---
 
@@ -773,7 +813,8 @@ Preferred path:
    the public surface before nzbd treats the patch as an integration plan;
 2. review and submit the prepared authoritative-restore patch and the agreed
    discovery-health implementation upstream;
-3. review and submit the independent peer-metadata allocation ceiling;
+3. review and submit the independent peer-metadata allocation ceiling and
+   file-sizing error propagation candidates;
 4. review the independent runtime resource candidates, including the
    established-peer response backlog and discovery-pressure chain, and submit
    only the boundaries a human can explain and maintain;
@@ -792,13 +833,14 @@ patch mapping, and reproduction commands are collected in the
 kit has been posted upstream, and rqbit's AI policy requires human review and
 editing before it is.
 
-The two gate APIs and the metadata allocation ceiling may be designed,
-reviewed, and released separately, but they are not separate permission to
-start production wiring. Starting M2 with authoritative restore alone would
-leave gate 7 failed and make tracker or DHT failure indistinguishable from an
-ordinary lack of peers. Shipping the two gate APIs without a pre-allocation
-magnet ceiling would still violate the hostile-input contract. Neither is an
-accepted shortcut.
+The two gate APIs, metadata allocation ceiling, and file-sizing error change
+may be designed, reviewed, and released separately, but they are not separate
+permission to start production wiring. Starting M2 with authoritative restore
+alone would leave gate 7 failed and make tracker or DHT failure
+indistinguishable from an ordinary lack of peers. Shipping the two gate APIs
+without a pre-allocation magnet ceiling would still violate the hostile-input
+contract; propagating a sizing error without a daemon disk policy would still
+leave ENOSPC behavior incomplete. None is an accepted shortcut.
 
 Two alternatives require an explicit ADR-19 amendment:
 
@@ -850,6 +892,7 @@ scripts/check-rqbit-session-peer-budget-patch.sh /path/to/rqbit
 scripts/check-rqbit-pending-handshake-budget.sh /path/to/rqbit
 scripts/check-rqbit-known-peer-budget-patch.sh /path/to/rqbit
 scripts/check-rqbit-metadata-size-limit-patch.sh /path/to/rqbit
+scripts/check-rqbit-file-sizing-error-patch.sh /path/to/rqbit
 scripts/check-rqbit-peer-response-budget-patch.sh /path/to/rqbit
 scripts/check-rqbit-discovery-pressure-patch.sh /path/to/rqbit
 ```

@@ -2101,6 +2101,21 @@ aarch64, and Windows x86_64. Every target observed the same sizing result:
 one 262,144-byte request, a zero-byte file, zero piece writes, `Paused` then
 `Live`, no stats-visible error, and no retry before observation.
 
+The contribution kit now carries exact-stable and current-main candidates that
+make this failure stop initialization. They preserve selected-file and padding
+behavior, add file/length context, and return the first `ensure_file_length`
+error through rqbit's existing initialization error path. A sensitivity
+mutation inside the helper makes the exact unit test fail, while a separate
+fail-closed verifier assertion rejects either source line if its blocking
+initialization boundary discards the helper result. The current-main candidate
+also types checksum cancellation and proves a concurrent pause suppresses only
+that marker, not a storage failure. Exact stable and documented-main verifier
+legs block pull requests; the moving-main compatibility leg remains advisory
+there and required on pushes and the weekly schedule. This candidate does not
+satisfy the storage policy by itself: it still needs human review,
+upstream acceptance, a stable release, and a daemon-owned disk guard, pause,
+API, and recovery contract before production wiring.
+
 The
 [hardened native run](https://github.com/pjunod/nzbd/actions/runs/31345445318)
 passed the behavioral probe and its fail-closed exact-test discovery guard on
