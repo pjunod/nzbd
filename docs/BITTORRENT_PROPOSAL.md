@@ -2093,8 +2093,13 @@ operation before that observation. The test intentionally passes only while
 that control-plane fail-open behavior remains visible; it is a release blocker
 and a regression witness, not successful ENOSPC handling. The shared runner
 must discover and execute exactly one instance of both ignored storage proofs.
-Local native validation passes; five-platform replacement evidence remains
-pending.
+The
+[2026-08-13 replacement run](https://github.com/pjunod/nzbd/actions/runs/31654021866)
+passed both exact proofs and the runner's discriminating discovery negative
+control on Linux x86_64 GNU, Linux x86_64 musl, Linux aarch64 musl, macOS
+aarch64, and Windows x86_64. Every target observed the same sizing result:
+one 262,144-byte request, a zero-byte file, zero piece writes, `Paused` then
+`Live`, no stats-visible error, and no retry before observation.
 
 The
 [hardened native run](https://github.com/pjunod/nzbd/actions/runs/31345445318)

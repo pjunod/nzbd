@@ -115,10 +115,12 @@ The initialization-time proof injects `StorageFull` from `ensure_file_length`.
 Stable rqbit emits a warning log but does not put the failure into torrent
 stats: a zero-byte file reports successful paused initialization and moves to
 `Live` on resume without a stats error or retry before that observation. That
-control-plane fail-open result is a release blocker. Local native validation is
-green; replacement five-platform evidence remains pending. Neither proof is a
-daemon API or enforcing multi-root guard, so they do not establish general or
-operator-visible ENOSPC behavior and do not authorize production wiring.
+control-plane fail-open result is a release blocker. The
+[2026-08-13 replacement run](https://github.com/pjunod/nzbd/actions/runs/31654021866)
+reproduced it on all five native targets with one 262,144-byte sizing request,
+a zero-byte file, zero piece writes, and no stats-visible error. Neither proof
+is a daemon API or enforcing multi-root guard, so they do not establish general
+or operator-visible ENOSPC behavior and do not authorize production wiring.
 
 **Reviewer acceptance:** supported deployment examples must exercise the
 actual bind mounts or volumes, case/normalization behavior, low-space guard,
@@ -192,6 +194,7 @@ relying on one local host:
 | Cross-platform filesystem behavior | [2026-08-08 probe run](https://github.com/pjunod/nzbd/actions/runs/31240896567) and [review correction](https://github.com/pjunod/nzbd/actions/runs/31264422471) |
 | Native adapter matrix and daemon isolation | [2026-08-09 M0 run](https://github.com/pjunod/nzbd/actions/runs/31331872561) |
 | Write-time storage-fault containment | [2026-08-10 hardened five-platform run](https://github.com/pjunod/nzbd/actions/runs/31345445318) |
+| Initialization-time storage-fault fail-open witness | [2026-08-13 replacement five-platform run](https://github.com/pjunod/nzbd/actions/runs/31654021866) |
 
 These links are evidence snapshots, not evergreen approval. The reviewed
 commit must have its own green required checks.
