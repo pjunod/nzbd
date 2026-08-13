@@ -46,6 +46,11 @@ readonly work_dir="$(mktemp -d "${TMPDIR:-/tmp}/nzbd-rqbit-sizing-error.XXXXXX")
 trap 'rm -rf -- "$work_dir"' EXIT
 
 git clone --quiet --no-hardlinks "$source_dir" "$work_dir/rqbit"
+# Cloning a repository whose worktree is detached follows its configured
+# default branch, not necessarily the commit checked out in that worktree.
+# Reproduce the exact source that was classified above before applying the
+# contribution patch; CI intentionally supplies detached SHA checkouts.
+git -C "$work_dir/rqbit" checkout --quiet --detach "$source_head"
 if git -C "$work_dir/rqbit" apply --check "$repository_root/$patch_file"; then
   git -C "$work_dir/rqbit" apply "$repository_root/$patch_file"
 elif [[ "$source_variant" == "main" ]]; then
