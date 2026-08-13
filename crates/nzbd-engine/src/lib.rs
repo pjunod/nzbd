@@ -39,6 +39,7 @@ use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio::time::Duration;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
+use volumes::DiskGuardRoot;
 
 /// Does this error message name an out-of-space condition?
 ///
@@ -81,8 +82,8 @@ pub struct Tuning {
     pub propagation_delay: Duration,
     /// Queue `*.volNNN+MM.par2` files paused (delayed-par download).
     pub pause_extra_pars: bool,
-    /// Pause all downloading when free space on the dest volume drops
-    /// below this (0 = disabled).
+    /// Pause all downloading when free space on any configured write volume
+    /// drops below this (0 = disabled).
     pub min_free_disk_bytes: u64,
     /// Daily / monthly download quotas in bytes (0 = unlimited); force-
     /// priority jobs bypass quota (never the disk guard).
@@ -124,6 +125,9 @@ pub struct EngineConfig {
     pub state_dir: PathBuf,
     /// Completed jobs are written to `<dest_dir>/<job name>/`.
     pub dest_dir: PathBuf,
+    /// Every configured filesystem root the daemon may write. The enforcing
+    /// guard probes all of them and gates intake on the lowest reading.
+    pub disk_guard_roots: Vec<DiskGuardRoot>,
     pub tuning: Tuning,
     pub speed_limit_bps: Option<u64>,
     /// How many jobs may download at once, from the config file. `None`
@@ -154,6 +158,10 @@ impl EngineConfig {
         EngineConfig {
             servers,
             state_dir,
+            disk_guard_roots: vec![DiskGuardRoot {
+                label: "downloads".into(),
+                path: dest_dir.clone(),
+            }],
             dest_dir,
             tuning,
             max_active_downloads: None,
@@ -226,47 +234,44 @@ impl Engine {
         let (refetch, refetch_dupes) =
             crate::owner::plan_url_refetches(owner.pending_url_fetches());
 
-        // Destination free-space prober — OFF the owner loop. statvfs on a
-        // write-saturated FUSE/network destination blocks for seconds, and
-        // running it inline every 10th tick starved lease handout: speed
-        // sawtoothed 30% down and slowly back at >100 MiB/s (field report
-        // 2026-07-26). The owner reads the cached answer; only this task
-        // (on a blocking thread) ever touches the syscall.
-        if cfg.tuning.min_free_disk_bytes > 0 {
-            let disk_free = owner.disk_free_handle();
-            // Prime the cache once before the owner starts, so the very
-            // first guard tick sees a real number — a daemon booting onto a
-            // full disk must hold downloads within a second, not a probe
-            // cycle later.
-            let d = cfg.dest_dir.clone();
-            let free = tokio::task::spawn_blocking(move || crate::volumes::free_space(&d))
-                .await
-                .unwrap_or(u64::MAX);
-            disk_free.store(free, std::sync::atomic::Ordering::Relaxed);
-            let dest = cfg.dest_dir.clone();
+        // Multi-root free-space prober — OFF the owner loop and startup
+        // critical path. Each root has its own blocking task and deadline,
+        // so a wedged FUSE/network mount cannot prevent the daemon serving
+        // its API or suppress fresh readings from other volumes.
+        {
+            let disk_guard = owner.disk_guard_handle();
+            let roots = cfg.disk_guard_roots.clone();
             let probe_cancel = cancel.clone();
             tracker.spawn(async move {
+                let mut probe = crate::volumes::DiskGuardProbe::default();
                 let mut tick = tokio::time::interval(std::time::Duration::from_secs(10));
                 tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                 loop {
                     tokio::select! {
                         _ = probe_cancel.cancelled() => break,
                         _ = tick.tick() => {
-                            let d = dest.clone();
                             let started = std::time::Instant::now();
-                            let free =
-                                tokio::task::spawn_blocking(move || crate::volumes::free_space(&d))
-                                    .await
-                                    .unwrap_or(u64::MAX);
+                            let Some(reading) = probe
+                                .probe_until_cancelled(
+                                    &roots,
+                                    std::time::Duration::from_secs(2),
+                                    &probe_cancel,
+                                )
+                                .await
+                            else {
+                                break;
+                            };
                             let ms = started.elapsed().as_millis() as u64;
                             if ms > 2000 {
                                 tracing::warn!(
                                     ms,
-                                    "free-space probe (statvfs) on the destination is slow — volume saturated? \
-                                     the disk-low guard reacts up to one probe late; nothing else waits on this"
+                                    roots = roots.len(),
+                                    complete = reading.all_roots_known,
+                                    "multi-root free-space probe was delayed or hit a per-root \
+                                     deadline; retaining last-known data for any unresponsive volume"
                                 );
                             }
-                            disk_free.store(free, std::sync::atomic::Ordering::Relaxed);
+                            disk_guard.store(Arc::new(reading));
                         }
                     }
                 }
@@ -601,6 +606,21 @@ impl EngineHandle {
             job: Box::new(job),
             fold_journals,
             emit_finished,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| EngineError::Closed)
+    }
+
+    /// Atomically replace an existing authority copy without ever inserting a
+    /// missing job, returning true only after its queue snapshot commits.
+    /// Used before and after awaited terminal side effects so demotion or an
+    /// ordinary snapshot I/O failure cannot leave an in-memory-only finalizer
+    /// key or resurrect a job the node just lost.
+    pub async fn import_job_if_present(&self, job: nzbd_types::Job) -> Result<bool, EngineError> {
+        let (tx, rx) = oneshot::channel();
+        self.send(QueueCommand::ImportJobIfPresent {
+            job: Box::new(job),
             reply: tx,
         })
         .await?;

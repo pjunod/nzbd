@@ -2274,17 +2274,22 @@ function storageModels(s) {
     return {
       key: "storage:" + (v.path || i), kind: "storage",
       cls: "storage-row" + level,
-      label: v.label || "path",
+      label: (v.label || "path") +
+        (v.current === false && v.available_bytes != null ? " · last known" : ""),
       path: v.path || "—",
       pct: hasReading ? Math.round(pct) + "%" : "measuring…",
       fill: hasReading ? pct.toFixed(1) + "%" : "0%",
       used: hasReading ? fmtBytes(used) + " / " + fmtBytes(total) : "capacity unavailable",
       free: hasReading ? fmtBytes(available) + " free" : "",
       tip: hasReading
-        ? (v.label || "path") + " on " + (v.path || "") + " — " +
+        ? (v.label || "path") +
+          (v.current === false && v.available_bytes != null ? " (last known)" : "") +
+          " on " + (v.path || "") + " — " +
           fmtBytes(used) + " used of " + fmtBytes(total) +
           " (" + Math.round(pct) + "%)"
-        : (v.label || "path") + " on " + (v.path || "") +
+        : (v.label || "path") +
+          (v.current === false && v.available_bytes != null ? " (last known)" : "") +
+          " on " + (v.path || "") +
           " — waiting for a capacity reading",
     };
   });
@@ -2486,9 +2491,16 @@ function renderStatus() {
   if (s.disk_low) {
     // Say WHICH signal stopped it. A statvfs forecast that reads fine
     // while every write fails is the whole reason this distinction exists.
-    holds.push(s.enospc_observed
-      ? `out of space on the destination volume — downloads held (observed from a write${s.enospc_where ? ": " + s.enospc_where : ""}); resume the queue once space is free`
-      : "low disk space on the destination volume — downloads held until space is freed");
+    const limitingRoot = s.disk_guard_label || s.disk_guard_path || "a configured write volume";
+    const limitingFree = Number.isFinite(s.disk_guard_free_bytes)
+      ? ` (${fmtBytes(s.disk_guard_free_bytes)} free)` : "";
+    holds.push(!s.disk_guard_write_latched && s.disk_guard_all_roots_known === false
+      ? `not every configured storage root could be checked — downloads remain held${Number.isFinite(s.disk_guard_free_bytes) ? `; lowest known reading is ${fmtBytes(s.disk_guard_free_bytes)} free` : ""}`
+      : !s.disk_guard_write_latched && s.disk_guard_free_bytes == null
+      ? "checking configured storage before downloads begin"
+      : s.disk_guard_write_latched
+      ? `out of space on a configured write volume — downloads held (observed from a write${s.enospc_where ? ": " + s.enospc_where : ""}); resume the queue once space is free`
+      : `low disk space on ${limitingRoot}${limitingFree} — downloads held until space is freed`);
   }
   if (s.quota_reached) holds.push("download quota reached — normal jobs held (force-priority still runs)");
   if (s.blocked_servers && s.blocked_servers.length)

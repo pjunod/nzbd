@@ -126,7 +126,10 @@ code. The daemon does not depend on it. The boundary currently provides:
   non-test build; normal admission still forces `storage_factory: None` and
   requires one explicit non-zero listen port. This proves containment of an
   injected write-time fault and a future interception point, not general
-  ENOSPC behavior. There is no daemon disk-guard latch, API responsiveness
+  ENOSPC behavior. The daemon now has a protocol-neutral multi-root guard,
+  fail-safe incomplete-probe recovery, cluster placement enforcement, and
+  local/per-node limiting-volume status, but no torrent path reports this
+  injected signal into that guard. There is still no torrent API-responsiveness
   proof, new-request pause, or continued-upload proof, and stable rqbit
   currently reports the affected torrent as an error rather than a paused
   download;

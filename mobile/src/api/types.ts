@@ -67,6 +67,7 @@ export interface StoragePath {
   path: string;
   available_bytes: number | null;
   total_bytes: number | null;
+  current?: boolean;
 }
 
 export interface StatusDto {
@@ -78,6 +79,11 @@ export interface StatusDto {
   session_downloaded_bytes: number;
   download_paused: boolean;
   disk_low: boolean;
+  disk_guard_free_bytes?: number | null;
+  disk_guard_label?: string | null;
+  disk_guard_path?: string | null;
+  disk_guard_write_latched?: boolean;
+  disk_guard_all_roots_known?: boolean;
   enospc_observed: number;
   enospc_where: string | null;
   quota_reached: boolean;

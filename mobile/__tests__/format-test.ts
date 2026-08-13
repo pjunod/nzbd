@@ -1,13 +1,15 @@
 import {
   criticalStorage,
+  diskGuardMessage,
   formatBytes,
   jobProgress,
   jobStatusKey,
   jobStatusLabel,
   normalizeServerUrl,
+  storageEvidenceLabel,
   storageUsage,
 } from '../src/api/format';
-import { JobSummary } from '../src/api/types';
+import { JobSummary, StatusDto } from '../src/api/types';
 
 const job = (changes: Partial<JobSummary> = {}): JobSummary => ({
   id: 1,
@@ -38,6 +40,66 @@ const job = (changes: Partial<JobSummary> = {}): JobSummary => ({
 });
 
 describe('API presentation helpers', () => {
+  test('distinguishes forecast holds from observed write failures', () => {
+    const base = {
+      disk_low: true,
+      disk_guard_label: 'category: tv',
+      disk_guard_path: '/library/tv',
+      disk_guard_free_bytes: 1024,
+      enospc_observed: 0,
+      enospc_where: null,
+    } as StatusDto;
+    expect(diskGuardMessage(base)).toContain('category: tv (1.00 KiB free)');
+    expect(
+      diskGuardMessage({
+        ...base,
+        disk_guard_write_latched: true,
+        enospc_observed: 1,
+        enospc_where: 'write /scratch/job.part',
+      }),
+    ).toBe('Downloads are held because a write ran out of space: write /scratch/job.part.');
+  });
+
+  test('labels only retained capacity as last known', () => {
+    expect(
+      storageEvidenceLabel({
+        label: 'library',
+        path: '/library',
+        available_bytes: 10,
+        total_bytes: 100,
+        current: false,
+      }),
+    ).toBe('library · last known');
+    expect(
+      storageEvidenceLabel({
+        label: 'library',
+        path: '/library',
+        available_bytes: null,
+        total_bytes: null,
+        current: false,
+      }),
+    ).toBe('library');
+  });
+
+  test('does not describe a high known reading as low during an incomplete hold', () => {
+    expect(
+      diskGuardMessage({
+        disk_low: true,
+        disk_guard_all_roots_known: false,
+        disk_guard_free_bytes: 1024 * 1024 * 1024,
+        disk_guard_write_latched: false,
+      } as StatusDto),
+    ).toBe(
+      'Downloads remain held because not every configured storage root could be checked; the lowest known reading is 1.00 GiB free.',
+    );
+  });
+
+  test('preserves the legacy low-space message for an older daemon response', () => {
+    expect(diskGuardMessage({ disk_low: true } as StatusDto)).toBe(
+      'Downloads are held because the destination volume is low on space.',
+    );
+  });
+
   test('normalizes a host and supplies the LAN-friendly HTTP scheme', () => {
     expect(normalizeServerUrl(' 192.168.1.20:6789 ')).toBe('http://192.168.1.20:6789');
     expect(normalizeServerUrl('https://downloads.example.test')).toBe(

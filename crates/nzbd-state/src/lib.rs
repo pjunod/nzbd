@@ -389,7 +389,7 @@ pub struct SnapshotStore {
 
 impl SnapshotStore {
     pub fn open(dir: &Path) -> Result<SnapshotStore, StateError> {
-        fsx::create_dir_all(dir)?;
+        fsx::create_dir_all_durable(dir)?;
         Ok(SnapshotStore {
             path: dir.join("queue.json"),
             tmp: dir.join("queue.json.tmp"),
@@ -438,9 +438,7 @@ impl SnapshotStore {
             ));
         }
         fsx::rename(&self.tmp, &self.path)?;
-        if let Ok(d) = File::open(&self.dir) {
-            let _ = d.sync_all(); // best-effort directory fsync
-        }
+        fsx::sync_dir(&self.dir)?;
         Ok(bytes.len() as u64)
     }
 
@@ -819,6 +817,25 @@ mod tests {
         assert!(loaded.download_paused);
         assert_eq!(loaded.speed_limit_bps, Some(1_000_000));
         assert!(!dir.path().join("queue.json.tmp").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn snapshot_commit_reports_directory_sync_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SnapshotStore::open(dir.path()).unwrap();
+        let doc = QueueSnapshotDoc {
+            schema_version: QUEUE_SCHEMA_VERSION,
+            jobs: vec![],
+            next_job_id: 1,
+            next_file_id: 1,
+            download_paused: false,
+            speed_limit_bps: None,
+            max_active_downloads: 1,
+        };
+        crate::fsx::fail_next_dir_sync();
+        let error = store.save(&doc).unwrap_err();
+        assert!(error.to_string().contains("fsync directory"));
     }
 
     #[test]

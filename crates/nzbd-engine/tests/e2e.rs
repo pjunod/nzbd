@@ -896,11 +896,19 @@ async fn disk_low_guard_flips_from_the_cached_probe() {
     ))
     .await
     .expect("engine spawn");
-    // The cache is primed before the owner starts, so this flips on the
-    // first guard tick (~1 s); the deadline is pure slack.
+    // A nonzero floor starts fail-safe, while the first probe runs without
+    // delaying Engine::spawn. Wait for the held snapshot to carry that
+    // completed probe's exact evidence rather than accepting the intentional
+    // initial held/unknown snapshot.
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     loop {
-        if engine.snapshot().disk_low {
+        let snap = engine.snapshot();
+        if snap.disk_low && snap.disk_guard_free_bytes.is_some() {
+            assert_eq!(snap.disk_guard_label.as_deref(), Some("downloads"));
+            assert_eq!(
+                snap.disk_guard_path.as_deref(),
+                Some(tmp.path().join("dest").to_string_lossy().as_ref())
+            );
             break;
         }
         assert!(
@@ -908,6 +916,40 @@ async fn disk_low_guard_flips_from_the_cached_probe() {
             "disk_low never flipped from the cached probe"
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    engine.shutdown().await;
+}
+
+#[tokio::test]
+async fn storage_inventory_publishes_when_the_enforcing_floor_is_disabled() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join("dest")).unwrap();
+    let mut tuning = test_tuning();
+    tuning.min_free_disk_bytes = 0;
+    let engine = Engine::spawn(EngineConfig::single_node(
+        vec![],
+        tmp.path().join("state"),
+        tmp.path().join("dest"),
+        tuning,
+        None,
+    ))
+    .await
+    .expect("engine spawn");
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let snapshot = engine.snapshot();
+        if !snapshot.storage_volumes.is_empty() {
+            assert!(!snapshot.disk_low);
+            assert!(snapshot.storage_volumes[0].current);
+            assert_eq!(snapshot.storage_volumes[0].label, "downloads");
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "storage inventory was not published with the floor disabled"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
     engine.shutdown().await;
 }
@@ -944,6 +986,7 @@ async fn an_observed_enospc_latches_the_disk_guard() {
         let snap = engine.snapshot();
         if snap.disk_low {
             assert_eq!(snap.enospc_observed, 1);
+            assert!(snap.disk_guard_write_latched);
             assert!(
                 snap.enospc_where
                     .as_deref()
@@ -975,6 +1018,7 @@ async fn an_observed_enospc_latches_the_disk_guard() {
     }
     // The count is a record, not a state: it survives the clear.
     assert_eq!(engine.snapshot().enospc_observed, 1);
+    assert!(!engine.snapshot().disk_guard_write_latched);
     engine.shutdown().await;
 }
 

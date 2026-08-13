@@ -151,7 +151,7 @@ surface that must be extended:
 | History store (`nzbd-state/src/history.rs`) | Terminal record format, cursor ordering, and cluster-wide durable tombstones | Torrent terminal records and payload-aware delete outcomes |
 | Client registry (`nzbd-api`) | Consumer attribution model | qBittorrent polling attribution |
 | UI and mobile shells (`nzbd-api/ui`, `mobile/`) | Existing navigation, controls, and additive JSON parsing | Protocol presentation and old-client tests for new values, not just new fields |
-| Enforcing disk guard (`nzbd-engine`) | ENOSPC latch and one-root `dest_dir` forecast | Multi-root enforcement and limiting-path publication after `REGRAB_LOOP_PLAN` F1–F3 |
+| Enforcing disk guard (`nzbd-engine`) | ENOSPC latch plus a multi-root forecast over the same configured storage inventory the API displays; the limiting roles, path, and free bytes are published | Route torrent-adapter storage faults and pause/upload recovery policy into the guard after the upstream gates pass |
 | NZB watch task (`nzbd/src/main.rs`) | Directory scan and rename-on-result pattern | Parameterized extension/admission callback or a distinct torrent watch task |
 | Cluster control plane (`nzbd-cluster`) | Leader fencing and whole-job lease model | Later exclusive torrent lease; coordinate with the already-planned `Segment` lease variant |
 
@@ -1077,20 +1077,48 @@ Do not count uploaded bytes against a download quota. Expose torrent upload
 totals separately. This is a documented behavior expansion for operators who
 enable BitTorrent; Usenet-only totals are unchanged.
 
-### 8.5 The disk guard covers torrent and resume paths
+### 8.5 The disk guard covers every configured write volume
 
-The enforcing low-disk task in `nzbd-engine` watches only `dest_dir`. The API
-also has a multi-root storage prober, but it is display-only and never drives
-`disk_low`. Torrent support therefore needs a new multi-root enforcing guard,
-not one additional path in an existing guard: probe every configured write
-root, gate on the limiting volume, and publish the limiting path/free-byte
-reading. An observed ENOSPC/EDQUOT from the torrent adapter latches the same
-immediate guard used by writers and PP.
+The enforcing task in `nzbd-engine` and the API storage panel derive their
+inventory from the same config method. Node-local state, shared cluster state
+when enabled, downloads, working, failed, intermediate, temporary, watch, and
+category roots are expanded. Exact path duplicates retain all of their role
+labels while sharing one probe. On platforms that expose stable filesystem
+identity, distinct paths are grouped by containing filesystem so several roles
+on one mount remain one failure domain. Windows conservatively keeps distinct
+path rows; the minimum is still enforced across every row.
 
-[`REGRAB_LOOP_PLAN.md`](REGRAB_LOOP_PLAN.md) F1–F3 must land before this work.
-That open defect is an existing write path filling a volume without tripping
-the guard; adding a second writer first would make field failures ambiguous
-and inherit a known unsafe edge.
+Each configured root is measured independently on a detached OS thread with a
+two-second response deadline after admission. A process-wide 64-call permit pool remains held
+until each filesystem syscall actually returns, including across hot reloads,
+so path churn cannot accumulate unbounded wedged work. The first cycle starts
+immediately but is not awaited by daemon startup; later cycles begin ten seconds
+after the prior bounded cycle finishes. Permit loss to an older wedged config
+can serialize the current roots, so a degraded recovery cycle may exceed two
+seconds even though each admitted filesystem call keeps its own response bound. A wedged mount
+therefore cannot block the owner/API or suppress current readings from other
+volumes while probe capacity remains. A timeout or
+permission error retains that root's last-known reading, marks the cycle
+incomplete, and cannot clear an existing threshold hold or observed-write
+latch. When a nonzero floor is configured, startup holds fail-safe until the
+first complete asynchronous reading; a zero floor keeps observability enabled
+without holding intake.
+
+The lowest reading gates local engine leasing and publishes its joined roles,
+common configured path, free bytes, and active write-latch cause through the
+engine snapshot and native status API. Cluster workers publish the hold and
+request zero free download and post-processing slots while it is active; the
+leader independently excludes those workers from new placement and releases an
+unleased delegation if its target becomes held. `/api/v1/cluster` publishes the same limiting facts
+for each node, while the ordinary status response describes the node serving
+that engine snapshot.
+
+[`REGRAB_LOOP_PLAN.md`](REGRAB_LOOP_PLAN.md) F1–F3 landed before this expansion.
+Observed ENOSPC/EDQUOT from existing writers and post-processing still latches
+the same immediate guard even when a mounted filesystem's forecast lies. The
+dormant torrent adapter does not yet report its `StorageFull` signal into that
+daemon path; the guard is ready to receive it, not evidence that production
+torrent I/O is enabled.
 
 A full disk pauses new piece requests and metadata writes but keeps the API
 and existing uploads alive where the library can serve already-present data.
@@ -2078,10 +2106,11 @@ involved. The custom-storage and broad-listen helpers are absent from non-test
 builds; the normal adapter still forbids custom storage and accepts only one
 explicit non-zero listen port. This pins a write-time engine seam and current
 containment behavior, but deliberately does not call the §14 ENOSPC row green:
-rqbit transitions the write-faulted torrent to `Error`, and M2 must latch
-nzbd's multi-root disk guard, stop new piece requests, expose the limiting root,
-and choose the documented pause/upload fallback. No daemon API or production
-torrent writer exists to prove those outcomes yet.
+rqbit transitions the write-faulted torrent to `Error`, and M2 must route that
+signal into nzbd's existing multi-root guard, stop new piece requests, and
+choose the documented pause/upload fallback. The guard already exposes its
+limiting volume; no daemon torrent API or production torrent writer exists to
+prove the remaining outcomes yet.
 
 A second ignored crate-private probe now covers the initialization-time path.
 It injects `StorageFull` from `ensure_file_length` while adding a paused,
@@ -2112,9 +2141,9 @@ also types checksum cancellation and proves a concurrent pause suppresses only
 that marker, not a storage failure. Exact stable and documented-main verifier
 legs block pull requests; the moving-main compatibility leg remains advisory
 there and required on pushes and the weekly schedule. This candidate does not
-satisfy the storage policy by itself: it still needs human review,
-upstream acceptance, a stable release, and a daemon-owned disk guard, pause,
-API, and recovery contract before production wiring.
+satisfy the storage policy by itself: it still needs human review, upstream
+acceptance, a stable release, and daemon-owned torrent fault routing, pause,
+API, and recovery behavior before production wiring.
 
 The
 [hardened native run](https://github.com/pjunod/nzbd/actions/runs/31345445318)

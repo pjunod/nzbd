@@ -15,9 +15,11 @@ use crate::queue::{
     SegRef, SelectionCtx,
 };
 use crate::rate::{RateLimiter, SpeedMeter};
-use crate::snapshot::{JobSummary, QueueSnapshot, SharedSnapshot};
+use crate::snapshot::{JobSummary, QueueSnapshot, SharedSnapshot, StorageVolumeSnapshot};
+use crate::volumes::DiskGuardReading;
 use crate::writer::{spawn_writer, WriteCmd, WriterHandle};
 use crate::Tuning;
+use arc_swap::ArcSwap;
 use nzbd_nzb::ParsedNzb;
 use nzbd_state::{FsJournal, JobJournals, JournalRecord, SnapshotStore, UncleanMarker};
 use nzbd_types::{
@@ -25,7 +27,6 @@ use nzbd_types::{
 };
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio::time::{Duration, Instant, MissedTickBehavior};
@@ -142,6 +143,13 @@ pub(crate) enum QueueCommand {
         fold_journals: bool,
         emit_finished: bool,
         reply: oneshot::Sender<()>,
+    },
+    /// Replace only an authority copy that still exists. This is the fenced
+    /// terminal-update path: a demoted worker must never resurrect a job that
+    /// `RetainJobs` already removed while an external disposition awaited.
+    ImportJobIfPresent {
+        job: Box<Job>,
+        reply: oneshot::Sender<bool>,
     },
     /// Clone a job's full current state out (for grants and completion
     /// reports).
@@ -417,13 +425,20 @@ pub(crate) struct Owner {
     /// slow state volume stretches the save cadence instead of consuming
     /// the owner loop.
     last_save_ms: u64,
-    /// Destination free space, updated by a dedicated prober task (engine
-    /// spawn wires it). The owner NEVER calls statvfs itself: on a
+    /// Lowest free-space reading across every configured write root, updated
+    /// by a dedicated prober task (engine spawn wires it). The owner NEVER
+    /// calls statvfs itself: on a
     /// write-saturated FUSE/network destination that syscall blocks for
     /// seconds, and it used to run inline every 10th tick — starving lease
     /// handout and cutting throughput 30% on a sawtooth (field report
-    /// 2026-07-26). `u64::MAX` = not yet measured; never trips the guard.
-    disk_free: Arc<AtomicU64>,
+    /// 2026-07-26). An initially unknown reading never trips the guard; an
+    /// incomplete later cycle cannot clear a hold that already exists.
+    disk_guard: Arc<ArcSwap<DiskGuardReading>>,
+    /// The exact reading used for the most recent admission decision.
+    /// Snapshot publication must not reload `disk_guard`: the prober may
+    /// publish a newer value between decision and status publication, which
+    /// would pair one cycle's hold with another cycle's evidence.
+    evaluated_disk_guard: Arc<DiskGuardReading>,
     marker: UncleanMarker,
     /// Queue-authority persistence (snapshot save/compact). Worker-mode
     /// engines run with this off; journals stay on regardless.
@@ -473,6 +488,32 @@ pub(crate) struct Owner {
     /// Round-robin cursor over the active set, advanced per granted
     /// lease. See `SelectionCtx::rotate`.
     rotate: usize,
+}
+
+fn disk_guard_decision(
+    was_held: bool,
+    mut write_latched: bool,
+    reading: &DiskGuardReading,
+    floor: u64,
+) -> (bool, bool) {
+    let free = reading.available_bytes;
+    let clear_at = floor.saturating_mul(2);
+    if write_latched
+        && clear_at > 0
+        && reading.all_roots_known
+        && free.is_some_and(|available| available >= clear_at)
+    {
+        write_latched = false;
+    }
+    let below_floor = floor > 0 && free.is_some_and(|available| available < floor);
+    // Once held, an incomplete cycle is not recovery evidence. Retain the
+    // hold until every configured root was measured and the minimum is above
+    // the threshold (or twice it for an observed-write latch).
+    let incomplete_hold = was_held && !reading.all_roots_known;
+    (
+        write_latched,
+        write_latched || below_floor || incomplete_hold,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -572,6 +613,7 @@ impl Owner {
             state.max_active_downloads = crate::queue::clamp_active_downloads(n);
         }
 
+        let initial_disk_hold = tuning.min_free_disk_bytes > 0;
         Ok(Owner {
             state,
             attempts: HashMap::new(),
@@ -612,10 +654,14 @@ impl Owner {
             dirty: false,
             last_save: Instant::now(),
             last_save_ms: 0,
-            disk_free: Arc::new(AtomicU64::new(u64::MAX)),
+            disk_guard: Arc::new(ArcSwap::from_pointee(DiskGuardReading::default())),
+            evaluated_disk_guard: Arc::new(DiskGuardReading::default()),
             volumes: crate::volumes::VolumeBook::load(state_dir, journal_suffix),
             quota_reached: false,
-            disk_low: false,
+            // A configured floor starts fail-safe until the first complete
+            // asynchronous probe. Startup remains nonblocking, but no work
+            // can slip through the measurement window.
+            disk_low: initial_disk_hold,
             enospc_latched: false,
             enospc_observed: 0,
             enospc_where: None,
@@ -1132,8 +1178,43 @@ impl Owner {
                 emit_finished,
                 reply,
             } => {
-                self.import_job(*job, fold_journals, emit_finished);
+                let _ = self.import_job(*job, fold_journals, emit_finished);
                 let _ = reply.send(());
+            }
+            QueueCommand::ImportJobIfPresent { job, reply } => {
+                let id = job.id;
+                let previous = self.state.job(id).cloned();
+                let previous_delegated = self.delegated.get(&id).cloned();
+                let previous_mirror = self.mirror.get(&id).copied();
+                let committed = previous.is_some() && self.import_job(*job, false, false);
+                if !committed {
+                    // Atomic means memory and disk agree. A failed snapshot
+                    // commit must not leave an in-memory-only PP_DONE or
+                    // finalization key that later scans mistake for durable.
+                    let _ = self.remove_job_silent(id);
+                    if let Some(previous) = previous {
+                        self.state.jobs.push(previous);
+                    }
+                    match previous_delegated {
+                        Some(node) => {
+                            self.delegated.insert(id, node);
+                        }
+                        None => {
+                            self.delegated.remove(&id);
+                        }
+                    }
+                    match previous_mirror {
+                        Some(stats) => {
+                            self.mirror.insert(id, stats);
+                        }
+                        None => {
+                            self.mirror.remove(&id);
+                        }
+                    }
+                    self.publish_now();
+                    self.bump_epoch();
+                }
+                let _ = reply.send(committed);
             }
             QueueCommand::ExportJob { job, reply } => {
                 let _ = reply.send(self.state.job(job).cloned().map(Box::new));
@@ -1300,7 +1381,7 @@ impl Owner {
 
     // -- cluster: import / export / delegation / adoption --------------------
 
-    fn import_job(&mut self, mut job: Job, fold_journals: bool, emit_finished: bool) {
+    fn import_job(&mut self, mut job: Job, fold_journals: bool, emit_finished: bool) -> bool {
         // Normalize transient state from the wire.
         for f in &mut job.files {
             for s in &mut f.segments {
@@ -1340,9 +1421,7 @@ impl Owner {
         }
         tracing::info!(job = job_id.0, %name, ?status, "job imported");
         self.dirty = true;
-        if self.persist {
-            self.save_snapshot();
-        }
+        let committed = self.persist && self.save_snapshot();
         self.publish_now();
         if terminal && emit_finished {
             self.emit(Event::JobFinished {
@@ -1353,6 +1432,7 @@ impl Owner {
             });
         }
         self.bump_epoch();
+        committed
     }
 
     fn remove_job_silent(&mut self, job_id: JobId) -> bool {
@@ -2293,8 +2373,8 @@ impl Owner {
 
     /// The prober task's write side, handed out at spawn (lib.rs) so the
     /// statvfs syscall lives on a blocking thread, never in this loop.
-    pub(crate) fn disk_free_handle(&self) -> Arc<AtomicU64> {
-        self.disk_free.clone()
+    pub(crate) fn disk_guard_handle(&self) -> Arc<ArcSwap<DiskGuardReading>> {
+        self.disk_guard.clone()
     }
 
     /// A write path hit ENOSPC/EDQUOT. Hold intake NOW.
@@ -2314,7 +2394,7 @@ impl Owner {
             tracing::error!(
                 whence,
                 observed = self.enospc_observed,
-                "out of space on the destination volume — holding all downloads (observed from a \
+                "out of space on a configured write volume — holding all downloads (observed from a \
                  write, not from the free-space probe)"
             );
         }
@@ -2330,52 +2410,65 @@ impl Owner {
     pub(crate) fn clear_enospc_latch(&mut self) {
         if self.enospc_latched {
             self.enospc_latched = false;
+            // Drop only the previous latch-derived hold before reevaluating.
+            // A current below-floor reading immediately restores disk_low;
+            // an unknown reading does not defeat the explicit override.
+            self.disk_low = false;
             tracing::info!(
                 observed = self.enospc_observed,
                 "out-of-space latch cleared by the operator"
             );
-            self.update_guards();
+            self.update_disk_guard();
             self.publish_now();
         }
     }
 
-    fn update_guards(&mut self) {
+    fn update_disk_guard(&mut self) {
+        let reading = self.disk_guard.load_full();
+        let free = reading.available_bytes;
         // Hysteresis: a mount that lied once has to prove itself with room
         // to spare before intake resumes, so a volume hovering at the
         // floor cannot flap the whole fleet. With no floor configured the
         // latch is the operator's to clear.
-        if self.enospc_latched {
-            let free = self.disk_free.load(Ordering::Relaxed);
-            let clear_at = self.tuning.min_free_disk_bytes.saturating_mul(2);
-            if clear_at > 0 && free >= clear_at {
-                self.enospc_latched = false;
-                tracing::info!(
-                    free,
-                    clear_at,
-                    "out-of-space latch cleared — the volume reports twice the floor free"
-                );
-            }
-        }
-        let below_floor = self.tuning.min_free_disk_bytes > 0
-            && self.disk_free.load(Ordering::Relaxed) < self.tuning.min_free_disk_bytes;
         let was = self.disk_low;
-        self.disk_low = self.enospc_latched || below_floor;
+        let was_latched = self.enospc_latched;
+        (self.enospc_latched, self.disk_low) = disk_guard_decision(
+            was,
+            self.enospc_latched,
+            &reading,
+            self.tuning.min_free_disk_bytes,
+        );
+        self.evaluated_disk_guard = reading.clone();
+        if was_latched && !self.enospc_latched {
+            tracing::info!(
+                free = free.unwrap_or_default(),
+                clear_at = self.tuning.min_free_disk_bytes.saturating_mul(2),
+                limiting_path = ?reading.limiting_path,
+                "out-of-space latch cleared — every volume reports twice the floor free"
+            );
+        }
         if self.disk_low != was {
             if self.disk_low {
                 tracing::warn!(
-                    free = self.disk_free.load(Ordering::Relaxed),
+                    free = free.unwrap_or_default(),
                     floor = self.tuning.min_free_disk_bytes,
+                    limiting_label = ?reading.limiting_label,
+                    limiting_path = ?reading.limiting_path,
                     observed_enospc = self.enospc_observed,
-                    "destination volume low on space — downloads held"
+                    "configured write volume low on space — downloads held"
                 );
             } else {
                 tracing::info!(
-                    free = self.disk_free.load(Ordering::Relaxed),
+                    free = free.unwrap_or_default(),
+                    limiting_path = ?reading.limiting_path,
                     "disk space recovered — downloads resume"
                 );
             }
             self.publish_now();
         }
+    }
+
+    fn update_quota_guard(&mut self) {
         if self.tuning.daily_quota_bytes > 0 || self.tuning.monthly_quota_bytes > 0 {
             let (day, month) = self
                 .volumes
@@ -2401,14 +2494,17 @@ impl Owner {
         let tick_started = Instant::now();
         self.guard_tick = self.guard_tick.wrapping_add(1);
         self.settle_download_labels();
-        // Guards on the FIRST tick and every 10th after (== 1, not == 0:
-        // a fresh boot should know it is out of disk within a second, not
-        // ten). NOT `is_multiple_of`: stabilized in 1.87, MSRV is 1.85.
-        let mut guards_ms = 0u64;
+        // Reading the enforcing disk cache is memory-only, so do it every
+        // owner tick. Quota totals still touch peer files and retain their
+        // 10-second cadence. NOT `is_multiple_of`: stabilized in 1.87;
+        // the workspace MSRV is 1.85.
+        let t = Instant::now();
+        self.update_disk_guard();
+        let mut guards_ms = t.elapsed().as_millis() as u64;
         if self.guard_tick % 10 == 1 {
             let t = Instant::now();
-            self.update_guards();
-            guards_ms = t.elapsed().as_millis() as u64;
+            self.update_quota_guard();
+            guards_ms = guards_ms.saturating_add(t.elapsed().as_millis() as u64);
         }
         let mut volumes_ms = 0u64;
         if self.guard_tick % 30 == 0 {
@@ -2642,11 +2738,31 @@ impl Owner {
             .map(|(id, _)| id.0)
             .collect();
         blocked_servers.sort_unstable();
+        let disk_guard = &self.evaluated_disk_guard;
         let snap = QueueSnapshot {
             up_since_unix: self.up_since_unix,
             download_paused: self.state.download_paused,
             quota_reached: self.quota_reached,
             disk_low: self.disk_low,
+            disk_guard_free_bytes: disk_guard.available_bytes,
+            disk_guard_label: disk_guard.limiting_label.clone(),
+            disk_guard_path: disk_guard
+                .limiting_path
+                .as_ref()
+                .map(|path| path.to_string_lossy().into_owned()),
+            disk_guard_write_latched: self.enospc_latched,
+            disk_guard_all_roots_known: disk_guard.all_roots_known,
+            storage_volumes: disk_guard
+                .volumes
+                .iter()
+                .map(|volume| StorageVolumeSnapshot {
+                    label: volume.label.clone(),
+                    path: volume.path.to_string_lossy().into_owned(),
+                    available_bytes: volume.available_bytes,
+                    total_bytes: volume.total_bytes,
+                    current: volume.current,
+                })
+                .collect(),
             enospc_observed: self.enospc_observed,
             enospc_where: self.enospc_where.clone(),
             blocked_servers,
@@ -2702,10 +2818,10 @@ impl Owner {
         self.shared.store(Arc::new(snap));
     }
 
-    fn save_snapshot(&mut self) {
+    fn save_snapshot(&mut self) -> bool {
         if !self.persist {
             self.dirty = false;
-            return;
+            return false;
         }
         let doc = self.state.to_doc();
         let write_started = Instant::now();
@@ -2723,7 +2839,7 @@ impl Owner {
                 if matches!(e, nzbd_state::StateError::Corrupt(_)) {
                     self.persist = false; // deposed: stop writing authority state
                 }
-                return;
+                return false;
             }
         };
         // Duration and throughput, remembered for the adaptive spacing and
@@ -2770,6 +2886,7 @@ impl Owner {
         }
         self.dirty = false;
         self.last_save = Instant::now();
+        true
     }
 
     fn emit(&self, ev: Event) {
@@ -3005,5 +3122,76 @@ mod tests {
         assert_eq!(save_spacing(65_000), Duration::from_secs(300));
         // …and the cap holds even for absurd values.
         assert_eq!(save_spacing(u64::MAX / 20), Duration::from_secs(300));
+    }
+
+    #[test]
+    fn incomplete_probe_cannot_clear_a_forecast_hold() {
+        let reading = DiskGuardReading {
+            available_bytes: Some(10_000),
+            all_roots_known: false,
+            ..Default::default()
+        };
+        assert_eq!(
+            disk_guard_decision(true, false, &reading, 100),
+            (false, true)
+        );
+    }
+
+    #[test]
+    fn incomplete_probe_cannot_clear_an_observed_write_latch() {
+        let reading = DiskGuardReading {
+            available_bytes: Some(10_000),
+            all_roots_known: false,
+            ..Default::default()
+        };
+        assert_eq!(disk_guard_decision(true, true, &reading, 100), (true, true));
+    }
+
+    #[test]
+    fn recovered_high_known_root_plus_unknown_sibling_retains_hold() {
+        let reading = DiskGuardReading {
+            available_bytes: Some(1_000_000_000),
+            all_roots_known: false,
+            ..Default::default()
+        };
+        assert_eq!(
+            disk_guard_decision(true, false, &reading, 100),
+            (false, true)
+        );
+    }
+
+    #[test]
+    fn complete_high_probe_releases_a_forecast_hold() {
+        let reading = DiskGuardReading {
+            available_bytes: Some(101),
+            all_roots_known: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            disk_guard_decision(true, false, &reading, 100),
+            (false, false)
+        );
+    }
+
+    #[test]
+    fn write_latch_requires_twice_the_floor_from_a_complete_probe() {
+        let below_clear = DiskGuardReading {
+            available_bytes: Some(199),
+            all_roots_known: true,
+            ..Default::default()
+        };
+        let at_clear = DiskGuardReading {
+            available_bytes: Some(200),
+            all_roots_known: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            disk_guard_decision(true, true, &below_clear, 100),
+            (true, true)
+        );
+        assert_eq!(
+            disk_guard_decision(true, true, &at_clear, 100),
+            (false, false)
+        );
     }
 }

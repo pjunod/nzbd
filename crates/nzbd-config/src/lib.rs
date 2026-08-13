@@ -37,6 +37,23 @@ pub struct Config {
     pub cluster: ClusterConfig,
 }
 
+/// One configured filesystem root the daemon writes to.
+///
+/// Labels are operator-facing roles (for example `state` or `category: tv`),
+/// while paths are already expanded. The engine uses the same inventory as
+/// the API storage panel so a displayed filesystem cannot be omitted from the
+/// enforcing disk guard.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StorageRoot {
+    pub label: String,
+    pub path: PathBuf,
+}
+
+/// Bound the number of independent filesystem probes and their detached OS
+/// threads. A config with more write roots is almost certainly generated or
+/// malformed and is refused before the daemon starts.
+pub const MAX_STORAGE_ROOTS: usize = 64;
+
 /// `[history]` — how much finished-job history to keep (ARCHITECTURE.md
 /// §8.6).
 ///
@@ -466,6 +483,60 @@ impl Config {
         expand_home(&self.paths.dest_dir)
     }
 
+    /// Every configured filesystem root the daemon can write.
+    ///
+    /// Exact duplicate paths are kept once with their role labels joined: they
+    /// are one failure domain and probing them repeatedly would add no safety.
+    /// Filesystem-level grouping still happens at measurement time where the
+    /// platform exposes a stable filesystem identity because distinct
+    /// configured paths can live on the same mounted volume. Windows keeps
+    /// distinct paths as conservative separate rows.
+    pub fn storage_roots(&self) -> Vec<StorageRoot> {
+        let mut roots = Vec::<StorageRoot>::new();
+        let mut push = |label: String, path: PathBuf| {
+            if let Some(root) = roots.iter_mut().find(|root| root.path == path) {
+                root.label.push_str(" · ");
+                root.label.push_str(&label);
+            } else {
+                roots.push(StorageRoot { label, path });
+            }
+        };
+        push("state".into(), self.state_dir());
+        if self.cluster.enabled {
+            if let Some(path) = &self.cluster.shared_dir {
+                push(
+                    "cluster state".into(),
+                    expand_home(path).join(".nzbd-cluster"),
+                );
+            }
+        }
+        push("downloads".into(), self.dest_dir());
+        push("working".into(), expand_home(&self.paths.main_dir));
+        push(
+            "failed".into(),
+            self.post
+                .failed_dir
+                .as_ref()
+                .map(|path| expand_home(path))
+                .unwrap_or_else(|| expand_home(&self.paths.main_dir).join("failed")),
+        );
+        if let Some(path) = &self.paths.inter_dir {
+            push("intermediate".into(), expand_home(path));
+        }
+        if let Some(path) = &self.paths.temp_dir {
+            push("temporary".into(), expand_home(path));
+        }
+        if let Some(path) = &self.paths.nzb_watch_dir {
+            push("watch".into(), expand_home(path));
+        }
+        for category in &self.categories {
+            if let Some(path) = &category.dest_dir {
+                push(format!("category: {}", category.name), expand_home(path));
+            }
+        }
+        roots
+    }
+
     /// Configured speed limit in bytes/sec.
     pub fn speed_limit_bps(&self) -> Option<u64> {
         self.queue.speed_limit_kib.map(|k| k * 1024)
@@ -532,6 +603,14 @@ impl Config {
                     "[[feed]] requires name and url".into(),
                 ));
             }
+        }
+        let storage_roots = self.storage_roots();
+        if storage_roots.len() > MAX_STORAGE_ROOTS {
+            return Err(ConfigError::Invalid(format!(
+                "configured write-root count {} exceeds the safety limit {}",
+                storage_roots.len(),
+                MAX_STORAGE_ROOTS
+            )));
         }
         if self.cluster.enabled {
             if self.cluster.node_name.trim().is_empty() {
@@ -1438,6 +1517,74 @@ Server2.Connections=0
             def.state_dir(),
             PathBuf::from(&home).join("downloads/queue")
         );
+    }
+
+    #[test]
+    fn storage_roots_are_complete_expanded_and_deduplicated() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cfg = Config::default();
+        cfg.paths.main_dir = tmp.path().join("working");
+        cfg.paths.queue_dir = Some(tmp.path().join("state"));
+        cfg.paths.dest_dir = tmp.path().join("downloads");
+        cfg.paths.inter_dir = Some(tmp.path().join("intermediate"));
+        cfg.paths.temp_dir = Some(tmp.path().join("temporary"));
+        cfg.paths.nzb_watch_dir = Some(tmp.path().join("watch"));
+        cfg.post.failed_dir = Some(tmp.path().join("failed"));
+        cfg.categories = vec![
+            CategoryConfig {
+                name: "tv".into(),
+                dest_dir: Some(tmp.path().join("library/tv")),
+                ..Default::default()
+            },
+            CategoryConfig {
+                name: "same-as-downloads".into(),
+                dest_dir: Some(tmp.path().join("downloads")),
+                ..Default::default()
+            },
+        ];
+        let roots = cfg.storage_roots();
+        let labels: Vec<_> = roots.iter().map(|root| root.label.as_str()).collect();
+        assert_eq!(
+            labels,
+            [
+                "state",
+                "downloads · category: same-as-downloads",
+                "working",
+                "failed",
+                "intermediate",
+                "temporary",
+                "watch",
+                "category: tv",
+            ]
+        );
+        assert!(roots.iter().all(|root| root.path.starts_with(tmp.path())));
+
+        cfg.cluster.enabled = true;
+        cfg.cluster.shared_dir = Some(tmp.path().join("shared"));
+        let cluster_roots = cfg.storage_roots();
+        assert_eq!(cluster_roots[0].path, tmp.path().join("state"));
+        assert_eq!(
+            cluster_roots[1].path,
+            tmp.path().join("shared/.nzbd-cluster")
+        );
+        assert_eq!(cluster_roots[1].label, "cluster state");
+    }
+
+    #[test]
+    fn excessive_storage_roots_are_rejected_before_probe_threads_start() {
+        let cfg = Config {
+            categories: (0..MAX_STORAGE_ROOTS)
+                .map(|index| CategoryConfig {
+                    name: format!("category-{index}"),
+                    dest_dir: Some(PathBuf::from(format!("/storage/{index}"))),
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let error = cfg.validate().unwrap_err().to_string();
+        assert!(error.contains("write-root count"), "{error}");
+        assert!(error.contains(&MAX_STORAGE_ROOTS.to_string()), "{error}");
     }
 }
 

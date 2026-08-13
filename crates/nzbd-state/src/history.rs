@@ -9,7 +9,7 @@
 //! all `history*.jsonl` files, deduped by (job, completed_at).
 
 use crate::{fsx, HistoryEntry, StateError};
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -105,6 +105,11 @@ pub struct HistoryDb {
     /// a tmp+rename landing between a thread's `open_append` and its write
     /// would drop that line into the unlinked old inode.
     jsonl_write: Mutex<()>,
+    /// Serializes the durable-failed-finalization protocol inside this
+    /// process. The portable append must cross its fsync barrier before the
+    /// derived SQLite row exists; a local row is therefore proof that this
+    /// node already completed that barrier for the logical key.
+    durable_record: Mutex<()>,
     retention: Mutex<Retention>,
     last_prune: Mutex<Option<Instant>>,
     /// Cached listing of the parked-NZB spool, so deriving `can_requeue`
@@ -149,6 +154,7 @@ impl HistoryDb {
                  dupe_key TEXT NOT NULL DEFAULT '',
                  dupe_score INTEGER NOT NULL DEFAULT 0,
                  completed_at INTEGER NOT NULL,
+                 portable_synced INTEGER NOT NULL DEFAULT 0,
                  UNIQUE(job_id, completed_at)
              );",
         )
@@ -176,6 +182,7 @@ impl HistoryDb {
             "ALTER TABLE history ADD COLUMN picked_up_by TEXT",
             "ALTER TABLE history ADD COLUMN stages TEXT NOT NULL DEFAULT '[]'",
             "ALTER TABLE history ADD COLUMN record TEXT",
+            "ALTER TABLE history ADD COLUMN portable_synced INTEGER NOT NULL DEFAULT 0",
         ] {
             let _ = conn.execute(ddl, []);
         }
@@ -210,6 +217,7 @@ impl HistoryDb {
             spool: db_path.parent().map(|d| d.join("nzbs")),
             last_refresh: Mutex::new(None),
             jsonl_write: Mutex::new(()),
+            durable_record: Mutex::new(()),
             retention: Mutex::new(Retention::UNLIMITED),
             last_prune: Mutex::new(None),
             spool_cache: Mutex::new(None),
@@ -747,6 +755,103 @@ impl HistoryDb {
         Ok(seq)
     }
 
+    /// Durably record a retryable terminal completion under its stable
+    /// `(job, completed_at)` key.
+    ///
+    /// The portable append and its fsync happen before the local SQLite
+    /// index is touched. A failed fsync therefore cannot leave an API-visible
+    /// derived row, and a retry always performs a fresh append+fsync. The
+    /// stable key makes multiple physical lines from a cross-node failover one
+    /// logical row when the per-node logs are merged.
+    pub fn record_seq_durable(
+        &self,
+        entry: &HistoryEntry,
+    ) -> Result<(i64, HistoryEntry), StateError> {
+        let canonical = self
+            .portable_entry((entry.job.0, entry.completed_at_unix))?
+            .unwrap_or_else(|| entry.clone());
+        self.record_seq_durable_with(&canonical, || self.append_jsonl(&canonical))
+            .map(|seq| (seq, canonical))
+    }
+
+    /// First portable payload for a logical key, in the same deterministic
+    /// file order used by rebuild. A successor re-appends this exact payload
+    /// under a fresh durability barrier rather than recomputing disposition
+    /// fields from its node-local view.
+    fn portable_entry(&self, key: HistoryKey) -> Result<Option<HistoryEntry>, StateError> {
+        let Some(own) = &self.jsonl else {
+            return Ok(None);
+        };
+        let Some(dir) = own.parent() else {
+            return Ok(None);
+        };
+        let mut files: Vec<_> = match fsx::read_dir(dir) {
+            Ok(entries) => entries
+                .flatten()
+                .map(|entry| entry.path())
+                .filter(|path| {
+                    let name = path.file_name().unwrap_or_default().to_string_lossy();
+                    name.starts_with("history") && name.ends_with(".jsonl")
+                })
+                .collect(),
+            Err(error) if error.is_not_found() => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        files.sort();
+        for path in files {
+            let file = match fsx::open(&path) {
+                Ok(file) => file,
+                Err(error) if error.is_not_found() => continue,
+                Err(error) => return Err(error),
+            };
+            for line in BufReader::new(file).split(b'\n') {
+                let line = fsx::ctx(line, "read", &path)?;
+                if let Ok(HistoryLogLine::Entry(entry)) =
+                    serde_json::from_slice::<HistoryLogLine>(&line)
+                {
+                    if (entry.job.0, entry.completed_at_unix) == key {
+                        return Ok(Some(*entry));
+                    }
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    fn record_seq_durable_with<F>(&self, entry: &HistoryEntry, append: F) -> Result<i64, StateError>
+    where
+        F: FnOnce() -> Result<(), StateError>,
+    {
+        let _guard = self.durable_record.lock().unwrap();
+        let key = (entry.job.0, entry.completed_at_unix);
+        if let Some((seq, true)) = self
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT id, portable_synced FROM history WHERE job_id = ?1 AND completed_at = ?2",
+                rusqlite::params![key.0, key.1],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, bool>(1)?)),
+            )
+            .optional()
+            .map_err(|error| StateError::Corrupt(format!("sqlite lookup: {error}")))?
+        {
+            return Ok(seq);
+        }
+        append()?;
+        let (_, seq) = self.insert_seq(entry, false)?;
+        self.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE history SET portable_synced = 1 WHERE job_id = ?1 AND completed_at = ?2",
+                rusqlite::params![key.0, key.1],
+            )
+            .map_err(|error| StateError::Corrupt(format!("sqlite durable marker: {error}")))?;
+        self.maybe_prune();
+        Ok(seq)
+    }
+
     /// Visible (non-hidden) entries — what NZBGet-compat clients see.
     pub fn list(&self, limit: usize) -> Result<Vec<HistoryEntry>, StateError> {
         self.list_filtered(limit, false)
@@ -944,7 +1049,7 @@ impl HistoryDb {
     fn append_jsonl(&self, entry: &HistoryEntry) -> Result<(), StateError> {
         if let Some(path) = &self.jsonl {
             if let Some(parent) = path.parent() {
-                fsx::create_dir_all(parent)?;
+                fsx::create_dir_all_durable(parent)?;
             }
             // Held across open+write+fsync: a compaction's rename landing
             // mid-append would write this line into the unlinked old inode.
@@ -961,6 +1066,10 @@ impl HistoryDb {
             line.push(b'\n');
             fsx::write_all(&mut f, &line, path)?;
             fsx::sync_data(&f, path)?;
+            // Repeated on every durable append, not only first creation: if a
+            // prior parent fsync failed, the file now exists but its directory
+            // entry is still not crash-safe.
+            fsx::sync_parent(path)?;
         }
         Ok(())
     }
@@ -1255,6 +1364,100 @@ mod tests {
             .max_by_key(|s| s.ms.unwrap_or(0))
             .unwrap();
         assert_eq!(slowest.stage, PostStage::ParRepair);
+    }
+
+    #[test]
+    fn failed_portable_sync_is_retried_before_the_derived_row_exists() {
+        use std::io::Write as _;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let portable = tmp.path().join("portable");
+        let log = portable.join("history.jsonl");
+        let db = HistoryDb::open(&tmp.path().join("history.sqlite"), Some(&portable)).unwrap();
+        let e = entry(77, 1_234);
+
+        let error = db
+            .record_seq_durable_with(&e, || {
+                std::fs::create_dir_all(&portable).unwrap();
+                let mut file = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&log)
+                    .unwrap();
+                serde_json::to_writer(&mut file, &e).unwrap();
+                file.write_all(b"\n").unwrap();
+                Err(StateError::Io {
+                    op: "fsync",
+                    path: log.clone(),
+                    source: std::io::Error::from_raw_os_error(28),
+                })
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("fsync"));
+        assert!(db.list(10).unwrap().is_empty());
+        assert_eq!(std::fs::read_to_string(&log).unwrap().lines().count(), 1);
+
+        // A refresh or peer reader can index the readable line despite the
+        // failed barrier. That derived row still is not durability proof.
+        db.insert_seq(&e, false).unwrap();
+
+        // A fresh append+fsync lands before the row receives its local durable
+        // marker, so terminal retirement cannot rely on the failed barrier.
+        db.record_seq_durable(&e).unwrap();
+        assert_eq!(db.list(10).unwrap().len(), 1);
+        assert_eq!(std::fs::read_to_string(&log).unwrap().lines().count(), 2);
+
+        // Once this node has a derived row created after a successful barrier,
+        // an in-process retry is a no-op for the portable file.
+        db.record_seq_durable(&e).unwrap();
+        assert_eq!(std::fs::read_to_string(&log).unwrap().lines().count(), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_parent_directory_sync_is_retried_before_durable_marker() {
+        let tmp = tempfile::tempdir().unwrap();
+        let portable = tmp.path().join("portable");
+        std::fs::create_dir(&portable).unwrap();
+        let log = portable.join("history.jsonl");
+        let db = HistoryDb::open(&tmp.path().join("history.sqlite"), Some(&portable)).unwrap();
+        let e = entry(78, 1_235);
+        crate::fsx::fail_next_dir_sync();
+        assert!(db.record_seq_durable(&e).is_err());
+        assert!(
+            log.is_file(),
+            "file fsync preceded the failed parent barrier"
+        );
+        assert!(db.list(10).unwrap().is_empty());
+        db.record_seq_durable(&e).unwrap();
+        assert_eq!(db.list(10).unwrap().len(), 1);
+        assert_eq!(std::fs::read_to_string(log).unwrap().lines().count(), 2);
+    }
+
+    #[test]
+    fn peer_retry_reuses_the_first_immutable_completion_payload() {
+        let tmp = tempfile::tempdir().unwrap();
+        let shared = tmp.path().join("shared");
+        let a =
+            HistoryDb::open_tagged(&tmp.path().join("a.sqlite"), Some(&shared), Some("a")).unwrap();
+        let b =
+            HistoryDb::open_tagged(&tmp.path().join("b.sqlite"), Some(&shared), Some("b")).unwrap();
+        let mut first = entry(79, 1_236);
+        first.final_dir = Some("/shared/failed/job".into());
+        first.params.push(("Failure:Files".into(), "parked".into()));
+        a.record_seq_durable(&first).unwrap();
+        let mut recomputed = first.clone();
+        recomputed.final_dir = None;
+        recomputed.params = vec![("Failure:Files".into(), "already gone".into())];
+        let (_, adopted) = b.record_seq_durable(&recomputed).unwrap();
+        assert_eq!(adopted.final_dir, first.final_dir);
+        assert_eq!(adopted.params, first.params);
+
+        let rebuilt = HistoryDb::open(&tmp.path().join("fresh.sqlite"), Some(&shared)).unwrap();
+        let visible = rebuilt.list(10).unwrap();
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].final_dir, first.final_dir);
+        assert_eq!(visible[0].params, first.params);
     }
 
     /// An index written by an older nzbd upgrades in place and its rows
