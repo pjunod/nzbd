@@ -62,24 +62,26 @@ else
 fi
 
 readonly source_file="$work_dir/rqbit/crates/librqbit/src/torrent_state/initializing.rs"
+readonly normalized_source="$work_dir/initializing.normalized.rs"
+tr '\n' ' ' <"$source_file" >"$normalized_source"
 for invariant in \
   'fn ensure_selected_file_lengths(' \
   '.ensure_file_length(idx, file_info.len)' \
   'self.only_files.as_deref(),' \
   'fn file_sizing_error_stops_initialization()'
 do
-  if ! rg -Fq "$invariant" "$source_file"; then
+  if ! grep -Fq "$invariant" "$source_file"; then
     echo "file-sizing error patch is missing invariant: $invariant" >&2
     exit 1
   fi
 done
 
-if rg -Fq 'if let Err(err) = self.files.ensure_file_length' "$source_file"; then
+if grep -Fq 'if let Err(err) = self.files.ensure_file_length' "$source_file"; then
   echo "file-sizing error patch still swallows the initialization failure" >&2
   exit 1
 fi
 
-if ! rg -Uq "$initialization_boundary" "$source_file"; then
+if ! grep -Eq "$initialization_boundary" "$normalized_source"; then
   echo "file-sizing helper result is not propagated at the $source_variant initialization boundary" >&2
   exit 1
 fi
@@ -87,23 +89,25 @@ fi
 if [[ "$source_variant" == "main" ]]; then
   readonly state_file="$work_dir/rqbit/crates/librqbit/src/torrent_state/mod.rs"
   readonly file_ops="$work_dir/rqbit/crates/librqbit/src/file_ops.rs"
+  readonly normalized_state="$work_dir/torrent-state.normalized.rs"
+  tr '\n' ' ' <"$state_file" >"$normalized_state"
   for invariant in \
     'struct InitialCheckPaused;' \
     'return Err(InitialCheckPaused.into());' \
     'fn should_suppress_initial_check_error(' \
     'fn pause_race_preserves_non_cancellation_initialization_errors()'
   do
-    if ! rg -Fq "$invariant" "$state_file" "$file_ops"; then
+    if ! grep -Fq "$invariant" "$state_file" "$file_ops"; then
       echo "rqbit main pause-race fix is missing invariant: $invariant" >&2
       exit 1
     fi
   done
   readonly pause_boundary='if should_suppress_initial_check_error\([[:space:]]*init\.is_pause_requested\(\),[[:space:]]*&err,[[:space:]]*\)[[:space:]]*\{'
-  if ! rg -Uq "$pause_boundary" "$state_file"; then
+  if ! grep -Eq "$pause_boundary" "$normalized_state"; then
     echo "rqbit main does not classify the actual initialization error boundary" >&2
     exit 1
   fi
-  if [[ "$(rg -Fc 'init.is_pause_requested()' "$state_file")" -ne 1 ]]; then
+  if [[ "$(grep -Fc 'init.is_pause_requested()' "$state_file")" -ne 1 ]]; then
     echo "rqbit main initialization error branch has an unreviewed pause-request fallback" >&2
     exit 1
   fi
@@ -119,7 +123,7 @@ fi
     -- --list)"
   readonly test_list
   for exact_test in "${exact_tests[@]}"; do
-    if ! rg -Fxq "$exact_test: test" <<<"$test_list"; then
+    if ! grep -Fxq "$exact_test: test" <<<"$test_list"; then
       echo "file-sizing error proof test was not discovered: $exact_test" >&2
       exit 1
     fi
@@ -135,7 +139,7 @@ fi
     if [[ $test_status -ne 0 ]]; then
       exit "$test_status"
     fi
-    if ! rg -Fq 'test result: ok. 1 passed; 0 failed; 0 ignored' <<<"$test_output"; then
+    if ! grep -Fq 'test result: ok. 1 passed; 0 failed; 0 ignored' <<<"$test_output"; then
       echo "file-sizing error proof did not execute exactly one passing test: $exact_test" >&2
       exit 1
     fi
