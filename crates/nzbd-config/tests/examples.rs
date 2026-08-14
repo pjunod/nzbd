@@ -187,6 +187,17 @@ fn coverage_measurement_fails_closed_and_runs_the_whole_workspace() {
         .expect("read coverage workflow");
     let makefile = std::fs::read_to_string(root.join("Makefile")).expect("read Makefile");
 
+    let coverage_job_header = workflow
+        .split_once("\n  coverage:\n")
+        .map(|(_, rest)| rest)
+        .and_then(|rest| rest.split_once("\n    steps:").map(|(header, _)| header))
+        .expect("find the coverage job header");
+    assert!(
+        !coverage_job_header.contains("continue-on-error"),
+        "the coverage job must not use continue-on-error, or any failing coverage step can \
+         report success"
+    );
+
     let instrumented_step = workflow
         .split_once("- name: run instrumented test suite")
         .map(|(_, rest)| rest)
