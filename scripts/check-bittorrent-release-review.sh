@@ -51,9 +51,9 @@ for heading in \
   require_literal "$review_doc" "$heading"
 done
 
-require_literal "$m0_report" '| 7. Public observability | **Pass locally** |'
-require_literal "$m0_report" '| 8. nzbd-authoritative persistence | **Pass locally** |'
-require_literal "$m0_report" '| 9. Resource, package, and license delta | **Pass locally; native measurements pending** |'
+require_literal "$m0_report" '| 7. Public observability | **Pass** |'
+require_literal "$m0_report" '| 8. nzbd-authoritative persistence | **Pass** |'
+require_literal "$m0_report" '| 9. Resource, package, and license delta | **Pass** |'
 require_literal "$proposal" '[pre-release operations review](BITTORRENT_RELEASE_REVIEW.md)'
 require_literal "$proposal" '#### 4.3.3 Maintained-engine amendment — selected 2026-08-14'
 require_literal "$readme" '[docs/BITTORRENT_RELEASE_REVIEW.md](docs/BITTORRENT_RELEASE_REVIEW.md)'
@@ -62,7 +62,7 @@ require_literal "$readme" '[docs/BITTORRENT_RELEASE_REVIEW.md](docs/BITTORRENT_R
 # Losing it would silently return the gate to "awaiting a reviewer" while the
 # proposal and M0 report still claim the boundaries were accepted.
 require_literal "$gate9_review" '### 4.1 Recorded disposition — accepted 2026-08-14'
-require_literal "$gate9_review" '**Status:** all eleven dispositions recorded; maintained implementation passes'
+require_literal "$gate9_review" '**Status:** all eleven dispositions recorded; maintained implementation and'
 require_literal "$gate9_review" 'reply `APPROVE RECOMMENDED DEFAULTS`, 2026-08-14T00:30:03Z'
 require_literal "$gate9_review" 'https://github.com/pjunod/nzbd/issues/83#issuecomment-5287959702'
 require_count "$gate9_review" '^\| *[0-9]+ \| \*\*Accepted' 11
@@ -70,7 +70,7 @@ require_count "$gate9_review" '^\| *[0-9]+ \| \*\*Accepted' 11
 # The selected maintained series implements items 6-11. M0 completion still
 # requires exact derivation, native evidence, independent review, and a dormant
 # production boundary.
-require_literal "$gate9_review" 'Gate 9 passes locally because the maintained engine enforces every applicable'
+require_literal "$gate9_review" 'Gate 9 passes because the maintained engine enforces every applicable boundary'
 require_literal "$proposal" 'The checked-in vendor is generated output and must never be hand-edited.'
 require_literal "$m0_report" 'gate 9 review brief §4.1'
 require_literal "$proposal" 'Its §4.1 records the accepted disposition'

@@ -1,7 +1,8 @@
 # BitTorrent M0 report — maintained rqbit v8.1.1 closes the engine boundary
 
-**Status:** all eleven gates pass locally; native rerun pending; daemon wiring
-remains disabled · **Original run:** 2026-08-05 · **Amended:** 2026-08-14 ·
+**Status:** all eleven gates pass locally and on the native matrix; independent
+review pending; daemon wiring remains disabled · **Original run:** 2026-08-05 ·
+**Amended:** 2026-08-14 ·
 **Engine:** rqbit v8.1.1 archive plus the ordered nine-patch maintained series,
 `default-features = false`, `rust-tls` ·
 **Host:** macOS 26.6 arm64 · **Decision owner:** ADR-19 in
@@ -53,18 +54,18 @@ ahead of that allocation. This still does not authorize production wiring.
 | 1. Rust 1.85 and platform packaging | **Pass** | A real Rust 1.85.1 macOS build passes, and the release harness links only macOS system libraries, not OpenSSL. The first checked-in `BitTorrent M0` run caught Tokio 1.53.0 using Rust 1.86's `OnceLock::wait` on Windows. After the workspace pinned Tokio 1.52.4, the [corrected run completed successfully](https://github.com/pjunod/nzbd/actions/runs/31060326800) on 2026-08-06 UTC: the isolated adapter suite passed on Linux glibc, macOS arm64, Windows MSVC, and x86-64/aarch64 musl under Rust 1.85, and the exact-engine/Rust-TLS dependency policy also passed. |
 | 2. v1 `.torrent`, magnet, TCP/IPv4, then seed | **Pass** | Deterministic generated payloads download through both admission paths; a local seeder accounts for both uploads and exact bytes match. The adapter checks nonzero piece length and total payload, checked aggregate length, whole SHA-1 hash width, exact hash count, and rqbit's `u32` absolute chunk-index boundary before the engine constructs its length table. |
 | 3. Controls and live limits | **Pass** | Pause/resume is exercised before completion, the live download limit is removed during transfer, and idempotent keep-data delete, idempotent delete-data, and unrelated-sibling retention pass. |
-| 4. Kill/restart never trusts partial data | **Pass locally** | The process-level contract persists two paused torrents, kills the child without a clean stop, changes one payload to complete valid bytes, starts a session with automatic restore disabled, and explicitly restores only the selected durable ID. The new session starts empty; exactly one torrent is admitted; and its progress remains the persisted 16 KiB and incomplete rather than trusting the 64 KiB now on disk. A full recheck remains a safe degradation path, not the normal ownership model. |
+| 4. Kill/restart never trusts partial data | **Pass** | The process-level contract persists two paused torrents, kills the child without a clean stop, changes one payload to complete valid bytes, starts a session with automatic restore disabled, and explicitly restores only the selected durable ID. The new session starts empty; exactly one torrent is admitted; and its progress remains the persisted 16 KiB and incomplete rather than trusting the 64 KiB now on disk. A full recheck remains a safe degradation path, not the normal ownership model. |
 | 5. Private-torrent discovery | **Pass** | A one-tracker private torrent downloads through a loopback HTTP tracker, and a deterministic peer-wire control proves public torrents consume an injected PEX peer while private torrents ignore it. A Linux capture harness starts live DHT, redirects both stable-8.1.1 bootstrap ports to a local KRPC probe, and observes separate public control hashes before and during a 15-second private canary window. It scans all captured UDP—not just redirected DHT—for the private hash in binary or LSD-style text form. The [first successful capture run](https://github.com/pjunod/nzbd/actions/runs/31128106994) passed on 2026-08-06 UTC: both DHT controls were observed and no private DHT/LSD hash appeared. Tracker order is still lost through a hash set before truncation, so the adapter rejects private metainfo unless it has exactly one unique tracker. Empty tracker slots are treated as absent; every non-empty tracker URL now fails closed before rqbit can silently discard malformed/non-UTF-8 input, unsupported schemes, missing hosts, or UDP without a port. A magnet does not expose the private bit before resolution; because stable rqbit has no per-add DHT suppression, the adapter rejects every magnet in a DHT-enabled session before calling the engine. A known-private `.torrent` is likewise rejected before engine admission when session DHT is live. Loopback and policy tests prove both guards fail before contact while DHT-disabled private admission remains available. |
 | 6. Path and delete safety | **Pass** | The adapter now repeats the portable lexical path invariant before rqbit admission: unnamed payloads, empty/dot/parent components, slash or backslash, absolute/UNC forms, Windows drive prefixes and device aliases, alternate-data-stream and other reserved characters, trailing dot/space aliases, malformed UTF-8, empty multi-file paths, missing/unsafe multi-file roots, metainfo-declared symlinks, exact duplicate paths, file-versus-directory-prefix overlaps, and portable Unicode NFC/full-case-fold collisions fail with safe nzbd-owned errors. Greek sigma, long-s, Windows dotless-i, compatibility-ligature, and sharp-s/full-fold aliases are covered without collapsing compatibility-only width pairs. rqbit's shared `torrent-content` fallback is therefore never used for an unnamed single-file torrent. Magnet input first resolves through rqbit's list-only path, which returns before storage construction; nzbd then applies the same metainfo contract and admits only the validated bytes. A fake BEP 9 peer proves an unsafe resolved path leaves the destination empty, and the real-admission corpus still proves rejection before an escape file exists. The session canonicalizes its output root and preflights every existing payload prefix with no-follow metadata: symlinks fail, prefixes must be directories, and leaves must be regular files while an existing regular leaf remains valid resume input. A Unix test proves a symlink is rejected before storage and its external target remains empty. The [first cross-platform filesystem-probe run](https://github.com/pjunod/nzbd/actions/runs/31240896567) passed on 2026-08-08 UTC for ASCII-case and Unicode NFC/NFD pairs. The [review-correction native run](https://github.com/pjunod/nzbd/actions/runs/31264422471) passed on 2026-08-08 UTC after proving default macOS storage also aliases compatibility ligatures and full-case-fold pairs; the adapter now rejects those pairs. The native matrix records all four rejected classes and requires the remaining compatibility-width pair that the adapter admits to stay distinct. The exact observations are recorded in §2.2. They describe hosted temporary volumes, not every operator payload mount. This is defense in depth, not a claim to close the check/write race. The importer-safe content inventory omits BEP 47 padding entries while raw engine-indexed progress remains available only as diagnostics. Delete-data removes only parsed torrent content; an unrelated sibling survives. Higher layers must still prove persisted delete-root authority, descriptor-relative containment across writes, and empirical filesystem-specific behavior across supported operator payload mounts in M5/M2. |
-| 7. Public observability | **Pass locally** | The adapter exposes phase, total/progress/upload bytes, verified file progress, rates/ETA inputs, peer counts, completion, admission facts, and its existing 2 KiB credential-safe error. Detailed tracker/DHT state is explicitly `unknown` because this engine does not provide it. Tests pin that default and prevent inference from peer count; no torrent-health percentage exists. |
-| 8. nzbd-authoritative persistence | **Pass locally** | The maintained `disable_auto_restore` option lets session construction admit nothing while retaining rqbit persistence and explicit selective restore. The gate-4 kill/restart test proves the chosen record and persisted verified progress remain subordinate to nzbd's durable selection. Upstream acceptance is not required for the pinned maintained engine. |
-| 9. Resource, package, and license delta | **Pass locally; native measurements pending** | The accepted measurements and dependency/license exceptions remain recorded in §4 and the [gate 9 review brief §4.1](BITTORRENT_GATE9_REVIEW.md#41-recorded-disposition--accepted-2026-08-14). The maintained engine now enforces tracker request size/deadline/cadence, 80/400 live peers, 1,024/4,096 retained peers, 256 pending handshakes, a 128-request per-peer response window, bounded DHT/metadata discovery, a 10 MiB pre-allocation metadata ceiling, and fail-closed file sizing. CI verifies the immutable upstream SHA-256, exact nine-patch order/membership, clean application, byte-identical vendor, and every focused behavior test. The local combined derivation and package suites pass; refreshed native measurements remain the matrix evidence to attach. |
+| 7. Public observability | **Pass** | The adapter exposes phase, total/progress/upload bytes, verified file progress, rates/ETA inputs, peer counts, completion, admission facts, and its existing 2 KiB credential-safe error. Detailed tracker/DHT state is explicitly `unknown` because this engine does not provide it. Tests pin that default and prevent inference from peer count; no torrent-health percentage exists. |
+| 8. nzbd-authoritative persistence | **Pass** | The maintained `disable_auto_restore` option lets session construction admit nothing while retaining rqbit persistence and explicit selective restore. The gate-4 kill/restart test proves the chosen record and persisted verified progress remain subordinate to nzbd's durable selection. Upstream acceptance is not required for the pinned maintained engine. |
+| 9. Resource, package, and license delta | **Pass** | The accepted measurements and dependency/license exceptions remain recorded in §4 and the [gate 9 review brief §4.1](BITTORRENT_GATE9_REVIEW.md#41-recorded-disposition--accepted-2026-08-14). The maintained engine now enforces tracker request size/deadline/cadence, 80/400 live peers, 1,024/4,096 retained peers, 256 pending handshakes, a 128-request per-peer response window, bounded DHT/metadata discovery, a 10 MiB pre-allocation metadata ceiling, and fail-closed file sizing. CI verifies the immutable upstream SHA-256, exact nine-patch order/membership, clean application, byte-identical vendor, and every focused behavior test. The [2026-08-14 maintained-engine run](https://github.com/pjunod/nzbd/actions/runs/31837867629) refreshed the resource measurements and passed every native M0 target. |
 | 10. One explicit rustls provider | **Pass** | The process starts without a provider, explicitly installs aws-lc, and constructs librqbit’s rustls client without the mixed-provider panic. |
 | 11. v1-only boundary | **Pass** | Stable input uses v1 pieces/`btih`; v2-only and hybrid `.torrent` files and magnets return separate named errors before managed-torrent admission. Magnet classification reads decoded `xt` query parameters rather than searching the whole URI, so version-looking text in a display name or tracker URL cannot create a false v2/hybrid result. The adapter accepts one valid 40-hex or 32-base32 `btih`, rejects missing, malformed, or duplicate v1 topics by name, and rechecks the resolved info dictionary before storage exists. |
 
-The local proof passes every gate. The native rerun and independent review are
-still required before the M0 work item is complete. This result authorizes M2
-planning only after those checks; it does not add daemon networking or payload
+The local proof and native rerun pass every gate. Independent review is still
+required before the M0 work item is complete. This result authorizes M2
+planning only after that review; it does not add daemon networking or payload
 I/O.
 
 ---
@@ -159,8 +160,9 @@ code. The daemon does not depend on it. The boundary currently provides:
   result and makes this proof fail. This closes the engine fail-open boundary;
   it does not satisfy the M2 disk-full contract.
   The [2026-08-13 replacement run](https://github.com/pjunod/nzbd/actions/runs/31654021866)
-  records the superseded fail-open behavior on every native M0 target; the
-  maintained-engine native rerun is pending;
+  records the superseded fail-open behavior on every native M0 target. The
+  [maintained-engine rerun](https://github.com/pjunod/nzbd/actions/runs/31837867629)
+  proves the corrected fail-closed result on those same targets;
 - explicit peer lifetimes: the dormant session pins stable 8.1.1's effective
   10-second connect and read/write timeouts and 120-second keepalive interval;
   per-add options inherit this reviewed session policy instead of introducing
@@ -681,27 +683,26 @@ intentionally does not link the blocked adapter.
 | OpenSSL dynamic link | none; only CoreFoundation, libiconv, and libSystem were listed on this host |
 
 The
-[review-correction cross-platform sampled-memory run](https://github.com/pjunod/nzbd/actions/runs/31344145707)
-passed both optimized probes on 2026-08-10 UTC after the probes began awaiting
-every session handle's initialized phase, added discriminating ceiling
-controls, and narrowed the preliminary ceilings. Values are process resident
-set samples in bytes; the time column is admission plus shutdown for the
-session probe and validation for the metainfo probe.
+[maintained-engine cross-platform run](https://github.com/pjunod/nzbd/actions/runs/31837867629)
+passed both optimized probes on 2026-08-14 UTC after deriving the exact
+nine-patch engine. Values are process resident-set samples in bytes; the time
+column is admission plus shutdown for the session probe and validation for the
+metainfo probe.
 
 | Platform | Probe | Baseline RSS | Maximum sampled RSS | Sampled growth | Time |
 |---|---|---:|---:|---:|---:|
-| Linux aarch64 musl | 100-torrent session | 1,789,952 | 6,717,440 | 4,927,488 | 51 ms + 1,002 ms |
-| Linux aarch64 musl | 100,000-file preflight | 745,472 | 4,591,616 | 3,846,144 | 85 ms |
-| Linux x86_64 GNU | 100-torrent session | 4,845,568 | 11,001,856 | 6,156,288 | 40 ms + 1,001 ms |
-| Linux x86_64 GNU | 100,000-file preflight | 2,793,472 | 18,137,088 | 15,343,616 | 63 ms |
-| Linux x86_64 musl | 100-torrent session | 4,919,296 | 9,838,592 | 4,919,296 | 94 ms + 1,001 ms |
-| Linux x86_64 musl | 100,000-file preflight | 831,488 | 4,812,800 | 3,981,312 | 116 ms |
-| macOS aarch64 | 100-torrent session | 6,946,816 | 11,010,048 | 4,063,232 | 32 ms + 1,003 ms |
-| macOS aarch64 | 100,000-file preflight | 5,980,160 | 33,325,056 | 27,344,896 | 62 ms |
-| Windows x86_64 MSVC | 100-torrent session | 8,306,688 | 11,243,520 | 2,936,832 | 2,713 ms + 1,007 ms |
-| Windows x86_64 MSVC | 100,000-file preflight | 4,694,016 | 8,458,240 | 3,764,224 | 137 ms |
+| Linux aarch64 musl | 100-torrent session | 1,859,584 | 6,107,136 | 4,247,552 | 51 ms + 1,001 ms |
+| Linux aarch64 musl | 100,000-file preflight | 745,472 | 4,591,616 | 3,846,144 | 84 ms |
+| Linux x86_64 GNU | 100-torrent session | 4,739,072 | 9,883,648 | 5,144,576 | 78 ms + 1,000 ms |
+| Linux x86_64 GNU | 100,000-file preflight | 2,633,728 | 18,108,416 | 15,474,688 | 85 ms |
+| Linux x86_64 musl | 100-torrent session | 4,919,296 | 9,560,064 | 4,640,768 | 58 ms + 1,000 ms |
+| Linux x86_64 musl | 100,000-file preflight | 831,488 | 4,751,360 | 3,919,872 | 117 ms |
+| macOS aarch64 | 100-torrent session | 6,979,584 | 10,502,144 | 3,522,560 | 64 ms + 1,003 ms |
+| macOS aarch64 | 100,000-file preflight | 5,980,160 | 33,275,904 | 27,295,744 | 76 ms |
+| Windows x86_64 MSVC | 100-torrent session | 8,343,552 | 11,206,656 | 2,863,104 | 2,608 ms + 1,003 ms |
+| Windows x86_64 MSVC | 100,000-file preflight | 4,722,688 | 8,491,008 | 3,768,320 | 141 ms |
 
-All session growth results stayed below 6 MiB and all metainfo growth
+All session growth results stayed below 5 MiB and all metainfo growth
 results stayed below 27 MiB, below the preliminary 32 MiB and 64 MiB
 regression ceilings. Those ceilings retain headroom for hosted-runner noise
 without permitting the previous order-of-magnitude regressions. The wide
@@ -752,11 +753,13 @@ Maintained patch `0018` deliberately invalidates that adverse witness. The
 current exact ignored proof requires the same request and filesystem facts but
 also requires a bounded file/length/cause error during admission or
 initialization; an asynchronously returned handle must enter `Error` and may
-never report `Paused` or `Live`. The local maintained-engine probe passes; its
-native rerun is pending. The M2 storage-full row remains blocked because this
-engine result is not yet routed into daemon pause, API, recovery, or existing-
-upload policy. Neither injected path simulates every real-filesystem ENOSPC or
-allocation policy.
+never report `Paused` or `Live`. The
+[maintained-engine native run](https://github.com/pjunod/nzbd/actions/runs/31837867629)
+passed on all five targets: each recorded one 262,144-byte sizing request, a
+zero-byte file, zero writes, and `control_plane=torrent_error`. The M2
+storage-full row remains blocked because this engine result is not yet routed
+into daemon pause, API, recovery, or existing-upload policy. Neither injected
+path simulates every real-filesystem ENOSPC or allocation policy.
 
 The 2026-08-07 review remediation refreshed these measurements after adding
 `icu_casemap 2.1.1` and `icu_casemap_data 2.1.1` for Unicode simple case
@@ -811,8 +814,9 @@ passed both jobs on 2026-08-06 UTC. The recorded delta and the narrow advisory
 dispositions were accepted on 2026-08-14. The maintained series now enforces
 the runtime boundaries that made gate 9 Partial. Its combined verifier proves
 the upstream checksum, exact series, generated vendor, focused tests, and
-affected crate suites locally; the refreshed native measurements remain the
-pending matrix evidence. A green exception alone is not evidence that the
+affected crate suites. The 2026-08-14 maintained-engine run refreshed the
+native measurements on all five targets. A green exception alone is not
+evidence that the
 underlying code became safe to enable.
 
 [`scripts/check-reviewed-dependency-exceptions.sh`](../scripts/check-reviewed-dependency-exceptions.sh)

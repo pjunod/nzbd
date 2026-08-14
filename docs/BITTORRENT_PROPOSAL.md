@@ -1967,8 +1967,8 @@ swarm is not evidence of terminal failure.
 
 ## 15. Implementation plan — each milestone leaves a usable truth
 
-### 15.1 M0 — maintained dependency and interoperability spike (local pass;
-native rerun pending)
+### 15.1 M0 — maintained dependency and interoperability spike (local and
+native pass; independent review pending)
 
 The checked-in adapter remains isolated from the daemon; there is no production
 config, API, or peer listener.
@@ -1988,11 +1988,11 @@ root cannot be established · resume can promote unverified data.
 seeds deterministic generated content with the internet disabled; the build
 matrix and a short spike report state pass/fail for all eleven §4.3 gates.
 
-**Result:** ADR-19 now selects the maintained v8.1.1 derivation. The local
-combined proof passes all eleven gates, including process-kill selective
+**Result:** ADR-19 now selects the maintained v8.1.1 derivation. The local and
+native combined proofs pass all eleven gates, including process-kill selective
 restore, explicit `unknown` discovery diagnostics, patch integrity, and
-reviewed runtime limits. The native target rerun remains the completion
-evidence. Do not start M2 session integration from this change. See
+reviewed runtime limits. Independent review remains the completion evidence.
+Do not start M2 session integration from this change. See
 [BITTORRENT_M0_REPORT.md](BITTORRENT_M0_REPORT.md).
 
 ### 15.2 M1a — queue schema envelope (complete)
@@ -2139,11 +2139,11 @@ transfer. The
 [first native evidence run](https://github.com/pjunod/nzbd/actions/runs/31330178035)
 passed the isolated adapter suite on 2026-08-09 UTC across Linux x86_64 GNU,
 Linux x86_64 musl, Linux aarch64 musl, macOS aarch64, and Windows x86_64. The
-[review-correction sampled-memory run](https://github.com/pjunod/nzbd/actions/runs/31344145707)
-passed the same five targets on 2026-08-10 UTC after every handle was awaited
-to its initialized phase and the discriminating ceiling controls were added:
-100-torrent sampled RSS growth ranged from 2,936,832 to 6,156,288 bytes, and
-100,000-file preflight growth ranged from 3,764,224 to 27,344,896 bytes. Exact
+[maintained-engine sampled-memory run](https://github.com/pjunod/nzbd/actions/runs/31837867629)
+passed the same five targets on 2026-08-14 UTC after deriving the exact
+nine-patch engine: 100-torrent sampled RSS growth ranged from 2,863,104 to
+5,144,576 bytes, and 100,000-file preflight growth ranged from 3,768,320 to
+27,295,744 bytes. Exact
 baselines, maxima, and timings are recorded in the M0 report. This is useful
 continuous coverage plus
 wall-clock and retained-memory regression evidence, not M5 completion:
@@ -2183,8 +2183,9 @@ The shared runner must discover and execute exactly one instance of both
 ignored storage proofs. The
 [2026-08-13 replacement run](https://github.com/pjunod/nzbd/actions/runs/31654021866)
 records the superseded fail-open result on Linux x86_64 GNU, Linux x86_64
-musl, Linux aarch64 musl, macOS aarch64, and Windows x86_64. The maintained
-fail-closed native rerun is pending.
+musl, Linux aarch64 musl, macOS aarch64, and Windows x86_64. The
+[maintained fail-closed run](https://github.com/pjunod/nzbd/actions/runs/31837867629)
+passes on those same targets.
 
 The maintained dependency includes the exact-stable change that makes this
 failure stop initialization. The stable and current-main variants preserve selected-file and padding

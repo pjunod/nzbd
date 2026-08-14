@@ -1,7 +1,8 @@
 # BitTorrent release review — prove the boundary before enabling it
 
 **Status:** pre-release review surface; production BitTorrent remains disabled ·
-**Decision:** maintained rqbit M0 passes locally; native rerun and M2/M5 remain ·
+**Decision:** maintained rqbit M0 passes locally and natively; independent
+review and M2/M5 remain ·
 **Owner:** ADR-19 in [BITTORRENT_PROPOSAL.md](BITTORRENT_PROPOSAL.md)
 
 This is the short operations and release-review surface for nzbd's proposed
@@ -20,9 +21,9 @@ listener, admission route, or session lifecycle today.
 | Review area | Current truth | Condition for release |
 |---|---|---|
 | Production reachability | None; `nzbd` does not depend on `nzbd-torrent` or `librqbit` | A separately reviewed milestone may wire the backend only after every stop gate passes |
-| Public observability | **M0 pass locally** — required facts and bounded error are exposed; unavailable tracker/DHT diagnostics are explicit `unknown` | M2 state, API, and UI contract tests must preserve that honest boundary |
-| Authoritative restore | **M0 pass locally** — automatic restore is disabled and the kill/restart proof admits only the selected durable record | M2 must connect selective restore to nzbd's durable queue |
-| Resource and dependency decision | **M0 pass locally; native measurements pending** | The maintained series and accepted limits in [BITTORRENT_GATE9_REVIEW.md](BITTORRENT_GATE9_REVIEW.md) must stay green across the native matrix |
+| Public observability | **M0 pass** — required facts and bounded error are exposed; unavailable tracker/DHT diagnostics are explicit `unknown` | M2 state, API, and UI contract tests must preserve that honest boundary |
+| Authoritative restore | **M0 pass** — automatic restore is disabled and the kill/restart proof admits only the selected durable record | M2 must connect selective restore to nzbd's durable queue |
+| Resource and dependency decision | **M0 pass** — accepted limits and refreshed measurements are green on all five native targets | The maintained series and accepted limits in [BITTORRENT_GATE9_REVIEW.md](BITTORRENT_GATE9_REVIEW.md) must stay green across the native matrix |
 | Adversarial M5 work | In progress | The remaining resource, mounted-filesystem, production shutdown, auth-limiting, and sustained-fuzz evidence is green |
 | Operator action today | None | Do not publish torrent ports, paths, or config; they are proposal contracts, not supported settings |
 
@@ -201,13 +202,13 @@ relying on one local host:
 
 | Evidence | Last recorded proof |
 |---|---|
-| Maintained v8.1.1 archive, exact nine-patch series, generated vendor, and focused upstream tests | Local combined verifier passed 2026-08-14; native workflow rerun pending |
+| Maintained v8.1.1 archive, exact nine-patch series, generated vendor, and focused upstream tests | [2026-08-14 maintained-rqbit workflow](https://github.com/pjunod/nzbd/actions/runs/31837867809) |
 | Native 100-torrent admission/shutdown pressure | [2026-08-09 matrix run](https://github.com/pjunod/nzbd/actions/runs/31330178035) |
 | Private DHT/LSD packet capture | [2026-08-06 capture run](https://github.com/pjunod/nzbd/actions/runs/31128106994) |
 | Cross-platform filesystem behavior | [2026-08-08 probe run](https://github.com/pjunod/nzbd/actions/runs/31240896567) and [review correction](https://github.com/pjunod/nzbd/actions/runs/31264422471) |
-| Native adapter matrix and daemon isolation | [2026-08-09 M0 run](https://github.com/pjunod/nzbd/actions/runs/31331872561) |
+| Native adapter matrix, resource measurements, and daemon isolation | [2026-08-14 maintained-engine M0 run](https://github.com/pjunod/nzbd/actions/runs/31837867629) |
 | Write-time storage-fault containment | [2026-08-10 hardened five-platform run](https://github.com/pjunod/nzbd/actions/runs/31345445318) |
-| Initialization-time storage-fault boundary | Historical fail-open witness: [2026-08-13 replacement five-platform run](https://github.com/pjunod/nzbd/actions/runs/31654021866); maintained fail-closed native rerun pending |
+| Initialization-time storage-fault boundary | Historical fail-open witness: [2026-08-13 replacement five-platform run](https://github.com/pjunod/nzbd/actions/runs/31654021866); maintained fail-closed proof: [2026-08-14 M0 run](https://github.com/pjunod/nzbd/actions/runs/31837867629) |
 
 These links are evidence snapshots, not evergreen approval. The reviewed
 commit must have its own green required checks.

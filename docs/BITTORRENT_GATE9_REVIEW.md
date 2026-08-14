@@ -1,7 +1,7 @@
 # BitTorrent gate 9 review — accept measured cost, not silent risk drift
 
-**Status:** all eleven dispositions recorded; maintained implementation passes
-locally; refreshed native measurements pending ·
+**Status:** all eleven dispositions recorded; maintained implementation and
+refreshed native measurements pass; independent review pending ·
 **Date:** 2026-08-07 · **Disposition and amendment recorded:** 2026-08-14 ·
 **Engine:** rqbit v8.1.1 archive plus the ordered nine-patch maintained series ·
 **Decision owner:** ADR-19 in
@@ -21,9 +21,9 @@ LSD queues also needed explicit discovery-pressure boundaries.
 That decision has been taken: §4.1 records the accepted disposition for all
 eleven items. ADR-19 now selects the maintained v8.1.1 series that implements
 items 6–11. The immutable archive checksum, exact patch membership/order,
-clean application, byte-identical vendor, and focused behavior tests pass
-locally. Refreshed native measurements remain before the gate's final matrix
-evidence is complete.
+clean application, byte-identical vendor, and focused behavior tests pass. The
+[2026-08-14 maintained-engine run](https://github.com/pjunod/nzbd/actions/runs/31837867629)
+also refreshes the measurements on all five native targets.
 
 No production BitTorrent path is enabled by this review or by its recorded
 disposition. Gate 8 uses the maintained selective-restore option. Gate 7
@@ -38,20 +38,20 @@ The isolated M0 adapter measured the following in one macOS 26.6 arm64 run:
 |---|---:|---|
 | Unstripped optimized `m0_idle` harness | 10,111,360 bytes (9.64 MiB) | Is this binary delta acceptable for the single-binary release? |
 | Maximum resident set for one idle session | 8,814,592 bytes (8.41 MiB) | Is this idle memory cost acceptable before real swarm load? |
-| Sampled growth for 100 initialized dormant torrents | 2,936,832–6,156,288 bytes across five native targets | Are the preliminary 32 MiB guard and sampled-growth method acceptable until active-swarm tests exist? |
-| Sampled growth for 100,000-file preflight | 3,764,224–27,344,896 bytes across five native targets | Are the preliminary 64 MiB guard and sampled-growth method acceptable until concurrent hostile-input tests exist? |
+| Sampled growth for 100 initialized dormant torrents | 2,863,104–5,144,576 bytes across five native targets | Are the preliminary 32 MiB guard and sampled-growth method acceptable until active-swarm tests exist? |
+| Sampled growth for 100,000-file preflight | 3,768,320–27,295,744 bytes across five native targets | Are the preliminary 64 MiB guard and sampled-growth method acceptable until concurrent hostile-input tests exist? |
 | Normal `nzbd-torrent` dependency closure | 222 package/version identities | Is the maintenance and audit surface acceptable? |
 | New workspace lockfile identities | 178 package/version identities | Is the dependency expansion proportionate to not implementing BitTorrent ourselves? |
 
 These are spike measurements, not permanent limits. The complete M0 rerun
-must measure the maintained dependency on every native target, and M2 must
-later measure the final daemon when it is linked. A
+measured the maintained dependency on every native target, and M2 must later
+measure the final daemon when it is linked. A
 reviewer can accept this preliminary cost without claiming the eventual daemon
 has the same size or resident set. The exact cross-platform baselines, maxima,
 growth, and timings are in the
 [M0 report](BITTORRENT_M0_REPORT.md#4-measurements-and-dependency-review),
 backed by the
-[successful review-correction run on 2026-08-10 UTC](https://github.com/pjunod/nzbd/actions/runs/31344145707).
+[successful maintained-engine run on 2026-08-14 UTC](https://github.com/pjunod/nzbd/actions/runs/31837867629).
 
 The proposed `max_peers_per_torrent = 80` and `max_peers_total = 400` are not
 implemented by stable 8.1.1. Stable hard-codes 128 live peer permits per
@@ -78,8 +78,8 @@ prevents alternate-address reconnects from being queued repeatedly. The
 proposal's preliminary 1,024/4,096 policy is informed by an exact-8.1.1 macOS
 arm64 measurement: the 296-byte `Peer` struct makes 4,096 raw records
 1,212,416 bytes (1.16 MiB), excluding map, allocator, and live-bitfield
-overhead. Maintained patch `0010` now enforces the accepted 1,024/4,096 values;
-the refreshed native measurements remain required evidence.
+overhead. Maintained patch `0010` now enforces the accepted 1,024/4,096 values,
+and the refreshed native measurements pass.
 
 The tracker-count preflight is also not a tracker-request budget. Stable 8.1.1
 and the pinned rqbit-main snapshot issue HTTP tracker requests without a
@@ -310,11 +310,11 @@ What the disposition does **not** do:
   exact ordered patch set, generated vendor, and CI drift proof are the
   reviewed maintained dependency.
 
-Gate 9 passes locally because the maintained engine enforces every applicable
-boundary in this table and the combined proof is green. Refreshed measurements
-across the documented native matrix and independent review remain before the
-M0 evidence is final. The final daemon must be remeasured during M2. Under item
-5, any input change reopens this disposition rather than inheriting it.
+Gate 9 passes because the maintained engine enforces every applicable boundary
+in this table, the combined proof is green, and the documented native matrix
+has refreshed the measurements. Independent review remains before the M0
+evidence is final. The final daemon must be remeasured during M2. Under item 5,
+any input change reopens this disposition rather than inheriting it.
 
 ## 5. Non-goals — this review cannot authorize M2
 
