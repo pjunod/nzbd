@@ -24,7 +24,7 @@ upstream acceptance is not a condition of the selected M0 engine.
 
 The dependency is derived from three reviewed inputs:
 
-- GitHub's immutable rqbit `v8.1.1` source archive;
+- the checksum-pinned rqbit `v8.1.1` source archive;
 - its SHA-256 in [`upstream-v8.1.1.sha256`](upstream-v8.1.1.sha256); and
 - the exact order in [`maintained-series.txt`](maintained-series.txt).
 
@@ -74,7 +74,8 @@ scripts/check-rqbit-maintained-patch-series.sh
 The script:
 
 1. checks exact series membership and order;
-2. downloads the v8.1.1 archive, or uses `RQBIT_UPSTREAM_ARCHIVE`;
+2. reuses a checksum-verified archive from the existing build cache, downloads
+   it once when absent, or uses `RQBIT_UPSTREAM_ARCHIVE`;
 3. verifies the SHA-256 before extraction;
 4. applies each patch with Git's conflict and whitespace checks;
 5. compares the derived `LICENSE`, `README.md`, and `crates/` tree byte for
@@ -83,14 +84,26 @@ The script:
 7. runs the affected `librqbit`, tracker, and DHT suites; and
 8. checks the derived upstream workspace, excluding the desktop package.
 
-For the quick, network-independent derivation check used by the ordinary
-policy gate:
+By default the script caches the verified archive under
+`SWARM_BUILD_CACHE_DIR` when the launcher provides it, then `CARGO_TARGET_DIR`,
+then the ordinary workspace `target/` directory. Set `RQBIT_UPSTREAM_CACHE` to
+choose another reusable cache path. A matching cached archive makes later
+policy-gate runs network-independent; a mismatched cache fails closed instead
+of silently replacing reviewed source bytes.
+
+For a cold offline checkout, provide the reviewed archive explicitly:
 
 ```sh
 RQBIT_UPSTREAM_ARCHIVE=/path/to/rqbit-v8.1.1.tar.gz \
   RQBIT_SERIES_DERIVE_ONLY=1 \
   scripts/check-rqbit-maintained-patch-series.sh
 ```
+
+If GitHub regenerates its tag archive with different bytes, the download fails
+the checked-in checksum. Keep the current vendor and patches unchanged, obtain
+the previously reviewed archive from a trusted cache, and pass it through
+`RQBIT_UPSTREAM_ARCHIVE`. Changing the checksum is an ADR-19 and gate-9 review,
+not a recovery shortcut.
 
 CI runs the complete proof. The ordinary workspace resolves `librqbit` through
 `contrib/rqbit/vendor/crates/librqbit`, keeps default features off, enables only

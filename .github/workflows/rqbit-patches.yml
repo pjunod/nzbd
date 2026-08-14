@@ -63,6 +63,17 @@ jobs:
         with:
           shared-key: rqbit-maintained-v8.1.1-1.85
       - name: Re-derive and test the shipped patch series
+        env:
+          RQBIT_UPSTREAM_CACHE: ${{ runner.temp }}/rqbit-source-cache/rqbit-v8.1.1.tar.gz
+        run: scripts/check-rqbit-maintained-patch-series.sh
+      - name: Prove the verified archive cache removes network dependence
+        env:
+          HTTPS_PROXY: http://127.0.0.1:1
+          NO_PROXY: ""
+          RQBIT_SERIES_DERIVE_ONLY: "1"
+          RQBIT_UPSTREAM_CACHE: ${{ runner.temp }}/rqbit-source-cache/rqbit-v8.1.1.tar.gz
+          https_proxy: http://127.0.0.1:1
+          no_proxy: ""
         run: scripts/check-rqbit-maintained-patch-series.sh
 
   authoritative-restore:

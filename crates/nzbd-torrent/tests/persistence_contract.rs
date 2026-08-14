@@ -11,6 +11,7 @@ use std::time::Duration;
 
 const CHILD_MODE: &str = "NZBD_M0_PERSISTENCE_CHILD";
 const PIECE_LENGTH: usize = 16 * 1024;
+const CHILD_MAX_LIFETIME: Duration = Duration::from_secs(30);
 
 fn bencode_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
     out.extend_from_slice(bytes.len().to_string().as_bytes());
@@ -78,6 +79,14 @@ async fn add_paused(session: &Arc<Session>, torrent: Vec<u8>) -> Arc<ManagedTorr
 }
 
 async fn child_phase(output: &Path, persistence: &Path, ready: &Path) {
+    // The parent normally kills this process at the ready boundary. Keep a
+    // process-wide deadline so an early parent panic or interrupt cannot leave
+    // a detached librqbit session running indefinitely.
+    let _lifetime_guard = std::thread::spawn(|| {
+        std::thread::sleep(CHILD_MAX_LIFETIME);
+        std::process::exit(1);
+    });
+
     install_process_crypto_provider().unwrap();
     let first_payload = payload(11);
     let second_payload = payload(29);

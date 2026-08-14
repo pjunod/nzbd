@@ -7,6 +7,7 @@ readonly checksum_file="$repository_root/contrib/rqbit/upstream-v8.1.1.sha256"
 readonly vendor_dir="$repository_root/contrib/rqbit/vendor"
 readonly upstream_url="https://github.com/ikatson/rqbit/archive/refs/tags/v8.1.1.tar.gz"
 readonly expected_series=$'0001-allow-persistence-without-auto-restore.patch\n0005-bound-tracker-requests.patch\n0007-bound-session-peers.patch\n0009-bound-pending-incoming-handshakes.patch\n0010-bound-known-peer-records.patch\n0012-bound-peer-response-backlog.patch\n0014-bound-discovery-pressure.patch\n0016-limit-peer-metadata-before-allocation.patch\n0018-propagate-file-sizing-errors.patch'
+readonly expected_vendor_entries=$'LICENSE\nREADME.md\ncrates'
 
 if [[ "$(<"$series_file")" != "$expected_series" ]]; then
   echo "maintained rqbit patch order or membership changed unexpectedly" >&2
@@ -17,15 +18,50 @@ fi
 readonly work_dir="$(mktemp -d "${TMPDIR:-/tmp}/nzbd-rqbit-series.XXXXXX")"
 trap 'rm -rf "$work_dir"' EXIT
 
-archive="${RQBIT_UPSTREAM_ARCHIVE:-$work_dir/rqbit-v8.1.1.tar.gz}"
-if [[ -z "${RQBIT_UPSTREAM_ARCHIVE:-}" ]]; then
-  curl --fail --location --silent --show-error "$upstream_url" --output "$archive"
-fi
+expected_checksum="$(awk 'NR == 1 { print $1 }' "$checksum_file")"
+readonly expected_checksum
 
-if command -v sha256sum >/dev/null 2>&1; then
-  (cd "$(dirname "$archive")" && sed "s#  rqbit-v8.1.1.tar.gz#  $(basename "$archive")#" "$checksum_file" | sha256sum -c - >/dev/null)
+archive_checksum() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{ print $1 }'
+  else
+    shasum -a 256 "$1" | awk '{ print $1 }'
+  fi
+}
+
+verify_archive() {
+  [[ -f "$1" ]] && [[ "$(archive_checksum "$1")" == "$expected_checksum" ]]
+}
+
+if [[ -n "${RQBIT_UPSTREAM_ARCHIVE:-}" ]]; then
+  archive="$RQBIT_UPSTREAM_ARCHIVE"
+  if ! verify_archive "$archive"; then
+    echo "rqbit upstream archive is missing or does not match $checksum_file: $archive" >&2
+    exit 1
+  fi
 else
-  (cd "$(dirname "$archive")" && sed "s#  rqbit-v8.1.1.tar.gz#  $(basename "$archive")#" "$checksum_file" | shasum -a 256 -c - >/dev/null)
+  cache_root="${SWARM_BUILD_CACHE_DIR:-${CARGO_TARGET_DIR:-$repository_root/target}}"
+  archive="${RQBIT_UPSTREAM_CACHE:-$cache_root/rqbit-sources/rqbit-v8.1.1.tar.gz}"
+  if [[ -e "$archive" ]]; then
+    if ! verify_archive "$archive"; then
+      echo "cached rqbit archive does not match $checksum_file: $archive" >&2
+      echo "remove that cache entry or set RQBIT_UPSTREAM_ARCHIVE to a verified copy" >&2
+      exit 1
+    fi
+  else
+    download="$work_dir/rqbit-v8.1.1.tar.gz.download"
+    if ! curl --fail --location --silent --show-error "$upstream_url" --output "$download"; then
+      echo "could not fetch rqbit v8.1.1; set RQBIT_UPSTREAM_ARCHIVE to a verified local copy" >&2
+      exit 1
+    fi
+    if ! verify_archive "$download"; then
+      echo "downloaded rqbit archive does not match $checksum_file" >&2
+      echo "GitHub archive bytes may have changed; supply the reviewed archive with RQBIT_UPSTREAM_ARCHIVE" >&2
+      exit 1
+    fi
+    mkdir -p "$(dirname "$archive")"
+    mv "$download" "$archive"
+  fi
 fi
 
 tar -xzf "$archive" -C "$work_dir"
@@ -40,6 +76,17 @@ while IFS= read -r patch_name; do
   git -C "$source_dir" diff --check
   git -C "$source_dir" add --all
 done <"$series_file"
+
+vendor_entries="$(
+  cd "$vendor_dir"
+  find . -mindepth 1 -maxdepth 1 -print | sed 's#^\./##' | LC_ALL=C sort
+)"
+readonly vendor_entries
+if [[ "$vendor_entries" != "$expected_vendor_entries" ]]; then
+  echo "checked-in rqbit vendor root contains unexpected or missing entries" >&2
+  diff -u <(printf '%s\n' "$expected_vendor_entries") <(printf '%s\n' "$vendor_entries") || true
+  exit 1
+fi
 
 if ! diff -u "$source_dir/LICENSE" "$vendor_dir/LICENSE" \
   || ! diff -u "$source_dir/README.md" "$vendor_dir/README.md" \
