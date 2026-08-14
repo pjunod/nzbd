@@ -245,6 +245,43 @@ async fn wait_for<F: Fn() -> bool>(what: &str, secs: u64, f: F) {
     }
 }
 
+/// Retry a request that a node may legitimately answer with the documented
+/// election-gap 503 (`proxy.rs`: "leadership is changing" / "no leader elected
+/// yet"). The proxy rejects *before* forwarding, so a 503 means the leader
+/// never saw the request and re-sending cannot duplicate it.
+///
+/// The eventual `201` is still required: any other status fails immediately,
+/// and a 503 that never clears fails on the deadline. Accepting "201 or 503"
+/// instead would let a genuine proxy regression pass silently.
+async fn post_until_created<F: FnMut() -> (u16, String)>(
+    what: &str,
+    secs: u64,
+    mut send: F,
+) -> String {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
+    loop {
+        let (code, body) = send();
+        if code == 201 {
+            return body;
+        }
+        assert_eq!(code, 503, "{what}: unexpected status {code}: {body}");
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "{what}: still 503 after {secs}s: {body}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// `POST /api/v1/jobs` against any node — leader or proxying non-leader —
+/// riding out an election gap. Returns the 201 body.
+async fn add_job(addr: &str, name: &str, nzb: &[u8]) -> String {
+    post_until_created(&format!("add job `{name}` via {addr}"), 15, || {
+        http(addr, "POST", &format!("/api/v1/jobs?name={name}"), nzb)
+    })
+    .await
+}
+
 fn journaled_segments(shared: &Path) -> Vec<u32> {
     nzbd_state::JobJournals::replay_all(&shared.join(".nzbd-cluster"))
         .unwrap_or_default()
@@ -254,6 +291,52 @@ fn journaled_segments(shared: &Path) -> Vec<u32> {
 }
 
 // ---------------------------------------------------------------------------
+
+// The add helper's retry contract, pinned without depending on real election
+// timing: an injected response sequence stands in for the cluster.
+
+#[tokio::test]
+async fn add_retries_the_election_gap_503_and_still_requires_a_201() {
+    let mut calls = 0;
+    let body = post_until_created("injected add", 15, || {
+        calls += 1;
+        match calls {
+            1 => (
+                503,
+                r#"{"error":"no leader elected yet; retry"}"#.to_string(),
+            ),
+            2 => (
+                503,
+                r#"{"error":"leadership is changing; retry"}"#.to_string(),
+            ),
+            _ => (201, r#"{"id":7}"#.to_string()),
+        }
+    })
+    .await;
+    assert_eq!(calls, 3, "both 503s must be retried");
+    assert_eq!(body, r#"{"id":7}"#);
+}
+
+#[tokio::test]
+#[should_panic(expected = "unexpected status 422")]
+async fn add_does_not_retry_a_real_failure() {
+    post_until_created("injected add", 15, || {
+        (422, r#"{"error":"not an NZB"}"#.to_string())
+    })
+    .await;
+}
+
+#[tokio::test]
+#[should_panic(expected = "still 503")]
+async fn add_fails_when_the_election_gap_never_closes() {
+    post_until_created("injected add", 0, || {
+        (
+            503,
+            r#"{"error":"leadership is changing; retry"}"#.to_string(),
+        )
+    })
+    .await;
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cluster_diagnostics_route_requires_configured_user_auth() {
@@ -413,13 +496,7 @@ async fn leader_retries_authority_adoption_after_snapshot_repair() {
         .unwrap()
         .save(&nzbd_state::QueueSnapshotDoc::default())
         .unwrap();
-    let (code, body) = http(
-        &node.url,
-        "POST",
-        "/api/v1/jobs?name=repaired",
-        post.nzb.as_bytes(),
-    );
-    assert_eq!(code, 201, "add after snapshot repair failed: {body}");
+    add_job(&node.url, "repaired", post.nzb.as_bytes()).await;
     wait_for("scheduling after snapshot repair", 20, || {
         get_json(&node.url, "/api/v1/jobs")["jobs"][0]["status"] == "completed"
     })
@@ -480,13 +557,7 @@ async fn distributed_download_via_any_node_with_budgets() {
     .await;
 
     // Add via the WORKER's API: must proxy to the leader.
-    let (code, body) = http(
-        &b.url,
-        "POST",
-        "/api/v1/jobs?name=clusterjob",
-        post.nzb.as_bytes(),
-    );
-    assert_eq!(code, 201, "proxied add failed: {body}");
+    add_job(&b.url, "clusterjob", post.nzb.as_bytes()).await;
 
     // The job gets delegated to b and completes.
     wait_for("delegation to b", 15, || {
@@ -570,13 +641,7 @@ async fn low_disk_worker_is_visible_and_receives_no_new_lease() {
     })
     .await;
 
-    let (code, body) = http(
-        &held.url,
-        "POST",
-        "/api/v1/jobs?name=held",
-        post.nzb.as_bytes(),
-    );
-    assert_eq!(code, 201, "proxied add failed: {body}");
+    add_job(&held.url, "held", post.nzb.as_bytes()).await;
     tokio::time::sleep(Duration::from_secs(2)).await;
     let jobs = get_json(&leader.url, "/api/v1/jobs");
     assert_eq!(jobs["jobs"][0]["assigned_node"], serde_json::Value::Null);
@@ -638,13 +703,7 @@ async fn worker_death_reclaims_and_resumes_elsewhere_without_refetch() {
         get_json(&a.url, "/api/v1/cluster")["is_leader"].as_bool() == Some(true)
     })
     .await;
-    let (code, _) = http(
-        &a.url,
-        "POST",
-        "/api/v1/jobs?name=reclaimable",
-        post.nzb.as_bytes(),
-    );
-    assert_eq!(code, 201);
+    add_job(&a.url, "reclaimable", post.nzb.as_bytes()).await;
 
     // Wait until b journaled some segments, then kill it.
     let shared = tmp.path().to_path_buf();
@@ -761,13 +820,8 @@ async fn leader_death_fails_over_and_adopts_the_running_lease() {
             && get_json(&a.url, "/api/v1/cluster")["is_leader"].as_bool() == Some(true)
     })
     .await;
-    let (code, _) = http(
-        &c.url,
-        "POST",
-        "/api/v1/jobs?name=failover",
-        post.nzb.as_bytes(),
-    );
-    assert_eq!(code, 201, "add via standby proxies to leader");
+    // Add via the standby coordinator: must proxy to the leader.
+    add_job(&c.url, "failover", post.nzb.as_bytes()).await;
 
     // b makes progress, then the leader dies.
     let shared = tmp.path().to_path_buf();
@@ -830,13 +884,7 @@ async fn single_node_cluster_restart_keeps_the_queue() {
     })
     .await;
 
-    let (code, _) = http(
-        &a.url,
-        "POST",
-        "/api/v1/jobs?name=solo",
-        post.nzb.as_bytes(),
-    );
-    assert_eq!(code, 201);
+    add_job(&a.url, "solo", post.nzb.as_bytes()).await;
     wait_for("completion", 30, || {
         get_json(&a.url, "/api/v1/jobs")["jobs"][0]["status"] == "completed"
     })
@@ -958,13 +1006,7 @@ async fn pp_runs_on_idle_node_via_anti_affinity() {
     })
     .await;
 
-    let (code, body) = http(
-        &a.url,
-        "POST",
-        "/api/v1/jobs?name=pardl",
-        post.nzb.as_bytes(),
-    );
-    assert_eq!(code, 201, "add failed: {body}");
+    add_job(&a.url, "pardl", post.nzb.as_bytes()).await;
 
     // Download completes on a (c can't download); PP is assigned to c,
     // executes there, and the stamped job comes back and is RETIRED to
