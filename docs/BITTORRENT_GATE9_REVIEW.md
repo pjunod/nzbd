@@ -1,8 +1,9 @@
 # BitTorrent gate 9 review — accept measured cost, not silent risk drift
 
-**Status:** all eleven dispositions recorded in §4.1; gate 9 remains Partial ·
-**Date:** 2026-08-07 · **Disposition recorded:** 2026-08-14 ·
-**Engine:** `librqbit =8.1.1` ·
+**Status:** all eleven dispositions recorded; maintained implementation passes
+locally; refreshed native measurements pending ·
+**Date:** 2026-08-07 · **Disposition and amendment recorded:** 2026-08-14 ·
+**Engine:** rqbit v8.1.1 archive plus the ordered nine-patch maintained series ·
 **Decision owner:** ADR-19 in
 [BITTORRENT_PROPOSAL.md](BITTORRENT_PROPOSAL.md)
 
@@ -18,14 +19,16 @@ resolved before this gate can pass. DHT, metadata-resolution, and current-main
 LSD queues also needed explicit discovery-pressure boundaries.
 
 That decision has been taken: §4.1 records the accepted disposition for all
-eleven items. Acceptance of items 6–11 is acceptance of a *requirement*, not
-evidence that the requirement is met, so gate 9 stays **Partial** until an
-accepted stable rqbit release enforces every recorded boundary and the full
-M0 gate is rerun.
+eleven items. ADR-19 now selects the maintained v8.1.1 series that implements
+items 6–11. The immutable archive checksum, exact patch membership/order,
+clean application, byte-identical vendor, and focused behavior tests pass
+locally. Refreshed native measurements remain before the gate's final matrix
+evidence is complete.
 
 No production BitTorrent path is enabled by this review or by its recorded
-disposition. Gates 7 and 8 still fail until accepted stable rqbit APIs provide
-authoritative restore and honest per-torrent discovery health.
+disposition. Gate 8 uses the maintained selective-restore option. Gate 7
+requires operational facts and explicit `unknown` discovery diagnostics, not
+a detailed upstream tracker/DHT API or a health percentage.
 
 ## 1. Decision requested — measured costs, exact exceptions, and resource gaps
 
@@ -41,7 +44,8 @@ The isolated M0 adapter measured the following in one macOS 26.6 arm64 run:
 | New workspace lockfile identities | 178 package/version identities | Is the dependency expansion proportionate to not implementing BitTorrent ourselves? |
 
 These are spike measurements, not permanent limits. The complete M0 rerun
-must measure the final daemon after an accepted rqbit release is linked. A
+must measure the maintained dependency on every native target, and M2 must
+later measure the final daemon when it is linked. A
 reviewer can accept this preliminary cost without claiming the eventual daemon
 has the same size or resident set. The exact cross-platform baselines, maxima,
 growth, and timings are in the
@@ -60,8 +64,8 @@ runtime contract. The contribution kit proves a candidate per-torrent default,
 per-add override, and shared session semaphore on both source lines. Incoming
 and outgoing peer managers hold both applicable permits through release, and
 two-torrent boundary tests exercise the aggregate ceiling. Until equivalent
-controls ship in an accepted stable release, the candidate remains evidence,
-not production capability.
+Maintained patch `0007` now enforces both budgets, and the adapter pins 80/400
+explicitly. Production networking remains disabled.
 
 The live-peer ceiling also does not bound retained peer records. Stable 8.1.1
 and current main insert every unique tracker, DHT, PEX, explicit, or incoming
@@ -74,8 +78,8 @@ prevents alternate-address reconnects from being queued repeatedly. The
 proposal's preliminary 1,024/4,096 policy is informed by an exact-8.1.1 macOS
 arm64 measurement: the 296-byte `Peer` struct makes 4,096 raw records
 1,212,416 bytes (1.16 MiB), excluding map, allocator, and live-bitfield
-overhead. That incomplete size measurement requires reviewer acceptance; it
-does not turn the candidate into shipped capability.
+overhead. Maintained patch `0010` now enforces the accepted 1,024/4,096 values;
+the refreshed native measurements remain required evidence.
 
 The tracker-count preflight is also not a tracker-request budget. Stable 8.1.1
 and the pinned rqbit-main snapshot issue HTTP tracker requests without a
@@ -83,8 +87,9 @@ tracker-owned deadline, buffer the full decoded response, and accept a
 tracker-provided zero-second HTTP announce interval; UDP accepts five seconds.
 The contribution kit proves a candidate 30-second complete-request deadline,
 1 MiB streamed response cap, and 60-second minimum unforced HTTP/UDP interval
-on both source lines. Until equivalent controls ship in an accepted stable
-release, preliminary resource acceptance cannot authorize tracker networking.
+on both source lines. Maintained patch `0005` provides those stable-line
+controls; preliminary resource acceptance still does not authorize tracker
+networking.
 
 The live-peer permits also start after an incoming client has completed enough
 of its handshake to be routed to a torrent. Stable 8.1.1 accepts every TCP
@@ -94,8 +99,9 @@ Current rqbit main has a configurable per-listener ceiling of 256 pending
 checks. The contribution kit carries a stable-only 256-check backport and a
 verifier for main's native boundary. This is a distinct pre-routing resource
 budget: neither the 80/400 live-peer candidate nor the fixed timeout closes an
-unbounded concurrency set. Until an accepted stable release enforces a
-reviewed limit, production listener activation remains unauthorized.
+unbounded concurrency set. Maintained patch `0009` provides the accepted
+stable 256-check boundary; production listener activation remains
+unauthorized.
 
 Established live-peer work has another independent gap. Valid BEP 3 piece
 requests enter an unbounded upload-scheduler channel and then an unbounded
@@ -108,9 +114,9 @@ is disconnected rather than parking its socket reader behind torrent-global
 upload throttling. The permit follows a piece response across both queues and
 a metadata response through the writer, and is released only after the socket
 write completes or is cancelled. Production-path admission and blocked-write
-tests fail under intentional guard/lifetime bypasses. Until an accepted stable
-release enforces a reviewer-approved window and overload policy, established
-peer traffic remains unauthorized.
+tests fail under intentional guard/lifetime bypasses. Maintained patch `0012`
+provides the accepted window and overload policy; established peer traffic
+remains unauthorized.
 
 Discovery has its own retained-work chain before a peer becomes live. Stable
 8.1.1 and the pinned rqbit-main snapshot use unbounded channels for outgoing
@@ -129,9 +135,10 @@ active maintenance requests per worker; 128 active metadata attempts; 256
 pending metadata candidates; and a 4,096-entry metadata deduplication set that
 does not terminate discovery. It also
 cancels LSD work with its owning stream, protects replacement registrations,
-and removes an existing duplicate DHT request per recursive step. These fixed
-values and UDP drop/backpressure choices are preliminary review evidence, not
-released capability.
+and removes an existing duplicate DHT request per recursive step. Maintained
+patch `0014` provides the stable-line DHT and metadata boundaries. The
+current-main LSD lifecycle work remains optional contribution material because
+v8.1.1 does not have that result stream.
 
 The normal closure is permissively licensed except for exact
 `option-ext 0.2.0`, which is MPL-2.0 file-level copyleft. The checked-in
@@ -184,6 +191,7 @@ Run the exact dependency and exception checks from the repository root:
 
 ```bash
 scripts/check-bittorrent-deps.sh                    # Exact rqbit/Rust-TLS graph; no OpenSSL.
+scripts/check-rqbit-maintained-patch-series.sh       # Exact archive, series, vendor, and proofs.
 scripts/check-reviewed-dependency-exceptions.sh    # Exact exception package and feature sets.
 cargo test -p nzbd-torrent --lib                    # Includes the no-UPnP construction invariant.
 cargo deny --all-features --locked check bans licenses sources
@@ -212,7 +220,8 @@ byte-for-byte acceptance comparisons.
 
 ## 4. Reviewer disposition — accept, reject, or require another boundary
 
-Gate 9 may move from Partial to Pass only if a reviewer accepts all of these:
+Gate 9 can pass only if the recorded dispositions and their implementation
+evidence all hold:
 
 1. **Binary and idle-memory cost.** The one-sample 9.64 MiB harness and
    8.41 MiB idle RSS are acceptable preliminary costs, subject to
@@ -225,35 +234,33 @@ Gate 9 may move from Partial to Pass only if a reviewer accepts all of these:
    only while its vulnerable parsing feature remains absent.
 5. **Renewal rule.** Any engine, feature, advisory, dependency-path, or MSRV
    change reopens this decision; a previous green run is not a waiver.
-6. **Runtime peer budgets.** Gate 9 cannot pass on the claim that the proposed
-   80/400 peer budgets are enforced. An accepted stable per-torrent limit and
-   shared-session cap must exist first, or the proposal must be explicitly
-   amended with new measured and reviewed limits. The prepared combined-permit
-   candidate is evidence for that review, not shipped capability.
-7. **Tracker request budgets.** An accepted stable engine must bound the
+6. **Runtime peer budgets.** The maintained engine must enforce the proposed
+   80/400 peer budgets or the proposal must be explicitly amended with new
+   measured and reviewed limits.
+7. **Tracker request budgets.** The maintained engine must bound the
    complete HTTP tracker request, decoded response body, and hostile unforced
    HTTP/UDP announce intervals. The prepared 30-second, 1 MiB, and 60-second
    candidate values are evidence for review, not shipped capability.
-8. **Pending incoming handshakes.** An accepted stable engine must bound
+8. **Pending incoming handshakes.** The maintained engine must bound
    incomplete pre-routing handshake work separately from routed live peers.
    The prepared stable 256-check backport and main's native per-listener
    boundary are evidence for review, not shipped capability. A reviewer must
    explicitly accept the preliminary value and the TCP-only first-release
    scope or require a different measured ceiling.
-9. **Retained peer records.** An accepted stable engine must separately bound
+9. **Retained peer records.** The maintained engine must separately bound
    queued, backoff, dead, and not-needed peer records per torrent and across
    the session. The prepared permit candidate and 296-byte raw-struct
    measurement are evidence for review, not shipped capability. A reviewer
    must accept or revise the preliminary 1,024/4,096 limits and require
    additional target-specific memory evidence if the raw measurement is not
    sufficient.
-10. **Established-peer response backlog.** An accepted stable engine must
+10. **Established-peer response backlog.** The maintained engine must
     bound remote-triggered piece and metadata responses across the upload
     scheduler and socket writer. The prepared 128-permit candidate and its
     failing negative control are evidence for review, not shipped capability.
     A reviewer must accept or revise the advertised window and over-window
     disconnect behavior.
-11. **Discovery-pressure budgets.** An accepted stable engine must bound DHT
+11. **Discovery-pressure budgets.** The maintained engine must bound DHT
     datagrams, recursive work, delivered peers, and retained metadata
     candidates. Any stable line that includes LSD must also tie its bounded
     result stream and announce task to one lifecycle. The prepared
@@ -290,33 +297,36 @@ the disposition of record; §4 remains the statement of what was asked.
 
 What the disposition does **not** do:
 
-- It does not move gate 9 to Pass. Items 6–11 accept requirements that no
-  accepted stable rqbit release enforces today, so the gate stays **Partial**.
+- It does not make old upstream evidence sufficient by itself. Items 6–11 are
+  enforced by the maintained stable series and must keep their exact
+  revert-sensitive tests green.
 - It does not enable any production BitTorrent configuration, listener,
   tracker, DHT, admission, payload I/O, or UI path.
-- It does not affect gates 7 and 8, which remain **Fail**, or gate 4, which
-  remains blocked by gate 8.
-- It does not accept a private rqbit fork. The recorded boundaries must be
-  accepted upstream and ship in a stable release, or ADR-19's
-  alternate-engine evaluation is triggered.
+- It does not make detailed tracker/DHT state a required public fact. Missing
+  detail remains `unknown`, never inferred from peers.
+- It does not give rqbit authority over the durable queue. Automatic restore is
+  disabled; nzbd selects every restore.
+- It does not accept an unexplained private fork. The immutable upstream input,
+  exact ordered patch set, generated vendor, and CI drift proof are the
+  reviewed maintained dependency.
 
-Gate 9 may move to Pass only when an accepted stable engine enforces every
-boundary in this table, the final-daemon measurements in items 1 and 9 are
-taken across the documented native matrix, and the complete M0 gate rerun is
-independently reviewed. Under item 5, any change to those inputs reopens this
-disposition rather than inheriting it.
+Gate 9 passes locally because the maintained engine enforces every applicable
+boundary in this table and the combined proof is green. Refreshed measurements
+across the documented native matrix and independent review remain before the
+M0 evidence is final. The final daemon must be remeasured during M2. Under item
+5, any input change reopens this disposition rather than inheriting it.
 
 ## 5. Non-goals — this review cannot authorize M2
 
-- It does not make rqbit's persistence subordinate to nzbd. Gate 8 still
-  requires an accepted stable authoritative-restore API.
-- It does not expose tracker or DHT health. Gate 7 still requires an accepted
-  stable discovery-health API.
+- It does not wire rqbit persistence into the daemon. The maintained API makes
+  selective restore possible, but M2 must integrate it with the durable queue.
+- It does not expose detailed tracker or DHT health. Gate 7 reports the
+  diagnostic as `unknown` while preserving required facts.
 - It does not add torrent configuration, admission, listeners, trackers, DHT,
   payload I/O, qBittorrent compatibility, or UI.
 - It does not treat the 80-entry bootstrap-input guard as a live-peer resource
-  cap or accept stable 8.1.1's hard-coded 128-per-torrent behavior. The prepared
-  shared-session patch still requires upstream acceptance and a stable release.
+  cap. The adapter separately pins the maintained engine's 80/400 runtime
+  limits.
 - It does not treat the 64-tracker input cap as a request lifetime, body, or
   announce-rate budget.
 - It does not treat the 10-second read timeout or live-peer permits as a limit
@@ -329,5 +339,5 @@ disposition rather than inheriting it.
   or magnet-metadata discovery queues and candidate sets.
 - It does not submit any prepared patch upstream.
 
-Gate 9 is one required decision among eleven, not permission to skip the two
-engine stop conditions.
+Gate 9 is one required decision among eleven, not permission to skip native M0
+evidence, independent review, or the separate M2 implementation.

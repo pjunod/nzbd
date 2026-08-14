@@ -38,7 +38,7 @@ for file in "$review_doc" "$proposal" "$m0_report" "$gate9_review" "$readme"; do
 done
 
 require_literal "$review_doc" '**Status:** pre-release review surface; production BitTorrent remains disabled'
-require_literal "$review_doc" '> **No-go:** do not add a production switch or weaken the daemon-isolation'
+require_literal "$review_doc" '> **No production wiring:** do not add a production switch or weaken the'
 
 for heading in \
   '## 2. Public traffic' \
@@ -51,25 +51,29 @@ for heading in \
   require_literal "$review_doc" "$heading"
 done
 
-require_literal "$m0_report" '| 7. Public observability | **Fail** |'
-require_literal "$m0_report" '| 8. nzbd-authoritative persistence | **Fail** |'
-require_literal "$m0_report" '| 9. Resource, package, and license delta | **Partial** |'
+require_literal "$m0_report" '| 7. Public observability | **Pass locally** |'
+require_literal "$m0_report" '| 8. nzbd-authoritative persistence | **Pass locally** |'
+require_literal "$m0_report" '| 9. Resource, package, and license delta | **Pass locally; native measurements pending** |'
 require_literal "$proposal" '[pre-release operations review](BITTORRENT_RELEASE_REVIEW.md)'
+require_literal "$proposal" '#### 4.3.3 Maintained-engine amendment — selected 2026-08-14'
 require_literal "$readme" '[docs/BITTORRENT_RELEASE_REVIEW.md](docs/BITTORRENT_RELEASE_REVIEW.md)'
 
 # The gate 9 human disposition is a recorded decision, not a rerunnable check.
 # Losing it would silently return the gate to "awaiting a reviewer" while the
 # proposal and M0 report still claim the boundaries were accepted.
 require_literal "$gate9_review" '### 4.1 Recorded disposition — accepted 2026-08-14'
-require_literal "$gate9_review" '**Status:** all eleven dispositions recorded in §4.1; gate 9 remains Partial'
+require_literal "$gate9_review" '**Status:** all eleven dispositions recorded; maintained implementation passes'
 require_literal "$gate9_review" 'reply `APPROVE RECOMMENDED DEFAULTS`, 2026-08-14T00:30:03Z'
 require_literal "$gate9_review" 'https://github.com/pjunod/nzbd/issues/83#issuecomment-5287959702'
 require_count "$gate9_review" '^\| *[0-9]+ \| \*\*Accepted' 11
 
-# Acceptance of items 6-11 accepted a requirement, not its implementation.
-# Gate 9 stays Partial until an accepted stable release enforces every boundary.
-require_literal "$gate9_review" 'It does not move gate 9 to Pass.'
+# The selected maintained series implements items 6-11. M0 completion still
+# requires exact derivation, native evidence, independent review, and a dormant
+# production boundary.
+require_literal "$gate9_review" 'Gate 9 passes locally because the maintained engine enforces every applicable'
+require_literal "$proposal" 'The checked-in vendor is generated output and must never be hand-edited.'
 require_literal "$m0_report" 'gate 9 review brief §4.1'
 require_literal "$proposal" 'Its §4.1 records the accepted disposition'
+require_literal "$review_doc" "the eleven-gate M0 evidence, and today's disabled production boundary"
 
-echo 'BitTorrent release-review policy: no-go state, operator review domains, and the recorded gate 9 disposition are explicit'
+echo 'BitTorrent release-review policy: maintained M0 state, operator review domains, and disabled production wiring are explicit'

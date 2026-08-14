@@ -135,8 +135,10 @@ matrix.
 
 M1b does not soften any M0 stop condition. Before M2:
 
-1. rqbit must expose authoritative restore and honest discovery health in a
-   stable release, or ADR-19 must select and prove another engine;
+1. ADR-19 selects the maintained rqbit v8.1.1 derivation; M2 remains blocked
+   until #85 proves all eleven M0 gates on the native matrix. Required transfer
+   facts must remain public and bounded, while unavailable detailed
+   tracker/DHT diagnostics stay explicit `unknown` rather than inferred;
 2. all eleven M0 gates must pass on native macOS, Linux glibc/musl, and
    Windows, including private-mode capture and dependency review.
 

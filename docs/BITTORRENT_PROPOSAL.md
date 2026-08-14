@@ -1,9 +1,11 @@
 # BitTorrent support — one queue, two transfer protocols
 
-**Status:** review incorporated; M0 no-go; M1b merged; M2 blocked ·
-**Decision:** ADR-19, production engine blocked; neutral queue seam authorized ·
-**Written:** 2026-08-05 · **Revised:** 2026-08-08 ·
-**Verified against:** `14f152b` ·
+**Status:** ADR-19 amended; maintained rqbit M0 candidate selected; M1b merged;
+production wiring remains disabled ·
+**Decision:** pin the reproducibly derived nine-patch rqbit v8.1.1 engine;
+complete M0 before decomposing M2 ·
+**Written:** 2026-08-05 · **Revised:** 2026-08-14 ·
+**Verified against:** rqbit v8.1.1 (`00b97485160ff5b5aa2b379ea0815d568ec665f0`) ·
 **Scope:** architecture, contracts, milestones, and review questions; no
 production BitTorrent path is authorized before the gates below pass
 
@@ -35,7 +37,11 @@ path but also found two stable-API gaps: fast-resume persistence restores its
 own complete torrent list before nzbd can reconcile it, and tracker/DHT health
 is not available through the public per-torrent stats model. The isolated
 adapter and schema groundwork may remain; production session wiring stops here
-until ADR-19 is amended with an upstream fix or a different engine.
+until ADR-19 is amended with a maintained fix or a different engine. The
+2026-08-14 amendment in §4.3.3 makes that decision: nzbd derives a pinned local
+rqbit v8.1.1 vendor from the immutable release archive plus exactly nine small,
+ordered patches. This is an explicit dependency boundary, not permission to
+wire a daemon session.
 
 A same-day re-check of stable 8.1.1 and rqbit's unreleased 9.0 branch found
 that both M0 blockers remain. That result changes the milestone dependency,
@@ -90,7 +96,7 @@ client before it becomes a feature catalogue.
 
 | Question | Proposed answer | Why |
 |---|---|---|
-| Torrent engine | Embed stable `librqbit` 8.1.1 with Rust TLS; TCP/IPv4 in v1 | It fits the Tokio/Rust/single-binary architecture. uTP and IPv6 belong to 9.x and are not claimed until a stable release passes the same gates. |
+| Torrent engine | Embed the maintained rqbit v8.1.1 source derivation with Rust TLS; TCP/IPv4 in v1 | The immutable upstream archive, checksum, ordered patch series, generated vendor, and CI drift proof form one reviewed dependency. uTP and IPv6 remain outside the first release. |
 | Queue ownership | nzbd remains the source of truth | A library resume file may accelerate recovery; it must not become a second job database. |
 | Domain model | Add a protocol-specific transfer record; do not fake pieces as NNTP articles | A peer, piece, tracker, and upload ratio have no honest mapping to server, segment, health, or par2. |
 | *arr integration | Emulate only the qBittorrent endpoints current Sonarr/Radarr use | The existing NZBGet shim cannot receive torrent grabs, and a full qBittorrent clone would be unrelated scope. |
@@ -285,7 +291,8 @@ path.
 
 ## 4. ADR-19 — embed a torrent library behind a backend adapter
 
-**Status:** Amended; backend boundary accepted, production engine unresolved
+**Status:** Amended 2026-08-14; maintained rqbit v8.1.1 candidate selected,
+production wiring still disabled
 
 **Deciders:** maintainer · security reviewer · operator representative
 
@@ -302,7 +309,7 @@ behavior. Rebuilding those protocols would be a new project, not a feature.
 
 | Option | Complexity | Runtime dependency | Protocol maturity | Fit with nzbd | Decision |
 |---|---:|---:|---:|---:|---|
-| Embed `librqbit` | Medium | none | Good v1 feature set; explicit gaps need a spike | Rust, Tokio, library API, Apache-2.0, single binary | **Choose, subject to M0** |
+| Embed `librqbit` | Medium | none | Good v1 feature set; nine bounded fixes close the reviewed M0 gaps | Rust, Tokio, library API, Apache-2.0, single binary | **Choose the reproducibly derived v8.1.1 patch series, subject to complete M0 evidence** |
 | Bind `libtorrent-rasterbar` | High | C++ library/FFI | Broad and mature, including extensive BEP coverage | Adds unsafe FFI, C++ packaging, and static-build complexity | Fallback if M0 fails a blocker |
 | Delegate to Transmission/qBittorrent/rqbit daemon | Low initial, high product | second daemon | Mature according to chosen daemon | Split queue, auth, persistence, paths, logs, lifecycle, and support boundary | Reject |
 | Implement BitTorrent in nzbd | Extreme | none | Years behind mature engines on day one | Maximum control, unacceptable protocol/security burden | Reject |
@@ -323,7 +330,7 @@ Those are promising inputs, not proof. M0 must build this exact dependency
 shape first:
 
 ```toml
-librqbit = { version = "=8.1.1", default-features = false, features = ["rust-tls"] }
+librqbit = { version = "=8.1.1", path = "contrib/rqbit/vendor/crates/librqbit", default-features = false, features = ["rust-tls"] }
 ```
 
 Pin the first accepted version because this adapter becomes a correctness
@@ -346,12 +353,19 @@ M0 passes only if it proves all of the following:
    validated.
 6. File paths are either rejected safely by the library or can be validated
    before any file is created.
-7. Torrent stats expose enough information for the §7 contracts without
-   reading library-private state.
+7. Torrent stats expose the required public facts without reading
+   library-private state: transfer phase, total and verified bytes, verified
+   per-file progress, completion, rates/ETA inputs, peer counts, admission
+   facts, and a bounded credential-safe last error. Detailed tracker/DHT state
+   is diagnostic only; an unavailable diagnostic is reported as `unknown` and
+   is never inferred from peer count or converted into a health percentage.
 8. Session persistence can be used as a resume accelerator without letting it
    auto-restore torrents absent from nzbd’s durable job store.
 9. The binary and idle-memory growth, dependency/package-count delta, and
-   transitive license delta are measured and accepted.
+   transitive license delta are measured and accepted; every reviewed runtime
+   resource boundary is enforced; and the exact upstream checksum, patch
+   membership/order, application, generated vendor, and behavior proofs are
+   protected against drift.
 10. The process installs one explicit rustls 0.23 `CryptoProvider` before
     either nzbd TLS or `librqbit` constructs a client, and a test proves the
     mixed aws-lc/ring dependency graph cannot reach an ambiguous-provider
@@ -360,11 +374,11 @@ M0 passes only if it proves all of the following:
     requires `btih`; v2-only and hybrid metainfo and magnets are rejected
     with distinct named errors unless an explicit test proves otherwise.
 
-If gates 1–8 fail and cannot be fixed by a small upstreamable adapter change,
+If gates 1–8 fail and cannot be fixed by a small maintainable engine change,
 evaluate `libtorrent-rasterbar`. Do not hide a library gap behind polling,
 unsafe file operations, or a second source of truth.
 
-#### 4.3.1 M0 result — stop before daemon integration
+#### 4.3.1 Historical M0 result — stop before daemon integration
 
 The 2026-08-05 spike is a **no-go for production wiring on stable 8.1.1**.
 The detailed commands, measurements, and evidence are in
@@ -411,7 +425,7 @@ safe but operationally different from the accepted fast-resume requirement;
 adopting it requires an explicit ADR change. If the upstream surface cannot be
 made stable and small, evaluate `libtorrent-rasterbar` as already specified.
 
-#### 4.3.2 Upstream re-check and M1b amendment
+#### 4.3.2 Historical upstream re-check and M1b amendment
 
 The 2026-08-05 follow-up checked crates.io's current stable release and rqbit
 main at `4e5f94c`. Stable remains 8.1.1. The unreleased tree identifies itself
@@ -477,6 +491,58 @@ Primary evidence: [crates.io stable release](https://crates.io/crates/librqbit),
 [unreleased session construction](https://github.com/ikatson/rqbit/blob/4e5f94cbcf1d57ec500885c77cf1e24d70232d89/crates/librqbit/src/session.rs),
 [tracker provider state](https://github.com/ikatson/rqbit/blob/4e5f94cbcf1d57ec500885c77cf1e24d70232d89/crates/tracker_comms/src/tracker_comms.rs),
 and [public torrent statistics](https://docs.rs/librqbit/8.1.1/librqbit/struct.TorrentStats.html).
+
+#### 4.3.3 Maintained-engine amendment — selected 2026-08-14
+
+This amendment supersedes the release-only conclusions in §§4.3.1–4.3.2.
+ADR-19 selects rqbit v8.1.1 plus exactly these nine stable patches:
+
+1. disable automatic restore while retaining explicit restore;
+2. bound tracker response size, request duration, and announce cadence;
+3. enforce per-torrent and shared live-peer ceilings;
+4. bound pre-routing incoming handshakes;
+5. enforce per-torrent and shared retained-known-peer ceilings;
+6. bound peer piece/metadata response backlog;
+7. bound DHT and metadata-discovery work;
+8. enforce the 10 MiB peer-metadata ceiling before allocation; and
+9. propagate file-sizing failures instead of logging and continuing.
+
+The machine-readable order is
+[`contrib/rqbit/maintained-series.txt`](../contrib/rqbit/maintained-series.txt).
+The upstream input is the immutable v8.1.1 archive with the checked SHA-256 in
+[`upstream-v8.1.1.sha256`](../contrib/rqbit/upstream-v8.1.1.sha256). CI rebuilds
+the vendor from that archive, applies every patch in order, compares the result
+byte-for-byte with `contrib/rqbit/vendor`, and runs the exact affected upstream
+tests. The checked-in vendor is generated output and must never be hand-edited.
+
+The series is about 2,800 changed lines and stays within the “small,
+maintainable engine change” branch of this ADR. It does not add a second
+runtime, change the queue owner, or adopt rqbit's private persistence format.
+The heavier `libtorrent-rasterbar` FFI/packaging fallback is therefore not
+triggered. Current-main variants and the optional detailed
+`discovery_health` patch remain upstream contribution material; they are not
+part of the production dependency.
+
+The resume decision is nzbd-authoritative selective restore. The engine starts
+with automatic restore disabled, nzbd admits only durable queue records, and
+the persisted engine state can accelerate only those selected restores. A full
+recheck is a safe degradation path, not the normal ownership model. The gate-4
+proof kills the writer process, starts an empty session, restores one selected
+record, and verifies that complete bytes placed on disk after the persisted
+16 KiB checkpoint do not become trusted progress.
+
+Gate 7 requires operational facts, not a synthetic swarm score. The adapter
+publishes transfer phase, total and verified bytes, per-file verified progress,
+completion, rates/ETA inputs, peer counts, admission facts, and a bounded
+credential-safe error. Detailed tracker and DHT state is diagnostic only; this
+candidate reports it as `unknown` when unavailable and never guesses from peer
+availability. No torrent-health percentage is defined.
+
+Gate 8 may pass on the maintained local patch; upstream acceptance is not a
+condition of this ADR. Gate 9 additionally requires patch integrity, every
+reviewed runtime limit, dependency/license evidence, and current native
+measurements. Passing M0 authorizes decomposition and review of M2; it does not
+add daemon config, admission, a listener, DHT, tracker work, or payload I/O.
 
 ### 4.4 Consequences
 
@@ -1340,45 +1406,26 @@ source_redirects = 5
   seed; it does not silently invent a ratio.
 - fixed metainfo and redirect limits: torrent sources are hostile input and
   an authenticated caller still should not make the daemon allocate without
-  bound. Stable rqbit's peer metadata reader otherwise allocates up to its
-  fixed 32 MiB ceiling before nzbd can inspect a magnet's resolved metainfo.
-  The prepared upstream `max_metadata_size` patch carries the configured
-  ceiling through peer options and checks it before allocation or metadata
-  requests. nzbd must not enable magnet admission until that contract ships
-  in an accepted stable release; post-resolution validation is too late to
-  enforce the allocation boundary.
+  bound. The maintained engine carries the adapter's 10 MiB
+  `max_metadata_size` through peer options and rejects the declared BEP 9 size
+  before allocating a peer buffer or sending metadata requests.
 - the `max_peers_per_torrent = 80` and `max_peers_total = 400` values are
-  accepted runtime budgets, not descriptions of stable 8.1.1. That release
-  hard-codes 128 live peers per torrent and exposes no session-wide cap. The
-  dormant adapter's 80-peer guard bounds explicit bootstrap input only;
-  tracker/PEX/DHT discovery can still fill the engine limit. Current rqbit main
-  has a per-torrent `peer_limit`, but production still needs that API in an
-  accepted stable release plus a caller-owned shared-session budget. The
-  contribution kit now proves a candidate option on stable and main: each live
-  incoming or outgoing peer holds its torrent permit and the optional shared
-  session permit until release. The tested candidate does not become usable by
-  nzbd until upstream accepts it and a stable release ships it.
+  enforced runtime budgets in the maintained engine, not merely bootstrap
+  input caps. Every incoming and outgoing live peer holds both applicable
+  permits through manager release.
 - the retained-peer limits are distinct from the 80/400 live-manager limits.
-  Stable 8.1.1 and current rqbit main retain every unique tracker, DHT, PEX,
-  explicit, or incoming address in a map and unbounded peer-adder channel,
-  including queued, backoff, dead, and not-needed records. A tested candidate
-  holds per-torrent and shared-session permits for the entire record lifetime,
+  The maintained engine holds per-torrent and shared-session permits for the
+  entire record lifetime,
   removes incoming-only records after their manager exits, and prevents
   alternate-address reconnects from being queued repeatedly while preserving
   the retained record handle separately from the connection address. The
-  preliminary 1,024/4,096 values cap the exact-8.1.1 296-byte raw `Peer`
-  structs at
+  accepted 1,024/4,096 values cap the exact-8.1.1 296-byte raw `Peer` structs at
   1,212,416 bytes (1.16 MiB) session-wide before map, allocator, and live
-  bitfield overhead. Reviewer acceptance and an accepted stable release are
-  still required; the size sample is not a complete memory measurement.
+  bitfield overhead. The size sample is not a complete memory measurement.
 - live-peer permits do not cover incomplete incoming handshakes before torrent
-  routing. Stable 8.1.1 accepts those sockets into an unbounded pending set for
-  up to the 10-second read timeout. Current rqbit main defaults its
-  per-listener boundary to 256; the contribution kit proves the same fixed
-  ceiling as a stable-only backport. The value is preliminary and TCP-only for
-  the first release. Production needs an accepted stable boundary plus human
-  acceptance of that measured policy; a timeout by itself is not a
-  concurrency limit.
+  routing, so the maintained stable backport caps that set at 256. The limit is
+  TCP-only for the first release; a timeout by itself is not treated as a
+  concurrency boundary.
 - live-peer admission, upload rate limits, and read/write timeouts also do not
   bound response records queued after a peer is established. Valid piece
   requests cross an unbounded upload scheduler and peer writer, while valid
@@ -1387,9 +1434,9 @@ source_redirects = 5
   advertises it as BEP 10 `reqq`, and holds each permit through the socket
   write. Admission never awaits: a peer that exceeds the advertised window is
   disconnected so its reader cannot stall behind torrent-global upload
-  throttling. The value, over-window policy, and accepted stable release remain
-  gate-9 prerequisites; the contribution evidence does not authorize the
-  production writer.
+  throttling. The maintained engine enforces the accepted 128-request window
+  and over-window disconnect policy. This does not authorize a production
+  writer.
 - live/retained-peer permits also do not bound discovery work before admission.
   Stable 8.1.1 and current main leave outgoing DHT datagrams, recursive nodes,
   delivered peers, and metadata candidates on unbounded retained-work paths;
@@ -1403,8 +1450,9 @@ source_redirects = 5
   starve later entries. The candidate also ties
   the LSD task to its stream, protects replacement registrations, and reuses
   one response instead of sending every recursive DHT request twice. The fixed
-  values, UDP drop policy, and accepted stable release remain gate-9
-  prerequisites; the contribution evidence does not authorize discovery.
+  values and UDP drop policy are enforced by the maintained stable series;
+  current-main LSD changes remain drift material because v8.1.1 has no LSD
+  result stream. This evidence does not authorize production discovery.
 - dormant torrent initialization is serialized explicitly. Stable rqbit's
   unset default permits three concurrent initialization integrity scans, which
   can multiply disk I/O before torrents become live. The one-scan guard does
@@ -1919,7 +1967,8 @@ swarm is not evidence of terminal failure.
 
 ## 15. Implementation plan — each milestone leaves a usable truth
 
-### 15.1 M0 — dependency and interoperability spike (complete, no-go)
+### 15.1 M0 — maintained dependency and interoperability spike (local pass;
+native rerun pending)
 
 The checked-in adapter remains isolated from the daemon; there is no production
 config, API, or peer listener.
@@ -1939,9 +1988,12 @@ root cannot be established · resume can promote unverified data.
 seeds deterministic generated content with the internet disabled; the build
 matrix and a short spike report state pass/fail for all eleven §4.3 gates.
 
-**Result:** the deterministic adapter suite passes, but gates 7 and 8 do not.
-Per the stop condition, do not start M1b backend routing or any M2
-session integration. See [BITTORRENT_M0_REPORT.md](BITTORRENT_M0_REPORT.md).
+**Result:** ADR-19 now selects the maintained v8.1.1 derivation. The local
+combined proof passes all eleven gates, including process-kill selective
+restore, explicit `unknown` discovery diagnostics, patch integrity, and
+reviewed runtime limits. The native target rerun remains the completion
+evidence. Do not start M2 session integration from this change. See
+[BITTORRENT_M0_REPORT.md](BITTORRENT_M0_REPORT.md).
 
 ### 15.2 M1a — queue schema envelope (complete)
 
@@ -1996,7 +2048,8 @@ F1–F3 landed on 2026-07-31, and
 [`DEFECT_HISTORY_DELETE.md`](DEFECT_HISTORY_DELETE.md) is resolved with shared
 JSONL tombstones. M2 may rely on the enforcing disk guard and terminal-history
 delete semantics; neither is still a reason to start production networking.
-The engine/API gates in ADR-19 remain the blocking prerequisite.
+The complete M0 matrix and independent review of the maintained engine remain
+the blocking prerequisites.
 
 Keep native UI changes minimal in this milestone; the API and logs must make
 every state observable.
@@ -2064,8 +2117,8 @@ separate evidence rather than silently extending every local gate.
 The checked-in
 [pre-release operations review](BITTORRENT_RELEASE_REVIEW.md) gives reviewers
 one short surface for public traffic, ports, paths, seeding, deletion, current
-evidence, and stop conditions. Its policy check intentionally pins the present
-no-go state: gates 7 and 8 remain failed and gate 9 remains Partial. Updating
+evidence, and stop conditions. Its policy check pins the selected engine
+boundary, the eleven-gate M0 state, and continued daemon isolation. Updating
 that check requires the same reviewed gate-state change as this proposal and
 the M0 report; it cannot be bypassed to expose production wiring.
 
@@ -2136,20 +2189,19 @@ aarch64, and Windows x86_64. Every target observed the same sizing result:
 one 262,144-byte request, a zero-byte file, zero piece writes, `Paused` then
 `Live`, no stats-visible error, and no retry before observation.
 
-The contribution kit now carries exact-stable and current-main candidates that
-make this failure stop initialization. They preserve selected-file and padding
+The maintained dependency includes the exact-stable change that makes this
+failure stop initialization. The stable and current-main variants preserve selected-file and padding
 behavior, add file/length context, and return the first `ensure_file_length`
 error through rqbit's existing initialization error path. A sensitivity
 mutation inside the helper makes the exact unit test fail, while a separate
 fail-closed verifier assertion rejects either source line if its blocking
 initialization boundary discards the helper result. The current-main candidate
 also types checksum cancellation and proves a concurrent pause suppresses only
-that marker, not a storage failure. Exact stable and documented-main verifier
-legs block pull requests; the moving-main compatibility leg remains advisory
-there and required on pushes and the weekly schedule. This candidate does not
-satisfy the storage policy by itself: it still needs human review, upstream
-acceptance, a stable release, and daemon-owned torrent fault routing, pause,
-API, and recovery behavior before production wiring.
+that marker, not a storage failure. The exact stable derivation and focused
+tests block pull requests; documented and moving-main variants remain upstream
+drift material. This fix does not satisfy the daemon storage policy by itself:
+M2 still needs torrent fault routing, pause, API, and recovery behavior before
+production wiring.
 
 The
 [hardened native run](https://github.com/pjunod/nzbd/actions/runs/31345445318)
@@ -2405,12 +2457,12 @@ data-loss change, not a feature toggle.
 | `librqbit` lacks a required control or platform | Feature cannot meet nzbd’s contract | M0 gates before production architecture; `libtorrent` is the named fallback. |
 | Stable library lacks BEP 52 | Some modern torrents reject | Honest v1 scope and named rejection; revisit on proven stable support. |
 | Stable library is TCP/IPv4 and private torrents use one tracker | Some peers/networks and tracker failover are unavailable | Publish the exact v1 matrix, verify primary-tracker private downloads, revisit only on a stable 9.x gate. |
-| Stable library cannot enforce the proposed 80/400 live-peer budgets | Tracker/PEX/DHT discovery can exceed configured resource expectations | Do not confuse the 80-entry bootstrap guard with a runtime cap; require an accepted stable per-torrent limit and caller-owned shared-session budget before M2. The tested contribution candidate is evidence, not released capability. |
-| Stable and current engines retain unbounded known-peer records | Tracker/DHT/PEX or repeated incoming addresses can grow queued, backoff, dead, and not-needed state outside live-peer permits | Require accepted per-torrent and shared-session retained-record limits before M2. Review the preliminary 1,024/4,096 policy against full map/allocator measurements; the tested permit candidate is evidence, not released capability. |
-| Stable listener leaves incomplete incoming handshakes unbounded | Remote clients can retain sockets, buffers, and tasks before live-peer permits apply | Require an accepted stable pre-routing handshake ceiling and review it separately from the 80/400 live-peer policy. Current main's native 256-per-listener default and the tested stable backport are evidence, not released capability. |
-| Tracker response or interval is hostile | Memory/request tasks remain unbounded or a tracker is hammered | Require an accepted stable request deadline, streamed body cap, and minimum unforced interval; tracker-count preflight alone is insufficient. |
-| Established peer floods piece or metadata requests | The upload scheduler and peer writer retain unbounded response records behind rate limits or a slow socket | Require an accepted stable per-peer response window spanning scheduler and writer. Review the tested candidate's advertised 128-request window, non-blocking admission, and over-window disconnect policy; the patch and negative controls are evidence, not released capability. |
-| DHT, LSD, or magnet discovery outruns its consumer | Datagram, recursive-node, maintenance, delivered-peer, metadata-future, candidate, or LSD work retains without a fixed bound before peer admission | Require accepted stable end-to-end discovery budgets. Review the candidate 256-record queues, 32-request workers, 128-active/256-pending metadata policy, 4,096-entry deduplication ceiling, best-effort delivery, current-main LSD lifecycle, and UDP overload policy; configured bootstrap fan-out remains a separate startup decision, and tested patches are evidence, not released capability. |
+| Maintained live-peer budgets regress | Tracker/PEX/DHT discovery can exceed configured resource expectations | Pin 80 per torrent and 400 per session in adapter options; exact boundary/release tests and the derivation drift check fail on guard removal. |
+| Retained known-peer records regress | Tracker/DHT/PEX or repeated incoming addresses can grow queued, backoff, dead, and not-needed state outside live-peer permits | Pin 1,024 per torrent and 4,096 per session; hold permits for the record lifetime and run exact refusal/release tests. |
+| Pending incoming handshakes regress | Remote clients can retain sockets, buffers, and tasks before live-peer permits apply | Keep the maintained 256 pre-routing ceiling and its exact boundary test separate from live-peer limits. |
+| Tracker response or interval is hostile | Memory/request tasks remain unbounded or a tracker is hammered | Maintain the request deadline, streamed 1 MiB body cap, and 60-second minimum unforced interval; tracker-count preflight alone is insufficient. |
+| Established peer floods piece or metadata requests | The upload scheduler and peer writer retain unbounded response records behind rate limits or a slow socket | Maintain the 128-request per-peer window spanning scheduler and writer, non-blocking admission, and over-window disconnect policy. |
+| DHT or magnet discovery outruns its consumer | Datagram, recursive-node, maintenance, delivered-peer, metadata-future, or candidate work retains without a fixed bound before peer admission | Maintain the reviewed stable queue/worker/candidate ceilings and best-effort overload policy. Keep current-main LSD lifecycle changes as optional upstream material until a future engine upgrade. |
 | Private tracker rejects or bans an unapproved rqbit client | Grab fails or tracker account is penalized | No qBittorrent wire-identity claim; disclose whitelist requirements and gate each supported tracker policy before M4. |
 | Torrent PP corrupts seeds | Tracker hash failures and broken uploads | No torrent PP in v1; future reflink-or-copy derivative only. |
 | Passkeys leak in logs/UI | Tracker account compromise | Secret classification, boundary redaction, fixtures in every output path. |
@@ -2427,7 +2479,7 @@ data-loss change, not a feature toggle.
 
 ---
 
-## 19. Review disposition — both reviews accepted; M0 still blocks wiring
+## 19. Review disposition — maintained rqbit selected; production still disabled
 
 The first 2026-08-05 review approved the architecture and rejected the
 original engine capability claim. Fable's follow-up review found the proxy
@@ -2436,7 +2488,7 @@ both review passes as follows:
 
 | Decision | Disposition |
 |---|---|
-| Engine | Pin stable `librqbit =8.1.1` subject to the eleven M0 gates; evaluate `libtorrent-rasterbar` only if a required stable capability fails. |
+| Engine | Pin the exact rqbit v8.1.1 archive plus the ordered nine-patch maintained series, generated vendor, and integrity CI. Evaluate `libtorrent-rasterbar` only if that bounded maintenance model cannot pass M0. |
 | Transport | Accept TCP/IPv4-only for the first release; uTP and IPv6 wait for a stable 9.x line and repeatable resume/interop proof. |
 | Torrent format | Accept v1 `.torrent`/`btih` magnets only; the M0 adapter rejects v2-only and hybrid metainfo/magnets with distinct named errors. |
 | Queue schema | Version 2 is the torrent-free envelope; M1b writes version 3 with the torrent variant and defaulted record. |
@@ -2454,11 +2506,11 @@ both review passes as follows:
 | Cluster | Keep torrent+cluster as a startup error. M6 still requires separate approval after single-node evidence. |
 
 The review authorized groundwork and the M0 spike, not a production torrent
-listener. That spike has now failed gates 7 and 8. The engine-neutral M1b seam
-is implemented under §4.3.2. Disk-guard F1–F3 and durable history deletion are
-now complete; M2 remains blocked until ADR-19 records an engine/API resolution
-and the complete M0 matrix passes. The mobile P0 prerequisites are complete;
-M3 remains downstream of the M2 engine/API decision.
+listener. ADR-19 now records the maintained engine/API resolution, and the
+local combined proof passes all gates. The engine-neutral M1b seam is already
+implemented. Disk-guard F1–F3 and durable history deletion are complete; M2
+remains blocked until the native M0 rerun and independent review complete. The
+mobile P0 prerequisites are complete; M3 remains downstream of M2.
 
 ---
 
