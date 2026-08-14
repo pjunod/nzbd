@@ -178,7 +178,7 @@ pub struct Extractors {
 
 /// The volume of a multi-volume set this file is, if it is one.
 ///
-/// `name.part07.rar` → 7, `name.r05` → 6 (old-style counts the bare `.rar` as
+/// `name.part07.rar` → 7, `name.r05` → 7 (old-style counts the bare `.rar` as
 /// volume 1 and `.r00` as volume 2), `name.rar` → 1. Anything else → None.
 fn volume_number(name: &str) -> Option<u32> {
     if let Some(idx) = name.rfind(".part") {
@@ -434,11 +434,28 @@ impl Extractors {
             let second = self
                 .extract_once(archive, ArchiveKind::SevenZip, dest, password)
                 .await;
-            return match second {
-                Ok(o) if o.success => Ok(o),
-                // Neither worked: report the first attempt's outcome, which
-                // is the one whose password/disk flags mean something.
-                other => first.or(other),
+            // The fallback gets the same delivery check the first attempt
+            // got. "Everything is Ok" over a short extraction is the exact
+            // lie this path exists to catch, and exempting the second tool
+            // from the test would leave `extract` returning success for an
+            // archive nothing read — the `unrar-free` failure again, one
+            // tool along.
+            let delivered = match &second {
+                Ok(o) => o.success && unpack_shortfall(dir, archive, dest).is_none(),
+                Err(_) => false,
+            };
+            if delivered {
+                return second;
+            }
+            // Neither delivered. Report the first attempt's outcome, which
+            // is the one whose password/disk flags mean something, but never
+            // as a success: no tool produced the set.
+            return match first.or(second) {
+                Ok(o) => Ok(ExtractOutcome {
+                    success: false,
+                    ..o
+                }),
+                Err(e) => Err(e),
             };
         }
         self.extract_once(archive, kind, dest, password).await
@@ -853,8 +870,14 @@ mod tests {
             &short_unrar,
             "#!/bin/sh\nfor dest; do :; done\nmkdir -p \"$dest\"\nprintf x > \"${dest}/partial.bin\"\necho 'All OK'\n",
         );
+        // The fallback must actually deliver the set, not merely print the
+        // success line: 200 packed bytes put the shortfall floor at 180.
         let good_7z = tmp.path().join("good-7z");
-        write_tool(&good_7z, "#!/bin/sh\necho 'Everything is Ok'\n");
+        write_tool(
+            &good_7z,
+            // 7-Zip's destination is the `-oDEST` flag, argument 4.
+            "#!/bin/sh\ndest=${4#-o}\nmkdir -p \"$dest\"\nhead -c 200 /dev/zero > \"${dest}/whole.bin\"\necho 'Everything is Ok'\n",
+        );
         let extractors = Extractors {
             unrar_cmd: short_unrar.to_string_lossy().into_owned(),
             sevenzip_cmd: good_7z.to_string_lossy().into_owned(),
@@ -869,9 +892,54 @@ mod tests {
             outcome.success,
             "7-Zip fallback must replace a short extraction"
         );
+        assert_eq!(
+            std::fs::metadata(dest.join("whole.bin")).unwrap().len(),
+            200,
+            "the reported success must be the fallback's full-size output"
+        );
         assert!(
             !dest.join("partial.bin").exists(),
-            "partial output was fenced"
+            "the short first attempt's output was discarded before the retry"
+        );
+    }
+
+    /// A fallback that also under-delivers is not a success.
+    ///
+    /// `Extractors::extract` used to shortfall-check only the first attempt,
+    /// so a 7-Zip run that printed "Everything is Ok" over an empty
+    /// destination was returned as a complete extraction — the whole failure
+    /// the fallback exists to catch, arriving through the fallback itself.
+    #[tokio::test]
+    async fn sevenzip_fallback_that_is_also_short_is_not_a_success() {
+        let tmp = tempfile::tempdir().unwrap();
+        let first = tmp.path().join("set.part01.rar");
+        std::fs::write(&first, vec![0u8; 100]).unwrap();
+        std::fs::write(tmp.path().join("set.part02.rar"), vec![0u8; 100]).unwrap();
+        let short_unrar = tmp.path().join("short-unrar");
+        write_tool(
+            &short_unrar,
+            "#!/bin/sh\nfor dest; do :; done\nmkdir -p \"$dest\"\nprintf x > \"${dest}/partial.bin\"\necho 'All OK'\n",
+        );
+        // Prints the success line, writes nothing.
+        let lying_7z = tmp.path().join("lying-7z");
+        write_tool(&lying_7z, "#!/bin/sh\necho 'Everything is Ok'\n");
+        let extractors = Extractors {
+            unrar_cmd: short_unrar.to_string_lossy().into_owned(),
+            sevenzip_cmd: lying_7z.to_string_lossy().into_owned(),
+            timeout: Duration::from_secs(2),
+        };
+        let dest = tmp.path().join("both-short-out");
+        let outcome = extractors
+            .extract(&first, ArchiveKind::Rar, &dest, None)
+            .await
+            .unwrap();
+        assert!(
+            !outcome.success,
+            "a fallback that read none of the volume set must not be reported as a complete extraction"
+        );
+        assert!(
+            unpack_shortfall(tmp.path(), &first, &dest).is_some(),
+            "the destination really is short, so the outcome above is the tool's claim being overruled"
         );
     }
 
@@ -882,8 +950,21 @@ mod tests {
         std::fs::write(&archive, b"rar data").unwrap();
         let failed = tmp.path().join("failed-tool");
         write_tool(&failed, "#!/bin/sh\necho failed >&2\nexit 2\n");
+
+        // When both RAR attempts fail the merge keeps the FIRST outcome,
+        // because that is the attempt whose password/disk flags were set by
+        // the tool that actually understands the archive. Give the two tools
+        // different failures so the choice is observable: unrar exits 5
+        // (unrar's write/disk-error code), 7-Zip fails with no disk marker
+        // at all. Merging the other way round would silently lose the
+        // "the volume is full" diagnosis operators act on.
+        let disk_full_unrar = tmp.path().join("disk-full-unrar");
+        write_tool(
+            &disk_full_unrar,
+            "#!/bin/sh\necho 'cannot write' >&2\nexit 5\n",
+        );
         let extractors = Extractors {
-            unrar_cmd: failed.to_string_lossy().into_owned(),
+            unrar_cmd: disk_full_unrar.to_string_lossy().into_owned(),
             sevenzip_cmd: failed.to_string_lossy().into_owned(),
             timeout: Duration::from_secs(2),
         };
@@ -897,6 +978,10 @@ mod tests {
             .await
             .unwrap();
         assert!(!outcome.success);
+        assert!(
+            outcome.disk_space_error,
+            "the merged outcome must carry the first attempt's disk flag; the 7-Zip fallback never set one"
+        );
 
         let good_7z = tmp.path().join("fallback-7z");
         write_tool(&good_7z, "#!/bin/sh\necho 'Everything is Ok'\n");

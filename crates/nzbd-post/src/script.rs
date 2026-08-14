@@ -309,10 +309,26 @@ mod tests {
         )
         .unwrap();
 
-        let invalid_utf8 = tmp.path().join("invalid-utf8");
-        std::fs::write(&invalid_utf8, [0xff, 0xfe]).unwrap();
+        // Non-UTF-8 *contents*: the header probe reads the file as a string,
+        // so this one fails to decode rather than failing to match. Both
+        // arms must skip the file; neither may abort the scan.
+        std::fs::write(tmp.path().join("undecodable-contents"), [0xff, 0xfe]).unwrap();
         std::fs::write(tmp.path().join("ordinary.txt"), "ordinary").unwrap();
 
         assert!(discover(tmp.path()).is_empty());
+
+        // Every rejection above has to be a rejection of that entry and not
+        // of the scan: a v2 extension directory sitting among them is still
+        // found. Its name is deliberately non-ASCII — the manifest's `main`
+        // is joined onto a `Path`, never round-tripped through `str`.
+        //
+        // (A name that is not valid UTF-8 at all would test the same join
+        // more sharply, but APFS refuses to create one — `mkdir` fails
+        // EILSEQ — so it cannot be exercised portably.)
+        let extension = tmp.path().join("séparé-ext");
+        std::fs::create_dir(&extension).unwrap();
+        write_script(&extension.join("main.sh"), "#!/bin/sh\nexit 0\n");
+        std::fs::write(extension.join("manifest.json"), br#"{"main":"main.sh"}"#).unwrap();
+        assert_eq!(discover(tmp.path()), vec![extension.join("main.sh")]);
     }
 }
