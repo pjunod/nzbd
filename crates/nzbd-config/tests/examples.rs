@@ -225,6 +225,12 @@ fn coverage_measurement_fails_closed_and_runs_the_whole_workspace() {
         coverage_floor > 0.0 && coverage_floor <= 100.0,
         "MINIMUM_LINE_COVERAGE must be a percentage in (0, 100]"
     );
+    // Raise this bound deliberately alongside MINIMUM_LINE_COVERAGE; never lower it.
+    assert!(
+        coverage_floor >= 87.4,
+        "MINIMUM_LINE_COVERAGE must not fall below the recorded 87.4% floor, or the coverage \
+         gate can be silently weakened"
+    );
 
     let floor_step = workflow
         .split_once("- name: enforce minimum line coverage")
@@ -235,6 +241,11 @@ fn coverage_measurement_fails_closed_and_runs_the_whole_workspace() {
         floor_step.contains("cargo llvm-cov report")
             && floor_step.contains("--fail-under-lines \"$MINIMUM_LINE_COVERAGE\""),
         "the coverage gate must pass the single workflow floor to cargo llvm-cov"
+    );
+    assert!(
+        !floor_step.contains("continue-on-error"),
+        "the coverage gate must not use continue-on-error, or a coverage regression can report \
+         success"
     );
     assert!(
         workflow.contains("if-no-files-found: error"),
