@@ -2,7 +2,7 @@
 
 **Status:** selected by ADR-19; isolated M0 dependency only · **Upstream base:**
 rqbit v8.1.1, commit `00b97485160ff5b5aa2b379ea0815d568ec665f0` ·
-**Stable patch delta:** 2,796 lines across exactly nine ordered patches ·
+**Stable patch delta:** 2,819 lines across exactly nine ordered patches ·
 **Production daemon:** still does not depend on or start rqbit
 
 Companion to
@@ -53,7 +53,7 @@ gate-9 disposition. A broad semver update is not permitted.
 
 ## 2. Why this remains rqbit, not libtorrent
 
-The stable series is 2,796 patch lines, applies cleanly to one immutable source
+The stable series is 2,819 patch lines, applies cleanly to one immutable source
 archive, and has focused tests at every changed behavior boundary. It preserves
 the Rust/Tokio single-binary architecture and adds no FFI or second daemon.
 That stays within ADR-19's small-maintainable-fix branch, so the heavier

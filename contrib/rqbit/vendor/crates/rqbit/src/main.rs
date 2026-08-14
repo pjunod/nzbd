@@ -481,12 +481,15 @@ async fn async_main(opts: Opts, cancel: CancellationToken) -> anyhow::Result<()>
     };
 
     let mut sopts = SessionOptions {
+        disable_auto_restore: false,
         disable_dht: opts.disable_dht,
         disable_dht_persistence: opts.disable_dht_persistence,
         dht_config: None,
         // This will be overriden by "server start" below if needed.
         persistence: None,
         peer_id: None,
+        peer_limit: None,
+        peer_limit_total: None,
         peer_opts: Some(PeerConnectionOptions {
             connect_timeout: Some(opts.peer_connect_timeout),
             read_write_timeout: Some(opts.peer_read_write_timeout),

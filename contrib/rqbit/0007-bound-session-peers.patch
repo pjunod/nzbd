@@ -1,3 +1,15 @@
+diff --git a/crates/rqbit/src/main.rs b/crates/rqbit/src/main.rs
+--- a/crates/rqbit/src/main.rs
++++ b/crates/rqbit/src/main.rs
+@@ -487,6 +487,8 @@ async fn run(opts: Opts) -> anyhow::Result<()> {
+         // This will be overriden by "server start" below if needed.
+         persistence: None,
+         peer_id: None,
++        peer_limit: None,
++        peer_limit_total: None,
+         peer_opts: Some(PeerConnectionOptions {
+             connect_timeout: Some(opts.peer_connect_timeout),
+             read_write_timeout: Some(opts.peer_read_write_timeout),
 diff --git a/crates/librqbit/src/session.rs b/crates/librqbit/src/session.rs
 index f0edb50b594c563c8283c428538583709f9b2781..3f83402405d66f623b887323156dfde6b0fa0a87 100644
 --- a/crates/librqbit/src/session.rs
