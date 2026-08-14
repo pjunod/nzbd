@@ -32,7 +32,8 @@ jobs:
 
       - name: run instrumented test suite
         run: |
-          cargo llvm-cov --workspace --lcov --output-path lcov.info 2>&1 | tee cov-run.out
+          set -euo pipefail
+          cargo llvm-cov --workspace --no-fail-fast --lcov --output-path lcov.info 2>&1 | tee cov-run.out
           TESTS=$(grep -oE 'test result: ok\. [0-9]+ passed' cov-run.out | grep -oE '[0-9]+' | awk '{s+=$1} END {print s}')
           COVERAGE=$(cargo llvm-cov report --json --summary-only \
             | python3 -c "import json,sys; print(round(json.load(sys.stdin)['data'][0]['totals']['lines']['percent'], 1))")
@@ -44,6 +45,7 @@ jobs:
         run: cargo llvm-cov report --html
 
       - name: generate badges
+        if: success()
         run: python3 scripts/coverage-badges.py --coverage "$COVERAGE" --tests "$TESTS" --out badges-out
 
       - uses: actions/upload-artifact@v4
@@ -52,11 +54,12 @@ jobs:
           path: |
             lcov.info
             target/llvm-cov/html/
+          if-no-files-found: error
 
       # Self-hosted badges: single-commit `badges` branch, force-updated on
       # every main push; README references the raw files.
       - name: publish badges branch
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        if: success() && github.event_name == 'push' && github.ref == 'refs/heads/main'
         run: |
           cd badges-out
           git init -q -b badges
