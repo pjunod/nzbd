@@ -286,6 +286,10 @@ mod tests {
         let wildcard =
             service_info("0.0.0.0:6789".parse().unwrap(), Some("nas"), false, "none").unwrap();
         assert!(wildcard.get_addresses().is_empty());
+        assert!(
+            wildcard.is_addr_auto(),
+            "a wildcard bind must advertise its real interface addresses"
+        );
         assert_eq!(wildcard.get_property_val_str("tls"), Some("0"));
         assert_eq!(wildcard.get_property_val_str("auth"), Some("none"));
     }
