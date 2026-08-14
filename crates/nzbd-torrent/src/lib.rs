@@ -407,12 +407,10 @@ fn redact_error_value(value: &str) -> Cow<'_, str> {
         let safe = url::Url::parse(candidate)
             .ok()
             .and_then(|url| {
+                // `host_str` returns the URL serialization, so an IPv6 literal
+                // already arrives bracketed. Re-bracketing it here produced a
+                // `[[::1]]` authority that no URL parser accepts.
                 let host = url.host_str()?;
-                let host = if host.contains(':') {
-                    format!("[{host}]")
-                } else {
-                    host.to_owned()
-                };
                 let port = url
                     .port()
                     .map(|port| format!(":{port}"))
