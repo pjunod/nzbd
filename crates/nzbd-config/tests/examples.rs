@@ -224,3 +224,10 @@ fn coverage_measurement_fails_closed_and_runs_the_whole_workspace() {
          test target, matching CI"
     );
 }
+
+// Deliberate issue #98 scratch failure. This commit exists only to prove that
+// the Coverage workflow reports a red check; it must never be merged.
+#[test]
+fn issue_98_scratch_coverage_failure_proof() {
+    panic!("deliberate issue #98 coverage failure proof");
+}
