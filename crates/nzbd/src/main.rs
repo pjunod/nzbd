@@ -1293,6 +1293,43 @@ mod tests {
     }
 
     #[test]
+    fn cluster_startup_fails_before_spawning_when_the_shared_volume_is_unusable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let blocker = tmp.path().join("not-a-directory");
+        std::fs::write(&blocker, "file").unwrap();
+
+        let mut cfg = nzbd_config::Config::default();
+        cfg.paths.main_dir = tmp.path().join("downloads");
+        cfg.paths.dest_dir = tmp.path().join("complete");
+        cfg.post.enabled = false;
+        cfg.cluster.enabled = true;
+        cfg.cluster.node_name = "node-a".into();
+        cfg.cluster.shared_dir = Some(blocker.join("shared"));
+        cfg.cluster.advertise_url = "http://127.0.0.1:6789".into();
+        cfg.cluster.secret = Some("cluster-secret".into());
+        let tuning = engine_tuning(&cfg);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let err = runtime
+            .block_on(run_cluster(
+                cfg,
+                Vec::new(),
+                tuning,
+                "127.0.0.1:0".into(),
+                nzbd_api::LogBuffer::new(1),
+            ))
+            .expect_err("cluster startup must fail when its shared root is below a regular file");
+        assert!(err.to_string().contains("io:"), "{err}");
+        assert!(
+            blocker.is_file(),
+            "startup must not replace the blocking file"
+        );
+    }
+
+    #[test]
     fn feeds_keep_ids_defaults_and_operator_options() {
         let cfg = cfg_with(
             "[[feed]]\nname = \"daily\"\nurl = \"https://indexer.test/daily\"\n\
