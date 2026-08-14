@@ -984,11 +984,13 @@ bind = "{api_addr}"
 
     // Boot the daemon.
     let bin = env!("CARGO_BIN_EXE_nzbd");
+    let daemon_log_path = tmp.path().join("daemon.log");
+    let daemon_log = std::fs::File::create(&daemon_log_path).unwrap();
     let child = Command::new(bin)
         .args(["run", "--config"])
         .arg(&cfg_path)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stdout(daemon_log.try_clone().unwrap())
+        .stderr(daemon_log)
         .spawn()
         .expect("spawn nzbd");
     let mut child = KillOnDrop(child);
@@ -1018,7 +1020,9 @@ bind = "{api_addr}"
     loop {
         assert!(
             start.elapsed() < Duration::from_secs(30),
-            "download did not finish"
+            "download did not finish\n--- daemon log ---\n{}",
+            std::fs::read_to_string(&daemon_log_path)
+                .unwrap_or_else(|error| format!("could not read daemon log: {error}"))
         );
         if std::fs::read(&payload_path)
             .map(|got| got == data)
@@ -1298,11 +1302,13 @@ bind = "{api_addr}"
     std::fs::write(&cfg_path, config).unwrap();
 
     let bin = env!("CARGO_BIN_EXE_nzbd");
+    let daemon_log_path = tmp.path().join("daemon.log");
+    let daemon_log = std::fs::File::create(&daemon_log_path).unwrap();
     let child = Command::new(bin)
         .args(["run", "--config"])
         .arg(&cfg_path)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stdout(daemon_log.try_clone().unwrap())
+        .stderr(daemon_log)
         .spawn()
         .expect("spawn nzbd");
     let _child = KillOnDrop(child);
@@ -1346,7 +1352,9 @@ bind = "{api_addr}"
     loop {
         assert!(
             start.elapsed() < Duration::from_secs(45),
-            "job never left the queue"
+            "job never left the queue\n--- daemon log ---\n{}",
+            std::fs::read_to_string(&daemon_log_path)
+                .unwrap_or_else(|error| format!("could not read daemon log: {error}"))
         );
         let v = jsonrpc(
             &api_addr,
