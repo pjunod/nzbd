@@ -173,6 +173,18 @@ fn the_image_is_told_which_commit_it_is() {
     }
 }
 
+fn workflow_job_body(workflow: &str, job: &str) -> String {
+    let marker = format!("\n  {job}:\n");
+    workflow
+        .split_once(&marker)
+        .map(|(_, rest)| rest)
+        .unwrap_or_else(|| panic!("find the {job} workflow job"))
+        .lines()
+        .take_while(|line| line.trim().is_empty() || line.starts_with("    "))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Coverage is release evidence, so a partial or failing suite must never
 /// produce a green workflow or update the public badges.
 ///
@@ -186,6 +198,40 @@ fn coverage_measurement_fails_closed_and_runs_the_whole_workspace() {
     let workflow = std::fs::read_to_string(root.join(".github/workflows/coverage.yml"))
         .expect("read coverage workflow");
     let makefile = std::fs::read_to_string(root.join("Makefile")).expect("read Makefile");
+
+    let job_uses_continue_on_error = |job: &str| {
+        job.lines().any(|line| {
+            line.strip_prefix("    ")
+                .is_some_and(|line| line.starts_with("continue-on-error:"))
+        })
+    };
+    let coverage_job = workflow_job_body(&workflow, "coverage");
+    assert!(
+        !job_uses_continue_on_error(&coverage_job),
+        "the coverage job must not use continue-on-error, or any failing coverage step can \
+         report success"
+    );
+
+    for (placement, fixture) in [
+        (
+            "above steps",
+            "\njobs:\n  coverage:\n    continue-on-error: true\n    steps: []\n  next:\n    name: next",
+        ),
+        (
+            "below steps",
+            "\njobs:\n  coverage:\n    steps: []\n    continue-on-error: true\n  next:\n    name: next",
+        ),
+    ] {
+        let fixture_job = workflow_job_body(fixture, "coverage");
+        assert!(
+            job_uses_continue_on_error(&fixture_job),
+            "the coverage-job guard must detect job keys {placement}"
+        );
+        assert!(
+            !fixture_job.contains("name: next"),
+            "the coverage-job slice must stop before the next job"
+        );
+    }
 
     let instrumented_step = workflow
         .split_once("- name: run instrumented test suite")
