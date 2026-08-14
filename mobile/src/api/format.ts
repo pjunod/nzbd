@@ -1,4 +1,4 @@
-import { JobStatus, JobSummary, StoragePath } from './types';
+import { JobStatus, JobSummary, StatusDto, StoragePath } from './types';
 
 const UNITS = ['B', 'KiB', 'MiB', 'GiB', 'TiB'];
 export const DEFAULT_NZBD_PORT = 6789;
@@ -22,6 +22,46 @@ export function formatDuration(seconds: number): string {
   const hours = Math.floor(seconds / 3600);
   const minutes = Math.ceil((seconds % 3600) / 60);
   return minutes > 0 ? `${hours}h ${minutes}m` : `${hours}h`;
+}
+
+export function diskGuardMessage(status: StatusDto): string | null {
+  if (!status.disk_low) return null;
+  const hasMultiRootEvidence =
+    status.disk_guard_free_bytes !== undefined ||
+    status.disk_guard_label !== undefined ||
+    status.disk_guard_path !== undefined ||
+    status.disk_guard_write_latched !== undefined ||
+    status.disk_guard_all_roots_known !== undefined;
+  if (!hasMultiRootEvidence) {
+    return 'Downloads are held because the destination volume is low on space.';
+  }
+  if (status.disk_guard_write_latched) {
+    return `Downloads are held because a write ran out of space${
+      status.enospc_where ? `: ${status.enospc_where}` : ''
+    }.`;
+  }
+  if (status.disk_guard_all_roots_known === false) {
+    const known = status.disk_guard_free_bytes;
+    return `Downloads remain held because not every configured storage root could be checked${
+      known != null ? `; the lowest known reading is ${formatBytes(known)} free` : ''
+    }.`;
+  }
+  if (status.disk_guard_free_bytes == null) {
+    return 'Downloads are held while configured storage is checked.';
+  }
+  const root = status.disk_guard_label ?? status.disk_guard_path;
+  const free = status.disk_guard_free_bytes;
+  const detail = root
+    ? `${root}${free != null ? ` (${formatBytes(free)} free)` : ''}`
+    : 'a configured write volume';
+  return `Downloads are held because ${detail} is low on space.`;
+}
+
+export function storageEvidenceLabel(storage: StoragePath): string {
+  const label = storage.label || 'volume';
+  return storage.current === false && storage.available_bytes != null
+    ? `${label} · last known`
+    : label;
 }
 
 export interface StorageUsage {

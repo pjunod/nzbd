@@ -118,9 +118,11 @@ stats: a zero-byte file reports successful paused initialization and moves to
 control-plane fail-open result is a release blocker. The
 [2026-08-13 replacement run](https://github.com/pjunod/nzbd/actions/runs/31654021866)
 reproduced it on all five native targets with one 262,144-byte sizing request,
-a zero-byte file, zero piece writes, and no stats-visible error. Neither proof
-is a daemon API or enforcing multi-root guard, so they do not establish general
-or operator-visible ENOSPC behavior and do not authorize production wiring.
+a zero-byte file, zero piece writes, and no stats-visible error. The daemon now
+has a protocol-neutral multi-root enforcing guard, cluster placement hold, and
+local/per-node limiting-volume status, but neither proof routes a torrent fault
+into it. They therefore do not establish operator-visible torrent ENOSPC
+behavior and do not authorize production wiring.
 
 The rqbit contribution kit includes independent stable and current-main
 candidates that propagate the first selected-file sizing error out of
@@ -128,7 +130,8 @@ initialization, with exact unit proofs and mutation-sensitivity checks. The
 current-main candidate also distinguishes typed checksum cancellation from
 real I/O failure so an overlapping pause cannot hide storage exhaustion. That
 candidate is review evidence only: it has not been submitted, accepted, or
-released, and it does not replace nzbd's required daemon-owned disk policy.
+released, and it does not replace nzbd's required torrent fault-routing,
+pause, and recovery policy.
 
 **Reviewer acceptance:** supported deployment examples must exercise the
 actual bind mounts or volumes, case/normalization behavior, low-space guard,

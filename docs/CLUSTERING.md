@@ -126,11 +126,12 @@ that. Documented in ARCHITECTURE.md §17.
 
 ## 5. Node registry
 
-Each node renews `<shared>/.nzbd-cluster/nodes/<name>.json`:
-`{name, api_url, roles, download_slots_free, pp_slots_free, busy_pp,
-rate_bps, seq, epoch_seen}` every `lease_interval`. Staleness is judged by
-observed non-progression, same as the election. The registry feeds the
-scheduler and `GET /api/v1/cluster`.
+Each node renews `<shared>/.nzbd-cluster/nodes/<name>.json` with its roles,
+capacity, load, disk-guard capability/state, and sequence. Staleness is judged
+by observed non-progression, same as the election. The registry feeds the
+scheduler and authenticated `GET /api/v1/cluster`. During a rolling upgrade, a
+new leader excludes legacy workers that cannot publish disk admission state;
+new workers also reject a grant if their local guard changes after polling.
 
 ## 6. Work distribution
 
@@ -145,6 +146,7 @@ trusted LAN assumed — provider credentials never cross this channel, §6.5).
 | `POST /cluster/v1/work/poll` | Worker offers `{node, free download slots, pp slots}`; leader replies with 0..n grants. A grant = `{lease_id, epoch, job_spec, server_budgets}` for a download job (C1) or `{lease_id, job, pp_stage_plan}` (C2) |
 | `POST /cluster/v1/work/heartbeat` | Worker renews `{lease_ids, per-job progress counters}`; reply may carry `{cancel: [lease_id]}` |
 | `POST /cluster/v1/work/complete` | Worker returns the **final `Job` value** (serde) + outcome; leader swaps it into authority state |
+| `POST /cluster/v1/work/reject` | Worker rejects a just-issued grant when its local disk admission state changed after the poll; leader releases the delegation immediately |
 | `GET /cluster/v1/leader` | `{epoch, node, api_url}` for proxying and diagnostics |
 
 `lease_id = "L<epoch>-<counter>"` — globally unique, and the fencing
@@ -240,7 +242,7 @@ cluster executor:
   to the leader (streaming reverse proxy; `X-Nzbd-Forwarded: <node>`
   guards loops). Election gaps surface as brief 502/503 — *arr clients
   retry.
-- `GET /api/v1/cluster` → `{leader, epoch, self, nodes[], leases[]}`.
+- Authenticated `GET /api/v1/cluster` → `{leader, epoch, self, nodes[], leases[]}`.
 - Events gain `LeaderChanged`, `NodeJoined/NodeLost`, `JobAssigned`.
 
 ## 9. Configuration
@@ -268,6 +270,12 @@ With `enabled = true`: queue authority, journals and job data live under
 a dest outside the shared volume is a validation warning — remote PP could
 not see the files). `enabled = false`: phase-1 behavior, byte-for-byte
 (modulo the per-job journal layout, migrated automatically).
+
+Clustered `failure_action = "park"` always uses
+`<shared_dir>/.nzbd-cluster/failed`, regardless of a node-local
+`post.failed_dir`. A leader can lose its lease after moving a failed tree but
+before stamping the queue row; the shared target lets its successor observe
+and complete that same idempotent action.
 
 ## 10. Failure matrix
 

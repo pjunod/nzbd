@@ -81,6 +81,19 @@ pub struct CompleteResponse {
     pub ok: bool,
 }
 
+/// A worker's local guard changed after it advertised capacity but before it
+/// could safely accept the returned grant.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RejectRequest {
+    pub node: String,
+    pub lease_id: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Default)]
+pub struct RejectResponse {
+    pub released: bool,
+}
+
 /// Node presence record (registry file on the shared volume).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeRecord {
@@ -90,6 +103,25 @@ pub struct NodeRecord {
     pub post_process: bool,
     pub max_download_jobs: u32,
     pub active_download_jobs: u32,
+    /// Missing/false on pre-multi-root workers. A new leader excludes those
+    /// workers until they upgrade because their disk admission state is
+    /// unknowable during a rolling restart.
+    #[serde(default)]
+    pub disk_guard_capable: bool,
+    /// This node is refusing new download and PP leases because at least one
+    /// configured write volume is constrained.
+    #[serde(default)]
+    pub disk_low: bool,
+    #[serde(default)]
+    pub disk_guard_free_bytes: Option<u64>,
+    #[serde(default)]
+    pub disk_guard_label: Option<String>,
+    #[serde(default)]
+    pub disk_guard_path: Option<String>,
+    #[serde(default)]
+    pub disk_guard_write_latched: bool,
+    #[serde(default)]
+    pub disk_guard_all_roots_known: bool,
     /// PP executor capacity (C2 anti-affinity scheduling input).
     #[serde(default)]
     pub pp_slots: u32,

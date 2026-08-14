@@ -78,6 +78,16 @@ names the post-processing scripts this category runs, by file name or
 stem (`"Clean.py"` and `"clean"` both select `Clean.py`); an empty list —
 the default — runs every discovered script, which is the global behavior.
 
+The daemon accepts at most 64 distinct configured write roots across state,
+cluster state, queue paths, watch paths, and category destinations. Exact path
+duplicates share one root. This per-configuration bound is paired with a
+process-wide 64-call probe ceiling that survives hot reloads until each
+filesystem syscall returns, so category/path churn cannot accumulate unbounded
+wedged threads. Startup names the count and limit when a config exceeds it.
+Where stable filesystem identity is available, distinct paths on one mount are
+reported as one failure domain. Windows conservatively reports them as separate
+rows while still enforcing the lowest free-space reading across all of them.
+
 > **Behavior change (integration phase 1).** These three keys were parsed
 > and advertised to compat clients as `CategoryN.DestDir` / `.Unpack` /
 > `.Extensions` for a long time while post-processing ignored all of
@@ -106,6 +116,10 @@ daily_quota_mb = 0           # 0 = unlimited (NZBGet DailyQuota)
 monthly_quota_mb = 0         # NZBGet MonthlyQuota
 quota_start_day = 1          # day of month the monthly quota resets
 ```
+
+`min_free_disk_mb` applies to the lowest reading across every configured write
+root, not only `paths.dest_dir`. A zero value disables the hold but keeps the
+same cached inventory visible in native status.
 
 `max_active_downloads` decides how many jobs are worked on at the same
 time. At `1` — the default, and what nzbd has always done — the top job

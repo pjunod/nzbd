@@ -77,19 +77,55 @@ pub struct ServerVolume {
     pub rate_bps: u64,
 }
 
+/// The enforcing disk guard's cached evidence for one filesystem.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct StorageVolumeSnapshot {
+    pub label: String,
+    pub path: String,
+    pub available_bytes: Option<u64>,
+    pub total_bytes: Option<u64>,
+    /// False when the current cycle could not measure this row. Non-None
+    /// capacity is conservative last-known data; None means no successful
+    /// reading has ever been observed.
+    pub current: bool,
+}
+
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct QueueSnapshot {
     pub up_since_unix: i64,
     pub download_paused: bool,
     /// Daily/monthly quota exhausted (force-priority jobs still run).
     pub quota_reached: bool,
-    /// Free space on the destination volume is below the floor — all
-    /// downloading is held.
+    /// Intake is held by a below-floor reading, an observed write failure, an
+    /// initial fail-safe measurement, or incomplete evidence after a prior
+    /// hold.
     pub disk_low: bool,
-    /// How many out-of-space errors (ENOSPC/EDQUOT) the write paths have
-    /// reported since start. Nonzero with `disk_low` set means the guard
-    /// was flipped by an observed failed write, not by the statvfs
-    /// forecast — which is the case the forecast got wrong for hours.
+    /// Lowest measured free space across every configured write root. None
+    /// means the enforcing probe has no usable reading or is disabled.
+    #[serde(default)]
+    pub disk_guard_free_bytes: Option<u64>,
+    /// Operator-facing role of the limiting configured root.
+    #[serde(default)]
+    pub disk_guard_label: Option<String>,
+    /// Configured path whose containing filesystem currently limits intake.
+    #[serde(default)]
+    pub disk_guard_path: Option<String>,
+    /// The current hold was latched by an observed ENOSPC/EDQUOT write,
+    /// rather than solely by the cached capacity forecast.
+    #[serde(default)]
+    pub disk_guard_write_latched: bool,
+    /// True only when the enforcing cycle measured every configured root.
+    /// False with `disk_low` can mean a prior hold is being retained because
+    /// incomplete evidence is not recovery proof.
+    #[serde(default)]
+    pub disk_guard_all_roots_known: bool,
+    /// The same per-filesystem evidence used by the enforcing guard. The API
+    /// renders this cache directly; it never launches an independent probe.
+    #[serde(default)]
+    pub storage_volumes: Vec<StorageVolumeSnapshot>,
+    /// Cumulative out-of-space errors (ENOSPC/EDQUOT) reported by write
+    /// paths since start. Use `disk_guard_write_latched`, not this historical
+    /// count, to identify the cause of the current hold.
     #[serde(default)]
     pub enospc_observed: u64,
     /// What the write path was doing when it last ran out of space

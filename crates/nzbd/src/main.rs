@@ -226,6 +226,19 @@ fn category_rules(cfg: &nzbd_config::Config) -> Vec<nzbd_post::manager::Category
         .collect()
 }
 
+/// The engine and API derive their storage inventory from the same config
+/// method. That keeps a newly configured write root from appearing on the
+/// dashboard while silently escaping the enforcing low-disk guard.
+fn disk_guard_roots(cfg: &nzbd_config::Config) -> Vec<nzbd_engine::volumes::DiskGuardRoot> {
+    cfg.storage_roots()
+        .into_iter()
+        .map(|root| nzbd_engine::volumes::DiskGuardRoot {
+            label: root.label,
+            path: root.path,
+        })
+        .collect()
+}
+
 /// NZBGet-style option projection for the compat shim's `config` method
 /// (*arr clients read categories and paths from here).
 fn compat_options(cfg: &nzbd_config::Config, bind: &str) -> Vec<(String, String)> {
@@ -645,6 +658,7 @@ fn run(
         tuning,
         cfg.speed_limit_bps(),
     );
+    engine_cfg.disk_guard_roots = disk_guard_roots(&cfg);
     engine_cfg.max_active_downloads = cfg.max_active_downloads();
 
     runtime.block_on(async move {
@@ -803,7 +817,9 @@ fn run(
         // outlives its cancel must not hold the daemon offline (field
         // report 2026-07-25: a restart hung for minutes behind one PP job;
         // the page never came back). Stragglers die with this pass's
-        // runtime; PP is crash-safe and re-runs on the next pass.
+        // runtime; PP is crash-safe and re-runs on the next pass. Filesystem
+        // probes use detached OS threads, so a wedged syscall cannot make
+        // Tokio runtime teardown wait for it.
         feed_cancel.cancel();
         pp_cancel.cancel();
         let subsystems = async {
@@ -907,6 +923,7 @@ async fn run_cluster(
         lease_interval: Duration::from_secs(c.lease_interval_secs.max(1)),
         takeover_after: Duration::from_secs(c.takeover_after_secs.max(2)),
         worker_ttl: Duration::from_secs(c.worker_ttl_secs.max(3)),
+        disk_guard_roots: disk_guard_roots(&cfg),
     };
 
     // Post-processing wiring (C2): PP runs wherever the leader's

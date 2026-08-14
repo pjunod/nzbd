@@ -5,7 +5,8 @@
 
 use nzbd_engine::{Engine, EngineConfig, EngineHandle, Tuning};
 use nzbd_post::manager::{
-    process_job, spawn_post_manager, PostConfig, PpFinal, RestartPoint, PP_DONE_PARAM,
+    process_job, spawn_post_manager, FailureAction, PostConfig, PpFinal, PpGate, RestartPoint,
+    PP_DONE_PARAM,
 };
 use nzbd_state::history::HistoryDb;
 use nzbd_types::{DupeInfo, FileEntry, FileId, Job, JobId, JobKind, JobStatus, JobTotals};
@@ -873,7 +874,6 @@ async fn per_job_password_unlocks_archive() {
 /// disk — the health gate is one of the terminal failures it covers.
 #[tokio::test]
 async fn health_action_delete_removes_files() {
-    use nzbd_post::manager::FailureAction;
     let tmp = tempfile::tempdir().unwrap();
     let engine = spawn_engine(tmp.path()).await;
     let dir = tmp.path().join("dest/sick");
@@ -919,6 +919,400 @@ async fn health_action_delete_removes_files() {
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+    cancel.cancel();
+    tracker.close();
+    tracker.wait().await;
+    engine.shutdown().await;
+}
+
+/// Losing authority after a cross-filesystem park must not let the stale
+/// finalizer stamp or announce the job. The already-moved tree is an
+/// idempotence witness for the next authority's startup scan.
+#[tokio::test]
+async fn failed_park_losing_admission_after_move_is_fenced_and_retried() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let engine = spawn_engine(tmp.path()).await;
+    let dir = tmp.path().join("dest/held-failure");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("partial.bin"), b"known bad bytes").unwrap();
+    let parked_root = tmp.path().join("failed");
+    let hist = history(tmp.path());
+    let admitted = Arc::new(AtomicBool::new(false));
+    let admitted_for_gate = admitted.clone();
+    let gate_checks = Arc::new(AtomicUsize::new(0));
+    let gate_checks_for_gate = gate_checks.clone();
+    let gate: PpGate = Some(Arc::new(move |_| {
+        admitted_for_gate.load(Ordering::Acquire)
+            || gate_checks_for_gate.fetch_add(1, Ordering::AcqRel) <= 3
+    }));
+    let config = PostConfig {
+        failure_action: FailureAction::Park,
+        failed_dir: Some(parked_root.clone()),
+        ..PostConfig::default()
+    };
+
+    let cancel = CancellationToken::new();
+    let tracker = TaskTracker::new();
+    spawn_post_manager(
+        engine.clone(),
+        config.clone(),
+        hist.clone(),
+        tmp.path().join("dest"),
+        gate.clone(),
+        cancel.clone(),
+        &tracker,
+    );
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let mut job = completed_job(
+        91,
+        "held-failure",
+        vec![file_entry(1, "partial.bin", None, false)],
+    );
+    job.status = JobStatus::Failed;
+    engine.import_job(job, false, true).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        gate_checks.load(Ordering::Acquire) >= 5,
+        "the fence closed only after durable history was written"
+    );
+    assert!(!dir.exists(), "the move finished before authority changed");
+    assert!(
+        parked_root.join("held-failure/partial.bin").is_file(),
+        "the external side effect remains visible"
+    );
+    assert_eq!(hist.list(10).unwrap().len(), 1);
+    assert!(!engine
+        .export_job(JobId(91))
+        .await
+        .unwrap()
+        .unwrap()
+        .params
+        .iter()
+        .any(|(key, _)| key == PP_DONE_PARAM));
+    cancel.cancel();
+    tracker.close();
+    tracker.wait().await;
+
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    admitted.store(true, Ordering::Release);
+    let cancel2 = CancellationToken::new();
+    let tracker2 = TaskTracker::new();
+    spawn_post_manager(
+        engine.clone(),
+        config,
+        hist.clone(),
+        tmp.path().join("dest"),
+        gate,
+        cancel2.clone(),
+        &tracker2,
+    );
+    let target = parked_root.join("held-failure/partial.bin");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let stamped = engine
+            .export_job(JobId(91))
+            .await
+            .unwrap()
+            .is_some_and(|job| job.params.iter().any(|(key, _)| key == PP_DONE_PARAM));
+        if target.is_file() && stamped && hist.list(10).unwrap().len() == 1 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "recovered failed park was not finalized"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(!dir.exists());
+    assert_eq!(hist.list(10).unwrap().len(), 1, "one logical completion");
+    let portable = std::fs::read_to_string(tmp.path().join("history.jsonl")).unwrap();
+    assert!(portable.lines().count() >= 1);
+    assert!(
+        portable.lines().all(|line| line.contains("held-failure")),
+        "cross-node retries may duplicate a physical line, but never its logical key"
+    );
+    cancel2.cancel();
+    tracker2.close();
+    tracker2.wait().await;
+    engine.shutdown().await;
+}
+
+/// `*PP:done` is a retirement instruction, so it may be committed only after
+/// the authoritative JSONL history append succeeds. A full state volume must
+/// leave the failed queue row recoverable and retry it once history storage is
+/// writable again.
+#[cfg(unix)]
+#[tokio::test]
+async fn failed_job_is_not_stamped_when_durable_history_write_fails() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let engine = spawn_engine(tmp.path()).await;
+    let portable = tmp.path().join("portable");
+    std::fs::create_dir(&portable).unwrap();
+    let hist =
+        Arc::new(HistoryDb::open(&tmp.path().join("history.sqlite"), Some(&portable)).unwrap());
+    let log = portable.join("history.jsonl");
+    std::fs::set_permissions(&portable, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+    let cancel = CancellationToken::new();
+    let tracker = TaskTracker::new();
+    spawn_post_manager(
+        engine.clone(),
+        PostConfig {
+            failure_action: FailureAction::None,
+            ..PostConfig::default()
+        },
+        hist.clone(),
+        tmp.path().join("dest"),
+        None,
+        cancel.clone(),
+        &tracker,
+    );
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let mut job = completed_job(92, "history-full", Vec::new());
+    job.status = JobStatus::Failed;
+    engine.import_job(job, false, true).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let retained = engine.export_job(JobId(92)).await.unwrap().unwrap();
+    assert!(!retained.params.iter().any(|(key, _)| key == PP_DONE_PARAM));
+    assert!(!log.exists(), "no durable JSONL record was possible");
+    assert!(
+        hist.list(10).unwrap().is_empty(),
+        "failed portable append must roll back the derived SQLite row"
+    );
+    cancel.cancel();
+    tracker.close();
+    tracker.wait().await;
+
+    std::fs::set_permissions(&portable, std::fs::Permissions::from_mode(0o700)).unwrap();
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    let cancel2 = CancellationToken::new();
+    let tracker2 = TaskTracker::new();
+    spawn_post_manager(
+        engine.clone(),
+        PostConfig {
+            failure_action: FailureAction::None,
+            ..PostConfig::default()
+        },
+        hist.clone(),
+        tmp.path().join("dest"),
+        None,
+        cancel2.clone(),
+        &tracker2,
+    );
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let stamped = engine
+            .export_job(JobId(92))
+            .await
+            .unwrap()
+            .is_some_and(|job| job.params.iter().any(|(key, _)| key == PP_DONE_PARAM));
+        if stamped && log.is_file() {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "failed finalization did not recover after history became writable"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(hist.list(10).unwrap().len(), 1);
+    assert_eq!(
+        std::fs::read_to_string(&log).unwrap().lines().count(),
+        1,
+        "the failed pre-write attempt leaves one durable portable completion"
+    );
+    cancel2.cancel();
+    tracker2.close();
+    tracker2.wait().await;
+    engine.shutdown().await;
+}
+
+/// The retry key itself is part of the queue's commit protocol. If queue.json
+/// cannot be replaced, no disposition or history append may happen; a restart
+/// from the last durable snapshot then finalizes once under a newly committed
+/// stable key.
+#[cfg(unix)]
+#[tokio::test]
+async fn failed_job_waits_for_failure_key_snapshot_commit_before_side_effects() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let state = tmp.path().join("state");
+    let engine = spawn_engine(tmp.path()).await;
+    let hist = history(&tmp.path().join("history"));
+    let mut job = completed_job(93, "snapshot-full", Vec::new());
+    job.status = JobStatus::Failed;
+    engine.import_job(job, false, true).await.unwrap();
+    let durable_before = std::fs::read(state.join("queue.json")).unwrap();
+
+    std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let cancel = CancellationToken::new();
+    let tracker = TaskTracker::new();
+    spawn_post_manager(
+        engine.clone(),
+        PostConfig {
+            failure_action: FailureAction::None,
+            ..PostConfig::default()
+        },
+        hist.clone(),
+        tmp.path().join("dest"),
+        None,
+        cancel.clone(),
+        &tracker,
+    );
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    assert!(hist.list(10).unwrap().is_empty());
+    let held = engine.export_job(JobId(93)).await.unwrap().unwrap();
+    assert!(!held.params.iter().any(|(key, _)| key == PP_DONE_PARAM));
+    cancel.cancel();
+    tracker.close();
+    tracker.wait().await;
+
+    // Gracefully stop the test runtime, then restore the exact pre-attempt
+    // snapshot to model a crash that could only recover the last committed
+    // queue state.
+    std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o700)).unwrap();
+    engine.shutdown().await;
+    std::fs::write(state.join("queue.json"), durable_before).unwrap();
+
+    let recovered = spawn_engine(tmp.path()).await;
+    let recovered_job = recovered.export_job(JobId(93)).await.unwrap().unwrap();
+    assert!(!recovered_job
+        .params
+        .iter()
+        .any(|(key, _)| key == "*PP:failure-at" || key == PP_DONE_PARAM));
+    let cancel2 = CancellationToken::new();
+    let tracker2 = TaskTracker::new();
+    spawn_post_manager(
+        recovered.clone(),
+        PostConfig {
+            failure_action: FailureAction::None,
+            ..PostConfig::default()
+        },
+        hist.clone(),
+        tmp.path().join("dest"),
+        None,
+        cancel2.clone(),
+        &tracker2,
+    );
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let stamped = recovered
+            .export_job(JobId(93))
+            .await
+            .unwrap()
+            .is_some_and(|job| job.params.iter().any(|(key, _)| key == PP_DONE_PARAM));
+        if stamped {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "recovered failure did not finalize after queue storage recovered"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(hist.list(10).unwrap().len(), 1);
+    cancel2.cancel();
+    tracker2.close();
+    tracker2.wait().await;
+    recovered.shutdown().await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn failed_final_stamp_commit_rolls_back_live_state_and_retries_once() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let state = tmp.path().join("state");
+    let engine = spawn_engine(tmp.path()).await;
+    let hist = history(&tmp.path().join("history"));
+    let mut events = engine.subscribe();
+    let checks = Arc::new(AtomicUsize::new(0));
+    let checks_for_gate = checks.clone();
+    let state_for_gate = state.clone();
+    let gate: PpGate = Some(Arc::new(move |_| {
+        if checks_for_gate.fetch_add(1, Ordering::AcqRel) == 3 {
+            std::fs::set_permissions(&state_for_gate, std::fs::Permissions::from_mode(0o555))
+                .unwrap();
+        }
+        true
+    }));
+    let cancel = CancellationToken::new();
+    let tracker = TaskTracker::new();
+    spawn_post_manager(
+        engine.clone(),
+        PostConfig {
+            failure_action: FailureAction::None,
+            ..PostConfig::default()
+        },
+        hist.clone(),
+        tmp.path().join("dest"),
+        gate,
+        cancel.clone(),
+        &tracker,
+    );
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let mut job = completed_job(94, "final-stamp-full", Vec::new());
+    job.status = JobStatus::Failed;
+    engine.import_job(job, false, true).await.unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    while hist.list(10).unwrap().is_empty() {
+        assert!(tokio::time::Instant::now() < deadline);
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let unstamped = engine.export_job(JobId(94)).await.unwrap().unwrap();
+    assert!(unstamped
+        .params
+        .iter()
+        .any(|(key, _)| key == "*PP:failure-at"));
+    assert!(!unstamped.params.iter().any(|(key, _)| key == PP_DONE_PARAM));
+
+    std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o700)).unwrap();
+    engine.emit(nzbd_engine::Event::JobFinished {
+        job: JobId(94),
+        name: "final-stamp-full".into(),
+        status: JobStatus::Failed,
+        health: 0,
+    });
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut finished = 0;
+    loop {
+        while let Ok(event) = events.try_recv() {
+            if matches!(
+                event,
+                nzbd_engine::Event::JobPpFinished { job: JobId(94), .. }
+            ) {
+                finished += 1;
+            }
+        }
+        let stamped = engine
+            .export_job(JobId(94))
+            .await
+            .unwrap()
+            .is_some_and(|job| job.params.iter().any(|(key, _)| key == PP_DONE_PARAM));
+        if stamped && finished == 1 {
+            break;
+        }
+        assert!(tokio::time::Instant::now() < deadline);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    while let Ok(event) = events.try_recv() {
+        if matches!(
+            event,
+            nzbd_engine::Event::JobPpFinished { job: JobId(94), .. }
+        ) {
+            finished += 1;
+        }
+    }
+    assert_eq!(finished, 1);
+    assert_eq!(hist.list(10).unwrap().len(), 1);
     cancel.cancel();
     tracker.close();
     tracker.wait().await;

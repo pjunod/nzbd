@@ -203,6 +203,7 @@ impl Default for PpCtx {
 /// (covers leadership takeover, lagged event streams, crashed PP attempts
 /// on a prior run — the `*PP:done` stamp keeps it idempotent).
 const RESCAN_INTERVAL: Duration = Duration::from_secs(30);
+const PP_FAILURE_AT_PARAM: &str = "*PP:failure-at";
 
 /// A safe point to resume a post-processing pipeline from.
 ///
@@ -379,6 +380,7 @@ async fn manager_task(
                                     &cancel,
                                     &finished_tx,
                                     job,
+                                    gate.clone(),
                                     gate.is_none(),
                                     RestartPoint::Beginning,
                                 );
@@ -387,107 +389,10 @@ async fn manager_task(
                         }
                     }
                     JobStatus::Failed if claim(&gate, job) => {
-                        // Below critical health: no PP; record history and
-                        // stamp so the retire sweep moves the job out.
-                        let exported = engine.export_job(job).await.ok().flatten();
-                        if exported.as_ref().is_some_and(pp_done) {
-                            continue; // already handled (rescan overlap)
-                        }
-                        let fetch_failure = exported
-                            .as_ref()
-                            .map(|j| matches!(j.kind, nzbd_types::JobKind::Url) && j.files.is_empty())
-                            .unwrap_or(false);
-                        let fail_status = if fetch_failure {
-                            "FAILURE/FETCH"
-                        } else {
-                            "FAILURE/HEALTH"
-                        };
-                        // Same disposition as every other terminal
-                        // failure: the health gate is not a special case,
-                        // it is just the earliest one.
-                        let disposition = match exported.as_ref() {
-                            Some(j) if !j.files.is_empty() => {
-                                let dir_name = nzbd_engine::queue::job_dir_name(j);
-                                Some(dispose_failed(
-                                    &cfg,
-                                    job,
-                                    &dest_dir.join(&dir_name),
-                                    &dest_dir,
-                                    &dir_name,
-                                    "local",
-                                ).await)
-                            }
-                            _ => None,
-                        };
-                        let mut fail_params =
-                            exported.as_ref().map(user_params).unwrap_or_default();
-                        if let Some(d) = disposition.as_ref() {
-                            fail_params.push(("Failure:Files".into(), d.note.clone()));
-                        }
-                        let entry = HistoryEntry {
-                            job,
-                            name: name.clone(),
-                            category: exported.as_ref().and_then(|j| j.category.clone()),
-                            final_dir: disposition
-                                .as_ref()
-                                .and_then(|d| d.files_at.as_ref())
-                                .map(|p| p.to_string_lossy().into_owned()),
-                            status: fail_status.into(),
-                            size: exported.as_ref().map(|j| j.totals.size).unwrap_or(0),
-                            health,
-                            params: fail_params.clone(),
-                            dupe_key: exported
-                                .as_ref()
-                                .map(|j| j.dupe.key.clone())
-                                .unwrap_or_default(),
-                            dupe_score: exported.as_ref().map(|j| j.dupe.score).unwrap_or(0),
-                            completed_at_unix: now(),
-                            hidden: false,
-                            first_seen_at_unix: None,
-                            last_seen_at_unix: None,
-                            seen_count: 0,
-                            removed_at_unix: None,
-                            picked_up_by: None,
-                            record: exported.as_ref().map(nzbd_state::JobRecord::from_job),
-                            stages: exported
-                                .as_ref()
-                                .map(|j| j.stages.clone())
-                                .unwrap_or_default(),
-                            seq: 0,
-                        };
-                        let h = history.clone();
-                        let record = entry.clone();
-                        let history_seq =
-                            tokio::task::spawn_blocking(move || h.record_seq(&record))
-                                .await
-                                .ok()
-                                .and_then(|r| r.ok())
-                                .unwrap_or(0);
-                        // These jobs never enter the stage pipeline, but they
-                        // ARE terminal, and a consumer waiting for
-                        // `job_pp_finished` must not wait forever on a
-                        // download that died at the health gate. The status
-                        // string is the history one verbatim
-                        // (`FAILURE/HEALTH` / `FAILURE/FETCH`) — same
-                        // FAILURE prefix consumers already switch on.
-                        engine.emit(Event::JobPpFinished {
-                            job,
-                            name,
-                            category: entry.category.clone(),
-                            pp_status: fail_status.into(),
-                            final_dir: None,
-                            size_bytes: entry.size,
-                            health,
-                            params: entry.params.clone(),
-                            history_seq,
-                        });
-                        if let Some(mut fin) = exported {
-                            if let Some(d) = disposition.as_ref() {
-                                fin.params.push(("Failure:Files".into(), d.note.clone()));
-                            }
-                            fin.params.push((PP_DONE_PARAM.into(), fail_status.into()));
-                            let _ = engine.import_job(fin, false, false).await;
-                        }
+                        handle_failed_job(
+                            &engine, &cfg, &history, &dest_dir, &gate, job, name, health,
+                        )
+                        .await;
                     }
                     _ => {}
                 },
@@ -518,7 +423,7 @@ async fn manager_task(
                     if restartable && claim(&gate, job) {
                         let attempt = spawn_job(
                             &tracker, &engine, &cfg, &history, &dest_dir, &sem,
-                            &cancel, &finished_tx, job, gate.is_none(), from,
+                            &cancel, &finished_tx, job, gate.clone(), gate.is_none(), from,
                         );
                         active.insert(job, attempt);
                     }
@@ -551,7 +456,7 @@ async fn manager_task(
                             } else {
                                 let attempt = spawn_job(
                                     &tracker, &engine, &cfg, &history, &dest_dir, &sem,
-                                    &cancel, &finished_tx, job, gate.is_none(), from,
+                                    &cancel, &finished_tx, job, gate.clone(), gate.is_none(), from,
                                 );
                                 active.insert(job, attempt);
                             }
@@ -569,6 +474,228 @@ async fn manager_task(
     // correct if the manager's own select loop is the first task to observe it.
     for attempt in active.values() {
         attempt.cancel.cancel();
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_failed_job(
+    engine: &EngineHandle,
+    cfg: &PostConfig,
+    history: &Arc<HistoryDb>,
+    dest_dir: &Path,
+    gate: &PpGate,
+    job: JobId,
+    name: String,
+    health: u16,
+) {
+    // Below critical health: no PP; record history and stamp so the retire
+    // sweep moves the job out. Cluster disk admission gates this whole
+    // operation because FailureAction::Park can copy across filesystems.
+    let mut exported = engine.export_job(job).await.ok().flatten();
+    if exported.as_ref().is_some_and(pp_done) {
+        return; // already handled (event/rescan overlap)
+    }
+    // Authority and disk admission can change while export awaits the owner.
+    // Recheck at the last boundary before Park may copy across filesystems.
+    if gate.as_ref().is_some_and(|claim| !claim(job)) {
+        return;
+    }
+    // Persist the logical finalization key on the queue row before any
+    // external side effect. History append failure or fence loss can then
+    // retry seconds later without manufacturing a second completion row.
+    let completed_at_unix = exported
+        .as_ref()
+        .and_then(|job| {
+            job.params
+                .iter()
+                .find(|(key, _)| key == PP_FAILURE_AT_PARAM)
+                .and_then(|(_, value)| value.parse::<i64>().ok())
+        })
+        .unwrap_or_else(now);
+    if let Some(finalizing) = exported.as_mut() {
+        if !finalizing
+            .params
+            .iter()
+            .any(|(key, _)| key == PP_FAILURE_AT_PARAM)
+        {
+            finalizing
+                .params
+                .push((PP_FAILURE_AT_PARAM.into(), completed_at_unix.to_string()));
+        }
+        // This result means the atomic replacement reached the queue
+        // snapshot, not merely that the in-memory row existed. Re-run it even
+        // when a prior failed attempt left the key in memory: no Park/Delete,
+        // history append, or terminal stamp may precede this durable commit.
+        match engine.import_job_if_present(finalizing.clone()).await {
+            Ok(true) => {}
+            Ok(false) | Err(_) => return,
+        }
+    }
+    if gate.as_ref().is_some_and(|claim| !claim(job)) {
+        return;
+    }
+    let fetch_failure = exported
+        .as_ref()
+        .map(|j| matches!(j.kind, nzbd_types::JobKind::Url) && j.files.is_empty())
+        .unwrap_or(false);
+    let fail_status = if fetch_failure {
+        "FAILURE/FETCH"
+    } else {
+        "FAILURE/HEALTH"
+    };
+    let disposition = match exported.as_ref() {
+        Some(j) if !j.files.is_empty() => {
+            let dir_name = nzbd_engine::queue::job_dir_name(j);
+            let source = dest_dir.join(&dir_name);
+            let observed = dispose_failed(cfg, job, &source, dest_dir, &dir_name, "local").await;
+            match canonical_failed_disposition(cfg, dest_dir, &dir_name, &source) {
+                Some(committed) => Some(committed),
+                None => {
+                    tracing::warn!(job = job.0, outcome = %observed.note,
+                        "failed-file disposition is incomplete; leaving the queue row retryable");
+                    return;
+                }
+            }
+        }
+        _ => None,
+    };
+    // Park may be a cross-filesystem copy. If authority or disk admission
+    // changed while it awaited, do not publish a terminal decision. A later
+    // authority retry recognizes the already-moved target idempotently.
+    if gate.as_ref().is_some_and(|claim| !claim(job)) {
+        return;
+    }
+    let mut fail_params = exported.as_ref().map(user_params).unwrap_or_default();
+    if let Some(d) = disposition.as_ref() {
+        fail_params.push(("Failure:Files".into(), d.note.clone()));
+    }
+    let entry = HistoryEntry {
+        job,
+        name: name.clone(),
+        category: exported.as_ref().and_then(|j| j.category.clone()),
+        final_dir: disposition
+            .as_ref()
+            .and_then(|d| d.files_at.as_ref())
+            .map(|p| p.to_string_lossy().into_owned()),
+        status: fail_status.into(),
+        size: exported.as_ref().map(|j| j.totals.size).unwrap_or(0),
+        health,
+        params: fail_params.clone(),
+        dupe_key: exported
+            .as_ref()
+            .map(|j| j.dupe.key.clone())
+            .unwrap_or_default(),
+        dupe_score: exported.as_ref().map(|j| j.dupe.score).unwrap_or(0),
+        completed_at_unix,
+        hidden: false,
+        first_seen_at_unix: None,
+        last_seen_at_unix: None,
+        seen_count: 0,
+        removed_at_unix: None,
+        picked_up_by: None,
+        record: exported.as_ref().map(nzbd_state::JobRecord::from_job),
+        stages: exported
+            .as_ref()
+            .map(|j| j.stages.clone())
+            .unwrap_or_default(),
+        seq: 0,
+    };
+    let h = history.clone();
+    let record = entry.clone();
+    let (history_seq, entry) =
+        match tokio::task::spawn_blocking(move || h.record_seq_durable(&record)).await {
+            Ok(Ok(recorded)) => recorded,
+            Ok(Err(error)) => {
+                if nzbd_engine::is_out_of_space(&error.to_string()) {
+                    engine.report_out_of_space(format!("record failed-job history: {error}"));
+                }
+                tracing::error!(job = job.0, error = %error,
+                "failed job was not stamped because durable history failed");
+                return;
+            }
+            Err(error) => {
+                tracing::error!(job = job.0, error = %error,
+                "failed job was not stamped because history task failed");
+                return;
+            }
+        };
+    if gate.as_ref().is_some_and(|claim| !claim(job)) {
+        return;
+    }
+    // These jobs never enter the stage pipeline, but they are terminal, and
+    // a consumer waiting for `job_pp_finished` must not wait forever after
+    // disk admission recovers.
+    if let Some(mut fin) = exported {
+        if let Some((_, note)) = entry.params.iter().find(|(key, _)| key == "Failure:Files") {
+            fin.params.push(("Failure:Files".into(), note.clone()));
+        }
+        fin.params.push((PP_DONE_PARAM.into(), fail_status.into()));
+        match engine.import_job_if_present(fin).await {
+            Ok(true) => {}
+            Ok(false) => return,
+            Err(error) => {
+                tracing::error!(job = job.0, error = %error,
+                    "failed job history is durable but its terminal stamp was not committed");
+                return;
+            }
+        }
+    }
+    engine.emit(Event::JobPpFinished {
+        job,
+        name,
+        category: entry.category.clone(),
+        pp_status: fail_status.into(),
+        final_dir: entry.final_dir.clone(),
+        size_bytes: entry.size,
+        health,
+        params: entry.params.clone(),
+        history_seq,
+    });
+}
+
+/// Convert a completed failure action into a node-independent history fact.
+/// A successor that observes an already-completed Delete/Park must emit the
+/// same immutable payload as the authority that performed it. Failed actions
+/// return `None` and remain retryable instead of recording a conflicting row.
+fn canonical_failed_disposition(
+    cfg: &PostConfig,
+    dest_dir: &Path,
+    dir_name: &str,
+    source: &Path,
+) -> Option<Disposition> {
+    match cfg.failure_action {
+        FailureAction::None => match source.try_exists() {
+            Ok(true) => Some(Disposition {
+                note: "kept".into(),
+                files_at: Some(source.to_path_buf()),
+            }),
+            Ok(false) => Some(Disposition {
+                note: "already gone".into(),
+                files_at: None,
+            }),
+            Err(_) => None,
+        },
+        FailureAction::Delete => match source.try_exists() {
+            Ok(false) => Some(Disposition {
+                note: "deleted".into(),
+                files_at: None,
+            }),
+            _ => None,
+        },
+        FailureAction::Park => {
+            let target = cfg
+                .failed_dir
+                .clone()
+                .unwrap_or_else(|| dest_dir.join(".failed"))
+                .join(dir_name);
+            match (source.try_exists(), target.try_exists()) {
+                (Ok(false), Ok(true)) => Some(Disposition {
+                    note: format!("parked at {}", target.display()),
+                    files_at: Some(target),
+                }),
+                _ => None,
+            }
+        }
     }
 }
 
@@ -600,6 +727,20 @@ async fn scan_queue(
             }
             continue;
         }
+        if !j.pp_done && j.status == JobStatus::Failed && claim(j.id) {
+            handle_failed_job(
+                engine,
+                cfg,
+                history,
+                dest_dir,
+                gate,
+                j.id,
+                j.name.clone(),
+                j.health,
+            )
+            .await;
+            continue;
+        }
         let needs_pp = !j.pp_done
             && matches!(
                 j.status,
@@ -616,6 +757,7 @@ async fn scan_queue(
                 cancel,
                 finished,
                 j.id,
+                gate.clone(),
                 gate.is_none(),
                 RestartPoint::Beginning,
             );
@@ -635,6 +777,7 @@ fn spawn_job(
     global_cancel: &CancellationToken,
     finished: &tokio::sync::mpsc::UnboundedSender<JobId>,
     job: JobId,
+    gate: PpGate,
     retire_local: bool,
     from: RestartPoint,
 ) -> ActiveAttempt {
@@ -656,11 +799,9 @@ fn spawn_job(
         // safe by the pipeline's own crash model: no `*PP:done` stamp has
         // been written, subprocesses are kill-on-drop, and the next pass's
         // rescan re-runs the job from scratch.
-        let permit = tokio::select! {
-            _ = global_cancel.cancelled() => None,
-            _ = task_cancel.cancelled() => None,
-            p = sem.acquire() => p.ok(),
-        };
+        let permit =
+            acquire_admitted_permit(sem, global_cancel.clone(), task_cancel.clone(), gate, job)
+                .await;
         if let Some(permit) = permit {
             let _permit = permit;
             let outcome = tokio::select! {
@@ -703,6 +844,83 @@ fn spawn_job(
     });
     ActiveAttempt {
         cancel: attempt_cancel,
+    }
+}
+
+async fn acquire_admitted_permit(
+    sem: Arc<tokio::sync::Semaphore>,
+    global_cancel: CancellationToken,
+    task_cancel: CancellationToken,
+    gate: PpGate,
+    job: JobId,
+) -> Option<tokio::sync::OwnedSemaphorePermit> {
+    let permit = tokio::select! {
+        _ = global_cancel.cancelled() => None,
+        _ = task_cancel.cancelled() => None,
+        p = sem.acquire_owned() => p.ok(),
+    }?;
+    // Placement and the filesystem guard can change while this attempt is
+    // waiting for a slot. Revalidate at the last admission boundary before
+    // repair/unpack/move is allowed to touch storage.
+    if gate.as_ref().is_some_and(|claim| !claim(job)) {
+        return None;
+    }
+    Some(permit)
+}
+
+#[cfg(test)]
+mod admission_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[tokio::test]
+    async fn gate_transition_while_waiting_for_slot_prevents_pipeline_start() {
+        let sem = Arc::new(tokio::sync::Semaphore::new(0));
+        let admitted = Arc::new(AtomicBool::new(true));
+        let admitted_for_gate = admitted.clone();
+        let gate: PpGate = Some(Arc::new(move |_| admitted_for_gate.load(Ordering::Acquire)));
+        let wait = tokio::spawn(acquire_admitted_permit(
+            sem.clone(),
+            CancellationToken::new(),
+            CancellationToken::new(),
+            gate,
+            JobId(7),
+        ));
+        tokio::task::yield_now().await;
+        admitted.store(false, Ordering::Release);
+        sem.add_permits(1);
+        assert!(wait.await.unwrap().is_none());
+        assert_eq!(sem.available_permits(), 1);
+    }
+
+    #[test]
+    fn failover_recomputes_identical_committed_dispositions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("dest");
+        let source = dest.join("job");
+        std::fs::create_dir_all(&source).unwrap();
+        let delete = PostConfig {
+            failure_action: FailureAction::Delete,
+            ..PostConfig::default()
+        };
+        assert!(canonical_failed_disposition(&delete, &dest, "job", &source).is_none());
+        std::fs::remove_dir_all(&source).unwrap();
+        let first = canonical_failed_disposition(&delete, &dest, "job", &source).unwrap();
+        let successor = canonical_failed_disposition(&delete, &dest, "job", &source).unwrap();
+        assert_eq!(first.note, successor.note);
+        assert_eq!(first.files_at, successor.files_at);
+
+        let failed = tmp.path().join("failed");
+        let park = PostConfig {
+            failure_action: FailureAction::Park,
+            failed_dir: Some(failed.clone()),
+            ..PostConfig::default()
+        };
+        std::fs::create_dir_all(failed.join("job")).unwrap();
+        let first = canonical_failed_disposition(&park, &dest, "job", &source).unwrap();
+        let successor = canonical_failed_disposition(&park, &dest, "job", &source).unwrap();
+        assert_eq!(first.note, successor.note);
+        assert_eq!(first.files_at, successor.files_at);
     }
 }
 
@@ -1559,7 +1777,22 @@ pub async fn dispose_failed(
         note: note.into(),
         files_at: Some(dir.to_path_buf()),
     };
+    // Park is retried after disk recovery or authority handoff. A prior
+    // attempt may have completed the move before losing its fence, so the
+    // target is the durable idempotence witness when the source is gone.
+    let park_target = (cfg.failure_action == FailureAction::Park).then(|| {
+        cfg.failed_dir
+            .clone()
+            .unwrap_or_else(|| dest_dir.join(".failed"))
+            .join(dir_name)
+    });
     if !dir.exists() {
+        if let Some(target) = park_target.filter(|target| target.exists()) {
+            return Disposition {
+                note: format!("parked at {}", target.display()),
+                files_at: Some(target),
+            };
+        }
         return Disposition {
             note: "already gone".into(),
             files_at: None,
@@ -1588,11 +1821,7 @@ pub async fn dispose_failed(
             }
         }
         FailureAction::Park => {
-            let root = cfg
-                .failed_dir
-                .clone()
-                .unwrap_or_else(|| dest_dir.join(".failed"));
-            let target = root.join(dir_name);
+            let target = park_target.expect("Park computed its idempotent target");
             let from = dir.to_path_buf();
             let to = target.clone();
             let tag = tag.to_string();

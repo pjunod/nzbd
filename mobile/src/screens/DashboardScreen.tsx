@@ -18,6 +18,7 @@ import { SafeAreaView } from 'react-native-safe-area-context';
 
 import {
   criticalStorage,
+  diskGuardMessage,
   formatBytes,
   formatDuration,
   isJobPaused,
@@ -25,6 +26,7 @@ import {
   jobProgress,
   jobStatusKey,
   jobStatusLabel,
+  storageEvidenceLabel,
   storageUsage,
 } from '../api/format';
 import {
@@ -475,7 +477,7 @@ function StorageVolume({
     >
       <View style={styles.storageTop}>
         <Text numberOfLines={1} style={styles.storageLabel}>
-          {storage.label || 'volume'}
+          {storageEvidenceLabel(storage)}
         </Text>
         <Text
           style={[
@@ -776,7 +778,9 @@ function GuardBanner({
   styles: ReturnType<typeof makeStyles>;
 }) {
   let message: string | null = null;
-  if (status.disk_low) message = 'Downloads are held because the destination volume is low on space.';
+  if (status.disk_low) {
+    message = diskGuardMessage(status);
+  }
   else if (status.quota_reached) message = 'Downloads are held because the configured quota was reached.';
   else if (status.blocked_servers.length > 0)
     message = `${status.blocked_servers.length} provider ${status.blocked_servers.length === 1 ? 'is' : 'are'} temporarily blocked.`;

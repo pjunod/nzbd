@@ -58,6 +58,9 @@ pub struct ClusterConfig {
     pub lease_interval: Duration,
     pub takeover_after: Duration,
     pub worker_ttl: Duration,
+    /// Every configured write root on this node, used by the engine's
+    /// enforcing low-disk guard.
+    pub disk_guard_roots: Vec<nzbd_engine::volumes::DiskGuardRoot>,
 }
 
 /// Post-processing wiring for a cluster node (C2): the PP pipeline config
@@ -91,9 +94,17 @@ impl ClusterRuntime {
         dest_dir: PathBuf,
         speed_limit_bps: Option<u64>,
         max_active_downloads: Option<u32>,
-        pp: Option<PpSetup>,
+        mut pp: Option<PpSetup>,
     ) -> Result<ClusterRuntime, ClusterError> {
         let layout = SharedLayout::new(&cfg.shared_dir, &cfg.node_name)?;
+        if let Some(setup) = pp.as_mut() {
+            if setup.post.failure_action == nzbd_post::manager::FailureAction::Park {
+                // A leader can lose authority after the move but before its
+                // terminal stamp. Park on the shared cluster volume so the
+                // successor can observe and finish that idempotent action.
+                setup.post.failed_dir = Some(cfg.shared_dir.join(".nzbd-cluster/failed"));
+            }
+        }
         let cancel = CancellationToken::new();
         let tracker = TaskTracker::new();
 
@@ -116,12 +127,13 @@ impl ClusterRuntime {
             servers: servers.clone(),
             state_dir: layout.state_dir(),
             dest_dir: dest_dir.clone(),
+            disk_guard_roots: cfg.disk_guard_roots.clone(),
             tuning,
             speed_limit_bps,
             max_active_downloads,
             persist_queue: false, // adopted on taking office
             journal_suffix: cfg.node_name.clone(),
-            persist_guard: Some(guard),
+            persist_guard: Some(guard.clone()),
         })
         .await?;
 
@@ -177,14 +189,20 @@ impl ClusterRuntime {
                     let view = view.clone();
                     let engine = engine.clone();
                     let me = cfg.node_name.clone();
+                    let failure_action = setup.post.failure_action;
+                    let live_authority = guard.clone();
                     move |job_id: nzbd_types::JobId| {
-                        if !view.borrow().is_me {
-                            return false;
-                        }
                         let snap = engine.snapshot();
                         match snap.jobs.iter().find(|j| j.id == job_id) {
-                            Some(j) if matches!(j.status, nzbd_types::JobStatus::Failed) => true,
-                            Some(j) => j.assigned_node.as_deref() == Some(me.as_str()),
+                            Some(j) => leader_local_pp_admits(
+                                live_authority(),
+                                view.borrow().is_me,
+                                snap.disk_low,
+                                j.status,
+                                j.assigned_node.as_deref(),
+                                &me,
+                                failure_action,
+                            ),
                             None => false,
                         }
                     }
@@ -323,7 +341,7 @@ impl ClusterRuntime {
                 events: None, // router_with starts the hub
             })
             .merge(nzbd_compat::router(compat_state)),
-            auth,
+            auth.clone(),
         )
         .layer(middleware::from_fn_with_state(
             ProxyState {
@@ -340,9 +358,13 @@ impl ClusterRuntime {
                 .expect("layout exists"),
             view: self.view.clone(),
         };
+        let diagnostics = nzbd_api::require_auth(
+            Router::new().route("/api/v1/cluster", get(cluster_info).with_state(info)),
+            auth,
+        );
         Router::new()
             .merge(leader::router(self.leader_shared.clone()))
-            .route("/api/v1/cluster", get(cluster_info).with_state(info))
+            .merge(diagnostics)
             .merge(proxied)
     }
 
@@ -351,6 +373,108 @@ impl ClusterRuntime {
         self.cancel.cancel();
         self.tracker.wait().await;
         self.engine.shutdown().await;
+    }
+}
+
+fn leader_local_pp_admits(
+    live_authority: bool,
+    is_leader: bool,
+    disk_low: bool,
+    status: nzbd_types::JobStatus,
+    assigned_node: Option<&str>,
+    local_node: &str,
+    failure_action: nzbd_post::manager::FailureAction,
+) -> bool {
+    if !live_authority || !is_leader {
+        return false;
+    }
+    if status == nzbd_types::JobStatus::Failed {
+        // Delete is deallocative and None is bookkeeping-only. Park can
+        // cross filesystems and copy the whole tree, so it waits for disk
+        // recovery and is retried by the post manager's queue scan.
+        return !disk_low || !matches!(failure_action, nzbd_post::manager::FailureAction::Park);
+    }
+    !disk_low && assigned_node == Some(local_node)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn local_pp_admission_closes_assignment_to_start_disk_transition() {
+        assert!(leader_local_pp_admits(
+            true,
+            true,
+            false,
+            nzbd_types::JobStatus::Completed,
+            Some("leader"),
+            "leader",
+            nzbd_post::manager::FailureAction::Delete,
+        ));
+        assert!(!leader_local_pp_admits(
+            true,
+            true,
+            true,
+            nzbd_types::JobStatus::Completed,
+            Some("leader"),
+            "leader",
+            nzbd_post::manager::FailureAction::Delete,
+        ));
+        // Park can copy across filesystems, so it is held and retried by the
+        // manager scan. Delete frees capacity; None writes no payload.
+        assert!(!leader_local_pp_admits(
+            true,
+            true,
+            true,
+            nzbd_types::JobStatus::Failed,
+            None,
+            "leader",
+            nzbd_post::manager::FailureAction::Park,
+        ));
+        assert!(leader_local_pp_admits(
+            true,
+            true,
+            false,
+            nzbd_types::JobStatus::Failed,
+            None,
+            "leader",
+            nzbd_post::manager::FailureAction::Park,
+        ));
+        for safe_action in [
+            nzbd_post::manager::FailureAction::Delete,
+            nzbd_post::manager::FailureAction::None,
+        ] {
+            assert!(leader_local_pp_admits(
+                true,
+                true,
+                true,
+                nzbd_types::JobStatus::Failed,
+                None,
+                "leader",
+                safe_action,
+            ));
+        }
+        assert!(!leader_local_pp_admits(
+            true,
+            false,
+            false,
+            nzbd_types::JobStatus::Failed,
+            None,
+            "leader",
+            nzbd_post::manager::FailureAction::Delete,
+        ));
+        // The watch view can lag a successor's epoch write. Every finalizer
+        // boundary must also consult the live epoch-file guard.
+        assert!(!leader_local_pp_admits(
+            false,
+            true,
+            false,
+            nzbd_types::JobStatus::Failed,
+            None,
+            "leader",
+            nzbd_post::manager::FailureAction::Delete,
+        ));
     }
 }
 

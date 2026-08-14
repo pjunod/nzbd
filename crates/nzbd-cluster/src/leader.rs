@@ -150,6 +150,7 @@ pub fn router(shared: Arc<LeaderShared>) -> Router {
         .route("/cluster/v1/work/poll", post(work_poll))
         .route("/cluster/v1/work/heartbeat", post(work_heartbeat))
         .route("/cluster/v1/work/complete", post(work_complete))
+        .route("/cluster/v1/work/reject", post(work_reject))
         .with_state(shared)
 }
 
@@ -158,6 +159,10 @@ fn authed(shared: &LeaderShared, headers: &HeaderMap) -> bool {
         headers.get(SECRET_HEADER).and_then(|v| v.to_str().ok()),
         &shared.cfg.secret,
     )
+}
+
+fn worker_admits_new_work(worker: &NodeRecord) -> bool {
+    worker.disk_guard_capable && !worker.disk_low
 }
 
 fn not_leader() -> Response {
@@ -176,7 +181,10 @@ fn denied() -> Response {
         .into_response()
 }
 
-async fn leader_info(State(s): State<Arc<LeaderShared>>) -> Response {
+async fn leader_info(State(s): State<Arc<LeaderShared>>, headers: HeaderMap) -> Response {
+    if !authed(&s, &headers) {
+        return denied();
+    }
     let v = s.view.borrow().clone();
     Json(serde_json::json!({
         "leader": v.record.as_ref().map(|r| &r.node),
@@ -197,6 +205,15 @@ async fn work_poll(
     }
     if !s.is_leader() {
         return not_leader();
+    }
+    // The registry is the leader's independent admission fact. Do not trust
+    // slot counts from a poll whose node is already known to be held.
+    if read_nodes(&s.layout)
+        .into_iter()
+        .find(|node| node.name == req.node)
+        .is_none_or(|node| !worker_admits_new_work(&node))
+    {
+        return Json(PollResponse::default()).into_response();
     }
 
     // Jobs delegated to this node without an active lease → grants.
@@ -299,6 +316,40 @@ async fn work_poll(
         s.apply_local_budgets().await;
     }
     Json(PollResponse { grants }).into_response()
+}
+
+async fn work_reject(
+    State(s): State<Arc<LeaderShared>>,
+    headers: HeaderMap,
+    Json(req): Json<RejectRequest>,
+) -> Response {
+    if !authed(&s, &headers) {
+        return denied();
+    }
+    if !s.is_leader() {
+        return not_leader();
+    }
+    let released = {
+        let mut leases = s.leases.lock().unwrap();
+        leases
+            .get(&req.lease_id)
+            .is_some_and(|lease| lease.node == req.node)
+            .then(|| leases.remove(&req.lease_id))
+            .flatten()
+    };
+    if let Some(lease) = released {
+        tracing::info!(
+            job = lease.job.0,
+            node = %req.node,
+            lease = %req.lease_id,
+            "worker rejected grant after its local admission state changed"
+        );
+        let _ = s.engine.set_delegated(lease.job, None).await;
+        s.apply_local_budgets().await;
+        Json(RejectResponse { released: true }).into_response()
+    } else {
+        Json(RejectResponse { released: false }).into_response()
+    }
 }
 
 async fn work_heartbeat(
@@ -530,15 +581,25 @@ async fn schedule(s: &Arc<LeaderShared>) {
     // assignment and poll, or vanished entirely). Release it.
     {
         let live: HashSet<&str> = workers.iter().map(|w| w.name.as_str()).collect();
+        let disk_held: HashSet<&str> = workers
+            .iter()
+            .filter(|worker| !worker_admits_new_work(worker))
+            .map(|worker| worker.name.as_str())
+            .collect();
         let leased: HashSet<JobId> = s.leases.lock().unwrap().values().map(|l| l.job).collect();
         for j in snap.jobs.iter() {
             if let Some(node) = j.assigned_node.as_deref() {
                 if node != s.cfg.node_name
-                    && !live.contains(node)
+                    && (!live.contains(node) || disk_held.contains(node))
                     && !leased.contains(&j.id)
                     && !matches!(j.status, JobStatus::Deleted)
                 {
-                    tracing::warn!(job = j.id.0, %node, "assigned node is gone; releasing delegation");
+                    tracing::warn!(
+                        job = j.id.0,
+                        %node,
+                        disk_low = disk_held.contains(node),
+                        "assigned node is unavailable; releasing delegation"
+                    );
                     let _ = s.engine.set_delegated(j.id, None).await;
                 }
             }
@@ -562,7 +623,7 @@ async fn schedule(s: &Arc<LeaderShared>) {
     // registry's self-reported load).
     let mut free: Vec<(String, u32)> = workers
         .iter()
-        .filter(|w| w.download && w.max_download_jobs > 0)
+        .filter(|w| w.download && w.max_download_jobs > 0 && worker_admits_new_work(w))
         .map(|w| {
             let held = leases_by_node.get(&w.name).copied().unwrap_or(0);
             (w.name.clone(), w.max_download_jobs.saturating_sub(held))
@@ -576,7 +637,7 @@ async fn schedule(s: &Arc<LeaderShared>) {
         .iter()
         .filter(|j| j.assigned_node.is_none() && matches!(j.status, JobStatus::Downloading))
         .count() as u32;
-    let self_capacity = if s.cfg.download {
+    let self_capacity = if s.cfg.download && !snap.disk_low {
         s.cfg.max_download_jobs.saturating_sub(self_active)
     } else {
         0
@@ -609,7 +670,10 @@ async fn schedule(s: &Arc<LeaderShared>) {
     // runs both when the cluster has spare hands.
     let leased_jobs: HashSet<JobId> = s.leases.lock().unwrap().values().map(|l| l.job).collect();
     let mut pp_targets: Vec<(String, u32, bool)> = Vec::new(); // (node, free_pp, downloading)
-    for w in workers.iter().filter(|w| w.post_process && w.pp_slots > 0) {
+    for w in workers
+        .iter()
+        .filter(|w| w.post_process && w.pp_slots > 0 && worker_admits_new_work(w))
+    {
         let pp_held = pp_leases_by_node.get(&w.name).copied().unwrap_or(0)
             + assigned_pp_backlog(&snap, &w.name, &leased_jobs);
         let free = w.pp_slots.saturating_sub(pp_held);
@@ -619,7 +683,7 @@ async fn schedule(s: &Arc<LeaderShared>) {
             pp_targets.push((w.name.clone(), free, downloading));
         }
     }
-    if s.cfg.post_process && s.cfg.pp_slots > 0 {
+    if s.cfg.post_process && s.cfg.pp_slots > 0 && !snap.disk_low {
         let held = assigned_pp_backlog(&snap, &s.cfg.node_name, &leased_jobs);
         let free = s.cfg.pp_slots.saturating_sub(held);
         if free > 0 {
@@ -660,4 +724,132 @@ fn assigned_pp_backlog(
                 && j.assigned_node.as_deref() == Some(node)
         })
         .count() as u32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::election::LeaderRecord;
+    use axum::extract::State;
+    use nzbd_engine::{Engine, EngineConfig, Tuning};
+    use nzbd_types::{DupeInfo, Job, JobKind, JobTotals};
+
+    #[test]
+    fn legacy_worker_without_disk_guard_capability_is_excluded() {
+        let old = serde_json::json!({
+            "name": "old",
+            "api_url": "http://old",
+            "download": true,
+            "post_process": true,
+            "max_download_jobs": 1,
+            "active_download_jobs": 0,
+            "pp_slots": 1,
+            "rate_bps": 0,
+            "seq": 1
+        });
+        let mut record: NodeRecord = serde_json::from_value(old).unwrap();
+        assert!(!worker_admits_new_work(&record));
+        record.disk_guard_capable = true;
+        assert!(worker_admits_new_work(&record));
+        record.disk_low = true;
+        assert!(!worker_admits_new_work(&record));
+    }
+
+    #[tokio::test]
+    async fn rejected_transition_grant_releases_lease_and_delegation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let layout = SharedLayout::new(tmp.path(), "leader").unwrap();
+        let engine = Engine::spawn(EngineConfig::single_node(
+            Vec::new(),
+            layout.state_dir(),
+            tmp.path().join("dest"),
+            Tuning::default(),
+            None,
+        ))
+        .await
+        .unwrap();
+        let job = Job {
+            id: JobId(91),
+            kind: JobKind::Nzb,
+            name: "reject".into(),
+            dir_name: "reject".into(),
+            name_provisional: false,
+            queued_at_unix: 0,
+            original_name: String::new(),
+            category: None,
+            priority: 0,
+            dupe: DupeInfo::default(),
+            params: Vec::new(),
+            files: Vec::new(),
+            totals: JobTotals::default(),
+            status: JobStatus::Queued,
+            torrent: None,
+            stages: Vec::new(),
+        };
+        engine.import_job(job, false, false).await.unwrap();
+        assert!(engine
+            .set_delegated(JobId(91), Some("worker".into()))
+            .await
+            .unwrap());
+
+        let (_view_tx, view) = watch::channel(LeaderView {
+            record: Some(LeaderRecord {
+                epoch: 3,
+                node: "leader".into(),
+                api_url: "http://leader.invalid".into(),
+                seq: 1,
+            }),
+            is_me: true,
+        });
+        let cfg = ClusterConfig {
+            node_name: "leader".into(),
+            shared_dir: tmp.path().to_path_buf(),
+            advertise_url: "http://leader.invalid".into(),
+            secret: "secret".into(),
+            coordinator: true,
+            priority: 0,
+            download: false,
+            max_download_jobs: 0,
+            post_process: false,
+            pp_slots: 0,
+            lease_interval: std::time::Duration::from_secs(1),
+            takeover_after: std::time::Duration::from_secs(2),
+            worker_ttl: std::time::Duration::from_secs(3),
+            disk_guard_roots: Vec::new(),
+        };
+        let shared = LeaderShared::new(engine.clone(), layout, cfg, Vec::new(), view);
+        shared.leases.lock().unwrap().insert(
+            "transition-lease".into(),
+            LeaseInfo {
+                job: JobId(91),
+                node: "worker".into(),
+                kind: LeaseKind::Download,
+                last_hb: Instant::now(),
+            },
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert(SECRET_HEADER, "secret".parse().unwrap());
+        let response = work_reject(
+            State(shared.clone()),
+            headers,
+            Json(RejectRequest {
+                node: "worker".into(),
+                lease_id: "transition-lease".into(),
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(shared.leases.lock().unwrap().is_empty());
+        assert_eq!(
+            engine
+                .snapshot()
+                .jobs
+                .iter()
+                .find(|job| job.id == JobId(91))
+                .unwrap()
+                .assigned_node,
+            None
+        );
+        engine.shutdown().await;
+    }
 }

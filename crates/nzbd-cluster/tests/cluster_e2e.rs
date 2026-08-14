@@ -63,6 +63,7 @@ struct NodeOpts {
     max_download_jobs: u32,
     /// PP executor (C2). Slots default to 1 when enabled.
     post_process: bool,
+    min_free_disk_bytes: u64,
 }
 
 struct Node {
@@ -80,6 +81,25 @@ async fn start_node(
     opts: NodeOpts,
     nserv_port: u16,
     connections: u16,
+) -> Node {
+    start_node_with_auth(
+        shared,
+        name,
+        opts,
+        nserv_port,
+        connections,
+        nzbd_api::AuthConfig::default(),
+    )
+    .await
+}
+
+async fn start_node_with_auth(
+    shared: &Path,
+    name: &str,
+    opts: NodeOpts,
+    nserv_port: u16,
+    connections: u16,
+    auth: nzbd_api::AuthConfig,
 ) -> Node {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -99,12 +119,17 @@ async fn start_node(
         lease_interval: Duration::from_millis(150),
         takeover_after: Duration::from_millis(900),
         worker_ttl: Duration::from_millis(1800),
+        disk_guard_roots: vec![nzbd_engine::volumes::DiskGuardRoot {
+            label: "downloads".into(),
+            path: shared.join("complete"),
+        }],
     };
     let tuning = Tuning {
         retry_interval: Duration::from_millis(400),
         connect_timeout: Duration::from_secs(5),
         article_timeout: Duration::from_secs(10),
         idle_hold: Duration::from_secs(1),
+        min_free_disk_bytes: opts.min_free_disk_bytes,
         ..Tuning::default()
     };
     let pp = if opts.post_process {
@@ -138,7 +163,7 @@ async fn start_node(
     .await
     .expect("cluster start");
 
-    let app = runtime.router("26.2", vec![]);
+    let app = runtime.router_with_auth("26.2", vec![], auth);
     let serve_cancel = CancellationToken::new();
     let sc = serve_cancel.clone();
     let serve_task = tokio::spawn(async move {
@@ -169,11 +194,25 @@ impl Node {
 }
 
 fn http(addr: &str, method: &str, path: &str, body: &[u8]) -> (u16, String) {
+    http_with_headers(addr, method, path, body, &[])
+}
+
+fn http_with_headers(
+    addr: &str,
+    method: &str,
+    path: &str,
+    body: &[u8],
+    headers: &[(&str, &str)],
+) -> (u16, String) {
     let mut sock = TcpStream::connect(addr).expect("connect");
     sock.set_read_timeout(Some(Duration::from_secs(10)))
         .unwrap();
+    let extra: String = headers
+        .iter()
+        .map(|(name, value)| format!("{name}: {value}\r\n"))
+        .collect();
     let req = format!(
-        "{method} {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "{method} {path} HTTP/1.1\r\nHost: {addr}\r\n{extra}Content-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
     );
     sock.write_all(req.as_bytes()).unwrap();
@@ -216,6 +255,77 @@ fn journaled_segments(shared: &Path) -> Vec<u32> {
 
 // ---------------------------------------------------------------------------
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cluster_diagnostics_route_requires_configured_user_auth() {
+    let tmp = tempfile::tempdir().unwrap();
+    let post = build_post("auth", &[("x.bin", prng_bytes(1, 1000))], 1000);
+    let ns = NservBuilder::new().with_post(&post).start().await.unwrap();
+    let node = start_node_with_auth(
+        tmp.path(),
+        "auth-node",
+        NodeOpts {
+            coordinator: true,
+            priority: 0,
+            download: false,
+            max_download_jobs: 0,
+            post_process: false,
+            min_free_disk_bytes: 0,
+        },
+        ns.port(),
+        1,
+        nzbd_api::AuthConfig {
+            username: "admin".into(),
+            password: Some("secret".into()),
+            token: None,
+        },
+    )
+    .await;
+
+    let (without_code, _) = http(&node.url, "GET", "/api/v1/cluster", b"");
+    assert_eq!(without_code, 401);
+    let (with_code, body) = http_with_headers(
+        &node.url,
+        "GET",
+        "/api/v1/cluster",
+        b"",
+        &[("Authorization", "Basic YWRtaW46c2VjcmV0")],
+    );
+    assert_eq!(with_code, 200, "authenticated diagnostics failed: {body}");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&body).unwrap()["self"],
+        "auth-node"
+    );
+
+    // User credentials do not replace the independent cluster secret.
+    let poll = br#"{"node":"auth-node","free_download_slots":1,"free_pp_slots":0}"#;
+    let (peer_code, _) = http_with_headers(
+        &node.url,
+        "POST",
+        "/cluster/v1/work/poll",
+        poll,
+        &[
+            ("Authorization", "Basic YWRtaW46c2VjcmV0"),
+            ("Content-Type", "application/json"),
+        ],
+    );
+    assert_eq!(peer_code, 401);
+
+    // Leader discovery is part of the same peer-only namespace and must not
+    // leak node URLs or epochs without the independent cluster credential.
+    let (leader_code, _) = http(&node.url, "GET", "/cluster/v1/leader", b"");
+    assert_eq!(leader_code, 401);
+    let (leader_authed_code, _) = http_with_headers(
+        &node.url,
+        "GET",
+        "/cluster/v1/leader",
+        b"",
+        &[("x-nzbd-cluster-secret", SECRET)],
+    );
+    assert_eq!(leader_authed_code, 200);
+
+    node.kill().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn three_nodes_elect_exactly_one_leader() {
     let tmp = tempfile::tempdir().unwrap();
@@ -228,6 +338,7 @@ async fn three_nodes_elect_exactly_one_leader() {
         download: true,
         max_download_jobs: 1,
         post_process: false,
+        min_free_disk_bytes: 0,
     };
     let a = start_node(tmp.path(), "a", opts(0), ns.port(), 4).await;
     let b = start_node(tmp.path(), "b", opts(1), ns.port(), 4).await;
@@ -278,6 +389,7 @@ async fn leader_retries_authority_adoption_after_snapshot_repair() {
             download: true,
             max_download_jobs: 1,
             post_process: false,
+            min_free_disk_bytes: 0,
         },
         ns.port(),
         2,
@@ -340,6 +452,7 @@ async fn distributed_download_via_any_node_with_budgets() {
             download: false,
             max_download_jobs: 0,
             post_process: false,
+            min_free_disk_bytes: 0,
         },
         ns.port(),
         4,
@@ -354,6 +467,7 @@ async fn distributed_download_via_any_node_with_budgets() {
             download: true,
             max_download_jobs: 2,
             post_process: false,
+            min_free_disk_bytes: 0,
         },
         ns.port(),
         4,
@@ -406,6 +520,73 @@ async fn distributed_download_via_any_node_with_budgets() {
     b.kill().await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn low_disk_worker_is_visible_and_receives_no_new_lease() {
+    let tmp = tempfile::tempdir().unwrap();
+    let post = build_post("held", &[("one.bin", prng_bytes(12, 20_000))], 10_000);
+    let ns = NservBuilder::new().with_post(&post).start().await.unwrap();
+
+    let leader = start_node(
+        tmp.path(),
+        "leader",
+        NodeOpts {
+            coordinator: true,
+            priority: 0,
+            download: false,
+            max_download_jobs: 0,
+            post_process: false,
+            min_free_disk_bytes: 0,
+        },
+        ns.port(),
+        2,
+    )
+    .await;
+    let held = start_node(
+        tmp.path(),
+        "held",
+        NodeOpts {
+            coordinator: false,
+            priority: 9,
+            download: true,
+            max_download_jobs: 1,
+            post_process: true,
+            min_free_disk_bytes: u64::MAX / 2,
+        },
+        ns.port(),
+        2,
+    )
+    .await;
+
+    wait_for("held worker publishes its limiting volume", 15, || {
+        get_json(&leader.url, "/api/v1/cluster")["nodes"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|node| {
+                node["name"] == "held"
+                    && node["disk_low"] == true
+                    && node["disk_guard_label"].as_str().is_some()
+            })
+    })
+    .await;
+
+    let (code, body) = http(
+        &held.url,
+        "POST",
+        "/api/v1/jobs?name=held",
+        post.nzb.as_bytes(),
+    );
+    assert_eq!(code, 201, "proxied add failed: {body}");
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let jobs = get_json(&leader.url, "/api/v1/jobs");
+    assert_eq!(jobs["jobs"][0]["assigned_node"], serde_json::Value::Null);
+    assert_eq!(jobs["jobs"][0]["status"], "queued");
+    assert_eq!(ns.total_hits(), 0);
+
+    leader.kill().await;
+    held.kill().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn worker_death_reclaims_and_resumes_elsewhere_without_refetch() {
     let tmp = tempfile::tempdir().unwrap();
@@ -431,6 +612,7 @@ async fn worker_death_reclaims_and_resumes_elsewhere_without_refetch() {
             download: false,
             max_download_jobs: 0,
             post_process: false,
+            min_free_disk_bytes: 0,
         },
         ns.port(),
         4,
@@ -445,6 +627,7 @@ async fn worker_death_reclaims_and_resumes_elsewhere_without_refetch() {
             download: true,
             max_download_jobs: 2,
             post_process: false,
+            min_free_disk_bytes: 0,
         },
         ns.port(),
         4,
@@ -483,6 +666,7 @@ async fn worker_death_reclaims_and_resumes_elsewhere_without_refetch() {
             download: true,
             max_download_jobs: 2,
             post_process: false,
+            min_free_disk_bytes: 0,
         },
         ns.port(),
         4,
@@ -533,6 +717,7 @@ async fn leader_death_fails_over_and_adopts_the_running_lease() {
             download: false,
             max_download_jobs: 0,
             post_process: false,
+            min_free_disk_bytes: 0,
         },
         ns.port(),
         4,
@@ -547,6 +732,7 @@ async fn leader_death_fails_over_and_adopts_the_running_lease() {
             download: true,
             max_download_jobs: 2,
             post_process: false,
+            min_free_disk_bytes: 0,
         },
         ns.port(),
         4,
@@ -561,6 +747,7 @@ async fn leader_death_fails_over_and_adopts_the_running_lease() {
             download: false,
             max_download_jobs: 0,
             post_process: false,
+            min_free_disk_bytes: 0,
         },
         ns.port(),
         4,
@@ -635,6 +822,7 @@ async fn single_node_cluster_restart_keeps_the_queue() {
         download: true,
         max_download_jobs: 2,
         post_process: false,
+        min_free_disk_bytes: 0,
     };
     let a = start_node(tmp.path(), "solo", opts(), ns.port(), 4).await;
     wait_for("self-election", 15, || {
@@ -737,6 +925,7 @@ async fn pp_runs_on_idle_node_via_anti_affinity() {
             download: true,
             max_download_jobs: 2,
             post_process: false,
+            min_free_disk_bytes: 0,
         },
         ns.port(),
         4,
@@ -751,6 +940,7 @@ async fn pp_runs_on_idle_node_via_anti_affinity() {
             download: false,
             max_download_jobs: 0,
             post_process: true,
+            min_free_disk_bytes: 0,
         },
         ns.port(),
         4,
