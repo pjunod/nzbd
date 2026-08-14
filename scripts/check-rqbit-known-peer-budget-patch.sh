@@ -40,14 +40,24 @@ readonly work_dir="$(mktemp -d "${TMPDIR:-/tmp}/nzbd-rqbit-known-peer-budget.XXX
 trap 'rm -rf -- "$work_dir"' EXIT
 
 git clone --quiet --no-hardlinks "$source_dir" "$work_dir/rqbit"
-if git -C "$work_dir/rqbit" apply --check "$repository_root/$patch_file"; then
+if [[ "$source_variant" == "stable" ]]; then
+  readonly -a stable_prerequisites=(
+    'contrib/rqbit/0001-allow-persistence-without-auto-restore.patch'
+    'contrib/rqbit/0005-bound-tracker-requests.patch'
+    'contrib/rqbit/0007-bound-session-peers.patch'
+    'contrib/rqbit/0009-bound-pending-incoming-handshakes.patch'
+  )
+  for prerequisite in "${stable_prerequisites[@]}"; do
+    git -C "$work_dir/rqbit" apply --check "$repository_root/$prerequisite"
+    git -C "$work_dir/rqbit" apply "$repository_root/$prerequisite"
+  done
+  git -C "$work_dir/rqbit" apply --check "$repository_root/$patch_file"
   git -C "$work_dir/rqbit" apply "$repository_root/$patch_file"
-elif [[ "$source_variant" == "main" ]]; then
+elif git -C "$work_dir/rqbit" apply --check "$repository_root/$patch_file"; then
+  git -C "$work_dir/rqbit" apply "$repository_root/$patch_file"
+else
   echo "direct apply drifted; attempting a three-way apply against $source_head" >&2
   git -C "$work_dir/rqbit" apply --3way "$repository_root/$patch_file"
-else
-  echo "stable v8.1.1 patch no longer applies to its pinned base" >&2
-  exit 1
 fi
 
 readonly session_source="$work_dir/rqbit/crates/librqbit/src/session.rs"

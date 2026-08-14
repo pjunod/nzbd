@@ -51,6 +51,11 @@ if ! grep -Fq 'features = ["fuzzing"]' fuzz/Cargo.toml; then
   exit 1
 fi
 
+if ! grep -Fq 'path = "../contrib/rqbit/vendor/crates/librqbit"' fuzz/Cargo.toml; then
+  echo 'the fuzz crate must use the same maintained rqbit vendor as the product lock' >&2
+  exit 1
+fi
+
 cargo metadata \
   --locked \
   --manifest-path fuzz/Cargo.toml \

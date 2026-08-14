@@ -16,7 +16,7 @@ pub use source_fetch::{fetch_torrent_source, TorrentSourceFetchLimits};
 use librqbit::api::TorrentIdOrHash;
 use librqbit::{
     AddTorrent, AddTorrentOptions, AddTorrentResponse, ManagedTorrent, PeerConnectionOptions,
-    Session, SessionOptions, TorrentStatsState,
+    Session, SessionOptions, TorrentStats as EngineTorrentStats, TorrentStatsState,
 };
 use std::borrow::Cow;
 use std::collections::HashSet;
@@ -53,6 +53,14 @@ pub const MAX_TORRENT_PATH_COMPONENT_BYTES: usize = 255;
 pub const MAX_TORRENT_PATH_BYTES: usize = 16 * 1024 * 1024;
 /// Maximum unique explicit bootstrap peers accepted for one torrent.
 pub const MAX_INITIAL_PEERS: usize = 80;
+/// Maximum live peers managed for one torrent.
+pub const MAX_LIVE_PEERS_PER_TORRENT: usize = 80;
+/// Maximum live peers managed across the embedded session.
+pub const MAX_LIVE_PEERS_TOTAL: usize = 400;
+/// Maximum retained peer records for one torrent.
+pub const MAX_KNOWN_PEERS_PER_TORRENT: usize = 1_024;
+/// Maximum retained peer records across the embedded session.
+pub const MAX_KNOWN_PEERS_TOTAL: usize = 4_096;
 /// Maximum unique non-empty trackers accepted from one torrent source.
 pub const MAX_TRACKERS_PER_TORRENT: usize = 64;
 /// Maximum decoded byte length of one tracker URL.
@@ -824,6 +832,8 @@ fn exact_add_options(
         disable_trackers: false,
         ratelimits: Default::default(),
         initial_peers: Some(initial_peers),
+        peer_limit: None,
+        known_peer_limit: None,
         preferred_id: None,
         storage_factory: None,
         defer_writes: None,
@@ -854,8 +864,14 @@ fn session_options(
         dht_config: None,
         fastresume: false,
         persistence: None,
+        // Even when M2 supplies an nzbd-owned persistence directory, session
+        // construction must admit nothing until the queue owner explicitly
+        // restores its authoritative jobs.
+        disable_auto_restore: true,
         peer_id: None,
         peer_opts: Some(explicit_peer_connection_options()),
+        known_peer_limit: Some(MAX_KNOWN_PEERS_PER_TORRENT),
+        known_peer_limit_total: Some(MAX_KNOWN_PEERS_TOTAL),
         defer_writes_up_to: None,
         default_storage_factory: None,
         cancellation_token: None,
@@ -865,6 +881,8 @@ fn session_options(
         concurrent_init_limit: Some(MAX_CONCURRENT_TORRENT_INITIALIZATIONS),
         root_span: None,
         ratelimits: Default::default(),
+        peer_limit: Some(MAX_LIVE_PEERS_PER_TORRENT),
+        peer_limit_total: Some(MAX_LIVE_PEERS_TOTAL),
         blocklist_url: None,
         trackers: HashSet::new(),
     }
@@ -877,6 +895,7 @@ fn explicit_peer_connection_options() -> PeerConnectionOptions {
         connect_timeout: Some(PEER_CONNECT_TIMEOUT),
         read_write_timeout: Some(PEER_READ_WRITE_TIMEOUT),
         keep_alive_interval: Some(PEER_KEEP_ALIVE_INTERVAL),
+        max_metadata_size: Some(DEFAULT_MAX_METAINFO_BYTES as u32),
     }
 }
 
@@ -1748,52 +1767,13 @@ impl TorrentHandle {
 
     pub fn stats(&self) -> TorrentStats {
         let stats = self.inner.stats();
-        let phase = match stats.state {
-            TorrentStatsState::Initializing => TorrentPhase::Initializing,
-            TorrentStatsState::Live => TorrentPhase::Live,
-            TorrentStatsState::Paused => TorrentPhase::Paused,
-            TorrentStatsState::Error => TorrentPhase::Error,
-        };
-        let (download_bps, upload_bps, peers) = stats
-            .live
-            .as_ref()
-            .map(|live| {
-                let peers = &live.snapshot.peer_stats;
-                (
-                    mib_per_second_to_bps(live.download_speed.mbps),
-                    mib_per_second_to_bps(live.upload_speed.mbps),
-                    TorrentPeerStats {
-                        queued: peers.queued,
-                        connecting: peers.connecting,
-                        live: peers.live,
-                        seen: peers.seen,
-                        dead: peers.dead,
-                    },
-                )
-            })
-            .unwrap_or_default();
         let content_files = self
             .inner
             .with_metadata(|metadata| {
                 project_content_files(&metadata.file_infos, &stats.file_progress)
             })
             .unwrap_or_default();
-        let eta_seconds = (download_bps > 0 && stats.progress_bytes < stats.total_bytes)
-            .then(|| (stats.total_bytes - stats.progress_bytes).div_ceil(download_bps));
-        TorrentStats {
-            phase,
-            progress_bytes: stats.progress_bytes,
-            uploaded_bytes: stats.uploaded_bytes,
-            total_bytes: stats.total_bytes,
-            file_progress_bytes: stats.file_progress,
-            content_files,
-            download_bps,
-            upload_bps,
-            eta_seconds,
-            peers,
-            finished: stats.finished,
-            error: stats.error.map(|error| display_safe_error(&error)),
-        }
+        project_stats_snapshot(stats, content_files)
     }
 
     pub async fn wait_until_initialized(&self) -> Result<(), TorrentError> {
@@ -1808,6 +1788,53 @@ impl TorrentHandle {
             .wait_until_completed()
             .await
             .map_err(engine_error)
+    }
+}
+
+fn project_stats_snapshot(
+    stats: EngineTorrentStats,
+    content_files: Vec<TorrentContentFile>,
+) -> TorrentStats {
+    let phase = match stats.state {
+        TorrentStatsState::Initializing => TorrentPhase::Initializing,
+        TorrentStatsState::Live => TorrentPhase::Live,
+        TorrentStatsState::Paused => TorrentPhase::Paused,
+        TorrentStatsState::Error => TorrentPhase::Error,
+    };
+    let (download_bps, upload_bps, peers) = stats
+        .live
+        .as_ref()
+        .map(|live| {
+            let peers = &live.snapshot.peer_stats;
+            (
+                mib_per_second_to_bps(live.download_speed.mbps),
+                mib_per_second_to_bps(live.upload_speed.mbps),
+                TorrentPeerStats {
+                    queued: peers.queued,
+                    connecting: peers.connecting,
+                    live: peers.live,
+                    seen: peers.seen,
+                    dead: peers.dead,
+                },
+            )
+        })
+        .unwrap_or_default();
+    let eta_seconds = (download_bps > 0 && stats.progress_bytes < stats.total_bytes)
+        .then(|| (stats.total_bytes - stats.progress_bytes).div_ceil(download_bps));
+    TorrentStats {
+        phase,
+        progress_bytes: stats.progress_bytes,
+        uploaded_bytes: stats.uploaded_bytes,
+        total_bytes: stats.total_bytes,
+        file_progress_bytes: stats.file_progress,
+        content_files,
+        download_bps,
+        upload_bps,
+        eta_seconds,
+        peers,
+        discovery: TorrentDiscoveryState::Unknown,
+        finished: stats.finished,
+        error: stats.error.map(|error| display_safe_error(&error)),
     }
 }
 
@@ -1853,6 +1880,17 @@ pub struct TorrentPeerStats {
     pub dead: usize,
 }
 
+/// Volatile discovery detail exposed by the selected engine boundary.
+///
+/// The maintained v8.1.1 patch set does not ship the optional tracker/DHT
+/// telemetry patch, so the adapter reports absence explicitly. Peer counts
+/// must never be reinterpreted as discovery health.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum TorrentDiscoveryState {
+    #[default]
+    Unknown,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TorrentStats {
     pub phase: TorrentPhase,
@@ -1867,6 +1905,7 @@ pub struct TorrentStats {
     pub upload_bps: u64,
     pub eta_seconds: Option<u64>,
     pub peers: TorrentPeerStats,
+    pub discovery: TorrentDiscoveryState,
     pub finished: bool,
     /// Redacted, control-character-free, and bounded to 2 KiB.
     pub error: Option<String>,
@@ -1924,6 +1963,30 @@ mod tests {
     }
 
     #[test]
+    fn stats_discovery_stays_unknown_when_live_peers_are_present() {
+        let mut live = librqbit::api::LiveStats::default();
+        live.snapshot.peer_stats.live = 7;
+        live.snapshot.peer_stats.seen = 11;
+        let stats = project_stats_snapshot(
+            EngineTorrentStats {
+                state: TorrentStatsState::Live,
+                file_progress: Vec::new(),
+                error: None,
+                progress_bytes: 1,
+                uploaded_bytes: 0,
+                total_bytes: 2,
+                finished: false,
+                live: Some(live),
+            },
+            Vec::new(),
+        );
+
+        assert_eq!(stats.peers.live, 7);
+        assert_eq!(stats.peers.seen, 11);
+        assert_eq!(stats.discovery, TorrentDiscoveryState::Unknown);
+    }
+
+    #[test]
     fn session_options_are_an_explicit_dormant_boundary() {
         // This pins the helper used by TorrentSession::start. If start stops
         // delegating here, move the assertion to the replacement call path.
@@ -1933,6 +1996,7 @@ mod tests {
         assert!(options.dht_config.is_none());
         assert!(!options.fastresume);
         assert!(options.persistence.is_none());
+        assert!(options.disable_auto_restore);
         assert!(options.peer_id.is_none());
         let peer_options = options.peer_opts.expect("peer policy must be explicit");
         assert_eq!(peer_options.connect_timeout, Some(PEER_CONNECT_TIMEOUT));
@@ -1943,6 +2007,10 @@ mod tests {
         assert_eq!(
             peer_options.keep_alive_interval,
             Some(PEER_KEEP_ALIVE_INTERVAL)
+        );
+        assert_eq!(
+            peer_options.max_metadata_size,
+            Some(DEFAULT_MAX_METAINFO_BYTES as u32)
         );
         assert!(options.listen_port_range.is_none());
         assert!(!options.enable_upnp_port_forwarding);
@@ -1956,6 +2024,10 @@ mod tests {
         );
         assert!(options.root_span.is_none());
         assert_eq!(options.ratelimits, Default::default());
+        assert_eq!(options.peer_limit, Some(MAX_LIVE_PEERS_PER_TORRENT));
+        assert_eq!(options.peer_limit_total, Some(MAX_LIVE_PEERS_TOTAL));
+        assert_eq!(options.known_peer_limit, Some(MAX_KNOWN_PEERS_PER_TORRENT));
+        assert_eq!(options.known_peer_limit_total, Some(MAX_KNOWN_PEERS_TOTAL));
         assert!(options.blocklist_url.is_none());
         assert!(options.trackers.is_empty());
     }
@@ -1991,6 +2063,8 @@ mod tests {
         assert!(options.force_tracker_interval.is_none());
         assert!(!options.disable_trackers);
         assert_eq!(options.ratelimits, Default::default());
+        assert!(options.peer_limit.is_none());
+        assert!(options.known_peer_limit.is_none());
         assert!(options.preferred_id.is_none());
         assert!(options.storage_factory.is_none());
         assert!(options.defer_writes.is_none());

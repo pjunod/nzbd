@@ -6,23 +6,31 @@ on:
     paths:
       - Cargo.toml
       - Cargo.lock
+      - contrib/rqbit/maintained-series.txt
+      - contrib/rqbit/*.sha256
+      - contrib/rqbit/vendor/**
       - crates/nzbd-torrent/**
       - crates/nzbd/src/main.rs
       - crates/nzbd/src/tls.rs
       - scripts/check-bittorrent-deps.sh
       - scripts/check-private-discovery-leaks.sh
       - scripts/check-bittorrent-storage-full-probe.sh
+      - scripts/check-rqbit-maintained-patch-series.sh
       - .github/workflows/bittorrent-m0.yml
   pull_request:
     paths:
       - Cargo.toml
       - Cargo.lock
+      - contrib/rqbit/maintained-series.txt
+      - contrib/rqbit/*.sha256
+      - contrib/rqbit/vendor/**
       - crates/nzbd-torrent/**
       - crates/nzbd/src/main.rs
       - crates/nzbd/src/tls.rs
       - scripts/check-bittorrent-deps.sh
       - scripts/check-private-discovery-leaks.sh
       - scripts/check-bittorrent-storage-full-probe.sh
+      - scripts/check-rqbit-maintained-patch-series.sh
       - .github/workflows/bittorrent-m0.yml
   workflow_dispatch:
 

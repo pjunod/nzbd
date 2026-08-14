@@ -18,6 +18,7 @@ members = [
     "crates/nzbd-cluster",
     "crates/nzbd-torrent",
 ]
+exclude = ["contrib/rqbit/vendor"]
 
 [workspace.package]
 # Releases are git tags `v<this>` — see docs/DEPLOY.md, "Cutting a
@@ -87,7 +88,7 @@ anyhow = "1"
 mdns-sd = "0.20.3"
 icu_normalizer = { version = "=2.1.1", default-features = false, features = ["compiled_data"] }
 icu_casemap = { version = "=2.1.1", default-features = false, features = ["compiled_data"] }
-librqbit = { version = "=8.1.1", default-features = false, features = ["rust-tls"] }
+librqbit = { version = "=8.1.1", path = "contrib/rqbit/vendor/crates/librqbit", default-features = false, features = ["rust-tls"] }
 url = "2"
 
 [profile.release]

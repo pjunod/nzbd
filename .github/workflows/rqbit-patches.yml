@@ -6,6 +6,10 @@ on:
     paths:
       - contrib/rqbit/*.patch
       - contrib/rqbit/*.md
+      - contrib/rqbit/maintained-series.txt
+      - contrib/rqbit/*.sha256
+      - contrib/rqbit/vendor/**
+      - scripts/check-rqbit-maintained-patch-series.sh
       - scripts/check-rqbit-authoritative-restore-patch.sh
       - scripts/check-rqbit-discovery-health-patch.sh
       - scripts/check-rqbit-tracker-request-budget-patch.sh
@@ -21,6 +25,10 @@ on:
     paths:
       - contrib/rqbit/*.patch
       - contrib/rqbit/*.md
+      - contrib/rqbit/maintained-series.txt
+      - contrib/rqbit/*.sha256
+      - contrib/rqbit/vendor/**
+      - scripts/check-rqbit-maintained-patch-series.sh
       - scripts/check-rqbit-authoritative-restore-patch.sh
       - scripts/check-rqbit-discovery-health-patch.sh
       - scripts/check-rqbit-tracker-request-budget-patch.sh
@@ -41,6 +49,31 @@ permissions:
   contents: read
 
 jobs:
+  maintained-series:
+    name: "blocking: maintained rqbit v8.1.1 series / Rust 1.85"
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.85"
+          components: rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: rqbit-maintained-v8.1.1-1.85
+      - name: Re-derive and test the shipped patch series
+        env:
+          RQBIT_UPSTREAM_CACHE: ${{ runner.temp }}/rqbit-source-cache/rqbit-v8.1.1.tar.gz
+        run: scripts/check-rqbit-maintained-patch-series.sh
+      - name: Prove the verified archive cache removes network dependence
+        env:
+          RQBIT_SERIES_DERIVE_ONLY: "1"
+          RQBIT_UPSTREAM_CACHE: ${{ runner.temp }}/rqbit-source-cache/rqbit-v8.1.1.tar.gz
+          https_proxy: http://127.0.0.1:1
+          no_proxy: ""
+        run: scripts/check-rqbit-maintained-patch-series.sh
+
   authoritative-restore:
     name: ${{ matrix.name }} / authoritative restore
     runs-on: ubuntu-latest

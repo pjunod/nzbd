@@ -1,0 +1,48 @@
+[package]
+name = "librqbit-upnp-serve"
+version = "1.0.1"
+edition = "2021"
+description = "Simple UPnP MediaServer implementation"
+license = "Apache-2.0"
+documentation = "https://docs.rs/librqbit-upnp-serve"
+repository = "https://github.com/ikatson/rqbit"
+readme = "README.md"
+
+[features]
+default = ["sha1-crypto-hash"]
+sha1-crypto-hash = [
+    "librqbit-sha1-wrapper/sha1-crypto-hash",
+    "librqbit-core/sha1-crypto-hash",
+]
+sha1-ring = ["librqbit-sha1-wrapper/sha1-ring", "librqbit-core/sha1-ring"]
+
+[dependencies]
+anyhow = "1.0.86"
+axum = { version = "0.8", features = ["tokio"] }
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1.40"
+bstr = "1.10.0"
+serde = { version = "1", features = ["derive"] }
+http = "1.1.0"
+httparse = "1.9.4"
+uuid = { version = "1.10.0", features = ["v4"] }
+librqbit-upnp = { version = "1", path = "../upnp", default-features = false }
+gethostname = "1"
+librqbit-sha1-wrapper = { path = "../sha1w", version = "4", default-features = false }
+librqbit-core = { version = "5", path = "../librqbit_core", default-features = false }
+mime_guess = "2.0.5"
+url = { version = "2", default-features = false }
+parking_lot = "0.12.3"
+tokio-util = "0.7.11"
+reqwest = { version = "0.12.7", default-features = false }
+socket2 = "0.5.7"
+quick-xml = { version = "0.37.1", features = ["serialize"] }
+network-interface = "2.0.0"
+futures = "0.3.30"
+
+[dev-dependencies]
+tracing-subscriber = "0.3.18"
+tower-http = { version = "0.6.2", features = ["trace"] }
+
+[[example]]
+name = "upnp-stub-server"

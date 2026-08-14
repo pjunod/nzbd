@@ -30,4 +30,4 @@ bench = false
 members = ["."]
 
 [workspace.dependencies]
-librqbit = { version = "=8.1.1", default-features = false, features = ["rust-tls"] }
+librqbit = { version = "=8.1.1", path = "../contrib/rqbit/vendor/crates/librqbit", default-features = false, features = ["rust-tls"] }

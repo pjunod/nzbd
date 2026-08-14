@@ -1,3 +1,14 @@
+diff --git a/crates/rqbit/src/main.rs b/crates/rqbit/src/main.rs
+--- a/crates/rqbit/src/main.rs
++++ b/crates/rqbit/src/main.rs
+@@ -481,6 +481,7 @@ async fn run(opts: Opts) -> anyhow::Result<()> {
+     };
+ 
+     let mut sopts = SessionOptions {
++        disable_auto_restore: false,
+         disable_dht: opts.disable_dht,
+         disable_dht_persistence: opts.disable_dht_persistence,
+         dht_config: None,
 diff --git a/crates/librqbit/src/session.rs b/crates/librqbit/src/session.rs
 index f0edb50b..a04aeb82 100644
 --- a/crates/librqbit/src/session.rs

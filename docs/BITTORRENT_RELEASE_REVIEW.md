@@ -1,7 +1,8 @@
 # BitTorrent release review — prove the boundary before enabling it
 
 **Status:** pre-release review surface; production BitTorrent remains disabled ·
-**Decision:** no-go while M0 gates 7 and 8 fail and gate 9 is Partial ·
+**Decision:** maintained rqbit M0 passes locally and natively; independent
+review and M2/M5 remain ·
 **Owner:** ADR-19 in [BITTORRENT_PROPOSAL.md](BITTORRENT_PROPOSAL.md)
 
 This is the short operations and release-review surface for nzbd's proposed
@@ -10,19 +11,19 @@ seeding, and deletion behavior must be true before the feature can ship. It is
 not an operator setup guide: the daemon has no torrent configuration, API,
 listener, admission route, or session lifecycle today.
 
-> **No-go:** do not add a production switch or weaken the daemon-isolation
-> check while [M0 gates 7 and 8](BITTORRENT_M0_REPORT.md#1-result-against-the-eleven-gates)
-> remain failed. Green adapter tests prove isolated behavior, not release
-> authority.
+> **No production wiring:** do not add a production switch or weaken the
+> daemon-isolation check in this M0 change. A green maintained-engine spike is
+> permission to decompose and review M2, not proof that daemon lifecycle,
+> storage, API, or operator behavior exists.
 
 ## 1. Decision at a glance
 
 | Review area | Current truth | Condition for release |
 |---|---|---|
 | Production reachability | None; `nzbd` does not depend on `nzbd-torrent` or `librqbit` | A separately reviewed milestone may wire the backend only after every stop gate passes |
-| Public observability | **Fail** — stable rqbit does not expose per-torrent tracker/DHT health or last tracker error | Accepted stable API plus nzbd state, API, and UI contract tests |
-| Authoritative restore | **Fail** — stable rqbit restores its own records before nzbd can reconcile durable jobs | Accepted stable opt-out plus restart/reconciliation tests |
-| Resource and dependency decision | **Partial** | Human acceptance of the measured cost and bounded runtime policies in [BITTORRENT_GATE9_REVIEW.md](BITTORRENT_GATE9_REVIEW.md) |
+| Public observability | **M0 pass** — required facts and bounded error are exposed; unavailable tracker/DHT diagnostics are explicit `unknown` | M2 state, API, and UI contract tests must preserve that honest boundary |
+| Authoritative restore | **M0 pass** — automatic restore is disabled and the kill/restart proof admits only the selected durable record | M2 must connect selective restore to nzbd's durable queue |
+| Resource and dependency decision | **M0 pass** — accepted limits and refreshed measurements are green on all five native targets | The maintained series and accepted limits in [BITTORRENT_GATE9_REVIEW.md](BITTORRENT_GATE9_REVIEW.md) must stay green across the native matrix |
 | Adversarial M5 work | In progress | The remaining resource, mounted-filesystem, production shutdown, auth-limiting, and sustained-fuzz evidence is green |
 | Operator action today | None | Do not publish torrent ports, paths, or config; they are proposal contracts, not supported settings |
 
@@ -48,7 +49,7 @@ change and requires its own reviewed milestone.
 | HTTP(S) trackers | Allowed; secrets and queries stay redacted | Only the one validated metainfo tracker in the first release |
 | UDP trackers | Allowed only without a SOCKS proxy | Same validation rule; proxy plus UDP fails closed |
 | PEX | Enabled by default for public torrents | Disabled regardless of operator settings |
-| DHT | Disabled by default; enabling it requires the accepted pre-metadata policy and health APIs | Disabled regardless of operator settings |
+| DHT | Disabled by default; enabling it requires the accepted pre-metadata privacy policy and complete release evidence | Disabled regardless of operator settings |
 | Local discovery (LSD) | Disabled by default | Disabled regardless of operator settings |
 | UPnP | Unavailable | Unavailable |
 
@@ -111,11 +112,11 @@ port directly, avoiding speed-dependent and temporary-port handoff races.
 Stable rqbit reports that torrent as `Error`, not the proposed disk-paused
 state.
 
-The initialization-time proof injects `StorageFull` from `ensure_file_length`.
-Stable rqbit emits a warning log but does not put the failure into torrent
-stats: a zero-byte file reports successful paused initialization and moves to
-`Live` on resume without a stats error or retry before that observation. That
-control-plane fail-open result is a release blocker. The
+The historical initialization-time proof injected `StorageFull` from
+`ensure_file_length`. Unmodified stable rqbit emits a warning log but does not
+put the failure into torrent stats: a zero-byte file reports successful paused
+initialization and moves to `Live` on resume without a stats error or retry
+before that observation. The
 [2026-08-13 replacement run](https://github.com/pjunod/nzbd/actions/runs/31654021866)
 reproduced it on all five native targets with one 262,144-byte sizing request,
 a zero-byte file, zero piece writes, and no stats-visible error. The daemon now
@@ -124,14 +125,15 @@ local/per-node limiting-volume status, but neither proof routes a torrent fault
 into it. They therefore do not establish operator-visible torrent ENOSPC
 behavior and do not authorize production wiring.
 
-The rqbit contribution kit includes independent stable and current-main
-candidates that propagate the first selected-file sizing error out of
-initialization, with exact unit proofs and mutation-sensitivity checks. The
-current-main candidate also distinguishes typed checksum cancellation from
-real I/O failure so an overlapping pause cannot hide storage exhaustion. That
-candidate is review evidence only: it has not been submitted, accepted, or
-released, and it does not replace nzbd's required torrent fault-routing,
-pause, and recovery policy.
+Maintained stable patch `0018` propagates the first selected-file sizing error
+out of initialization, with an exact unit proof and mutation-sensitivity
+check. The current-main contribution variant also distinguishes typed checksum
+cancellation from real I/O failure so an overlapping pause cannot hide storage
+exhaustion. The maintained fix closes the engine fail-open boundary; it does
+not replace M2's required torrent fault-routing, pause, and recovery policy.
+The native harness now treats the historical `Paused`-then-`Live` result as a
+failure: admission or initialization must expose the bounded file, length, and
+storage cause, and any asynchronously returned handle must enter `Error`.
 
 **Reviewer acceptance:** supported deployment examples must exercise the
 actual bind mounts or volumes, case/normalization behavior, low-space guard,
@@ -200,12 +202,13 @@ relying on one local host:
 
 | Evidence | Last recorded proof |
 |---|---|
+| Maintained v8.1.1 archive, exact nine-patch series, generated vendor, and focused upstream tests | [2026-08-14 maintained-rqbit workflow](https://github.com/pjunod/nzbd/actions/runs/31837867809) |
 | Native 100-torrent admission/shutdown pressure | [2026-08-09 matrix run](https://github.com/pjunod/nzbd/actions/runs/31330178035) |
 | Private DHT/LSD packet capture | [2026-08-06 capture run](https://github.com/pjunod/nzbd/actions/runs/31128106994) |
 | Cross-platform filesystem behavior | [2026-08-08 probe run](https://github.com/pjunod/nzbd/actions/runs/31240896567) and [review correction](https://github.com/pjunod/nzbd/actions/runs/31264422471) |
-| Native adapter matrix and daemon isolation | [2026-08-09 M0 run](https://github.com/pjunod/nzbd/actions/runs/31331872561) |
+| Native adapter matrix, resource measurements, and daemon isolation | [2026-08-14 maintained-engine M0 run](https://github.com/pjunod/nzbd/actions/runs/31837867629) |
 | Write-time storage-fault containment | [2026-08-10 hardened five-platform run](https://github.com/pjunod/nzbd/actions/runs/31345445318) |
-| Initialization-time storage-fault fail-open witness | [2026-08-13 replacement five-platform run](https://github.com/pjunod/nzbd/actions/runs/31654021866) |
+| Initialization-time storage-fault boundary | Historical fail-open witness: [2026-08-13 replacement five-platform run](https://github.com/pjunod/nzbd/actions/runs/31654021866); maintained fail-closed proof: [2026-08-14 M0 run](https://github.com/pjunod/nzbd/actions/runs/31837867629) |
 
 These links are evidence snapshots, not evergreen approval. The reviewed
 commit must have its own green required checks.
@@ -215,8 +218,10 @@ commit must have its own green required checks.
 Before any production wiring PR can be approved, the reviewer records all of
 the following:
 
-- M0 gates 7 and 8 pass against an accepted stable engine release.
-- Gate 9 is Pass with the resource ceilings and dependency exceptions accepted.
+- All eleven M0 gates pass for the exact maintained engine on every supported
+  native target, with checksum/series/vendor integrity and independent review.
+- Gate 9's resource ceilings, measurements, and dependency exceptions remain
+  accepted and enforced.
 - The remaining M5 resource, filesystem, shutdown, auth, and sustained-fuzz
   work is executable and green.
 - Public/private captures match §2 and every port is visible before startup.
@@ -227,7 +232,8 @@ the following:
 - Disabled upgrades open no peer socket and admit no torrent.
 - Rollback and downgrade drain/export steps have been exercised.
 
-This document's drift check intentionally pins today's no-go state. When the
-stop gates genuinely pass, the production-wiring PR must update the proposal,
-M0 report, this review, and the check together. Bypassing the check is not a
-substitute for that decision.
+This document's drift check intentionally pins the selected maintained engine,
+the eleven-gate M0 evidence, and today's disabled production boundary. M2 and
+later production-wiring changes must update the proposal, M0 report, this
+review, and the check together. Bypassing the check is not a substitute for
+that decision.
