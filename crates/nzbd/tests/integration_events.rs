@@ -15,7 +15,8 @@
 use nzbd_nserv::{build_post, prng_bytes, NservBuilder};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
-use std::process::{Child, Command, Stdio};
+use std::path::PathBuf;
+use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
 // ---------------------------------------------------------------------------
@@ -228,7 +229,15 @@ fn names(frames: &[Frame]) -> Vec<&str> {
 struct Daemon {
     addr: String,
     tmp: tempfile::TempDir,
+    log_path: PathBuf,
     _child: KillOnDrop,
+}
+
+impl Daemon {
+    fn log(&self) -> String {
+        std::fs::read_to_string(&self.log_path)
+            .unwrap_or_else(|error| format!("could not read daemon log: {error}"))
+    }
 }
 
 /// Boot a daemon against a mock news server, with `extra` appended to the
@@ -266,11 +275,13 @@ bind = "{addr}"
     let cfg_path = tmp.path().join("nzbd.toml");
     std::fs::write(&cfg_path, config).unwrap();
 
+    let log_path = tmp.path().join("daemon.log");
+    let daemon_log = std::fs::File::create(&log_path).unwrap();
     let child = Command::new(env!("CARGO_BIN_EXE_nzbd"))
         .args(["run", "--config"])
         .arg(&cfg_path)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stdout(daemon_log.try_clone().unwrap())
+        .stderr(daemon_log)
         .spawn()
         .expect("spawn nzbd");
     let child = KillOnDrop(child);
@@ -278,6 +289,7 @@ bind = "{addr}"
     Daemon {
         addr,
         tmp,
+        log_path,
         _child: child,
     }
 }
@@ -326,7 +338,13 @@ fn a_finished_download_announces_its_stages_its_final_dir_and_its_history_row() 
     assert_eq!(code, 201, "add rejected: {body}");
 
     let deadline = Instant::now() + Duration::from_secs(60);
-    let frames = sse.until(deadline, "job_pp_finished");
+    let frames = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        sse.until(deadline, "job_pp_finished")
+    }))
+    .unwrap_or_else(|panic| {
+        eprintln!("--- daemon log ---\n{}", d.log());
+        std::panic::resume_unwind(panic)
+    });
     let engine_frames: Vec<&Frame> = frames
         .iter()
         .filter(|f| !matches!(f.event.as_str(), "tick" | "hb" | "log"))
