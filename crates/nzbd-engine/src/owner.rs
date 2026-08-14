@@ -2464,7 +2464,7 @@ impl Owner {
                     "disk space recovered — downloads resume"
                 );
             }
-            self.publish_now();
+            self.publish_guard_change(was, self.disk_low);
         }
     }
 
@@ -2485,8 +2485,19 @@ impl Owner {
                     reached = self.quota_reached,
                     "download quota state changed"
                 );
-                self.publish_now();
+                self.publish_guard_change(was, self.quota_reached);
             }
+        }
+    }
+
+    /// Publish every admission-guard transition. Releasing a hold also
+    /// advances the work epoch: connection tasks that received an empty
+    /// lease batch are parked on that watch and otherwise have no reason to
+    /// ask the owner for newly eligible work again.
+    fn publish_guard_change(&mut self, was_held: bool, is_held: bool) {
+        self.publish_now();
+        if was_held && !is_held {
+            self.bump_epoch();
         }
     }
 
@@ -3001,6 +3012,36 @@ fn read_par2_name(path: &Path) -> Option<String> {
 mod tests {
     use super::*;
 
+    fn guard_test_owner(tuning: Tuning) -> (tempfile::TempDir, Owner, watch::Receiver<u64>) {
+        let tmp = tempfile::tempdir().unwrap();
+        let (budget_tx, _) = watch::channel(HashMap::new());
+        let (events, _) = broadcast::channel(1);
+        let (epoch_tx, epoch_rx) = watch::channel(0);
+        let (engine_tx, _) = mpsc::channel(1);
+        let owner = Owner::recover(
+            &tmp.path().join("state"),
+            tmp.path().join("dest"),
+            Arc::new(Vec::new()),
+            tuning,
+            false,
+            "guard-test",
+            None,
+            budget_tx,
+            crate::new_shared_snapshot(),
+            events,
+            epoch_tx,
+            Arc::new(SpeedMeter::new()),
+            Arc::new(RateLimiter::new(None)),
+            None,
+            None,
+            engine_tx,
+            TaskTracker::new(),
+            CancellationToken::new(),
+        )
+        .unwrap();
+        (tmp, owner, epoch_rx)
+    }
+
     fn bare_job() -> Job {
         Job {
             id: JobId(1),
@@ -3192,6 +3233,56 @@ mod tests {
         assert_eq!(
             disk_guard_decision(true, true, &at_clear, 100),
             (false, false)
+        );
+    }
+
+    #[test]
+    fn clearing_disk_guard_wakes_parked_connection_tasks() {
+        let tuning = Tuning {
+            min_free_disk_bytes: 100,
+            ..Tuning::default()
+        };
+        let (_tmp, mut owner, mut epoch) = guard_test_owner(tuning);
+        assert!(owner.disk_low, "a configured floor starts fail-safe");
+        let _ = epoch.borrow_and_update();
+        assert!(!epoch.has_changed().unwrap());
+
+        owner.disk_guard.store(Arc::new(DiskGuardReading {
+            available_bytes: Some(101),
+            all_roots_known: true,
+            ..Default::default()
+        }));
+        owner.update_disk_guard();
+
+        assert!(!owner.disk_low, "the complete high probe clears the hold");
+        assert!(
+            epoch.has_changed().unwrap(),
+            "a task parked on the work epoch must be woken"
+        );
+    }
+
+    #[test]
+    fn clearing_quota_guard_wakes_parked_connection_tasks() {
+        let tuning = Tuning {
+            daily_quota_bytes: 1,
+            ..Tuning::default()
+        };
+        let (_tmp, mut owner, mut epoch) = guard_test_owner(tuning);
+        owner.quota_reached = true;
+        let _ = epoch.borrow_and_update();
+        assert!(!epoch.has_changed().unwrap());
+
+        // The empty volume book is deterministically below the configured
+        // quota, directly exercising the rollover/recovery transition.
+        owner.update_quota_guard();
+
+        assert!(
+            !owner.quota_reached,
+            "the fresh quota period clears the hold"
+        );
+        assert!(
+            epoch.has_changed().unwrap(),
+            "a task parked on the work epoch must be woken"
         );
     }
 }
