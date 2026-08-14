@@ -58,39 +58,13 @@ impl Advertiser {
         tls: bool,
         auth: &str,
     ) -> Option<Self> {
-        let host_label = host_label(node_name);
-        let hostname = format!("{host_label}.local.");
-        let instance = format!("nzbd on {}", instance_label(node_name, &host_label));
-        let tls_value = if tls { "1" } else { "0" };
-        let properties = [
-            ("path", API_PATH),
-            ("tls", tls_value),
-            ("auth", auth),
-            ("version", env!("CARGO_PKG_VERSION")),
-        ];
-        let auto_addresses = listener.ip().is_unspecified();
-        let advertised_address = if auto_addresses {
-            String::new()
-        } else {
-            listener.ip().to_string()
-        };
-        let mut service = match ServiceInfo::new(
-            SERVICE_TYPE,
-            &instance,
-            &hostname,
-            advertised_address,
-            listener.port(),
-            &properties[..],
-        ) {
+        let service = match service_info(listener, node_name, tls, auth) {
             Ok(service) => service,
             Err(error) => {
                 tracing::warn!(%error, "could not construct local API advertisement");
                 return None;
             }
         };
-        if auto_addresses {
-            service = service.enable_addr_auto();
-        }
         let fullname = service.get_fullname().to_owned();
         let daemon = match ServiceDaemon::new() {
             Ok(daemon) => daemon,
@@ -137,6 +111,45 @@ impl Advertiser {
         );
         Some(Self { daemon, fullname })
     }
+}
+
+/// Construct the DNS-SD record separately from multicast registration so the
+/// client-visible discovery contract can be verified without requiring a
+/// network interface or publishing a service from the test process.
+fn service_info(
+    listener: SocketAddr,
+    node_name: Option<&str>,
+    tls: bool,
+    auth: &str,
+) -> Result<ServiceInfo, mdns_sd::Error> {
+    let host_label = host_label(node_name);
+    let hostname = format!("{host_label}.local.");
+    let instance = format!("nzbd on {}", instance_label(node_name, &host_label));
+    let tls_value = if tls { "1" } else { "0" };
+    let properties = [
+        ("path", API_PATH),
+        ("tls", tls_value),
+        ("auth", auth),
+        ("version", env!("CARGO_PKG_VERSION")),
+    ];
+    let auto_addresses = listener.ip().is_unspecified();
+    let advertised_address = if auto_addresses {
+        String::new()
+    } else {
+        listener.ip().to_string()
+    };
+    let mut service = ServiceInfo::new(
+        SERVICE_TYPE,
+        &instance,
+        &hostname,
+        advertised_address,
+        listener.port(),
+        &properties[..],
+    )?;
+    if auto_addresses {
+        service = service.enable_addr_auto();
+    }
+    Ok(service)
 }
 
 impl Drop for Advertiser {
@@ -207,7 +220,14 @@ mod tests {
     fn dns_labels_are_safe_and_bounded() {
         assert_eq!(dns_label("Paul's MacBook.local"), "paul-s-macbook");
         assert_eq!(dns_label("---"), "nzbd");
+        assert_eq!(dns_label("node---"), "node");
         assert!(dns_label(&"a".repeat(80)).len() <= 63);
+        assert_eq!(host_label(Some("Living Room.local")), "living-room");
+        assert_eq!(instance_label(None, "fallback"), "fallback");
+        assert_eq!(
+            instance_label(Some("Living Room"), "fallback"),
+            "living-room"
+        );
     }
 
     #[test]
@@ -220,5 +240,57 @@ mod tests {
         assert_eq!(auth_mode(&api), "basic,bearer");
         api.password = None;
         assert_eq!(auth_mode(&api), "bearer");
+    }
+
+    #[test]
+    fn disabled_and_loopback_listeners_never_publish() {
+        let disabled = ApiConfig {
+            discovery: false,
+            ..ApiConfig::default()
+        };
+        assert!(Advertiser::start(
+            &disabled,
+            "192.0.2.7:6789".parse().unwrap(),
+            Some("nas"),
+            false
+        )
+        .is_none());
+
+        let enabled = ApiConfig::default();
+        assert!(Advertiser::start(
+            &enabled,
+            "127.0.0.1:6789".parse().unwrap(),
+            Some("nas"),
+            false
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn service_record_carries_only_connection_metadata() {
+        let listener: SocketAddr = "192.0.2.7:7443".parse().unwrap();
+        let service = service_info(listener, Some("Living Room"), true, "basic,bearer").unwrap();
+
+        assert_eq!(service.get_hostname(), "living-room.local.");
+        assert_eq!(service.get_port(), 7443);
+        assert!(service.get_addresses().contains(&listener.ip()));
+        assert_eq!(service.get_property_val_str("path"), Some(API_PATH));
+        assert_eq!(service.get_property_val_str("tls"), Some("1"));
+        assert_eq!(service.get_property_val_str("auth"), Some("basic,bearer"));
+        assert_eq!(
+            service.get_property_val_str("version"),
+            Some(env!("CARGO_PKG_VERSION"))
+        );
+        assert_eq!(service.get_properties().len(), 4, "no credentials or state");
+
+        let wildcard =
+            service_info("0.0.0.0:6789".parse().unwrap(), Some("nas"), false, "none").unwrap();
+        assert!(wildcard.get_addresses().is_empty());
+        assert!(
+            wildcard.is_addr_auto(),
+            "a wildcard bind must advertise its real interface addresses"
+        );
+        assert_eq!(wildcard.get_property_val_str("tls"), Some("0"));
+        assert_eq!(wildcard.get_property_val_str("auth"), Some("none"));
     }
 }
