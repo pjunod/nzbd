@@ -1700,7 +1700,13 @@ whose prefix merely resembles the configured root. The existing job
 - Treat [the gate 9 review brief](BITTORRENT_GATE9_REVIEW.md) as the human
   decision record. CI can prove the reviewed boundary has not changed, but it
   cannot decide whether 9.64 MiB of binary growth, 8.41 MiB of idle RSS, or a
-  222-package closure is acceptable.
+  222-package closure is acceptable. Its §4.1 records the accepted disposition
+  of 2026-08-14: the measured prototype cost and two capability-restricted
+  dependency exceptions are accepted, and the peer, tracker, handshake,
+  retained-record, response-window, and discovery boundaries are accepted as
+  requirements a stable engine must enforce before production use. Under that
+  disposition's renewal rule, any engine, dependency-path, feature, advisory,
+  MSRV, or relevant policy change reopens it.
 - Subscribe to upstream releases and security notices, then test upgrades
   against the local swarm harness before changing the pin.
 - Keep the adapter's deterministic preflight mutation corpus in ordinary CI:

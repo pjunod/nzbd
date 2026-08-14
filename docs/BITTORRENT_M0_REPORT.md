@@ -45,7 +45,7 @@ authorize production wiring.
 | 6. Path and delete safety | **Pass** | The adapter now repeats the portable lexical path invariant before rqbit admission: unnamed payloads, empty/dot/parent components, slash or backslash, absolute/UNC forms, Windows drive prefixes and device aliases, alternate-data-stream and other reserved characters, trailing dot/space aliases, malformed UTF-8, empty multi-file paths, missing/unsafe multi-file roots, metainfo-declared symlinks, exact duplicate paths, file-versus-directory-prefix overlaps, and portable Unicode NFC/full-case-fold collisions fail with safe nzbd-owned errors. Greek sigma, long-s, Windows dotless-i, compatibility-ligature, and sharp-s/full-fold aliases are covered without collapsing compatibility-only width pairs. rqbit's shared `torrent-content` fallback is therefore never used for an unnamed single-file torrent. Magnet input first resolves through rqbit's list-only path, which returns before storage construction; nzbd then applies the same metainfo contract and admits only the validated bytes. A fake BEP 9 peer proves an unsafe resolved path leaves the destination empty, and the real-admission corpus still proves rejection before an escape file exists. The session canonicalizes its output root and preflights every existing payload prefix with no-follow metadata: symlinks fail, prefixes must be directories, and leaves must be regular files while an existing regular leaf remains valid resume input. A Unix test proves a symlink is rejected before storage and its external target remains empty. The [first cross-platform filesystem-probe run](https://github.com/pjunod/nzbd/actions/runs/31240896567) passed on 2026-08-08 UTC for ASCII-case and Unicode NFC/NFD pairs. The [review-correction native run](https://github.com/pjunod/nzbd/actions/runs/31264422471) passed on 2026-08-08 UTC after proving default macOS storage also aliases compatibility ligatures and full-case-fold pairs; the adapter now rejects those pairs. The native matrix records all four rejected classes and requires the remaining compatibility-width pair that the adapter admits to stay distinct. The exact observations are recorded in §2.2. They describe hosted temporary volumes, not every operator payload mount. This is defense in depth, not a claim to close the check/write race. The importer-safe content inventory omits BEP 47 padding entries while raw engine-indexed progress remains available only as diagnostics. Delete-data removes only parsed torrent content; an unrelated sibling survives. Higher layers must still prove persisted delete-root authority, descriptor-relative containment across writes, and empirical filesystem-specific behavior across supported operator payload mounts in M5/M2. |
 | 7. Public observability | **Fail** | Public stats expose phase, total/progress/upload bytes, file progress, rates, ETA inputs, peer counts, completion, and error. Stable 8.1.1 does not expose per-torrent tracker state, DHT state, or last tracker error. A tested upstream patch now supplies that snapshot, but this gate remains failed until an accepted stable release contains it. “No peers” cannot safely substitute for those facts. |
 | 8. nzbd-authoritative persistence | **Fail** | The contract test proves that `Session::new_with_opts` auto-restores the library record before returning. The persistence module and store injection point are private in 8.1.1, so nzbd cannot filter first. A tested upstream patch now supplies the missing opt-out, but this gate remains failed until an accepted stable release contains it. |
-| 9. Resource, package, and license delta | **Partial** | Measurements are recorded in §4. A blocking cargo-deny 0.20.2 policy passes locally across all features and the locked graph, and its [first Actions run passed](https://github.com/pjunod/nzbd/actions/runs/31064446916) on 2026-08-06 UTC. The repository-wide Supply chain check also freezes the reviewed advisory package/feature sets and sole MPL-2.0 package path without pinning nzbd's own version. Stable 8.1.1 hard-codes 128 live peers per torrent, exposes no session-wide cap, retains an unbounded known-peer set, and leaves the pre-routing incoming-handshake set unbounded; its HTTP tracker path also has no request deadline, buffers the whole response, and accepts a zero announce interval. Established peers can additionally pipeline piece and metadata requests into unbounded scheduler/writer queues. DHT datagrams, recursive nodes, maintenance work, delivered peers, and metadata queues have separate unbounded retained-work paths; current main adds an unbounded LSD result stream. Tested contribution candidates now prove each runtime boundary, but they are not shipped capability. The adapter's input caps cannot close those gaps. The [gate 9 review brief](BITTORRENT_GATE9_REVIEW.md) isolates the remaining human acceptance and resource-control decisions. |
+| 9. Resource, package, and license delta | **Partial** | Measurements are recorded in §4. A blocking cargo-deny 0.20.2 policy passes locally across all features and the locked graph, and its [first Actions run passed](https://github.com/pjunod/nzbd/actions/runs/31064446916) on 2026-08-06 UTC. The repository-wide Supply chain check also freezes the reviewed advisory package/feature sets and sole MPL-2.0 package path without pinning nzbd's own version. Stable 8.1.1 hard-codes 128 live peers per torrent, exposes no session-wide cap, retains an unbounded known-peer set, and leaves the pre-routing incoming-handshake set unbounded; its HTTP tracker path also has no request deadline, buffers the whole response, and accepts a zero announce interval. Established peers can additionally pipeline piece and metadata requests into unbounded scheduler/writer queues. DHT datagrams, recursive nodes, maintenance work, delivered peers, and metadata queues have separate unbounded retained-work paths; current main adds an unbounded LSD result stream. Tested contribution candidates now prove each runtime boundary, but they are not shipped capability. The adapter's input caps cannot close those gaps. All eleven human dispositions were accepted on 2026-08-14 and are recorded in [gate 9 review brief §4.1](BITTORRENT_GATE9_REVIEW.md#41-recorded-disposition--accepted-2026-08-14); items 6-11 accept required boundaries that no accepted stable release enforces yet, so the gate stays Partial. |
 | 10. One explicit rustls provider | **Pass** | The process starts without a provider, explicitly installs aws-lc, and constructs librqbit’s rustls client without the mixed-provider panic. |
 | 11. v1-only boundary | **Pass** | Stable input uses v1 pieces/`btih`; v2-only and hybrid `.torrent` files and magnets return separate named errors before managed-torrent admission. Magnet classification reads decoded `xt` query parameters rather than searching the whole URI, so version-looking text in a display name or tracker URL cannot create a false v2/hybrid result. The adapter accepts one valid 40-hex or 32-base32 `btih`, rejects missing, malformed, or duplicate v1 topics by name, and rechecks the resolved info dictionary before storage exists. |
 
@@ -790,9 +790,11 @@ by rustls. Three exact advisory exceptions remain:
 and RustSec jobs on every pull request, main or release-tag push, a daily
 schedule, and manual dispatch. The
 [first blocking run](https://github.com/pjunod/nzbd/actions/runs/31064446916)
-passed both jobs on 2026-08-06 UTC. Gate 9 remains **Partial** until a reviewer
-accepts both the recorded delta and the narrow advisory dispositions. A green
-exception is not evidence that the underlying code became safe to enable.
+passed both jobs on 2026-08-06 UTC. The recorded delta and the narrow advisory
+dispositions were accepted on 2026-08-14, but gate 9 remains **Partial**: the
+same decision requires runtime boundaries that no accepted stable release
+enforces. A green exception is not evidence that the underlying code became
+safe to enable.
 
 [`scripts/check-reviewed-dependency-exceptions.sh`](../scripts/check-reviewed-dependency-exceptions.sh)
 now makes the disposition executable in the repository-wide Supply chain
@@ -802,8 +804,9 @@ the three named RustSec ignores. Workspace-member versions are normalized, and
 an obsolete package pin fails with the exception that must be reconsidered.
 The adapter unit test independently proves that its constructed rqbit options
 cannot enable UPnP. The [gate 9 review brief](BITTORRENT_GATE9_REVIEW.md)
-collects the measurements, exceptions, renewal rules, and exact decision the
-reviewer must accept or reject; this report does not pre-accept it.
+collects the measurements, exceptions, renewal rules, and the exact decision
+that was put to the reviewer; its §4.1 records the accepted disposition. This
+report states the outcome and does not widen it.
 
 ---
 
@@ -825,9 +828,11 @@ Preferred path:
    ownership, privacy, or observability contracts;
 6. pin the first stable release containing the accepted contracts;
 7. rerun all eleven M0 gates on native macOS, Linux glibc/musl, and Windows;
-8. run the packet-capture private-mode test and obtain reviewer acceptance of
-   the resource, package, license, and advisory dispositions isolated in the
-   [gate 9 review brief](BITTORRENT_GATE9_REVIEW.md); and
+8. run the packet-capture private-mode test and confirm the pinned release
+   enforces every boundary accepted in
+   [gate 9 review brief §4.1](BITTORRENT_GATE9_REVIEW.md#41-recorded-disposition--accepted-2026-08-14),
+   including the final-daemon and per-platform memory remeasurements that
+   disposition requires; and
 9. only then resume M2 daemon integration.
 
 The human-review checklist, submission order, issue draft, PR draft, exact

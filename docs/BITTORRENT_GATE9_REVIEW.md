@@ -1,7 +1,8 @@
 # BitTorrent gate 9 review — accept measured cost, not silent risk drift
 
-**Status:** ready for reviewer decision; gate 9 remains Partial ·
-**Date:** 2026-08-07 · **Engine:** `librqbit =8.1.1` ·
+**Status:** all eleven dispositions recorded in §4.1; gate 9 remains Partial ·
+**Date:** 2026-08-07 · **Disposition recorded:** 2026-08-14 ·
+**Engine:** `librqbit =8.1.1` ·
 **Decision owner:** ADR-19 in
 [BITTORRENT_PROPOSAL.md](BITTORRENT_PROPOSAL.md)
 
@@ -9,16 +10,22 @@ Companion to
 [BITTORRENT_M0_REPORT.md](BITTORRENT_M0_REPORT.md) (the complete spike result)
 — this is the shortest review surface for gate 9's resource, package, license,
 and advisory decision. Review the table and §4; do not mark the gate Pass
-merely because CI is green. The remaining decision is whether the recorded
+merely because CI is green. The decision requested was whether the recorded
 cost and three constrained exceptions are acceptable for the eventual first
 release, and whether the missing live-peer, retained-peer, tracker-request,
 pre-routing handshake, and established-peer response-backlog controls must be
 resolved before this gate can pass. DHT, metadata-resolution, and current-main
-LSD queues also need explicit discovery-pressure boundaries.
+LSD queues also needed explicit discovery-pressure boundaries.
 
-No production BitTorrent path is enabled by this review. Gates 7 and 8 still
-fail until accepted stable rqbit APIs provide authoritative restore and honest
-per-torrent discovery health.
+That decision has been taken: §4.1 records the accepted disposition for all
+eleven items. Acceptance of items 6–11 is acceptance of a *requirement*, not
+evidence that the requirement is met, so gate 9 stays **Partial** until an
+accepted stable rqbit release enforces every recorded boundary and the full
+M0 gate is rerun.
+
+No production BitTorrent path is enabled by this review or by its recorded
+disposition. Gates 7 and 8 still fail until accepted stable rqbit APIs provide
+authoritative restore and honest per-torrent discovery health.
 
 ## 1. Decision requested — measured costs, exact exceptions, and resource gaps
 
@@ -258,6 +265,46 @@ Gate 9 may move from Partial to Pass only if a reviewer accepts all of these:
 If any item is rejected, gate 9 remains Partial and the remedy must be named:
 upgrade or patch the dependency, remove the capability, change engines, or set
 an accepted resource budget. Silence is not acceptance.
+
+### 4.1 Recorded disposition — accepted 2026-08-14
+
+The decision owner accepted the recommended package for all eleven §4 items,
+with no exceptions, on
+[issue #83](https://github.com/pjunod/nzbd/issues/83#issuecomment-5287959702)
+(reply `APPROVE RECOMMENDED DEFAULTS`, 2026-08-14T00:30:03Z). This section is
+the disposition of record; §4 remains the statement of what was asked.
+
+| # | Disposition | Recorded scope of the acceptance |
+|---:|---|---|
+| 1 | **Accepted provisionally** | The one-sample 9.64 MiB harness, 8.41 MiB idle RSS, and the preliminary 32 MiB / 64 MiB sampled-growth guards are acceptable prototype costs. The final daemon must be remeasured on every supported native target; a materially larger result reopens this item. |
+| 2 | **Accepted as locked** | The 222-package normal closure, 178 new lockfile identities, and exactly one MPL-2.0 package (`option-ext 0.2.0`) are acceptable. CI must continue to reject dependency and license drift. |
+| 3 | **Accepted as a capability restriction** | Compiling `quick-xml 0.37.5` is acceptable only while UPnP cannot be enabled and CI proves that boundary. The first release ships without UPnP; enabling it requires a patched or replaced dependency and a new review. |
+| 4 | **Accepted as a capability restriction** | Retaining `time 0.3.41` is acceptable only while the `parsing` feature is absent from the resolved graph and CI proves the exact feature set. Feature drift fails closed and reopens this item. |
+| 5 | **Accepted** | Renewal is automatic: any engine, dependency-path, feature, advisory, MSRV, or relevant policy change reopens this decision. A previously green run is not a waiver. |
+| 6 | **Accepted as a required boundary** | A stable engine limit of **80 live peers per torrent** and **400 across the nzbd session** is required. Stable 8.1.1's hard-coded 128-per-torrent-only behavior is explicitly not accepted. Production stays disabled until both limits ship and are tested. |
+| 7 | **Accepted as a required boundary** | A **30-second** complete tracker-request deadline, **1 MiB** decoded response cap, and **60-second** minimum unforced HTTP/UDP reannounce interval are required before tracker networking is authorized. |
+| 8 | **Accepted as a required boundary** | A **256-connection** pending-handshake ceiling is required for the first TCP-only release, as a budget distinct from live-peer permits. Excess incoming work waits rather than growing without bound. |
+| 9 | **Accepted as a required boundary** | **1,024** retained peer records per torrent and **4,096** per session are required, covering queued, backoff, dead, and not-needed records. The 296-byte raw-struct measurement is not sufficient on its own: final per-platform memory measurements are required before release and may revise these values. |
+| 10 | **Accepted as a required boundary** | A **128-permit** advertised response window per established peer is required, with over-window peers disconnected rather than parked behind torrent-global upload throttling. |
+| 11 | **Accepted as a required boundary** | The prepared conservative discovery bounds are required: 256-record DHT send, recursive-node, delivered-peer, maintenance, and LSD queues; 32 active recursive and 32 active maintenance requests per worker; 128 active and 256 pending metadata attempts; and a 4,096-entry deduplication set that does not terminate discovery. Excess datagrams and work are dropped or backpressured, and LSD work is cancelled with its owning stream. Stable engine support and the failing negative controls are still required. |
+
+What the disposition does **not** do:
+
+- It does not move gate 9 to Pass. Items 6–11 accept requirements that no
+  accepted stable rqbit release enforces today, so the gate stays **Partial**.
+- It does not enable any production BitTorrent configuration, listener,
+  tracker, DHT, admission, payload I/O, or UI path.
+- It does not affect gates 7 and 8, which remain **Fail**, or gate 4, which
+  remains blocked by gate 8.
+- It does not accept a private rqbit fork. The recorded boundaries must be
+  accepted upstream and ship in a stable release, or ADR-19's
+  alternate-engine evaluation is triggered.
+
+Gate 9 may move to Pass only when an accepted stable engine enforces every
+boundary in this table, the final-daemon measurements in items 1 and 9 are
+taken across the documented native matrix, and the complete M0 gate rerun is
+independently reviewed. Under item 5, any change to those inputs reopens this
+disposition rather than inheriting it.
 
 ## 5. Non-goals — this review cannot authorize M2
 
