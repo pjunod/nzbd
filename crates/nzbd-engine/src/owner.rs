@@ -3063,6 +3063,123 @@ mod tests {
         }
     }
 
+    fn pending_job(id: u32) -> Job {
+        let mut job = bare_job();
+        job.id = JobId(id);
+        job.name = format!("job-{id}");
+        job.dir_name = job.name.clone();
+        job.status = JobStatus::Queued;
+        job.files = vec![nzbd_types::FileEntry {
+            id: FileId(id * 10),
+            subject: "payload.bin".into(),
+            filename: "payload.bin".into(),
+            filename_confirmed: true,
+            is_par2: false,
+            paused: false,
+            groups: vec!["alt.test".into()],
+            date: None,
+            segments: vec![nzbd_types::Segment {
+                message_id: "part@example".into(),
+                number: 1,
+                size: 100,
+                state: SegmentState::Pending,
+            }],
+            crc32: None,
+            finalized: false,
+        }];
+        recompute_job_totals(&mut job);
+        job
+    }
+
+    #[test]
+    fn writer_errors_fail_pending_segments_and_latch_out_of_space() {
+        let (_tmp, mut owner, _epoch) = guard_test_owner(Tuning::default());
+        owner.state.jobs.push(pending_job(2));
+
+        owner.on_msg(EngineMsg::WriterError {
+            job: JobId(2),
+            file: FileId(20),
+            error: "write payload.bin: No space left on device (os error 28)".into(),
+        });
+        let job = owner.state.job(JobId(2)).unwrap();
+        assert_eq!(job.files[0].segments[0].state, SegmentState::Failed);
+        assert!(job.files[0].finalized);
+        assert!(owner.disk_low);
+        assert!(owner.enospc_latched);
+        assert_eq!(owner.enospc_observed, 1);
+
+        // Re-reporting an already-terminal segment is idempotent, while a
+        // missing file/job is ignored rather than corrupting another row.
+        owner.on_msg(EngineMsg::WriterError {
+            job: JobId(2),
+            file: FileId(20),
+            error: "permission denied".into(),
+        });
+        owner.on_msg(EngineMsg::WriterError {
+            job: JobId(2),
+            file: FileId(999),
+            error: "gone".into(),
+        });
+        owner.on_msg(EngineMsg::SegmentWritten {
+            job: JobId(999),
+            file: FileId(999),
+            seg_number: 1,
+            offset: 0,
+            len: 1,
+            crc: 0,
+            file_size: 1,
+            server: ServerId(1),
+        });
+        owner.on_msg(EngineMsg::WriterFinalized {
+            job: JobId(999),
+            file: FileId(999),
+            ok: true,
+            final_path: None,
+            combined_crc: None,
+        });
+
+        owner.disk_low = false;
+        let (reply, received) = oneshot::channel();
+        owner.on_msg(EngineMsg::WorkRequest {
+            server: ServerId(999),
+            max: 1,
+            reply,
+        });
+        assert!(received.blocking_recv().unwrap().is_empty());
+    }
+
+    #[test]
+    fn failed_fenced_replace_restores_delegation_and_mirror_overlay() {
+        let (_tmp, mut owner, _epoch) = guard_test_owner(Tuning::default());
+        let original = pending_job(3);
+        owner.state.jobs.push(original.clone());
+        owner.delegated.insert(JobId(3), "worker-a".into());
+        owner.mirror.insert(
+            JobId(3),
+            MirrorStats {
+                done_articles: 4,
+                failed_articles: 1,
+                downloaded_bytes: 40,
+                health: 800,
+            },
+        );
+        let mut replacement = original;
+        replacement.priority = 99;
+        let (reply, mut received) = oneshot::channel();
+        owner.on_command(QueueCommand::ImportJobIfPresent {
+            job: Box::new(replacement),
+            reply,
+        });
+
+        assert!(!received.try_recv().unwrap());
+        assert_eq!(owner.state.job(JobId(3)).unwrap().priority, 0);
+        assert_eq!(
+            owner.delegated.get(&JobId(3)).map(String::as_str),
+            Some("worker-a")
+        );
+        assert_eq!(owner.mirror[&JobId(3)].downloaded_bytes, 40);
+    }
+
     /// The monotonic figure the post manager measured is what lands on the
     /// span. Wall-clock is a fallback, not the primary — an NTP step
     /// during a long repair must not produce a duration nobody can trust.

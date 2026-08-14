@@ -381,7 +381,60 @@ async fn stream_body(
 
 #[cfg(test)]
 mod adaptive_tests {
-    use super::AdaptiveDepth;
+    use super::*;
+    use crate::queue::SegRef;
+    use nzbd_types::{CertLevel, FileId, JobId, ServerId, TlsMode};
+
+    fn test_server(port: u16) -> ServerDef {
+        ServerDef {
+            id: ServerId(1),
+            name: "pool-test".into(),
+            host: "127.0.0.1".into(),
+            port,
+            tls: TlsMode::None,
+            username: None,
+            password: None,
+            active: true,
+            tier: 0,
+            group: 0,
+            fill: false,
+            max_connections: 1,
+            pipeline_depth: 1,
+            retention_days: 0,
+            cert_verification: CertLevel::Strict,
+        }
+    }
+
+    fn context(
+        server: ServerDef,
+        engine_tx: mpsc::Sender<EngineMsg>,
+        cancel: CancellationToken,
+    ) -> (
+        ConnCtx,
+        watch::Sender<u64>,
+        watch::Sender<std::collections::HashMap<ServerId, u16>>,
+    ) {
+        let (epoch_tx, epoch) = watch::channel(0);
+        let (budget_tx, budgets) = watch::channel(std::collections::HashMap::new());
+        (
+            ConnCtx {
+                server,
+                conn_index: 0,
+                tls: None,
+                engine_tx,
+                epoch,
+                budgets,
+                limiter: Arc::new(RateLimiter::new(None)),
+                meter: Arc::new(SpeedMeter::new()),
+                cancel,
+                connect_timeout: Duration::from_secs(1),
+                read_timeout: Duration::from_secs(1),
+                idle_hold: Duration::from_secs(60),
+            },
+            epoch_tx,
+            budget_tx,
+        )
+    }
 
     #[test]
     fn climbs_on_sustained_success_and_halves_on_error() {
@@ -414,5 +467,88 @@ mod adaptive_tests {
         assert_eq!(a.get(), 1);
         a.on_error();
         assert_eq!(a.get(), 1);
+    }
+
+    #[tokio::test]
+    async fn connection_task_stops_when_owner_or_reply_channel_closes() {
+        let (engine_tx, engine_rx) = mpsc::channel(1);
+        drop(engine_rx);
+        let cancel = CancellationToken::new();
+        let (ctx, _epoch, _budget) = context(test_server(9), engine_tx, cancel);
+        connection_task(ctx).await;
+
+        let (engine_tx, mut engine_rx) = mpsc::channel(1);
+        let cancel = CancellationToken::new();
+        let (ctx, _epoch, _budget) = context(test_server(9), engine_tx, cancel);
+        let task = tokio::spawn(connection_task(ctx));
+        match engine_rx.recv().await {
+            Some(EngineMsg::WorkRequest { reply, .. }) => drop(reply),
+            other => panic!("unexpected {other:?}"),
+        }
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn empty_work_batch_parks_until_cancellation() {
+        let (engine_tx, mut engine_rx) = mpsc::channel(1);
+        let cancel = CancellationToken::new();
+        let (ctx, _epoch, _budget) = context(test_server(9), engine_tx, cancel.clone());
+        let task = tokio::spawn(connection_task(ctx));
+        match engine_rx.recv().await {
+            Some(EngineMsg::WorkRequest { reply, .. }) => reply.send(Vec::new()).unwrap(),
+            other => panic!("unexpected {other:?}"),
+        }
+        cancel.cancel();
+        task.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn connect_failure_reports_server_and_releases_every_lease() {
+        // Accept the TCP connection and close it without an NNTP greeting.
+        // This deterministically fails authentication setup without relying
+        // on a magic supposedly-unused port.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (socket, _) = listener.accept().unwrap();
+            drop(socket);
+        });
+        let (engine_tx, mut engine_rx) = mpsc::channel(8);
+        let cancel = CancellationToken::new();
+        let (ctx, _epoch, _budget) = context(test_server(port), engine_tx, cancel.clone());
+        let (writer, _writer_rx) = mpsc::channel(1);
+        let lease = Lease {
+            r: SegRef {
+                job: JobId(3),
+                file: FileId(4),
+                seg_number: 5,
+            },
+            message_id: "article@example".into(),
+            writer,
+        };
+        let task = tokio::spawn(connection_task(ctx));
+        match engine_rx.recv().await {
+            Some(EngineMsg::WorkRequest { reply, .. }) => reply.send(vec![lease]).unwrap(),
+            other => panic!("unexpected {other:?}"),
+        }
+        assert!(matches!(
+            engine_rx.recv().await,
+            Some(EngineMsg::ConnectFailed {
+                server: ServerId(1)
+            })
+        ));
+        assert!(matches!(
+            engine_rx.recv().await,
+            Some(EngineMsg::SegmentFailed {
+                job: JobId(3),
+                file: FileId(4),
+                seg_number: 5,
+                server: ServerId(1),
+                outcome: AttemptOutcome::ConnectionFailed,
+            })
+        ));
+        cancel.cancel();
+        task.await.unwrap();
+        server.join().unwrap();
     }
 }

@@ -198,6 +198,16 @@ pub fn fold_wire_ema(
 mod tests {
     use super::*;
 
+    #[test]
+    fn configured_rate_is_observable_and_zero_means_unlimited() {
+        let limiter = RateLimiter::new(None);
+        assert_eq!(limiter.get(), None);
+        limiter.set(Some(12_345));
+        assert_eq!(limiter.get(), Some(12_345));
+        limiter.set(Some(0));
+        assert_eq!(limiter.get(), None);
+    }
+
     #[tokio::test(start_paused = true)]
     async fn limiter_paces_to_the_configured_rate() {
         let lim = RateLimiter::new(Some(1000)); // 1000 B/s

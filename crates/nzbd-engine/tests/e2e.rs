@@ -2,9 +2,15 @@
 //! (ARCHITECTURE.md §14): bit-identical downloads, tier failover, CRC
 //! retry, health gating, pause/resume/delete, and unclean-restart resume.
 
-use nzbd_engine::{Engine, EngineConfig, EngineHandle, Event, Tuning};
+use nzbd_engine::{
+    AddOpts, Engine, EngineConfig, EngineHandle, Event, MirrorStats, MoveOp, Tuning,
+};
 use nzbd_nserv::{build_post, prng_bytes, Behavior, GeneratedPost, Nserv, NservBuilder};
-use nzbd_types::{CertLevel, JobId, JobStatus, ServerDef, ServerId, TlsMode};
+use nzbd_types::{
+    CertLevel, FileEntry, FileId, Job, JobId, JobKind, JobStatus, PostStage, Segment, SegmentState,
+    ServerDef, ServerId, TlsMode,
+};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::sync::broadcast;
@@ -44,6 +50,71 @@ fn dormant_torrent_job() -> nzbd_types::Job {
         }),
         stages: Vec::new(),
     }
+}
+
+fn transfer_job(id: u32, name: &str, status: JobStatus) -> Job {
+    Job {
+        id: JobId(id),
+        kind: JobKind::Nzb,
+        name: name.into(),
+        dir_name: name.into(),
+        name_provisional: false,
+        queued_at_unix: 1_800_000_000,
+        original_name: name.into(),
+        category: Some("test".into()),
+        priority: 0,
+        dupe: Default::default(),
+        params: vec![("tracking".into(), format!("job-{id}"))],
+        files: vec![FileEntry {
+            id: FileId(id * 10),
+            subject: format!("{name}.bin"),
+            filename: format!("{name}.bin"),
+            filename_confirmed: true,
+            is_par2: false,
+            paused: false,
+            groups: vec!["alt.test".into()],
+            date: None,
+            segments: vec![Segment {
+                message_id: format!("{name}@example").into_boxed_str(),
+                number: 1,
+                size: 100,
+                state: SegmentState::Pending,
+            }],
+            crc32: None,
+            finalized: false,
+        }],
+        totals: Default::default(),
+        status,
+        torrent: None,
+        stages: Vec::new(),
+    }
+}
+
+fn delayed_par_job(id: u32) -> Job {
+    let mut job = transfer_job(id, "recovery", JobStatus::Completed);
+    job.files = [("opaque-a.par2", 100u32), ("opaque-b.par2", 250u32)]
+        .into_iter()
+        .enumerate()
+        .map(|(index, (name, size))| FileEntry {
+            id: FileId(id * 10 + index as u32),
+            subject: name.into(),
+            filename: name.into(),
+            filename_confirmed: true,
+            is_par2: true,
+            paused: true,
+            groups: vec!["alt.test".into()],
+            date: None,
+            segments: vec![Segment {
+                message_id: format!("{name}@example").into_boxed_str(),
+                number: 1,
+                size,
+                state: SegmentState::Pending,
+            }],
+            crc32: None,
+            finalized: false,
+        })
+        .collect();
+    job
 }
 
 fn server_def(id: u32, port: u16, tier: u8, connections: u16, pipeline: u8) -> ServerDef {
@@ -204,6 +275,498 @@ async fn wait_finished(
     })
     .await
     .expect("timed out waiting for JobFinished")
+}
+
+#[tokio::test]
+async fn queue_controls_apply_atomically_and_report_missing_targets() {
+    let tmp = tempfile::tempdir().unwrap();
+    let engine = spawn_engine(tmp.path(), Vec::new()).await;
+    let post = build_post(
+        "controls",
+        &[
+            ("one.bin", prng_bytes(1, 100)),
+            ("two.bin", prng_bytes(2, 100)),
+        ],
+        100,
+    );
+
+    let first = engine
+        .add_nzb_opts(
+            "controls",
+            post.nzb.as_bytes(),
+            AddOpts {
+                category: Some("movies".into()),
+                priority: 10,
+                paused: true,
+                params: vec![("tracking".into(), "alpha".into())],
+                client: Some("coverage-client".into()),
+                ..AddOpts::default()
+            },
+        )
+        .await
+        .unwrap();
+    let summary = engine.snapshot().jobs[0].clone();
+    assert_eq!(summary.id, first);
+    assert_eq!(summary.status, JobStatus::Paused);
+    assert_eq!(summary.category.as_deref(), Some("movies"));
+    assert_eq!(summary.priority, 10);
+    assert_eq!(summary.params, vec![("tracking".into(), "alpha".into())]);
+
+    assert!(!engine.pause_job(first).await.unwrap());
+    assert!(engine.resume_job(first).await.unwrap());
+    assert!(engine.pause_job(first).await.unwrap());
+    assert!(engine.resume_job(first).await.unwrap());
+    assert!(!engine.resume_job(first).await.unwrap());
+    assert!(!engine.pause_job(JobId(999_001)).await.unwrap());
+    assert!(engine.set_priority(first, 37).await.unwrap());
+    assert!(!engine.set_priority(JobId(999_001), 1).await.unwrap());
+    assert_eq!(engine.snapshot().jobs[0].priority, 37);
+
+    let exported = engine.export_job(first).await.unwrap().unwrap();
+    let first_file = exported.files[0].id;
+    assert!(engine
+        .set_file_paused(first, first_file, true)
+        .await
+        .unwrap());
+    assert!(engine.export_job(first).await.unwrap().unwrap().files[0].paused);
+    assert!(engine
+        .set_file_paused(first, first_file, false)
+        .await
+        .unwrap());
+    assert!(!engine
+        .set_file_paused(first, FileId(999_001), true)
+        .await
+        .unwrap());
+    assert!(!engine
+        .set_file_paused(JobId(999_001), first_file, true)
+        .await
+        .unwrap());
+    assert!(engine.delete_file(first, first_file).await.unwrap());
+    assert!(!engine.delete_file(first, first_file).await.unwrap());
+    assert_eq!(
+        engine.export_job(first).await.unwrap().unwrap().files.len(),
+        1
+    );
+
+    let second = engine
+        .add_nzb("second", post.nzb.as_bytes(), None, 0)
+        .await
+        .unwrap();
+    let third = engine
+        .add_nzb("third", post.nzb.as_bytes(), None, 0)
+        .await
+        .unwrap();
+    assert!(engine.move_job(third, MoveOp::Top).await.unwrap());
+    assert_eq!(engine.snapshot().jobs[0].id, third);
+    assert!(engine.move_job(third, MoveOp::Up).await.unwrap());
+    assert_eq!(engine.snapshot().jobs[0].id, third);
+    assert!(engine.move_job(third, MoveOp::Down).await.unwrap());
+    assert_eq!(engine.snapshot().jobs[1].id, third);
+    assert!(engine.move_job(third, MoveOp::Bottom).await.unwrap());
+    assert_eq!(engine.snapshot().jobs.last().unwrap().id, third);
+    assert!(!engine.move_job(JobId(999_001), MoveOp::Top).await.unwrap());
+
+    let mut events = engine.subscribe();
+    engine.pause_all("coverage-client").await.unwrap();
+    assert!(matches!(
+        events.recv().await.unwrap(),
+        Event::QueuePauseChanged {
+            paused: true,
+            ref source
+        } if source == "coverage-client"
+    ));
+    engine.resume_all("coverage-client").await.unwrap();
+    assert!(matches!(
+        events.recv().await.unwrap(),
+        Event::QueuePauseChanged {
+            paused: false,
+            ref source
+        } if source == "coverage-client"
+    ));
+
+    engine.set_speed_limit(Some(12_345)).await.unwrap();
+    assert_eq!(engine.snapshot().speed_limit_bps, Some(12_345));
+    engine.set_speed_limit(None).await.unwrap();
+    assert_eq!(engine.snapshot().speed_limit_bps, None);
+    assert_eq!(engine.set_max_active_downloads(0).await.unwrap(), 1);
+    assert_eq!(
+        engine.set_max_active_downloads(u32::MAX).await.unwrap(),
+        100
+    );
+    assert_eq!(engine.snapshot().max_active_downloads, 100);
+
+    let shared = engine.shared_snapshot();
+    assert_eq!(shared.load_full().jobs.len(), 3);
+    let mut external = engine.subscribe();
+    engine.emit(Event::SpeedLimitChanged {
+        bytes_per_sec: Some(77),
+    });
+    assert!(matches!(
+        external.recv().await.unwrap(),
+        Event::SpeedLimitChanged {
+            bytes_per_sec: Some(77)
+        }
+    ));
+
+    assert!(engine.delete_job(second, false).await.unwrap());
+    assert!(!engine.delete_job(second, false).await.unwrap());
+    assert_eq!(engine.snapshot().jobs.len(), 2);
+    engine.shutdown().await;
+}
+
+#[tokio::test]
+async fn cluster_commands_normalize_delegate_retain_and_fence_jobs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut inactive_a = server_def(1, 9, 0, 3, 1);
+    inactive_a.active = false;
+    let mut inactive_b = server_def(2, 9, 0, 2, 1);
+    inactive_b.active = false;
+    let engine = spawn_engine(tmp.path(), vec![inactive_a, inactive_b]).await;
+
+    engine
+        .set_server_budgets(HashMap::from([(ServerId(1), 2), (ServerId(2), 1)]))
+        .await
+        .unwrap();
+    let applied = engine
+        .set_server_connection_caps(HashMap::from([
+            (ServerId(1), 0),
+            (ServerId(2), u16::MAX),
+            (ServerId(999), 4),
+        ]))
+        .await
+        .unwrap();
+    assert_eq!(applied, HashMap::from([(ServerId(1), 1), (ServerId(2), 2)]));
+
+    let mut imported = transfer_job(40, "imported", JobStatus::Downloading);
+    imported.files[0].segments[0].state = SegmentState::Leased {
+        server: ServerId(1),
+    };
+    engine.import_job(imported, false, false).await.unwrap();
+    let normalized = engine.export_job(JobId(40)).await.unwrap().unwrap();
+    assert_eq!(normalized.status, JobStatus::Queued);
+    assert_eq!(normalized.files[0].segments[0].state, SegmentState::Pending);
+
+    let mut assigned = engine.subscribe();
+    assert!(engine
+        .set_delegated(JobId(40), Some("worker-a".into()))
+        .await
+        .unwrap());
+    assert!(matches!(
+        assigned.recv().await.unwrap(),
+        Event::JobAssigned {
+            job: JobId(40),
+            node: Some(ref node)
+        } if node == "worker-a"
+    ));
+    engine.mirror_progress(
+        JobId(40),
+        MirrorStats {
+            done_articles: 7,
+            failed_articles: 2,
+            downloaded_bytes: 77,
+            health: 750,
+        },
+    );
+    // A round trip behind the fire-and-forget update is a deterministic
+    // mailbox barrier; no polling sleep is needed.
+    engine.export_job(JobId(40)).await.unwrap();
+    let summary = engine.snapshot().jobs[0].clone();
+    assert_eq!(summary.assigned_node.as_deref(), Some("worker-a"));
+    assert_eq!(summary.done_articles, 7);
+    assert_eq!(summary.failed_articles, 2);
+    assert_eq!(summary.downloaded_bytes, 77);
+    assert_eq!(summary.health, 750);
+    assert!(engine.set_delegated(JobId(40), None).await.unwrap());
+    assert!(!engine
+        .set_delegated(JobId(999), Some("worker".into()))
+        .await
+        .unwrap());
+
+    assert!(engine
+        .enter_post_stage(JobId(40), PostStage::ParVerify, 1_000, None)
+        .await
+        .unwrap());
+    engine.close_post_stage_now(JobId(40), 1_002, Some(1_500));
+    engine.export_job(JobId(40)).await.unwrap();
+    let staged = engine.export_job(JobId(40)).await.unwrap().unwrap();
+    assert_eq!(
+        staged.status,
+        JobStatus::Post {
+            stage: PostStage::ParVerify
+        }
+    );
+    assert_eq!(staged.stages[0].ms, Some(1_500));
+    assert!(!engine
+        .enter_post_stage(JobId(999), PostStage::Move, 2_000, None)
+        .await
+        .unwrap());
+    engine.close_post_stage(JobId(999), 2_001, None).await;
+    assert!(engine
+        .set_job_status(JobId(40), JobStatus::PostQueued)
+        .await
+        .unwrap());
+    assert!(!engine
+        .set_job_status(JobId(999), JobStatus::Completed)
+        .await
+        .unwrap());
+
+    let mut replacement = engine.export_job(JobId(40)).await.unwrap().unwrap();
+    replacement.priority = 44;
+    assert!(engine.import_job_if_present(replacement).await.unwrap());
+    assert_eq!(
+        engine
+            .export_job(JobId(40))
+            .await
+            .unwrap()
+            .unwrap()
+            .priority,
+        44
+    );
+    let mut absent = transfer_job(999, "absent", JobStatus::Queued);
+    absent.priority = 88;
+    assert!(!engine.import_job_if_present(absent).await.unwrap());
+    assert!(engine.export_job(JobId(999)).await.unwrap().is_none());
+
+    let mut terminal = engine.export_job(JobId(40)).await.unwrap().unwrap();
+    terminal.status = JobStatus::Completed;
+    let mut finished = engine.subscribe();
+    engine.import_job(terminal, false, true).await.unwrap();
+    assert!(matches!(
+        finished.recv().await.unwrap(),
+        Event::JobFinished {
+            job: JobId(40),
+            status: JobStatus::Completed,
+            ..
+        }
+    ));
+
+    engine
+        .import_job(delayed_par_job(41), false, false)
+        .await
+        .unwrap();
+    let freed = engine
+        .unpause_par_blocks(JobId(41), 2, Some(50))
+        .await
+        .unwrap();
+    assert!(freed >= 2);
+    let recovery = engine.export_job(JobId(41)).await.unwrap().unwrap();
+    assert_eq!(recovery.status, JobStatus::Queued);
+    assert!(recovery.files.iter().any(|file| !file.paused));
+    assert_eq!(
+        engine
+            .unpause_par_blocks(JobId(999), 2, Some(50))
+            .await
+            .unwrap(),
+        0
+    );
+
+    engine
+        .import_job(transfer_job(42, "discard", JobStatus::Queued), false, false)
+        .await
+        .unwrap();
+    assert!(engine
+        .set_delegated(JobId(42), Some("worker-b".into()))
+        .await
+        .unwrap());
+    engine
+        .retain_jobs(vec![JobId(40), JobId(41)])
+        .await
+        .unwrap();
+    assert!(engine.export_job(JobId(42)).await.unwrap().is_none());
+    assert!(engine
+        .snapshot()
+        .jobs
+        .iter()
+        .all(|job| job.assigned_node.is_none()));
+
+    // RetainJobs demotes persistence. A fenced replace must report false and
+    // restore the previous in-memory copy instead of applying the mutation.
+    let before = engine.export_job(JobId(40)).await.unwrap().unwrap();
+    let mut fenced = before.clone();
+    fenced.priority = 99;
+    assert!(!engine.import_job_if_present(fenced).await.unwrap());
+    assert_eq!(
+        engine
+            .export_job(JobId(40))
+            .await
+            .unwrap()
+            .unwrap()
+            .priority,
+        before.priority
+    );
+    engine.fold_job_journals(JobId(40)).await.unwrap();
+    assert!(engine.remove_job_silent(JobId(41)).await.unwrap());
+    assert!(!engine.remove_job_silent(JobId(41)).await.unwrap());
+    engine.shutdown().await;
+}
+
+#[tokio::test]
+async fn successful_authority_adoption_merges_durable_and_local_state() {
+    let tmp = tempfile::tempdir().unwrap();
+    let authority = spawn_engine(tmp.path(), Vec::new()).await;
+    authority
+        .import_job(transfer_job(70, "durable", JobStatus::Queued), false, false)
+        .await
+        .unwrap();
+    authority.pause_all("authority").await.unwrap();
+    authority.set_speed_limit(Some(4_096)).await.unwrap();
+    authority.shutdown().await;
+
+    let mut config = EngineConfig::single_node(
+        Vec::new(),
+        tmp.path().join("state"),
+        tmp.path().join("dest"),
+        test_tuning(),
+        None,
+    );
+    config.persist_queue = false;
+    config.journal_suffix = "worker".into();
+    let worker = Engine::spawn(config).await.unwrap();
+    worker
+        .import_job(transfer_job(71, "local", JobStatus::Queued), false, false)
+        .await
+        .unwrap();
+    assert_eq!(worker.snapshot().jobs.len(), 1);
+
+    worker.adopt_authority().await.unwrap();
+    let snapshot = worker.snapshot();
+    let mut ids: Vec<JobId> = snapshot.jobs.iter().map(|job| job.id).collect();
+    ids.sort();
+    assert_eq!(ids, vec![JobId(70), JobId(71)]);
+    assert!(snapshot.download_paused);
+    assert_eq!(snapshot.speed_limit_bps, Some(4_096));
+    worker.shutdown().await;
+}
+
+#[tokio::test]
+async fn folding_a_foreign_journal_recovers_progress_and_surfaces_missing_disk_data() {
+    let tmp = tempfile::tempdir().unwrap();
+    let engine = spawn_engine(tmp.path(), Vec::new()).await;
+    engine
+        .import_job(transfer_job(80, "folded", JobStatus::Queued), false, false)
+        .await
+        .unwrap();
+
+    let mut foreign = nzbd_state::JobJournals::open(&tmp.path().join("state"), "lease-7").unwrap();
+    foreign
+        .append(&nzbd_state::JournalRecord {
+            job: JobId(80),
+            file: FileId(800),
+            segment_number: 1,
+            offset: 0,
+            len: 100,
+            crc32: 0x1234_5678,
+            file_size: 100,
+        })
+        .unwrap();
+    foreign.sync().unwrap();
+    drop(foreign);
+
+    let mut events = engine.subscribe();
+    engine.fold_job_journals(JobId(80)).await.unwrap();
+    let finished = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Event::FileFinished {
+                job: JobId(80), ok, ..
+            } = events.recv().await.unwrap()
+            {
+                break ok;
+            }
+        }
+    })
+    .await
+    .expect("recovered file must reach a terminal writer result");
+    assert!(!finished, "the journal cannot invent the missing part file");
+
+    let job = engine.export_job(JobId(80)).await.unwrap().unwrap();
+    assert_eq!(
+        job.files[0].segments[0].state,
+        SegmentState::Done {
+            offset: 0,
+            len: 100,
+            crc: 0x1234_5678,
+        }
+    );
+    assert!(job.files[0].finalized);
+    assert_eq!(job.status, JobStatus::Failed);
+    engine.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn duplicate_inflight_url_add_updates_params_without_a_second_job() {
+    use std::io::{Read as _, Write as _};
+
+    let post = build_post("deduplicated", &[("one.bin", vec![1, 2, 3])], 3);
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (accepted_tx, accepted_rx) = std::sync::mpsc::sync_channel(0);
+    let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+    let nzb = post.nzb.clone();
+    let server = std::thread::spawn(move || {
+        let (mut socket, _) = listener.accept().unwrap();
+        let mut request = [0u8; 2048];
+        let _ = socket.read(&mut request);
+        accepted_tx.send(()).unwrap();
+        release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{nzb}",
+            nzb.len()
+        );
+        let _ = socket.write_all(response.as_bytes());
+    });
+
+    let tmp = tempfile::tempdir().unwrap();
+    let engine = spawn_engine(tmp.path(), Vec::new()).await;
+    let url = format!("http://127.0.0.1:{port}/opaque.nzb&i=1&r=secret");
+    let first = engine
+        .add_url(
+            "",
+            &url,
+            AddOpts {
+                params: vec![("tracking".into(), "first".into())],
+                client: Some("first-client".into()),
+                ..AddOpts::default()
+            },
+        )
+        .await
+        .unwrap();
+    accepted_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+
+    let duplicate = engine
+        .add_url(
+            "",
+            &url,
+            AddOpts {
+                params: vec![
+                    ("tracking".into(), "second".into()),
+                    ("new-key".into(), "new-value".into()),
+                ],
+                client: Some("second-client".into()),
+                ..AddOpts::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(duplicate, first);
+    assert_eq!(engine.snapshot().jobs.len(), 1);
+    let fetching = engine.export_job(first).await.unwrap().unwrap();
+    assert_eq!(fetching.status, JobStatus::Fetching);
+    assert!(fetching
+        .params
+        .iter()
+        .any(|(key, value)| key == "tracking" && value == "second"));
+    assert!(fetching
+        .params
+        .iter()
+        .any(|(key, value)| key == "new-key" && value == "new-value"));
+    assert!(fetching
+        .params
+        .iter()
+        .any(|(key, value)| key == "*Client" && value == "second-client"));
+
+    release_tx.send(()).unwrap();
+    server.join().unwrap();
+    engine.shutdown().await;
 }
 
 /// Payload with dot-heavy and escape-heavy regions: encoded lines starting

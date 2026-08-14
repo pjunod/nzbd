@@ -303,6 +303,9 @@ mod tests {
             owner.try_structural(),
             Ok(BackendFact::Ready { job: JobId(1), .. })
         ));
+
+        adapter.forget_progress(JobId(1));
+        assert!(owner.latest_progress().is_empty());
     }
 
     #[test]
@@ -356,5 +359,11 @@ mod tests {
         let error = SafeError::from_redacted("é".repeat(2_000));
         assert!(error.as_str().len() <= SafeError::MAX_BYTES);
         assert!(error.as_str().is_char_boundary(error.as_str().len()));
+
+        // 2,048 is inside a three-byte code point here, so truncation must
+        // walk back to a real UTF-8 boundary rather than panic or emit junk.
+        let error = SafeError::from_redacted("€".repeat(1_000));
+        assert_eq!(error.as_str().len(), 2_046);
+        assert!(error.as_str().ends_with('€'));
     }
 }

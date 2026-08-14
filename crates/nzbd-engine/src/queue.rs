@@ -1320,6 +1320,62 @@ mod tests {
     }
 
     #[test]
+    fn regenerated_nzb_is_parseable_and_escapes_queue_evidence() {
+        let parsed = nzbd_nzb::ParsedNzb {
+            meta: nzbd_nzb::NzbMeta {
+                title: Some("ignored request title".into()),
+                category: Some("ignored category".into()),
+                password: None,
+            },
+            files: vec![nzbd_nzb::ParsedFile {
+                subject: "subject \"payload & <one>.bin\" yEnc".into(),
+                poster: Some("poster".into()),
+                date: Some(1_700_000_000),
+                groups: vec!["alt.test & binaries".into(), "alt.<backup>".into()],
+                segments: vec![
+                    nzbd_nzb::ParsedSegment {
+                        message_id: "one&part@example".into(),
+                        number: 1,
+                        bytes: 123,
+                    },
+                    nzbd_nzb::ParsedSegment {
+                        message_id: "two<part>@example".into(),
+                        number: 2,
+                        bytes: 456,
+                    },
+                ],
+            }],
+        };
+        let mut state = QueueState::default();
+        let id = state.admit_nzb(
+            "Queue & <Title> \"quoted\"".into(),
+            &parsed,
+            Some("tv & movies".into()),
+            0,
+            false,
+        );
+        // Admission deliberately cleans request names; this test starts at
+        // the regeneration boundary, whose input is the stored queue value.
+        state.job_mut(id).unwrap().name = "Queue & <Title> \"quoted\"".into();
+
+        let xml = job_to_nzb(state.job(id).unwrap());
+        assert!(xml.contains("Queue &amp; &lt;Title&gt; &quot;quoted&quot;"));
+        assert!(xml.contains("tv &amp; movies"));
+        assert!(xml.contains("alt.test &amp; binaries"));
+        assert!(xml.contains("alt.&lt;backup&gt;"));
+        assert!(xml.contains("one&amp;part@example"));
+        assert!(xml.contains("two&lt;part&gt;@example"));
+        let reparsed = nzbd_nzb::parse(xml.as_bytes()).unwrap();
+        assert_eq!(reparsed.files.len(), 1);
+        assert_eq!(reparsed.files[0].date, Some(1_700_000_000));
+        assert_eq!(reparsed.files[0].segments.len(), 2);
+        assert_eq!(reparsed.files[0].segments[0].number, 1);
+        assert_eq!(reparsed.files[0].segments[0].bytes, 123);
+        assert_eq!(reparsed.files[0].segments[1].number, 2);
+        assert_eq!(reparsed.files[0].segments[1].bytes, 456);
+    }
+
+    #[test]
     fn clean_name_strips_glued_indexer_query() {
         // The exact shape *arr + indexers produce.
         let nzb = nzb_with(&[], None);
