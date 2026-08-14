@@ -515,22 +515,23 @@ async fn handle_failed_job(
         })
         .unwrap_or_else(now);
     if let Some(finalizing) = exported.as_mut() {
-        if !finalizing
+        let needs_failure_at_commit = !finalizing
             .params
             .iter()
-            .any(|(key, _)| key == PP_FAILURE_AT_PARAM)
-        {
+            .any(|(key, _)| key == PP_FAILURE_AT_PARAM);
+        if needs_failure_at_commit {
             finalizing
                 .params
                 .push((PP_FAILURE_AT_PARAM.into(), completed_at_unix.to_string()));
-        }
-        // This result means the atomic replacement reached the queue
-        // snapshot, not merely that the in-memory row existed. Re-run it even
-        // when a prior failed attempt left the key in memory: no Park/Delete,
-        // history append, or terminal stamp may precede this durable commit.
-        match engine.import_job_if_present(finalizing.clone()).await {
-            Ok(true) => {}
-            Ok(false) | Err(_) => return,
+            // This result means the atomic replacement reached the queue
+            // snapshot, not merely that the in-memory row existed: no
+            // Park/Delete, history append, or terminal stamp may precede this
+            // durable commit. A key exported on a later retry is already
+            // durable, so do not rewrite the whole queue snapshot again.
+            match engine.import_job_if_present(finalizing.clone()).await {
+                Ok(true) => {}
+                Ok(false) | Err(_) => return,
+            }
         }
     }
     if gate.as_ref().is_some_and(|claim| !claim(job)) {
@@ -624,9 +625,11 @@ async fn handle_failed_job(
                     );
                     Some(Disposition {
                         note: observed.note,
-                        // Nothing was moved or deleted. Do not turn the
-                        // source path into a fabricated successful final dir.
-                        files_at: None,
+                        // A failed Delete/Park leaves operator-cleanup work.
+                        // Preserve the path observed by dispose_failed; it is
+                        // evidence of where the bytes remain, not a claim that
+                        // the configured action succeeded.
+                        files_at: observed.files_at,
                     })
                 }
             }

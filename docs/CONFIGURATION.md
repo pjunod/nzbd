@@ -249,11 +249,13 @@ par_fetch_timeout_secs = 600   # wait for delayed par files during repair
 Failed-file disposition is retried before the terminal history row is written.
 A stable local error such as permission denied is attempted three times, then
 the job is retired with the last `delete failed: ...` or `park failed: ...`
-note and no claimed final directory. The attempt count lives in the durable
-queue row beside the failure timestamp, so restarting the daemon does not
-reset the budget. Disk-full/quota errors and a closed cluster admission or
-authority gate do not consume that budget; they remain retryable until storage
-or ownership recovers.
+note and the observed path to any files left for operator cleanup. With an
+uninterrupted daemon, the first attempt is immediate and the next two follow
+the 30-second rescans, so exhaustion takes about 60 seconds. A restart may make
+the next attempt happen sooner, but the attempt count lives in the durable
+queue row beside the failure timestamp and never resets. Disk-full/quota errors
+and a closed cluster admission or authority gate do not consume that budget;
+they remain retryable until storage or ownership recovers.
 
 The PP pipeline per job: par-rename → rar-rename → par verify (native
 quick-verify from download CRCs; repair only on damage) → unpack (with a

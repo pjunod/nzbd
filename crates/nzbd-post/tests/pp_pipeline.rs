@@ -1061,7 +1061,11 @@ async fn permanently_undeletable_failed_job_retires_after_durable_retry_bound() 
     }
 
     let row = hist.list(10).unwrap().remove(0);
-    assert_eq!(row.final_dir, None, "a failed delete moved no files");
+    assert_eq!(
+        row.final_dir.as_deref(),
+        Some(dir.to_string_lossy().as_ref()),
+        "history must name the leftover files that require operator cleanup"
+    );
     assert!(row
         .params
         .iter()
