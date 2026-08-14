@@ -204,6 +204,8 @@ impl Default for PpCtx {
 /// on a prior run — the `*PP:done` stamp keeps it idempotent).
 const RESCAN_INTERVAL: Duration = Duration::from_secs(30);
 const PP_FAILURE_AT_PARAM: &str = "*PP:failure-at";
+const PP_FAILURE_DISPOSITION_ATTEMPTS_PARAM: &str = "*PP:failure-disposition-attempts";
+const FAILURE_DISPOSITION_ATTEMPT_LIMIT: u32 = 3;
 
 /// A safe point to resume a post-processing pipeline from.
 ///
@@ -551,9 +553,81 @@ async fn handle_failed_job(
             match canonical_failed_disposition(cfg, dest_dir, &dir_name, &source) {
                 Some(committed) => Some(committed),
                 None => {
-                    tracing::warn!(job = job.0, outcome = %observed.note,
-                        "failed-file disposition is incomplete; leaving the queue row retryable");
-                    return;
+                    // A stale authority must never spend the retry budget. In
+                    // particular, Park can finish its external move just as
+                    // the lease or disk-admission gate closes.
+                    if gate.as_ref().is_some_and(|claim| !claim(job)) {
+                        return;
+                    }
+                    // ENOSPC/EDQUOT is not a permanently broken disposition:
+                    // it is admission evidence. Hold intake and keep retrying
+                    // after recovery, regardless of earlier local failures.
+                    if nzbd_engine::is_out_of_space(&observed.note) {
+                        engine.report_out_of_space(format!(
+                            "failed-file disposition for job {}: {}",
+                            job.0, observed.note
+                        ));
+                        tracing::warn!(job = job.0, outcome = %observed.note,
+                            "failed-file disposition is waiting for disk admission");
+                        return;
+                    }
+
+                    let Some(finalizing) = exported.as_mut() else {
+                        return;
+                    };
+                    let attempts = finalizing
+                        .params
+                        .iter()
+                        .find(|(key, _)| key == PP_FAILURE_DISPOSITION_ATTEMPTS_PARAM)
+                        .and_then(|(_, value)| value.parse::<u32>().ok())
+                        .unwrap_or(0)
+                        .saturating_add(1)
+                        .min(FAILURE_DISPOSITION_ATTEMPT_LIMIT);
+                    match finalizing
+                        .params
+                        .iter_mut()
+                        .find(|(key, _)| key == PP_FAILURE_DISPOSITION_ATTEMPTS_PARAM)
+                    {
+                        Some((_, value)) => *value = attempts.to_string(),
+                        None => finalizing.params.push((
+                            PP_FAILURE_DISPOSITION_ATTEMPTS_PARAM.into(),
+                            attempts.to_string(),
+                        )),
+                    }
+                    // The counter and the stable completion timestamp share
+                    // the queue row's atomic snapshot. A daemon restart then
+                    // resumes this budget instead of manufacturing a fresh
+                    // set of attempts.
+                    match engine.import_job_if_present(finalizing.clone()).await {
+                        Ok(true) => {}
+                        Ok(false) | Err(_) => return,
+                    }
+                    if gate.as_ref().is_some_and(|claim| !claim(job)) {
+                        return;
+                    }
+                    if attempts < FAILURE_DISPOSITION_ATTEMPT_LIMIT {
+                        tracing::warn!(
+                            job = job.0,
+                            attempts,
+                            limit = FAILURE_DISPOSITION_ATTEMPT_LIMIT,
+                            outcome = %observed.note,
+                            "failed-file disposition is incomplete; leaving the queue row retryable"
+                        );
+                        return;
+                    }
+
+                    tracing::error!(
+                        job = job.0,
+                        attempts,
+                        outcome = %observed.note,
+                        "failed-file disposition exhausted its local retry bound; recording the observed failure"
+                    );
+                    Some(Disposition {
+                        note: observed.note,
+                        // Nothing was moved or deleted. Do not turn the
+                        // source path into a fabricated successful final dir.
+                        files_at: None,
+                    })
                 }
             }
         }
@@ -656,7 +730,8 @@ async fn handle_failed_job(
 /// Convert a completed failure action into a node-independent history fact.
 /// A successor that observes an already-completed Delete/Park must emit the
 /// same immutable payload as the authority that performed it. Failed actions
-/// return `None` and remain retryable instead of recording a conflicting row.
+/// return `None`; the caller retries transient failures without a bound and
+/// retires stable local failures only after its durable attempt budget.
 fn canonical_failed_disposition(
     cfg: &PostConfig,
     dest_dir: &Path,

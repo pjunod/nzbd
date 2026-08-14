@@ -925,6 +925,172 @@ async fn health_action_delete_removes_files() {
     engine.shutdown().await;
 }
 
+/// A local disposition error must not leave a failed queue row warning on
+/// every rescan forever. The attempt count is part of the durable queue row,
+/// so a daemon restart consumes the remaining budget instead of resetting it.
+#[cfg(unix)]
+#[tokio::test]
+async fn permanently_undeletable_failed_job_retires_after_durable_retry_bound() {
+    use std::os::unix::fs::PermissionsExt;
+
+    const ATTEMPTS_PARAM: &str = "*PP:failure-disposition-attempts";
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("dest/undeletable");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("partial.bin"), b"known bad bytes").unwrap();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let config = PostConfig {
+        failure_action: FailureAction::Delete,
+        ..PostConfig::default()
+    };
+    let hist = history(tmp.path());
+
+    let engine = spawn_engine(tmp.path()).await;
+    let cancel = CancellationToken::new();
+    let tracker = TaskTracker::new();
+    spawn_post_manager(
+        engine.clone(),
+        config.clone(),
+        hist.clone(),
+        tmp.path().join("dest"),
+        None,
+        cancel.clone(),
+        &tracker,
+    );
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let mut job = completed_job(
+        95,
+        "undeletable",
+        vec![file_entry(1, "partial.bin", None, false)],
+    );
+    job.status = JobStatus::Failed;
+    engine.import_job(job, false, true).await.unwrap();
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let attempts = engine.export_job(JobId(95)).await.unwrap().and_then(|job| {
+            job.params
+                .into_iter()
+                .find(|(key, _)| key == ATTEMPTS_PARAM)
+                .map(|(_, value)| value)
+        });
+        if attempts.as_deref() == Some("1") {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the first failed disposition attempt was not persisted"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(hist.list(10).unwrap().is_empty());
+    cancel.cancel();
+    tracker.close();
+    tracker.wait().await;
+    engine.shutdown().await;
+
+    let recovered = spawn_engine(tmp.path()).await;
+    assert!(recovered
+        .export_job(JobId(95))
+        .await
+        .unwrap()
+        .unwrap()
+        .params
+        .iter()
+        .any(|(key, value)| key == ATTEMPTS_PARAM && value == "1"));
+    let cancel2 = CancellationToken::new();
+    let tracker2 = TaskTracker::new();
+    spawn_post_manager(
+        recovered.clone(),
+        config,
+        hist.clone(),
+        tmp.path().join("dest"),
+        None,
+        cancel2.clone(),
+        &tracker2,
+    );
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let attempts = recovered
+            .export_job(JobId(95))
+            .await
+            .unwrap()
+            .and_then(|job| {
+                job.params
+                    .into_iter()
+                    .find(|(key, _)| key == ATTEMPTS_PARAM)
+                    .map(|(_, value)| value)
+            });
+        if attempts.as_deref() == Some("2") {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the restart did not resume the durable disposition budget"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    recovered.emit(nzbd_engine::Event::JobFinished {
+        job: JobId(95),
+        name: "undeletable".into(),
+        status: JobStatus::Failed,
+        health: 0,
+    });
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let stamped = recovered
+            .export_job(JobId(95))
+            .await
+            .unwrap()
+            .is_some_and(|job| {
+                job.params
+                    .iter()
+                    .any(|(key, value)| key == PP_DONE_PARAM && value == "FAILURE/HEALTH")
+            });
+        if stamped && hist.list(10).unwrap().len() == 1 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the permanent disposition failure never reached history"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    let row = hist.list(10).unwrap().remove(0);
+    assert_eq!(row.final_dir, None, "a failed delete moved no files");
+    assert!(row
+        .params
+        .iter()
+        .any(|(key, value)| { key == "Failure:Files" && value.starts_with("delete failed:") }));
+    assert!(dir.join("partial.bin").is_file());
+
+    // A finish event models another rescan finding the same queue row. The
+    // terminal stamp must make this a no-op: no fourth attempt or history row.
+    recovered.emit(nzbd_engine::Event::JobFinished {
+        job: JobId(95),
+        name: "undeletable".into(),
+        status: JobStatus::Failed,
+        health: 0,
+    });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let terminal = recovered.export_job(JobId(95)).await.unwrap().unwrap();
+    assert!(terminal
+        .params
+        .iter()
+        .any(|(key, value)| key == ATTEMPTS_PARAM && value == "3"));
+    assert_eq!(hist.list(10).unwrap().len(), 1);
+
+    cancel2.cancel();
+    tracker2.close();
+    tracker2.wait().await;
+    recovered.shutdown().await;
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
 /// Losing authority after a cross-filesystem park must not let the stale
 /// finalizer stamp or announce the job. The already-moved tree is an
 /// idempotence witness for the next authority's startup scan.
