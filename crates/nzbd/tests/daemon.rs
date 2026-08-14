@@ -8,6 +8,7 @@
 use nzbd_nserv::{build_post, prng_bytes, NservBuilder};
 use std::io::{Read, Write};
 use std::net::TcpStream;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -20,20 +21,42 @@ fn http(addr: &str, method: &str, path: &str, body: &[u8]) -> (u16, String) {
 /// its listener bounces — this poller must treat any socket error as "not
 /// yet", not panic (it flaked exactly that way: connect landed on the
 /// dying listener, then the read hit ECONNRESET).
-fn wait_healthy(addr: &str, deadline: Duration) {
+///
+/// A daemon that has *exited* is a different thing from a slow one, and it
+/// fails here immediately: waiting out the budget to report "did not become
+/// healthy" names the symptom and discards the cause.
+fn wait_healthy(daemon: &KillOnDrop, addr: &str, deadline: Duration) {
     let start = Instant::now();
     loop {
-        if start.elapsed() > deadline {
-            panic!("daemon did not become healthy at {addr}");
+        if let Some(cause) = daemon.died() {
+            panic!("daemon is not coming up at {addr}: {cause}");
         }
-        if let Some((200, body)) = try_http(addr, "GET", "/healthz", b"", None) {
+        if let Some((200, body)) = probe(addr, "/healthz") {
             if body == "ok" {
                 return;
             }
         }
+        if start.elapsed() > deadline {
+            panic!(
+                "daemon did not become healthy at {addr} within {deadline:?} \
+                 (process still alive)"
+            );
+        }
         std::thread::sleep(Duration::from_millis(100));
     }
 }
+
+/// A readiness probe, as opposed to a request whose answer the test asserts
+/// on. Each attempt is bounded well below the caller's budget: `try_http`
+/// allows a 10s read against a 15s startup budget, so one stalled probe used
+/// two thirds of it and the timeout then blamed a daemon that was merely
+/// slow to answer once.
+fn probe(addr: &str, path: &str) -> Option<(u16, String)> {
+    request(addr, "GET", path, b"", None, PROBE_TIMEOUT)
+}
+
+/// Bound on a single readiness probe (connect and read alike).
+const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// `http`, but for the window right after a restart. `wait_healthy` can be
 /// answered by the OUTGOING listener a moment before it closes, so the very
@@ -64,27 +87,85 @@ fn free_port() -> u16 {
         .port()
 }
 
-/// Terminate the daemon gracefully (SIGTERM) so it flushes journals —
-/// and, under instrumented builds, its coverage profile. Falls back to
-/// SIGKILL if it doesn't exit within a few seconds.
-struct KillOnDrop(Child);
+/// The daemon under test. Terminates it gracefully (SIGTERM) on drop so it
+/// flushes journals — and, under instrumented builds, its coverage profile —
+/// falling back to SIGKILL if it doesn't exit within a few seconds.
+///
+/// It also keeps the daemon's stderr and can say whether the process is
+/// already gone. A daemon that dies during startup — a config it rejects, a
+/// port taken between `free_port` and its own `bind` (it exits 1 with
+/// "Address already in use"), a panic — otherwise surfaced only as a
+/// readiness timeout with its output sent to `/dev/null`, so every such
+/// failure was reported as "daemon did not become healthy" with no cause
+/// recorded anywhere.
+struct KillOnDrop {
+    child: std::cell::RefCell<Child>,
+    stderr: PathBuf,
+}
+
+impl KillOnDrop {
+    fn new(child: Child, stderr: PathBuf) -> Self {
+        KillOnDrop {
+            child: std::cell::RefCell::new(child),
+            stderr,
+        }
+    }
+
+    fn id(&self) -> u32 {
+        self.child.borrow().id()
+    }
+
+    /// `Some(reason)` once the daemon has exited: it is never coming up, and
+    /// the reason quotes its status and the tail of its stderr.
+    fn died(&self) -> Option<String> {
+        let status = self.child.borrow_mut().try_wait().ok().flatten()?;
+        let log = std::fs::read_to_string(&self.stderr).unwrap_or_default();
+        let tail = log
+            .lines()
+            .rev()
+            .take(20)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect::<Vec<_>>()
+            .join("\n");
+        Some(format!(
+            "exited with {status}\n--- daemon stderr (tail) ---\n{tail}"
+        ))
+    }
+}
+
 impl Drop for KillOnDrop {
     fn drop(&mut self) {
+        let child = self.child.get_mut();
+        if matches!(child.try_wait(), Ok(Some(_))) {
+            return; // already exited and reaped
+        }
         #[cfg(unix)]
         {
             let _ = Command::new("kill")
-                .args(["-TERM", &self.0.id().to_string()])
+                .args(["-TERM", &child.id().to_string()])
                 .status();
             for _ in 0..50 {
-                if matches!(self.0.try_wait(), Ok(Some(_))) {
+                if matches!(child.try_wait(), Ok(Some(_))) {
                     return;
                 }
                 std::thread::sleep(Duration::from_millis(100));
             }
         }
-        let _ = self.0.kill();
-        let _ = self.0.wait();
+        let _ = child.kill();
+        let _ = child.wait();
     }
+}
+
+/// Send a daemon's stderr to a file under its own tempdir, so a failed
+/// startup can be quoted instead of guessed at.
+fn daemon_stderr(dir: &Path) -> (Stdio, PathBuf) {
+    static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let path = dir.join(format!("nzbd-stderr-{n}.log"));
+    let file = std::fs::File::create(&path).expect("create daemon stderr log");
+    (Stdio::from(file), path)
 }
 
 /// Like `http`, but tolerates a dead/bouncing listener (returns None) and
@@ -96,8 +177,25 @@ fn try_http(
     body: &[u8],
     basic: Option<&str>,
 ) -> Option<(u16, String)> {
-    let mut sock = TcpStream::connect(addr).ok()?;
-    sock.set_read_timeout(Some(Duration::from_secs(10))).ok()?;
+    request(addr, method, path, body, basic, Duration::from_secs(10))
+}
+
+/// One HTTP/1.1 request with an explicit per-attempt bound. Every wait in
+/// this file polls, so no single attempt may be allowed to consume the
+/// caller's whole budget — an unbounded connect or read turns "the daemon
+/// never came up" into a claim the test cannot actually support.
+fn request(
+    addr: &str,
+    method: &str,
+    path: &str,
+    body: &[u8],
+    basic: Option<&str>,
+    timeout: Duration,
+) -> Option<(u16, String)> {
+    let target = addr.parse().ok()?;
+    let mut sock = TcpStream::connect_timeout(&target, timeout).ok()?;
+    sock.set_read_timeout(Some(timeout)).ok()?;
+    sock.set_write_timeout(Some(timeout)).ok()?;
     let auth = basic
         .map(|cred| {
             use base64::Engine as _;
@@ -124,6 +222,121 @@ fn try_http(
     Some((status, payload))
 }
 
+// ---------------------------------------------------------------------------
+// The startup waiters' own contract, pinned without the real daemon so it
+// holds regardless of machine load.
+// ---------------------------------------------------------------------------
+
+/// A stub daemon: a process the test controls, plus its stderr log.
+fn stub_daemon(dir: &Path, script: &str) -> KillOnDrop {
+    let (stderr, stderr_path) = daemon_stderr(dir);
+    let child = Command::new("/bin/sh")
+        .args(["-c", script])
+        .stdout(Stdio::null())
+        .stderr(stderr)
+        .spawn()
+        .expect("spawn stub");
+    KillOnDrop::new(child, stderr_path)
+}
+
+/// `KillOnDrop` holds a `RefCell`, so the wait is not `UnwindSafe`; nothing
+/// here observes the daemon after the panic beyond dropping it.
+fn panic_message<F: FnOnce()>(f: F) -> String {
+    let hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let payload =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).expect_err("must panic");
+    std::panic::set_hook(hook);
+    payload
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
+        .unwrap_or_default()
+}
+
+/// A daemon that died must fail its wait *immediately* and quote the cause.
+/// Reported as a plain budget timeout instead, a dead daemon is
+/// indistinguishable from a slow one — which is how a startup failure
+/// ("Address already in use" between `free_port` and the daemon's own bind)
+/// reached a reviewer as nothing but "daemon did not become healthy".
+#[test]
+fn a_dead_daemon_fails_its_wait_at_once_and_says_why() {
+    let tmp = tempfile::tempdir().unwrap();
+    let daemon = stub_daemon(
+        tmp.path(),
+        "echo 'Error: Address already in use (os error 48)' >&2; exit 1",
+    );
+    // The process must be reapable before the wait starts.
+    while daemon.died().is_none() {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let addr = format!("127.0.0.1:{}", free_port());
+
+    let start = Instant::now();
+    let message = panic_message(|| wait_healthy(&daemon, &addr, Duration::from_secs(60)));
+    assert!(
+        start.elapsed() < Duration::from_secs(5),
+        "a dead daemon must not be waited out: took {:?}",
+        start.elapsed()
+    );
+    assert!(
+        message.contains("Address already in use"),
+        "the daemon's own stderr must reach the failure: {message}"
+    );
+    assert!(
+        message.contains("exit status: 1"),
+        "and its status: {message}"
+    );
+}
+
+/// The liveness assertion still holds: a daemon that is alive but never
+/// serves must fail on its budget, so widening the wait can never turn a
+/// daemon that does not come up into a pass.
+#[test]
+fn a_live_daemon_that_never_serves_still_fails_on_its_budget() {
+    let tmp = tempfile::tempdir().unwrap();
+    let daemon = stub_daemon(tmp.path(), "sleep 30");
+    let addr = format!("127.0.0.1:{}", free_port());
+
+    let start = Instant::now();
+    let message = panic_message(|| wait_healthy(&daemon, &addr, Duration::from_secs(1)));
+    assert!(message.contains("did not become healthy"), "{message}");
+    assert!(
+        (Duration::from_secs(1)..Duration::from_secs(10)).contains(&start.elapsed()),
+        "must fail on its own budget, not early or late: {:?}",
+        start.elapsed()
+    );
+}
+
+/// One probe attempt is bounded, so the caller's budget is spent polling
+/// rather than blocked in a single read. A listener that accepts and then
+/// says nothing is exactly the shape of a daemon whose port is bound before
+/// it can answer; unbounded, one such attempt ate two thirds of the startup
+/// budget and the timeout then blamed the daemon.
+#[test]
+fn a_probe_against_a_silent_listener_is_bounded() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    std::thread::spawn(move || {
+        // Accept and hold: never write a response.
+        let held: Vec<_> = listener.incoming().take(4).filter_map(Result::ok).collect();
+        std::thread::sleep(Duration::from_secs(30));
+        drop(held);
+    });
+
+    let start = Instant::now();
+    assert_eq!(
+        probe(&addr, "/healthz"),
+        None,
+        "a silent listener is not ready"
+    );
+    assert!(
+        start.elapsed() < PROBE_TIMEOUT * 2,
+        "one probe must stay near its bound, took {:?}",
+        start.elapsed()
+    );
+}
+
 /// `[api] tls = true` with no cert configured: the daemon self-generates a
 /// persistent certificate and serves HTTPS, including the PWA assets.
 #[test]
@@ -142,14 +355,15 @@ fn https_selfsigned_serves_healthz_and_pwa_assets() {
     std::fs::write(&cfg_path, config).unwrap();
 
     let bin = env!("CARGO_BIN_EXE_nzbd");
+    let (stderr, stderr_path) = daemon_stderr(tmp.path());
     let child = Command::new(bin)
         .args(["run", "--config"])
         .arg(&cfg_path)
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(stderr)
         .spawn()
         .expect("spawn nzbd");
-    let _child = KillOnDrop(child);
+    let daemon = KillOnDrop::new(child, stderr_path);
 
     // A TLS client that accepts any certificate (it's self-signed).
     #[derive(Debug)]
@@ -196,32 +410,47 @@ fn https_selfsigned_serves_healthz_and_pwa_assets() {
     let connector = tokio_rustls::TlsConnector::from(Arc::new(client_cfg));
 
     let rt = tokio::runtime::Runtime::new().unwrap();
+    // Every step is inside one bound: connect, TLS handshake and read had no
+    // timeout at all, and the loop below only checks its deadline *between*
+    // attempts — so a single stalled handshake could overshoot the budget by
+    // any amount and then be reported as "https did not come up".
     let https_get = |path: &'static str| -> Option<(u16, Vec<u8>)> {
         rt.block_on(async {
-            use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-            let tcp = tokio::net::TcpStream::connect(&api_addr).await.ok()?;
-            let sni = rustls::pki_types::ServerName::try_from("localhost").unwrap();
-            let mut tls = connector.connect(sni, tcp).await.ok()?;
-            let req =
-                format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
-            tls.write_all(req.as_bytes()).await.ok()?;
-            let mut resp = Vec::new();
-            let _ = tls.read_to_end(&mut resp).await;
-            let head = String::from_utf8_lossy(&resp);
-            let status: u16 = head.split_whitespace().nth(1)?.parse().ok()?;
-            let body_at = resp.windows(4).position(|w| w == b"\r\n\r\n")? + 4;
-            Some((status, resp[body_at..].to_vec()))
+            tokio::time::timeout(PROBE_TIMEOUT, async {
+                use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+                let tcp = tokio::net::TcpStream::connect(&api_addr).await.ok()?;
+                let sni = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+                let mut tls = connector.connect(sni, tcp).await.ok()?;
+                let req =
+                    format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+                tls.write_all(req.as_bytes()).await.ok()?;
+                let mut resp = Vec::new();
+                let _ = tls.read_to_end(&mut resp).await;
+                let head = String::from_utf8_lossy(&resp);
+                let status: u16 = head.split_whitespace().nth(1)?.parse().ok()?;
+                let body_at = resp.windows(4).position(|w| w == b"\r\n\r\n")? + 4;
+                Some((status, resp[body_at..].to_vec()))
+            })
+            .await
+            .ok()
+            .flatten()
         })
     };
 
     // Wait for the TLS listener (plain-HTTP probing can't work here).
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
-        assert!(Instant::now() < deadline, "https did not come up");
+        if let Some(cause) = daemon.died() {
+            panic!("https is not coming up at {api_addr}: {cause}");
+        }
         if let Some((200, body)) = https_get("/healthz") {
             assert!(body.ends_with(b"ok"), "healthz over https");
             break;
         }
+        assert!(
+            Instant::now() < deadline,
+            "https did not come up (process still alive)"
+        );
         std::thread::sleep(Duration::from_millis(150));
     }
 
@@ -293,15 +522,16 @@ fn restart_completes_with_an_open_sse_stream() {
     std::fs::write(&cfg_path, config).unwrap();
 
     let bin = env!("CARGO_BIN_EXE_nzbd");
+    let (stderr, stderr_path) = daemon_stderr(tmp.path());
     let child = Command::new(bin)
         .args(["run", "--config"])
         .arg(&cfg_path)
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(stderr)
         .spawn()
         .expect("spawn nzbd");
-    let _child = KillOnDrop(child);
-    wait_healthy(&addr, Duration::from_secs(15));
+    let daemon = KillOnDrop::new(child, stderr_path);
+    wait_healthy(&daemon, &addr, Duration::from_secs(15));
 
     // Open an SSE stream and HOLD it open (like a browser tab): read the
     // response head, then keep the socket alive across the restart.
@@ -349,7 +579,7 @@ fn restart_completes_with_an_open_sse_stream() {
     drop(sse);
 
     // And the daemon is serving again.
-    wait_healthy(&addr, Duration::from_secs(10));
+    wait_healthy(&daemon, &addr, Duration::from_secs(10));
 }
 
 /// Regression (field report 2026-07-25, #2 of the day): a restart clicked
@@ -417,6 +647,7 @@ scripts_dir = "{scripts}"
     let bin = env!("CARGO_BIN_EXE_nzbd");
     let daemon_log_path = tmp.path().join("daemon.log");
     let daemon_log = std::fs::File::create(&daemon_log_path).unwrap();
+    let stderr_path = daemon_log_path.clone();
     let child = Command::new(bin)
         .args(["run", "--config"])
         .arg(&cfg_path)
@@ -424,8 +655,8 @@ scripts_dir = "{scripts}"
         .stderr(daemon_log)
         .spawn()
         .expect("spawn nzbd");
-    let _child = KillOnDrop(child);
-    wait_healthy(&api_addr, Duration::from_secs(15));
+    let daemon = KillOnDrop::new(child, stderr_path);
+    wait_healthy(&daemon, &api_addr, Duration::from_secs(15));
 
     let (code, _) = http(
         &api_addr,
@@ -455,7 +686,7 @@ scripts_dir = "{scripts}"
     // the script finished (10 minutes here); the page just never loaded.
     let (code, _) = http(&api_addr, "POST", "/api/v1/restart", b"");
     assert_eq!(code, 200);
-    wait_healthy(&api_addr, Duration::from_secs(20));
+    wait_healthy(&daemon, &api_addr, Duration::from_secs(20));
 
     // Serving real state again, and the interrupted job survived into the
     // restarted queue (unstamped, so PP will pick it back up).
@@ -487,15 +718,16 @@ fn settings_live_apply_restart_flow_keeps_secrets() {
     std::fs::write(&cfg_path, &config).unwrap();
 
     let bin = env!("CARGO_BIN_EXE_nzbd");
+    let (stderr, stderr_path) = daemon_stderr(tmp.path());
     let child = Command::new(bin)
         .args(["run", "--config"])
         .arg(&cfg_path)
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(stderr)
         .spawn()
         .expect("spawn nzbd");
-    let _child = KillOnDrop(child);
-    wait_healthy(&addr, Duration::from_secs(15));
+    let daemon = KillOnDrop::new(child, stderr_path);
+    wait_healthy(&daemon, &addr, Duration::from_secs(15));
 
     let auth = Some("nzbd:pw1");
     let json = |s: &str| -> serde_json::Value {
@@ -649,6 +881,7 @@ fn setup_unwritable_config_offers_copyable_toml() {
     let port = free_port();
     let addr = format!("127.0.0.1:{port}");
     let bin = env!("CARGO_BIN_EXE_nzbd");
+    let (stderr, stderr_path) = daemon_stderr(tmp.path());
     let child = Command::new(bin)
         .args(["run", "--config"])
         .arg(&cfg_path)
@@ -662,11 +895,11 @@ fn setup_unwritable_config_offers_copyable_toml() {
             tmp.path().join("isolated-main"),
         )
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(stderr)
         .spawn()
         .expect("spawn nzbd");
-    let _child = KillOnDrop(child);
-    wait_healthy(&addr, Duration::from_secs(15));
+    let daemon = KillOnDrop::new(child, stderr_path);
+    wait_healthy(&daemon, &addr, Duration::from_secs(15));
 
     let json = |s: &str| -> serde_json::Value {
         let (start, end) = (s.find('{').unwrap(), s.rfind('}').unwrap());
@@ -754,6 +987,7 @@ fn a_missing_config_is_recovered_from_the_data_volume_not_replaced_by_the_wizard
     assert!(!cfg_path.exists(), "the config file really is gone");
 
     let bin = env!("CARGO_BIN_EXE_nzbd");
+    let (stderr, stderr_path) = daemon_stderr(tmp.path());
     let child = Command::new(bin)
         .args(["run", "--config"])
         .arg(&cfg_path)
@@ -763,11 +997,11 @@ fn a_missing_config_is_recovered_from_the_data_volume_not_replaced_by_the_wizard
         .env(nzbd_config::durable::MAIN_DIR_ENV, &main_dir)
         .env("HOME", tmp.path())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(stderr)
         .spawn()
         .expect("spawn nzbd");
-    let _child = KillOnDrop(child);
-    wait_healthy(&api_addr, Duration::from_secs(15));
+    let daemon = KillOnDrop::new(child, stderr_path);
+    wait_healthy(&daemon, &api_addr, Duration::from_secs(15));
 
     // Auth is on, which can only come from the recovered config.
     let (code, _) = try_http(&api_addr, "GET", "/api/v1/status", b"", None).unwrap();
@@ -828,6 +1062,7 @@ fn first_run_setup_wizard_writes_config_and_reloads() {
     let cfg_path = tmp.path().join("conf/nzbd.toml");
 
     let bin = env!("CARGO_BIN_EXE_nzbd");
+    let (stderr, stderr_path) = daemon_stderr(tmp.path());
     let child = Command::new(bin)
         .args(["run", "--config"])
         .arg(&cfg_path)
@@ -841,11 +1076,11 @@ fn first_run_setup_wizard_writes_config_and_reloads() {
             tmp.path().join("isolated-main"),
         )
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(stderr)
         .spawn()
         .expect("spawn nzbd");
-    let _child = KillOnDrop(child);
-    wait_healthy(&api_addr, Duration::from_secs(15));
+    let daemon = KillOnDrop::new(child, stderr_path);
+    wait_healthy(&daemon, &api_addr, Duration::from_secs(15));
 
     let (code, body) = http(&api_addr, "GET", "/api/v1/setup", b"");
     assert_eq!(code, 200);
@@ -990,6 +1225,7 @@ bind = "{api_addr}"
     let bin = env!("CARGO_BIN_EXE_nzbd");
     let daemon_log_path = tmp.path().join("daemon.log");
     let daemon_log = std::fs::File::create(&daemon_log_path).unwrap();
+    let stderr_path = daemon_log_path.clone();
     let child = Command::new(bin)
         .args(["run", "--config"])
         .arg(&cfg_path)
@@ -997,8 +1233,8 @@ bind = "{api_addr}"
         .stderr(daemon_log)
         .spawn()
         .expect("spawn nzbd");
-    let mut child = KillOnDrop(child);
-    wait_healthy(&api_addr, Duration::from_secs(15));
+    let daemon = KillOnDrop::new(child, stderr_path);
+    wait_healthy(&daemon, &api_addr, Duration::from_secs(15));
 
     // `nzbd add` via the real CLI.
     let out = Command::new(bin)
@@ -1086,13 +1322,13 @@ bind = "{api_addr}"
     assert_eq!(v["result"]["RemainingSizeMB"], 0);
 
     // Graceful shutdown on SIGINT clears the unclean marker.
-    let pid = child.0.id();
+    let pid = daemon.id();
     unsafe {
         libc_kill(pid as i32, 2 /* SIGINT */);
     }
     let start = Instant::now();
     loop {
-        if let Ok(Some(_)) = child.0.try_wait() {
+        if daemon.died().is_some() {
             break;
         }
         assert!(
@@ -1151,15 +1387,16 @@ bind = "{api_addr}"
 
     let post = build_post("park me", &[("payload.bin", prng_bytes(9, 40_000))], 20_000);
     let bin = env!("CARGO_BIN_EXE_nzbd");
+    let (stderr, stderr_path) = daemon_stderr(tmp.path());
     let child = Command::new(bin)
         .args(["run", "--config"])
         .arg(&cfg_path)
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(stderr)
         .spawn()
         .expect("spawn nzbd");
-    let _child = KillOnDrop(child);
-    wait_healthy(&api_addr, Duration::from_secs(15));
+    let daemon = KillOnDrop::new(child, stderr_path);
+    wait_healthy(&daemon, &api_addr, Duration::from_secs(15));
 
     let (code, body) = http(
         &api_addr,
@@ -1308,6 +1545,7 @@ bind = "{api_addr}"
     let bin = env!("CARGO_BIN_EXE_nzbd");
     let daemon_log_path = tmp.path().join("daemon.log");
     let daemon_log = std::fs::File::create(&daemon_log_path).unwrap();
+    let stderr_path = daemon_log_path.clone();
     let child = Command::new(bin)
         .args(["run", "--config"])
         .arg(&cfg_path)
@@ -1315,8 +1553,8 @@ bind = "{api_addr}"
         .stderr(daemon_log)
         .spawn()
         .expect("spawn nzbd");
-    let _child = KillOnDrop(child);
-    wait_healthy(&api_addr, Duration::from_secs(15));
+    let daemon = KillOnDrop::new(child, stderr_path);
+    wait_healthy(&daemon, &api_addr, Duration::from_secs(15));
 
     // 1. Version gate (Sonarr requires >= 12).
     let v = jsonrpc(&api_addr, serde_json::json!({"method": "version", "id": 1}));
