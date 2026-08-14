@@ -239,6 +239,54 @@ fn disk_guard_roots(cfg: &nzbd_config::Config) -> Vec<nzbd_engine::volumes::Disk
         .collect()
 }
 
+/// Map daemon queue settings onto the engine's runtime units and bounds.
+fn engine_tuning(cfg: &nzbd_config::Config) -> Tuning {
+    Tuning {
+        article_retries: cfg.queue.article_retries,
+        retry_interval: Duration::from_secs(cfg.queue.retry_interval_secs),
+        article_timeout: Duration::from_secs(cfg.queue.article_timeout_secs),
+        propagation_delay: Duration::from_secs(cfg.queue.propagation_delay_mins as u64 * 60),
+        min_free_disk_bytes: cfg.queue.min_free_disk_mb * 1024 * 1024,
+        daily_quota_bytes: cfg.queue.daily_quota_mb * 1024 * 1024,
+        monthly_quota_bytes: cfg.queue.monthly_quota_mb * 1024 * 1024,
+        quota_start_day: cfg.queue.quota_start_day.clamp(1, 28),
+        health_abort: nzbd_post::manager::FailureAction::parse(&cfg.post.failure_action)
+            != nzbd_post::manager::FailureAction::None,
+        ..Tuning::default()
+    }
+}
+
+/// Resolve and bound the daemon's cluster settings before any cluster task is
+/// started. Returning the shared path alongside the runtime config keeps every
+/// cluster subsystem on the same expanded volume root.
+fn cluster_runtime_config(
+    cfg: &nzbd_config::Config,
+) -> anyhow_lite::Result<(nzbd_cluster::ClusterConfig, PathBuf)> {
+    let c = &cfg.cluster;
+    let secret = c
+        .resolve_secret()
+        .map_err(|e| anyhow_lite::Error::msg(e.to_string()))?;
+    let shared_dir =
+        nzbd_config::expand_home(c.shared_dir.as_ref().expect("validated: shared_dir set"));
+    let runtime = nzbd_cluster::ClusterConfig {
+        node_name: c.node_name.clone(),
+        shared_dir: shared_dir.clone(),
+        advertise_url: c.advertise_url.clone(),
+        secret,
+        coordinator: c.coordinator,
+        priority: c.priority,
+        download: c.download,
+        max_download_jobs: c.max_download_jobs,
+        post_process: c.post_process,
+        pp_slots: c.pp_slots.max(1),
+        lease_interval: Duration::from_secs(c.lease_interval_secs.max(1)),
+        takeover_after: Duration::from_secs(c.takeover_after_secs.max(2)),
+        worker_ttl: Duration::from_secs(c.worker_ttl_secs.max(3)),
+        disk_guard_roots: disk_guard_roots(cfg),
+    };
+    Ok((runtime, shared_dir))
+}
+
 /// NZBGet-style option projection for the compat shim's `config` method
 /// (*arr clients read categories and paths from here).
 fn compat_options(cfg: &nzbd_config::Config, bind: &str) -> Vec<(String, String)> {
@@ -619,19 +667,7 @@ fn run(
         );
     }
 
-    let tuning = Tuning {
-        article_retries: cfg.queue.article_retries,
-        retry_interval: Duration::from_secs(cfg.queue.retry_interval_secs),
-        article_timeout: Duration::from_secs(cfg.queue.article_timeout_secs),
-        propagation_delay: Duration::from_secs(cfg.queue.propagation_delay_mins as u64 * 60),
-        min_free_disk_bytes: cfg.queue.min_free_disk_mb * 1024 * 1024,
-        daily_quota_bytes: cfg.queue.daily_quota_mb * 1024 * 1024,
-        monthly_quota_bytes: cfg.queue.monthly_quota_mb * 1024 * 1024,
-        quota_start_day: cfg.queue.quota_start_day.clamp(1, 28),
-        health_abort: nzbd_post::manager::FailureAction::parse(&cfg.post.failure_action)
-            != nzbd_post::manager::FailureAction::None,
-        ..Tuning::default()
-    };
+    let tuning = engine_tuning(&cfg);
 
     // Log the *resolved* directories before touching them: `~` expansion
     // and the `<main_dir>/queue` default mean the effective paths are not
@@ -893,11 +929,7 @@ async fn run_cluster(
     logbuf: Arc<nzbd_api::LogBuffer>,
 ) -> anyhow_lite::Result<()> {
     let c = &cfg.cluster;
-    let secret = c
-        .resolve_secret()
-        .map_err(|e| anyhow_lite::Error::msg(e.to_string()))?;
-    let shared_dir =
-        nzbd_config::expand_home(c.shared_dir.as_ref().expect("validated: shared_dir set"));
+    let (cluster_cfg, shared_dir) = cluster_runtime_config(&cfg)?;
     // Job data must be visible to every node: default dest to the shared
     // volume unless the operator pointed it there (or elsewhere) already.
     let dest_dir = cfg.dest_dir();
@@ -908,23 +940,6 @@ async fn run_cluster(
             "dest_dir is outside the shared volume; remote post-processing (phase C2) will not see the files"
         );
     }
-
-    let cluster_cfg = nzbd_cluster::ClusterConfig {
-        node_name: c.node_name.clone(),
-        shared_dir: shared_dir.clone(),
-        advertise_url: c.advertise_url.clone(),
-        secret,
-        coordinator: c.coordinator,
-        priority: c.priority,
-        download: c.download,
-        max_download_jobs: c.max_download_jobs,
-        post_process: c.post_process,
-        pp_slots: c.pp_slots.max(1),
-        lease_interval: Duration::from_secs(c.lease_interval_secs.max(1)),
-        takeover_after: Duration::from_secs(c.takeover_after_secs.max(2)),
-        worker_ttl: Duration::from_secs(c.worker_ttl_secs.max(3)),
-        disk_guard_roots: disk_guard_roots(&cfg),
-    };
 
     // Post-processing wiring (C2): PP runs wherever the leader's
     // anti-affinity scheduler assigns it — as a work lease on an idle node
@@ -1197,6 +1212,174 @@ mod tests {
         // Zero timeout is clamped to something sane rather than "instant".
         assert!(pc.tool_timeout >= Duration::from_secs(1));
         assert!(pc.scripts_dir.is_some());
+    }
+
+    #[test]
+    fn engine_tuning_preserves_units_and_safety_bounds() {
+        let mut cfg = cfg_with(
+            "[queue]\narticle_retries = 7\nretry_interval_secs = 11\n\
+             article_timeout_secs = 13\npropagation_delay_mins = 3\n\
+             min_free_disk_mb = 4\ndaily_quota_mb = 5\nmonthly_quota_mb = 6\n\
+             quota_start_day = 99\n\n[post]\nfailure_action = \"none\"\n",
+        );
+        let tuning = engine_tuning(&cfg);
+        assert_eq!(tuning.article_retries, 7);
+        assert_eq!(tuning.retry_interval, Duration::from_secs(11));
+        assert_eq!(tuning.article_timeout, Duration::from_secs(13));
+        assert_eq!(tuning.propagation_delay, Duration::from_secs(180));
+        assert_eq!(tuning.min_free_disk_bytes, 4 * 1024 * 1024);
+        assert_eq!(tuning.daily_quota_bytes, 5 * 1024 * 1024);
+        assert_eq!(tuning.monthly_quota_bytes, 6 * 1024 * 1024);
+        assert_eq!(tuning.quota_start_day, 28);
+        assert!(!tuning.health_abort);
+
+        cfg.queue.quota_start_day = 0;
+        cfg.post.failure_action = "park".into();
+        let bounded = engine_tuning(&cfg);
+        assert_eq!(bounded.quota_start_day, 1);
+        assert!(bounded.health_abort);
+    }
+
+    #[test]
+    fn cluster_runtime_config_resolves_secret_volume_and_liveness_bounds() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cfg = nzbd_config::Config::default();
+        cfg.paths.main_dir = tmp.path().join("downloads");
+        cfg.paths.dest_dir = tmp.path().join("shared/complete");
+        cfg.cluster.enabled = true;
+        cfg.cluster.node_name = "node-a".into();
+        cfg.cluster.shared_dir = Some(tmp.path().join("shared"));
+        cfg.cluster.advertise_url = "https://node-a.test:6789".into();
+        cfg.cluster.secret = Some("cluster-secret".into());
+        cfg.cluster.coordinator = false;
+        cfg.cluster.priority = 4;
+        cfg.cluster.download = false;
+        cfg.cluster.max_download_jobs = 6;
+        cfg.cluster.post_process = true;
+        cfg.cluster.pp_slots = 0;
+        cfg.cluster.lease_interval_secs = 0;
+        cfg.cluster.takeover_after_secs = 0;
+        cfg.cluster.worker_ttl_secs = 0;
+
+        let (runtime, shared_dir) = cluster_runtime_config(&cfg).unwrap();
+        assert_eq!(shared_dir, tmp.path().join("shared"));
+        assert_eq!(runtime.node_name, "node-a");
+        assert_eq!(runtime.shared_dir, shared_dir);
+        assert_eq!(runtime.advertise_url, "https://node-a.test:6789");
+        assert_eq!(runtime.secret, "cluster-secret");
+        assert!(!runtime.coordinator);
+        assert_eq!(runtime.priority, 4);
+        assert!(!runtime.download);
+        assert_eq!(runtime.max_download_jobs, 6);
+        assert!(runtime.post_process);
+        assert_eq!(runtime.pp_slots, 1);
+        assert_eq!(runtime.lease_interval, Duration::from_secs(1));
+        assert_eq!(runtime.takeover_after, Duration::from_secs(2));
+        assert_eq!(runtime.worker_ttl, Duration::from_secs(3));
+        assert!(
+            runtime
+                .disk_guard_roots
+                .iter()
+                .any(|root| root.path == cfg.paths.dest_dir),
+            "the cluster engine enforces every configured write root"
+        );
+
+        cfg.cluster.secret = None;
+        let err = match cluster_runtime_config(&cfg) {
+            Err(err) => err,
+            Ok(_) => panic!("cluster startup without a secret must fail closed"),
+        };
+        assert!(err.to_string().contains("requires secret"), "{err}");
+    }
+
+    #[test]
+    fn feeds_keep_ids_defaults_and_operator_options() {
+        let cfg = cfg_with(
+            "[[feed]]\nname = \"daily\"\nurl = \"https://indexer.test/daily\"\n\
+             interval_mins = 0\nfilter = \"Require: *1080p*\"\ncategory = \"tv\"\n\
+             priority = 25\npause = true\n\n\
+             [[feed]]\nname = \"manual\"\nurl = \"https://indexer.test/manual\"\n\
+             interval_mins = 30\n",
+        );
+        let feeds = feed_defs(&cfg);
+
+        assert_eq!(feeds.len(), 2);
+        assert_eq!(feeds[0].id, 1);
+        assert_eq!(feeds[0].name, "daily");
+        assert_eq!(feeds[0].url, "https://indexer.test/daily");
+        assert_eq!(feeds[0].interval, Duration::from_secs(60));
+        assert_eq!(feeds[0].filter, "Require: *1080p*");
+        assert_eq!(feeds[0].category.as_deref(), Some("tv"));
+        assert_eq!(feeds[0].priority, 25);
+        assert!(feeds[0].pause);
+        assert_eq!(feeds[1].id, 2);
+        assert_eq!(feeds[1].interval, Duration::from_secs(30 * 60));
+        assert!(!feeds[1].pause);
+    }
+
+    #[test]
+    fn recovered_config_restore_is_best_effort_and_exact() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("config/nzbd.toml");
+        assert!(restore_config_file(&target, "[api]\ndiscovery = false\n"));
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "[api]\ndiscovery = false\n"
+        );
+
+        let blocker = tmp.path().join("not-a-directory");
+        std::fs::write(&blocker, "file").unwrap();
+        assert!(!restore_config_file(
+            &blocker.join("config/nzbd.toml"),
+            "ignored"
+        ));
+
+        let directory_target = tmp.path().join("directory-target");
+        std::fs::create_dir(&directory_target).unwrap();
+        assert!(!restore_config_file(&directory_target, "ignored"));
+    }
+
+    #[test]
+    fn history_directory_failure_names_the_unusable_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let blocker = tmp.path().join("not-a-directory");
+        std::fs::write(&blocker, "file").unwrap();
+        let local = blocker.join("history-local");
+        let err = match open_history(
+            &local,
+            &tmp.path().join("history-jsonl"),
+            None,
+            nzbd_state::history::Retention::UNLIMITED,
+        ) {
+            Err(err) => err,
+            Ok(_) => panic!("a history directory below a regular file must fail"),
+        };
+        let message = err.to_string();
+        assert!(
+            message.contains("history db: create directory"),
+            "{message}"
+        );
+        assert!(message.contains(&local.display().to_string()), "{message}");
+    }
+
+    #[test]
+    fn directory_config_path_explains_the_docker_bind_mount_mistake() {
+        let tmp = tempfile::tempdir().unwrap();
+        let err = match run(
+            Some(tmp.path().to_path_buf()),
+            Some("127.0.0.1:0".into()),
+            nzbd_api::LogBuffer::new(1),
+        ) {
+            Err(err) => err,
+            Ok(_) => panic!("a directory cannot be parsed as nzbd.toml"),
+        };
+        let message = err.to_string();
+        assert!(message.contains("is a DIRECTORY, not a file"), "{message}");
+        assert!(message.contains("Docker bind mount"), "{message}");
+        assert!(
+            message.contains(&tmp.path().display().to_string()),
+            "{message}"
+        );
     }
 
     #[test]
