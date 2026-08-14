@@ -212,4 +212,61 @@ mod tests {
             .unwrap();
         assert_eq!(body, b"<nzb />");
     }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn relative_redirect_loops_and_http_failures_are_explicit() {
+        assert!(parse_url("http://example.test:99999/file.nzb").is_err());
+
+        // Alternate the two relative redirect spellings until the bounded
+        // redirect budget is exhausted. This is deterministic and proves the
+        // fetcher cannot spin forever on a hostile indexer.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let redirects = std::thread::spawn(move || {
+            for hop in 0..=MAX_REDIRECTS {
+                let (mut socket, _) = listener.accept().unwrap();
+                let mut request = [0u8; 2048];
+                let _ = socket.read(&mut request);
+                let location = if hop % 2 == 0 { "next" } else { "/start" };
+                let _ = socket.write_all(
+                    format!(
+                        "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    )
+                    .as_bytes(),
+                );
+            }
+        });
+        let error = http_get(&format!("http://127.0.0.1:{port}/start"))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, FetchError::TooManyRedirects));
+        redirects.join().unwrap();
+
+        for (response, expected) in [
+            (
+                "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                "status 404",
+            ),
+            (
+                "HTTP/1.1 302 Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                "redirect without Location",
+            ),
+        ] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let response = response.to_string();
+            let server = std::thread::spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                let mut request = [0u8; 2048];
+                let _ = socket.read(&mut request);
+                let _ = socket.write_all(response.as_bytes());
+            });
+            let error = http_get(&format!("http://127.0.0.1:{port}/file.nzb"))
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(expected), "unexpected error: {error}");
+            server.join().unwrap();
+        }
+    }
 }

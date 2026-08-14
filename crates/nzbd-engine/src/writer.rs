@@ -467,4 +467,141 @@ mod tests {
             vec![1, 2, 3, 4, 5, 6, 7, 8]
         );
     }
+
+    #[tokio::test]
+    async fn recovery_finalize_is_idempotent_when_final_file_already_exists() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("done.bin"), b"durable bytes").unwrap();
+        let tracker = TaskTracker::new();
+        let (engine_tx, mut engine_rx) = channel(4);
+        let writer = spawn_writer(
+            &tracker,
+            JobId(7),
+            FileId(8),
+            tmp.path().to_path_buf(),
+            "done.bin".into(),
+            engine_tx,
+        );
+
+        writer
+            .tx
+            .send(WriteCmd::Finalize {
+                file_size: 13,
+                combined_crc: Some(42),
+            })
+            .await
+            .unwrap();
+        match engine_rx.recv().await {
+            Some(EngineMsg::WriterFinalized {
+                ok,
+                final_path,
+                combined_crc,
+                ..
+            }) => {
+                assert!(ok);
+                assert_eq!(
+                    final_path.as_deref(),
+                    Some(tmp.path().join("done.bin").as_path())
+                );
+                assert_eq!(combined_crc, Some(42));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        assert_eq!(
+            std::fs::read(tmp.path().join("done.bin")).unwrap(),
+            b"durable bytes"
+        );
+    }
+
+    #[tokio::test]
+    async fn segment_write_errors_are_reported_and_closed_engine_stops_writer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let blocked_dir = tmp.path().join("not-a-directory");
+        std::fs::write(&blocked_dir, b"file").unwrap();
+        let tracker = TaskTracker::new();
+        let (engine_tx, mut engine_rx) = channel(4);
+        let writer = spawn_writer(
+            &tracker,
+            JobId(1),
+            FileId(2),
+            blocked_dir,
+            "x.bin".into(),
+            engine_tx,
+        );
+        writer
+            .tx
+            .send(WriteCmd::Segment {
+                seg_number: 3,
+                offset: 0,
+                data: vec![1, 2, 3],
+                crc: 4,
+                file_size: 3,
+                server: ServerId(5),
+            })
+            .await
+            .unwrap();
+        match engine_rx.recv().await {
+            Some(EngineMsg::WriterError { job, file, error }) => {
+                assert_eq!(job, JobId(1));
+                assert_eq!(file, FileId(2));
+                assert!(error.contains("x.bin.part"));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+
+        let tracker = TaskTracker::new();
+        let (engine_tx, engine_rx) = channel(1);
+        drop(engine_rx);
+        let writer = spawn_writer(
+            &tracker,
+            JobId(9),
+            FileId(10),
+            tmp.path().join("writable"),
+            "orphan.bin".into(),
+            engine_tx,
+        );
+        writer
+            .tx
+            .send(WriteCmd::Segment {
+                seg_number: 1,
+                offset: 0,
+                data: vec![9],
+                crc: 0,
+                file_size: 1,
+                server: ServerId(1),
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), writer.tx.closed())
+            .await
+            .expect("writer must stop when the engine receiver closes");
+    }
+
+    #[tokio::test]
+    async fn recovery_finalize_rejects_a_non_file_part_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("bad.bin.part")).unwrap();
+        let tracker = TaskTracker::new();
+        let (engine_tx, mut engine_rx) = channel(4);
+        let writer = spawn_writer(
+            &tracker,
+            JobId(1),
+            FileId(1),
+            tmp.path().to_path_buf(),
+            "bad.bin".into(),
+            engine_tx,
+        );
+        writer
+            .tx
+            .send(WriteCmd::Finalize {
+                file_size: 10,
+                combined_crc: None,
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            engine_rx.recv().await,
+            Some(EngineMsg::WriterFinalized { ok: false, .. })
+        ));
+    }
 }
