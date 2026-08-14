@@ -204,6 +204,38 @@ fn coverage_measurement_fails_closed_and_runs_the_whole_workspace() {
         "the instrumented suite must use --no-fail-fast so every workspace \
          test target contributes evidence before the job fails"
     );
+
+    let coverage_floors: Vec<_> = workflow
+        .lines()
+        .filter_map(|line| {
+            line.trim()
+                .strip_prefix("MINIMUM_LINE_COVERAGE:")
+                .map(str::trim)
+        })
+        .collect();
+    assert_eq!(
+        coverage_floors.len(),
+        1,
+        "the minimum line coverage must have one reviewable workflow constant"
+    );
+    let coverage_floor: f64 = coverage_floors[0]
+        .parse()
+        .expect("MINIMUM_LINE_COVERAGE must be a numeric percentage");
+    assert!(
+        coverage_floor > 0.0 && coverage_floor <= 100.0,
+        "MINIMUM_LINE_COVERAGE must be a percentage in (0, 100]"
+    );
+
+    let floor_step = workflow
+        .split_once("- name: enforce minimum line coverage")
+        .map(|(_, rest)| rest)
+        .and_then(|rest| rest.split_once("\n      - name:").map(|(step, _)| step))
+        .expect("find the minimum line-coverage gate");
+    assert!(
+        floor_step.contains("cargo llvm-cov report")
+            && floor_step.contains("--fail-under-lines \"$MINIMUM_LINE_COVERAGE\""),
+        "the coverage gate must pass the single workflow floor to cargo llvm-cov"
+    );
     assert!(
         workflow.contains("if-no-files-found: error"),
         "the coverage artifact must fail loudly when lcov.info is missing"

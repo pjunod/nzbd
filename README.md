@@ -145,7 +145,10 @@ engine e2e + multi-node cluster tests + the whole-daemon test, plus an
 MSRV 1.85 check), **Lint** (`cargo fmt --check`, `clippy -D warnings`),
 and **Coverage** (`cargo llvm-cov`, self-hosted badges). Coverage runs every
 workspace test target even after a failure, then fails the job before reports
-or badges can be published unless the whole instrumented suite passed.
+or badges can be published unless the whole instrumented suite passed. It also
+rejects line-coverage regressions below the single `MINIMUM_LINE_COVERAGE`
+constant in [`.github/workflows/coverage.yml`](.github/workflows/coverage.yml);
+raise that value only after a complete `main` run proves the new floor.
 
 The `Makefile` wraps the whole workflow — `make` (or `make help`) lists
 every target:

@@ -7,6 +7,8 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # Raise only after a complete main-branch run proves the new floor.
+  MINIMUM_LINE_COVERAGE: 87.4
   # External-tool tests (par2, 7z) self-skip on machines without the
   # binaries; in CI a missing tool must be a failure, never a skip.
   NZBD_REQUIRE_TOOLS: 1
@@ -40,6 +42,11 @@ jobs:
           echo "TESTS=$TESTS" >> "$GITHUB_ENV"
           echo "COVERAGE=$COVERAGE" >> "$GITHUB_ENV"
           echo "### Coverage: ${COVERAGE}% lines · ${TESTS} tests passed" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: enforce minimum line coverage
+        run: |
+          cargo llvm-cov report --summary-only \
+            --fail-under-lines "$MINIMUM_LINE_COVERAGE"
 
       - name: HTML report
         run: cargo llvm-cov report --html
