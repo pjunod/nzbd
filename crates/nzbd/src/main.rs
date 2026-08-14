@@ -1304,7 +1304,8 @@ mod tests {
         cfg.post.enabled = false;
         cfg.cluster.enabled = true;
         cfg.cluster.node_name = "node-a".into();
-        cfg.cluster.shared_dir = Some(blocker.join("shared"));
+        let shared_root = blocker.join("shared");
+        cfg.cluster.shared_dir = Some(shared_root.clone());
         cfg.cluster.advertise_url = "http://127.0.0.1:6789".into();
         cfg.cluster.secret = Some("cluster-secret".into());
         let tuning = engine_tuning(&cfg);
@@ -1313,16 +1314,32 @@ mod tests {
             .build()
             .unwrap();
 
-        let err = runtime
-            .block_on(run_cluster(
-                cfg,
-                Vec::new(),
-                tuning,
-                "127.0.0.1:0".into(),
-                nzbd_api::LogBuffer::new(1),
-            ))
+        let result = runtime
+            .block_on(async {
+                tokio::time::timeout(
+                    Duration::from_secs(2),
+                    run_cluster(
+                        cfg,
+                        Vec::new(),
+                        tuning,
+                        "127.0.0.1:0".into(),
+                        nzbd_api::LogBuffer::new(1),
+                    ),
+                )
+                .await
+            })
+            .expect("cluster startup must terminate instead of serving after the guard regresses");
+        let err = result
             .expect_err("cluster startup must fail when its shared root is below a regular file");
-        assert!(err.to_string().contains("io:"), "{err}");
+        let shared_root_error =
+            std::fs::create_dir_all(shared_root.join(".nzbd-cluster").join("nodes"))
+                .expect_err("the test's shared root must remain unusable");
+        assert_eq!(
+            err.to_string(),
+            format!("io: {shared_root_error}"),
+            "startup must stop on the configured shared root {}",
+            shared_root.display()
+        );
         assert!(
             blocker.is_file(),
             "startup must not replace the blocking file"
