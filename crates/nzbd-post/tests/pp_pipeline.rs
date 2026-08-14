@@ -991,19 +991,22 @@ async fn permanently_undeletable_failed_job_retires_after_durable_retry_bound() 
     engine.shutdown().await;
 
     let recovered = spawn_engine(tmp.path()).await;
-    assert!(recovered
-        .export_job(JobId(95))
-        .await
-        .unwrap()
-        .unwrap()
-        .params
-        .iter()
-        .any(|(key, value)| key == ATTEMPTS_PARAM && value == "1"));
+    // Exactly one attempt: the import's `JobFinished` event and the manager's
+    // startup scan both observe this row, but they are one retry occasion.
+    let durable = recovered.export_job(JobId(95)).await.unwrap().unwrap();
+    assert!(
+        durable
+            .params
+            .iter()
+            .any(|(key, value)| key == ATTEMPTS_PARAM && value == "1"),
+        "one occasion must spend one attempt (durable params: {:?})",
+        durable.params
+    );
     let cancel2 = CancellationToken::new();
     let tracker2 = TaskTracker::new();
     spawn_post_manager(
         recovered.clone(),
-        config,
+        config.clone(),
         hist.clone(),
         tmp.path().join("dest"),
         None,
@@ -1032,12 +1035,28 @@ async fn permanently_undeletable_failed_job_retires_after_durable_retry_bound() 
         );
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
-    recovered.emit(nzbd_engine::Event::JobFinished {
-        job: JobId(95),
-        name: "undeletable".into(),
-        status: JobStatus::Failed,
-        health: 0,
-    });
+    assert!(hist.list(10).unwrap().is_empty());
+    cancel2.cancel();
+    tracker2.close();
+    tracker2.wait().await;
+    recovered.shutdown().await;
+
+    // Third occasion — again a restart, so each attempt is a distinct one.
+    // (Un-restarted, the remaining attempts arrive on the next 30s rescans;
+    // driving them with extra `JobFinished` emits would model one occasion as
+    // several and is exactly the miscount this bound is meant to resist.)
+    let recovered = spawn_engine(tmp.path()).await;
+    let cancel3 = CancellationToken::new();
+    let tracker3 = TaskTracker::new();
+    spawn_post_manager(
+        recovered.clone(),
+        config,
+        hist.clone(),
+        tmp.path().join("dest"),
+        None,
+        cancel3.clone(),
+        &tracker3,
+    );
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {
@@ -1088,11 +1107,143 @@ async fn permanently_undeletable_failed_job_retires_after_durable_retry_bound() 
         .any(|(key, value)| key == ATTEMPTS_PARAM && value == "3"));
     assert_eq!(hist.list(10).unwrap().len(), 1);
 
-    cancel2.cancel();
-    tracker2.close();
-    tracker2.wait().await;
+    cancel3.cancel();
+    tracker3.close();
+    tracker3.wait().await;
     recovered.shutdown().await;
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// Regression (#107): the queue scan and a `JobFinished` event routinely
+/// observe the *same* still-retryable failed row — a retryable row carries no
+/// `*PP:done` stamp, so the overlap guard cannot collapse them. Counting both
+/// spends two of the three attempts in one instant, which contradicts
+/// ARCHITECTURE.md §9 ("immediately, then on the next two 30-second rescans",
+/// ~60s) and silently halves the operator's retry window.
+///
+/// Ordering here is forced, not slept on: job 95 is in the queue before the
+/// manager starts, so the startup scan is its first observation, and job 96 is
+/// imported *after* that scan so its own event is always a first observation.
+/// The manager awaits each `JobFinished` arm before receiving the next, so job
+/// 96's attempt landing proves job 95's duplicate event was already handled.
+#[cfg(unix)]
+#[tokio::test]
+async fn one_failed_row_seen_by_both_scan_and_event_spends_one_attempt() {
+    use std::os::unix::fs::PermissionsExt;
+
+    const ATTEMPTS_PARAM: &str = "*PP:failure-disposition-attempts";
+
+    let attempts = |engine: EngineHandle, job: u32| async move {
+        engine
+            .export_job(JobId(job))
+            .await
+            .unwrap()
+            .and_then(|job| {
+                job.params
+                    .into_iter()
+                    .find(|(key, _)| key == ATTEMPTS_PARAM)
+                    .map(|(_, value)| value)
+            })
+    };
+
+    let tmp = tempfile::tempdir().unwrap();
+    let undeletable = |name: &str| {
+        let dir = tmp.path().join("dest").join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("partial.bin"), b"known bad bytes").unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        dir
+    };
+    let dir_a = undeletable("seen-twice");
+    let dir_b = undeletable("barrier");
+
+    let config = PostConfig {
+        failure_action: FailureAction::Delete,
+        ..PostConfig::default()
+    };
+    let hist = history(tmp.path());
+    let engine = spawn_engine(tmp.path()).await;
+
+    // In the queue *before* the manager exists: the startup scan is this
+    // row's first observation, and no event was ever emitted for it.
+    let mut job = completed_job(
+        95,
+        "seen-twice",
+        vec![file_entry(1, "partial.bin", None, false)],
+    );
+    job.status = JobStatus::Failed;
+    engine.import_job(job, false, false).await.unwrap();
+
+    let cancel = CancellationToken::new();
+    let tracker = TaskTracker::new();
+    spawn_post_manager(
+        engine.clone(),
+        config,
+        hist.clone(),
+        tmp.path().join("dest"),
+        None,
+        cancel.clone(),
+        &tracker,
+    );
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while attempts(engine.clone(), 95).await.as_deref() != Some("1") {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the startup scan never made the first disposition attempt"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    // Imported after that scan, so job 96 is unobserved until its own event.
+    let mut barrier = completed_job(
+        96,
+        "barrier",
+        vec![file_entry(2, "partial.bin", None, false)],
+    );
+    barrier.status = JobStatus::Failed;
+    engine.import_job(barrier, false, false).await.unwrap();
+
+    // The duplicate observation of job 95, then the barrier.
+    engine.emit(nzbd_engine::Event::JobFinished {
+        job: JobId(95),
+        name: "seen-twice".into(),
+        status: JobStatus::Failed,
+        health: 0,
+    });
+    engine.emit(nzbd_engine::Event::JobFinished {
+        job: JobId(96),
+        name: "barrier".into(),
+        status: JobStatus::Failed,
+        health: 0,
+    });
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while attempts(engine.clone(), 96).await.as_deref() != Some("1") {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the barrier job's own first observation was dropped"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    assert_eq!(
+        attempts(engine.clone(), 95).await.as_deref(),
+        Some("1"),
+        "the scan and the event are one retry occasion, not two attempts"
+    );
+    assert!(
+        hist.list(10).unwrap().is_empty(),
+        "no row may retire while its budget is unspent"
+    );
+
+    cancel.cancel();
+    tracker.close();
+    tracker.wait().await;
+    engine.shutdown().await;
+    for dir in [dir_a, dir_b] {
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
 }
 
 /// Losing authority after a cross-filesystem park must not let the stale

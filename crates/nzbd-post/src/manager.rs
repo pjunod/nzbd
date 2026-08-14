@@ -358,13 +358,19 @@ async fn manager_task(
     let mut rescan = tokio::time::interval(RESCAN_INTERVAL);
     rescan.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
+    // When each job last spent a failed-file disposition attempt, so that one
+    // occasion spends one attempt — see `handle_failed_job`.
+    let mut last_disposition: HashMap<JobId, tokio::time::Instant> = HashMap::new();
+
     loop {
         tokio::select! {
             _ = cancel.cancelled() => break,
             _ = rescan.tick() => {
+                // Anything older than a full period can no longer suppress.
+                last_disposition.retain(|_, at| at.elapsed() < RESCAN_INTERVAL);
                 scan_queue(
                     &tracker, &engine, &cfg, &history, &dest_dir, &gate, &sem,
-                    &cancel, &finished_tx, &mut active,
+                    &cancel, &finished_tx, &mut active, &mut last_disposition,
                 ).await;
             }
             ev = rx.recv() => match ev {
@@ -393,6 +399,7 @@ async fn manager_task(
                     JobStatus::Failed if claim(&gate, job) => {
                         handle_failed_job(
                             &engine, &cfg, &history, &dest_dir, &gate, job, name, health,
+                            &mut last_disposition,
                         )
                         .await;
                     }
@@ -489,6 +496,7 @@ async fn handle_failed_job(
     job: JobId,
     name: String,
     health: u16,
+    last_disposition: &mut HashMap<JobId, tokio::time::Instant>,
 ) {
     // Below critical health: no PP; record history and stamp so the retire
     // sweep moves the job out. Cluster disk admission gates this whole
@@ -572,6 +580,35 @@ async fn handle_failed_job(
                             "failed-file disposition is waiting for disk admission");
                         return;
                     }
+
+                    // One attempt per job per rescan period. The queue scan and
+                    // a `JobFinished { Failed }` event routinely observe the
+                    // same still-retryable row — it carries no `*PP:done`
+                    // stamp for the overlap guard above to skip on — and
+                    // counting both spends two of the three attempts in one
+                    // instant, against the documented cadence (ARCHITECTURE.md
+                    // §9: "immediately, then on the next two 30-second
+                    // rescans", ~60s).
+                    //
+                    // Debounced on elapsed time rather than keyed to the tick:
+                    // the event arrives *before* the startup scan's tick, so
+                    // per-tick state would still let that scan spend a second
+                    // attempt, and a rescan firing a hair early must still
+                    // count as the next period. Half an interval separates the
+                    // two cases by three orders of magnitude — the overlap is
+                    // milliseconds, a real retry is 30 seconds.
+                    //
+                    // Only this counter is debounced, and only here: a
+                    // disposition that resolves, or a finalization retrying
+                    // after a failed commit, is a different path and stays
+                    // immediate.
+                    if last_disposition
+                        .get(&job)
+                        .is_some_and(|at| at.elapsed() < RESCAN_INTERVAL / 2)
+                    {
+                        return;
+                    }
+                    last_disposition.insert(job, tokio::time::Instant::now());
 
                     let Some(finalizing) = exported.as_mut() else {
                         return;
@@ -789,6 +826,7 @@ async fn scan_queue(
     cancel: &CancellationToken,
     finished: &tokio::sync::mpsc::UnboundedSender<JobId>,
     active: &mut HashMap<JobId, ActiveAttempt>,
+    last_disposition: &mut HashMap<JobId, tokio::time::Instant>,
 ) {
     let claim = |job: JobId| gate.as_ref().map(|f| f(job)).unwrap_or(true);
     for j in engine.snapshot().jobs.iter() {
@@ -815,6 +853,7 @@ async fn scan_queue(
                 j.id,
                 j.name.clone(),
                 j.health,
+                last_disposition,
             )
             .await;
             continue;
