@@ -8,6 +8,9 @@
 
 mod source_fetch;
 
+#[cfg(test)]
+mod m0_storage_full_probe;
+
 pub use source_fetch::{fetch_torrent_source, TorrentSourceFetchLimits};
 
 use librqbit::api::TorrentIdOrHash;
@@ -635,6 +638,33 @@ impl TorrentSession {
         self.inner.ratelimits.set_upload_bps(bytes_per_second);
     }
 
+    /// Start the crate-private M0 seeder with a multi-port range so rqbit can
+    /// bind the first available port itself. This removes the test-only
+    /// bind/drop/rebind race without weakening the production requirement for
+    /// one explicit non-zero listen port.
+    #[cfg(test)]
+    async fn start_with_listen_range_for_m0(
+        output_root: PathBuf,
+        listen_port_range: Range<u16>,
+    ) -> Result<Self, TorrentError> {
+        if listen_port_range.start == 0 || listen_port_range.start >= listen_port_range.end {
+            return Err(TorrentError::InvalidListenPortRange);
+        }
+        install_process_crypto_provider()?;
+        std::fs::create_dir_all(&output_root).map_err(engine_error)?;
+        let output_root = std::fs::canonicalize(output_root).map_err(engine_error)?;
+        let options = session_options(false, Some(listen_port_range), None);
+        let inner = Session::new_with_opts(output_root.clone(), options)
+            .await
+            .map_err(engine_error)?;
+        Ok(Self {
+            inner,
+            dht_enabled: false,
+            output_root,
+            proxy_enabled: false,
+        })
+    }
+
     pub async fn add_metainfo(
         &self,
         bytes: Vec<u8>,
@@ -644,6 +674,25 @@ impl TorrentSession {
         validate_metainfo_admission(&bytes, self.proxy_enabled, self.dht_enabled)?;
         validate_existing_filesystem_paths(&bytes, &self.output_root)?;
         self.add_validated_metainfo(bytes.into(), config).await
+    }
+
+    /// Admit validated metainfo through a caller-supplied storage factory for
+    /// the crate-private M0 fault-injection unit probe. This method is absent
+    /// from every non-test build.
+    #[cfg(test)]
+    async fn add_metainfo_with_storage_for_m0(
+        &self,
+        bytes: Vec<u8>,
+        mut config: TorrentAddConfig,
+        storage_factory: librqbit::storage::BoxStorageFactory,
+    ) -> Result<TorrentHandle, TorrentError> {
+        normalize_initial_peers(&mut config.initial_peers)?;
+        validate_metainfo_admission(&bytes, self.proxy_enabled, self.dht_enabled)?;
+        validate_existing_filesystem_paths(&bytes, &self.output_root)?;
+        let mut options = managed_add_options(config);
+        options.storage_factory = Some(storage_factory);
+        self.add_validated_metainfo_with_options(bytes.into(), options)
+            .await
     }
 
     pub async fn add_magnet(
@@ -689,7 +738,15 @@ impl TorrentSession {
         bytes: bytes::Bytes,
         config: TorrentAddConfig,
     ) -> Result<TorrentHandle, TorrentError> {
-        let options = managed_add_options(config);
+        self.add_validated_metainfo_with_options(bytes, managed_add_options(config))
+            .await
+    }
+
+    async fn add_validated_metainfo_with_options(
+        &self,
+        bytes: bytes::Bytes,
+        options: AddTorrentOptions,
+    ) -> Result<TorrentHandle, TorrentError> {
         let handle = self
             .inner
             // Keep rqbit's URL variant outside managed admission. Its stable

@@ -2065,6 +2065,39 @@ deadline on shared CI do not establish peak-memory exhaustion resistance,
 filesystem containment, production shutdown orchestration, or sustained
 fuzzing adequacy.
 
+An ignored crate-private local-swarm unit probe now injects `StorageFull` from
+`pwrite_all` after one successful 16 KiB piece write. Before admitting the
+faulted 256 KiB torrent, it requires a separate 64 MiB filesystem-backed
+control torrent to be live with nonzero incomplete progress. The target must
+then remain incomplete in `Error` with an independently bounded stats response
+while the already-active control remains live, completes, and leaves the
+fault state and write accounting unchanged. The seeder is capped at 8 MiB/s
+so the fault boundary cannot race the control's completion, and rqbit binds
+directly from a test-only multi-port range so no temporary-listener handoff is
+involved. The custom-storage and broad-listen helpers are absent from non-test
+builds; the normal adapter still forbids custom storage and accepts only one
+explicit non-zero listen port. This pins a write-time engine seam and current
+containment behavior, but deliberately does not call the §14 ENOSPC row green:
+initialization-time `ensure_file_length` failure remains unproved, rqbit transitions the affected
+torrent to `Error`, and M2 must latch nzbd's multi-root disk guard, stop new
+piece requests, expose the limiting root, and choose the documented
+pause/upload fallback. No daemon API or production torrent writer exists to
+prove those outcomes yet.
+
+The
+[hardened native run](https://github.com/pjunod/nzbd/actions/runs/31345445318)
+passed the behavioral probe and its fail-closed exact-test discovery guard on
+Linux x86_64 GNU, Linux x86_64 musl, Linux aarch64 musl, macOS aarch64, and
+Windows x86_64 on 2026-08-10 UTC. Each target injected the fault on write
+attempt two after one 16,384-byte write call returned successfully, returned
+the independently scheduled fault stats inside one second, kept the
+already-live control active and incomplete at the boundary, completed all
+67,108,864 control bytes under the deterministic seed cap, and reasserted
+unchanged fault state and write accounting afterward. The runner first proved
+that its discovery guard rejects a benchmark-classified non-test line and then
+required discovery and execution of exactly the one ignored proof test. This
+evidence does not broaden the proof beyond the limitations above.
+
 ### 15.8 M6 — cluster torrent leases (separate approval)
 
 **Work:** implement §12 only after single-node field data exists · lease kind ·
