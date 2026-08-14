@@ -9,7 +9,7 @@
 mod source_fetch;
 
 #[cfg(test)]
-mod m0_storage_full_probe;
+mod m0_storage_full_probe_tests;
 
 pub use source_fetch::{fetch_torrent_source, TorrentSourceFetchLimits};
 
