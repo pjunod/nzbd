@@ -150,17 +150,17 @@ code. The daemon does not depend on it. The boundary currently provides:
   download;
 - a second ignored, crate-private unit probe injects `ErrorKind::StorageFull`
   from `ensure_file_length` while adding a paused, peerless 256 KiB torrent.
-  The probe fails unless the current stable engine exhibits the unsafe behavior
-  being guarded: initialization returns success, the torrent reports `Paused`
-  with no stats error and zero progress, the requested file remains zero bytes,
-  and resume moves it to `Live` without putting the sizing failure into torrent
-  stats or retrying it before that observation. Stable rqbit emits a warning log
-  at the failure site, but that is not durable control-plane state. The probe
-  also requires exactly one 262,144-byte sizing request and zero piece writes.
-  This converts the previously unproved path into a deterministic fail-open
-  regression witness; it does not satisfy the M2 disk-full contract.
+  With maintained patch `0018`, the probe fails unless admission or
+  initialization exposes a bounded error retaining the file name, requested
+  length, and storage cause. If scheduling returns a handle before the failure,
+  stats must enter `Error`; `Paused` or `Live` is a failure. The requested file
+  must remain zero bytes after exactly one 262,144-byte sizing request and zero
+  piece writes. Reverting `0018` restores the historical `Paused`-then-`Live`
+  result and makes this proof fail. This closes the engine fail-open boundary;
+  it does not satisfy the M2 disk-full contract.
   The [2026-08-13 replacement run](https://github.com/pjunod/nzbd/actions/runs/31654021866)
-  reproduced this second proof on every native M0 target;
+  records the superseded fail-open behavior on every native M0 target; the
+  maintained-engine native rerun is pending;
 - explicit peer lifetimes: the dormant session pins stable 8.1.1's effective
   10-second connect and read/write timeouts and 120-second keepalive interval;
   per-add options inherit this reviewed session policy instead of introducing
@@ -734,20 +734,29 @@ This evidence remains deliberately narrow: it proves the injected write-time
 path and an already-active sibling's containment, not durable persistence of
 the accepted chunk.
 
-The follow-on initialization-time proof injects `StorageFull` into
+The historical initialization-time proof injected `StorageFull` into
 `ensure_file_length` for a paused, peerless 262,144-byte torrent. The
 [replacement storage-fault run](https://github.com/pjunod/nzbd/actions/runs/31654021866)
-passed both exact ignored proofs and the shared runner's discriminating
-discovery negative control on all five native targets on 2026-08-13 UTC.
+passed the two then-current ignored proofs and the shared runner's
+discriminating discovery negative control on all five native targets on
+2026-08-13 UTC.
 Every target observed exactly one 262,144-byte sizing request, a zero-byte
 filesystem object, zero piece writes, successful initialization into `Paused`,
 a subsequent transition to `Live`, no stats-visible error, and no sizing retry
 before that observation. Every target returned the stats response in 0 ms and
 completed the sizing witness in about one second. This is adverse evidence:
 stable rqbit emits a warning log but continues without durable control-plane
-fault state after the allocation failure. The M2 storage-full row therefore
-remains blocked. Neither injected path simulates every real-filesystem ENOSPC
-or allocation policy.
+fault state after the allocation failure.
+
+Maintained patch `0018` deliberately invalidates that adverse witness. The
+current exact ignored proof requires the same request and filesystem facts but
+also requires a bounded file/length/cause error during admission or
+initialization; an asynchronously returned handle must enter `Error` and may
+never report `Paused` or `Live`. The local maintained-engine probe passes; its
+native rerun is pending. The M2 storage-full row remains blocked because this
+engine result is not yet routed into daemon pause, API, recovery, or existing-
+upload policy. Neither injected path simulates every real-filesystem ENOSPC or
+allocation policy.
 
 The 2026-08-07 review remediation refreshed these measurements after adding
 `icu_casemap 2.1.1` and `icu_casemap_data 2.1.1` for Unicode simple case

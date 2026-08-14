@@ -1,4 +1,7 @@
-use super::{TorrentAddConfig, TorrentHandle, TorrentPhase, TorrentSession, TorrentStats};
+use super::{
+    TorrentAddConfig, TorrentError, TorrentHandle, TorrentPhase, TorrentSession, TorrentStats,
+    DISPLAY_SAFE_ERROR_MAX_BYTES,
+};
 use anyhow::Result;
 use librqbit::storage::filesystem::FilesystemStorageFactory;
 use librqbit::storage::{BoxStorageFactory, StorageFactory, StorageFactoryExt, TorrentStorage};
@@ -192,8 +195,8 @@ fn stats_with_deadline(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "native M0 storage sizing-fault control-plane probe; run explicitly"]
-async fn storage_full_during_file_sizing_does_not_reach_stats() -> Result<(), Box<dyn Error>> {
+#[ignore = "native M0 storage sizing-fault admission probe; run explicitly"]
+async fn storage_full_during_file_sizing_is_fail_closed() -> Result<(), Box<dyn Error>> {
     let sizing_payload = payload(FAULT_PAYLOAD_BYTES, 13);
     let sizing_metainfo = metainfo(&sizing_payload, SIZING_FILE_NAME);
     let download_root = tempfile::tempdir()?;
@@ -204,8 +207,10 @@ async fn storage_full_during_file_sizing_does_not_reach_stats() -> Result<(), Bo
     let ensure_length_attempts = Arc::new(AtomicUsize::new(0));
     let requested_length = Arc::new(AtomicUsize::new(0));
 
-    let sizing = downloader
-        .add_metainfo_with_storage_for_m0(
+    let admission_started = Instant::now();
+    let admission_result = tokio::time::timeout(
+        FAULT_DEADLINE,
+        downloader.add_metainfo_with_storage_for_m0(
             sizing_metainfo,
             TorrentAddConfig {
                 paused: true,
@@ -220,27 +225,66 @@ async fn storage_full_during_file_sizing_does_not_reach_stats() -> Result<(), Bo
                 requested_length: requested_length.clone(),
             }
             .boxed(),
-        )
-        .await?;
+        ),
+    )
+    .await
+    .map_err(|_| io::Error::other("sizing-fault admission exceeded 20 seconds"))?;
+    let admission_elapsed = admission_started.elapsed();
+    let (control_plane, stats_elapsed) = match admission_result {
+        Err(TorrentError::Engine(error_text)) => {
+            validate_sizing_error(&error_text)?;
+            ("admission_error", Duration::ZERO)
+        }
+        Err(error) => {
+            return Err(io::Error::other(format!(
+                "sizing fault returned the wrong adapter error: {error}"
+            ))
+            .into())
+        }
+        Ok(handle) => {
+            let initialization_error =
+                tokio::time::timeout(FAULT_DEADLINE, handle.wait_until_initialized())
+                    .await
+                    .map_err(|_| {
+                        io::Error::other("sizing-fault initialization exceeded 20 seconds")
+                    })?
+                    .expect_err("sizing fault must fail initialization");
+            let TorrentError::Engine(initialization_error) = initialization_error else {
+                return Err(io::Error::other(format!(
+                    "sizing fault returned the wrong initialization error: {initialization_error}"
+                ))
+                .into());
+            };
+            validate_sizing_error(&initialization_error)?;
 
-    tokio::time::timeout(FAULT_DEADLINE, sizing.wait_until_initialized())
-        .await
-        .map_err(|_| io::Error::other("sizing-fault initialization exceeded 20 seconds"))??;
-    let (paused_stats, stats_elapsed) = stats_with_deadline(&sizing, "sizing-fault torrent")?;
+            let (stats, stats_elapsed) = stats_with_deadline(&handle, "sizing-fault torrent")?;
+            let stats_error = stats.error.as_deref().ok_or_else(|| {
+                io::Error::other(format!(
+                    "sizing fault reached stats without an error: {stats:?}"
+                ))
+            })?;
+            validate_sizing_error(stats_error)?;
+            if stats.phase != TorrentPhase::Error || stats.finished || stats.progress_bytes != 0 {
+                return Err(io::Error::other(format!(
+                    "sizing fault did not remain in the error state: {stats:?}"
+                ))
+                .into());
+            }
+            ("torrent_error", stats_elapsed)
+        }
+    };
+
     let payload_path = download_root.path().join(SIZING_FILE_NAME);
     let observed_file_bytes = std::fs::metadata(&payload_path)?.len();
-    if paused_stats.phase != TorrentPhase::Paused
-        || paused_stats.finished
-        || paused_stats.progress_bytes != 0
-        || paused_stats.error.is_some()
-        || ensure_length_attempts.load(Ordering::SeqCst) != 1
+    let admitted_torrents = downloader.inner.with_torrents(|torrents| torrents.count());
+    if ensure_length_attempts.load(Ordering::SeqCst) != 1
         || requested_length.load(Ordering::SeqCst) != FAULT_PAYLOAD_BYTES
         || write_attempts.load(Ordering::SeqCst) != 0
         || successful_bytes.load(Ordering::SeqCst) != 0
         || observed_file_bytes != 0
     {
         return Err(io::Error::other(format!(
-            "stable rqbit sizing-fault behavior changed: stats={paused_stats:?}, ensure_length_attempts={}, requested_length={}, write_attempts={}, successful_bytes={}, observed_file_bytes={observed_file_bytes}",
+            "sizing fault did not fail closed: control_plane={control_plane}, admitted_torrents={admitted_torrents}, ensure_length_attempts={}, requested_length={}, write_attempts={}, successful_bytes={}, observed_file_bytes={observed_file_bytes}",
             ensure_length_attempts.load(Ordering::SeqCst),
             requested_length.load(Ordering::SeqCst),
             write_attempts.load(Ordering::SeqCst),
@@ -249,51 +293,32 @@ async fn storage_full_during_file_sizing_does_not_reach_stats() -> Result<(), Bo
         .into());
     }
 
-    downloader.resume(&sizing).await?;
-    let resumed_stats = tokio::time::timeout(FAULT_DEADLINE, async {
-        loop {
-            let (stats, _) = stats_with_deadline(&sizing, "resumed sizing-fault torrent")?;
-            if stats.phase == TorrentPhase::Live {
-                break Ok::<_, Box<dyn Error>>(stats);
-            }
-            if stats.phase == TorrentPhase::Error {
-                break Err(io::Error::other(format!(
-                    "sizing fault became visible only after resume: {stats:?}"
-                ))
-                .into());
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    })
-    .await
-    .map_err(|_| io::Error::other("sizing-fault torrent did not resume within 20 seconds"))??;
-    if resumed_stats.error.is_some()
-        || resumed_stats.progress_bytes != 0
-        || std::fs::metadata(&payload_path)?.len() != 0
-        || ensure_length_attempts.load(Ordering::SeqCst) != 1
-        || write_attempts.load(Ordering::SeqCst) != 0
-    {
-        return Err(io::Error::other(format!(
-            "resumed sizing-fault torrent did not preserve the stats-visible behavior: stats={resumed_stats:?}, ensure_length_attempts={}, write_attempts={}, observed_file_bytes={}",
-            ensure_length_attempts.load(Ordering::SeqCst),
-            write_attempts.load(Ordering::SeqCst),
-            std::fs::metadata(&payload_path)?.len()
-        ))
-        .into());
-    }
-
     stop_with_deadline(downloader, "sizing-fault downloader").await?;
     println!(
-        "bittorrent_storage_sizing_full injected_fault_kind=StorageFull ensure_length_attempts={} requested_bytes={} observed_file_bytes={} initialized_phase={:?} resumed_phase={:?} write_attempts={} stats_error_visible={} stats_ms={}",
+        "bittorrent_storage_sizing_full injected_fault_kind=StorageFull ensure_length_attempts={} requested_bytes={} observed_file_bytes={} control_plane={} admitted_torrents={} write_attempts={} admission_ms={} stats_ms={}",
         ensure_length_attempts.load(Ordering::SeqCst),
         requested_length.load(Ordering::SeqCst),
         observed_file_bytes,
-        paused_stats.phase,
-        resumed_stats.phase,
+        control_plane,
+        admitted_torrents,
         write_attempts.load(Ordering::SeqCst),
-        paused_stats.error.is_some() || resumed_stats.error.is_some(),
+        admission_elapsed.as_millis(),
         stats_elapsed.as_millis()
     );
+    Ok(())
+}
+
+fn validate_sizing_error(error: &str) -> Result<(), Box<dyn Error>> {
+    if error.len() > DISPLAY_SAFE_ERROR_MAX_BYTES
+        || !error.contains(SIZING_FILE_NAME)
+        || !error.contains(&FAULT_PAYLOAD_BYTES.to_string())
+        || !error.contains(INJECTED_SIZING_ERROR)
+    {
+        return Err(io::Error::other(format!(
+            "sizing fault lost its bounded file, length, or storage cause: {error}"
+        ))
+        .into());
+    }
     Ok(())
 }
 

@@ -111,7 +111,7 @@ port directly, avoiding speed-dependent and temporary-port handoff races.
 Stable rqbit reports that torrent as `Error`, not the proposed disk-paused
 state.
 
-The historical initialization-time proof injects `StorageFull` from
+The historical initialization-time proof injected `StorageFull` from
 `ensure_file_length`. Unmodified stable rqbit emits a warning log but does not
 put the failure into torrent stats: a zero-byte file reports successful paused
 initialization and moves to `Live` on resume without a stats error or retry
@@ -130,6 +130,9 @@ check. The current-main contribution variant also distinguishes typed checksum
 cancellation from real I/O failure so an overlapping pause cannot hide storage
 exhaustion. The maintained fix closes the engine fail-open boundary; it does
 not replace M2's required torrent fault-routing, pause, and recovery policy.
+The native harness now treats the historical `Paused`-then-`Live` result as a
+failure: admission or initialization must expose the bounded file, length, and
+storage cause, and any asynchronously returned handle must enter `Error`.
 
 **Reviewer acceptance:** supported deployment examples must exercise the
 actual bind mounts or volumes, case/normalization behavior, low-space guard,
@@ -204,7 +207,7 @@ relying on one local host:
 | Cross-platform filesystem behavior | [2026-08-08 probe run](https://github.com/pjunod/nzbd/actions/runs/31240896567) and [review correction](https://github.com/pjunod/nzbd/actions/runs/31264422471) |
 | Native adapter matrix and daemon isolation | [2026-08-09 M0 run](https://github.com/pjunod/nzbd/actions/runs/31331872561) |
 | Write-time storage-fault containment | [2026-08-10 hardened five-platform run](https://github.com/pjunod/nzbd/actions/runs/31345445318) |
-| Initialization-time storage-fault fail-open witness | [2026-08-13 replacement five-platform run](https://github.com/pjunod/nzbd/actions/runs/31654021866) |
+| Initialization-time storage-fault boundary | Historical fail-open witness: [2026-08-13 replacement five-platform run](https://github.com/pjunod/nzbd/actions/runs/31654021866); maintained fail-closed native rerun pending |
 
 These links are evidence snapshots, not evergreen approval. The reviewed
 commit must have its own green required checks.
