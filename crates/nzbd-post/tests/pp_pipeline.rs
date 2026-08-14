@@ -1186,7 +1186,14 @@ async fn one_failed_row_seen_by_both_scan_and_event_spends_one_attempt() {
         &tracker,
     );
 
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    // These two waits are pure liveness — they poll for a step to happen, and
+    // the bound only decides how long a genuinely stuck manager hangs before
+    // reporting. Neither carries any part of the claim under test, which is
+    // the *count* asserted below. 10s rather than this file's usual 5s
+    // because instrumentation widens exactly these windows (#107), and a
+    // deadline that fires early would redden the fail-closed Coverage gate
+    // without anything being wrong.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     while attempts(engine.clone(), 95).await.as_deref() != Some("1") {
         assert!(
             tokio::time::Instant::now() < deadline,
@@ -1218,7 +1225,7 @@ async fn one_failed_row_seen_by_both_scan_and_event_spends_one_attempt() {
         health: 0,
     });
 
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     while attempts(engine.clone(), 96).await.as_deref() != Some("1") {
         assert!(
             tokio::time::Instant::now() < deadline,
@@ -1293,11 +1300,32 @@ async fn failed_park_losing_admission_after_move_is_fenced_and_retried() {
     );
     job.status = JobStatus::Failed;
     engine.import_job(job, false, true).await.unwrap();
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    assert!(
-        gate_checks.load(Ordering::Acquire) >= 5,
-        "the fence closed only after durable history was written"
-    );
+    // Wait for the fence to be *reached* rather than assuming a fixed budget
+    // covers reaching it (#107). Getting there means a cross-filesystem park
+    // move plus a durable history write — real filesystem work — and a 200ms
+    // sleep asserted only that a loaded machine finishes both in time, which
+    // it does not: this failed 55 of 64 runs of an oversubscribed suite.
+    //
+    // The ordering claim is untouched, and it is what the assertions below
+    // still state. `handle_failed_job` consults the gate again *after*
+    // `record_seq_durable` and before the terminal stamp, so "history written
+    // and the fence closed" is precisely the window in which a stale
+    // finalizer would wrongly stamp — waiting for that state tests the fence
+    // at its decision point instead of hoping the clock lands inside it.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let checks = gate_checks.load(Ordering::Acquire);
+        let recorded = hist.list(10).unwrap().len();
+        if checks >= 5 && recorded == 1 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the park never reached the post-history fence \
+             (gate checks: {checks}, history rows: {recorded})"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
     assert!(!dir.exists(), "the move finished before authority changed");
     assert!(
         parked_root.join("held-failure/partial.bin").is_file(),
