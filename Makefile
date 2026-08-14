@@ -139,11 +139,11 @@ msrv: ## Type-check on the minimum supported Rust (1.85)
 
 .PHONY: coverage
 coverage: ## Line-coverage summary (needs cargo-llvm-cov; `make toolchain` installs it)
-	$(CARGO) llvm-cov --workspace --summary-only
+	$(CARGO) llvm-cov --workspace --no-fail-fast --summary-only
 
 .PHONY: coverage-html
 coverage-html: ## Full HTML coverage report under target/llvm-cov/html/
-	$(CARGO) llvm-cov --workspace --html
+	$(CARGO) llvm-cov --workspace --no-fail-fast --html
 	@echo "report: target/llvm-cov/html/index.html"
 
 .PHONY: fuzz-deps

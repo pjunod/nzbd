@@ -172,3 +172,55 @@ fn the_image_is_told_which_commit_it_is() {
         );
     }
 }
+
+/// Coverage is release evidence, so a partial or failing suite must never
+/// produce a green workflow or update the public badges.
+///
+/// Regression (2026-08-14): the instrumented command was piped through `tee`
+/// without `pipefail`, which discarded Cargo's failing exit status. It also
+/// stopped at the first failing target, then published partial measurements.
+/// Keep the CI and local entry points pinned to the same fail-closed contract.
+#[test]
+fn coverage_measurement_fails_closed_and_runs_the_whole_workspace() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let workflow = std::fs::read_to_string(root.join(".github/workflows/coverage.yml"))
+        .expect("read coverage workflow");
+    let makefile = std::fs::read_to_string(root.join("Makefile")).expect("read Makefile");
+
+    let instrumented_step = workflow
+        .split_once("- name: run instrumented test suite")
+        .map(|(_, rest)| rest)
+        .and_then(|rest| rest.split_once("\n      - name:").map(|(step, _)| step))
+        .expect("find the instrumented coverage step");
+    assert!(
+        instrumented_step.contains("set -euo pipefail"),
+        "the instrumented step pipes Cargo through tee, so it must enable \
+         pipefail or a failing suite reports success"
+    );
+    assert!(
+        instrumented_step
+            .lines()
+            .any(|line| line.contains("cargo llvm-cov --workspace --no-fail-fast")),
+        "the instrumented suite must use --no-fail-fast so every workspace \
+         test target contributes evidence before the job fails"
+    );
+    assert!(
+        workflow.contains("if-no-files-found: error"),
+        "the coverage artifact must fail loudly when lcov.info is missing"
+    );
+    assert!(
+        workflow.contains(
+            "if: success() && github.event_name == 'push' && github.ref == 'refs/heads/main'"
+        ),
+        "badge publication must be explicitly gated on the instrumented suite succeeding"
+    );
+
+    assert_eq!(
+        makefile
+            .matches("$(CARGO) llvm-cov --workspace --no-fail-fast")
+            .count(),
+        2,
+        "both make coverage and make coverage-html must run every workspace \
+         test target, matching CI"
+    );
+}
