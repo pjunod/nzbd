@@ -1,0 +1,170 @@
+diff --git a/crates/librqbit/src/torrent_state/initializing.rs b/crates/librqbit/src/torrent_state/initializing.rs
+index 264f6cb4b2c673ccb416aa0bba3f6e9530e2e6e9..0c0662172f79654b4e96c79a083d95af78607122 100644
+--- a/crates/librqbit/src/torrent_state/initializing.rs
++++ b/crates/librqbit/src/torrent_state/initializing.rs
+@@ -26,6 +26,39 @@ use crate::{
+ 
+ use super::{paused::TorrentStatePaused, ManagedTorrentShared, TorrentMetadata};
+ 
++fn ensure_selected_file_lengths(
++    files: &dyn crate::storage::TorrentStorage,
++    file_infos: &FileInfos,
++    only_files: Option<&[usize]>,
++) -> anyhow::Result<()> {
++    for (idx, file_info) in file_infos.iter().enumerate() {
++        if !only_files
++            .map(|selected| selected.contains(&idx))
++            .unwrap_or(true)
++            || file_info.attrs.padding
++        {
++            continue;
++        }
++
++        let started = Instant::now();
++        files
++            .ensure_file_length(idx, file_info.len)
++            .with_context(|| {
++                format!(
++                    "error setting length for file {:?} to {}",
++                    file_info.relative_filename, file_info.len
++                )
++            })?;
++        trace!(
++            "Set length for file {:?} to {} in {:?}",
++            file_info.relative_filename,
++            SF::new(file_info.len),
++            started.elapsed()
++        );
++    }
++    Ok(())
++}
++
+ pub struct TorrentStateInitializing {
+     pub(crate) files: FileStorage,
+     pub(crate) shared: Arc<ManagedTorrentShared>,
+@@ -238,35 +271,13 @@ impl TorrentStateInitializing {
+             SF::new(hns.selected_bytes)
+         );
+ 
+-        // Ensure file lenghts are correct, and reopen read-only.
++        // Ensure file lengths are correct, and reopen read-only.
+         self.shared.spawner.spawn_block_in_place(|| {
+-            for (idx, fi) in self.metadata.file_infos.iter().enumerate() {
+-                if self
+-                    .only_files
+-                    .as_ref()
+-                    .map(|v| v.contains(&idx))
+-                    .unwrap_or(true)
+-                {
+-                    let now = Instant::now();
+-                    if fi.attrs.padding {
+-                        continue;
+-                    }
+-                    if let Err(err) = self.files.ensure_file_length(idx, fi.len) {
+-                        warn!(
+-                            "Error setting length for file {:?} to {}: {:#?}",
+-                            fi.relative_filename, fi.len, err
+-                        );
+-                    } else {
+-                        trace!(
+-                            "Set length for file {:?} to {} in {:?}",
+-                            fi.relative_filename,
+-                            SF::new(fi.len),
+-                            now.elapsed()
+-                        );
+-                    }
+-                }
+-            }
+-            Ok::<_, anyhow::Error>(())
++            ensure_selected_file_lengths(
++                self.files.as_ref(),
++                &self.metadata.file_infos,
++                self.only_files.as_deref(),
++            )
+         })?;
+ 
+         let paused = TorrentStatePaused {
+@@ -279,3 +290,83 @@ impl TorrentStateInitializing {
+         Ok(paused)
+     }
+ }
++
++#[cfg(test)]
++mod tests {
++    use std::{
++        io,
++        path::Path,
++        sync::atomic::{AtomicUsize, Ordering},
++    };
++
++    use super::ensure_selected_file_lengths;
++    use crate::{
++        file_info::FileInfo, storage::TorrentStorage, ManagedTorrentShared, TorrentMetadata,
++    };
++
++    #[derive(Default)]
++    struct FailingLengthStorage {
++        attempts: AtomicUsize,
++    }
++
++    impl TorrentStorage for FailingLengthStorage {
++        fn init(
++            &mut self,
++            _shared: &ManagedTorrentShared,
++            _metadata: &TorrentMetadata,
++        ) -> anyhow::Result<()> {
++            Ok(())
++        }
++
++        fn pread_exact(
++            &self,
++            _file_id: usize,
++            _offset: u64,
++            _buf: &mut [u8],
++        ) -> anyhow::Result<()> {
++            unreachable!()
++        }
++
++        fn pwrite_all(&self, _file_id: usize, _offset: u64, _buf: &[u8]) -> anyhow::Result<()> {
++            unreachable!()
++        }
++
++        fn remove_file(&self, _file_id: usize, _filename: &Path) -> anyhow::Result<()> {
++            unreachable!()
++        }
++
++        fn remove_directory_if_empty(&self, _path: &Path) -> anyhow::Result<()> {
++            unreachable!()
++        }
++
++        fn ensure_file_length(&self, file_id: usize, length: u64) -> anyhow::Result<()> {
++            assert_eq!(file_id, 0);
++            assert_eq!(length, 262_144);
++            self.attempts.fetch_add(1, Ordering::SeqCst);
++            Err(io::Error::new(io::ErrorKind::StorageFull, "injected storage full").into())
++        }
++
++        fn take(&self) -> anyhow::Result<Box<dyn TorrentStorage>> {
++            unreachable!()
++        }
++    }
++
++    #[test]
++    fn file_sizing_error_stops_initialization() {
++        let storage = FailingLengthStorage::default();
++        let file_infos = vec![FileInfo {
++            relative_filename: "payload.bin".into(),
++            offset_in_torrent: 0,
++            piece_range: 0..16,
++            attrs: Default::default(),
++            len: 262_144,
++        }];
++
++        let error = ensure_selected_file_lengths(&storage, &file_infos, None).unwrap_err();
++        assert_eq!(storage.attempts.load(Ordering::SeqCst), 1);
++        let error = format!("{error:#}");
++        assert!(error.contains("payload.bin"), "{error}");
++        assert!(error.contains("262144"), "{error}");
++        assert!(error.contains("injected storage full"), "{error}");
++    }
++}

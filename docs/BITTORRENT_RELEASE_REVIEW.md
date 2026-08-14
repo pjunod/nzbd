@@ -122,6 +122,14 @@ a zero-byte file, zero piece writes, and no stats-visible error. Neither proof
 is a daemon API or enforcing multi-root guard, so they do not establish general
 or operator-visible ENOSPC behavior and do not authorize production wiring.
 
+The rqbit contribution kit includes independent stable and current-main
+candidates that propagate the first selected-file sizing error out of
+initialization, with exact unit proofs and mutation-sensitivity checks. The
+current-main candidate also distinguishes typed checksum cancellation from
+real I/O failure so an overlapping pause cannot hide storage exhaustion. That
+candidate is review evidence only: it has not been submitted, accepted, or
+released, and it does not replace nzbd's required daemon-owned disk policy.
+
 **Reviewer acceptance:** supported deployment examples must exercise the
 actual bind mounts or volumes, case/normalization behavior, low-space guard,
 symlink race boundary, import path, and restart authority. Until that matrix
