@@ -458,21 +458,23 @@ async fn malformed_sources_and_credentials_fail_before_any_socket() {
 }
 
 #[tokio::test]
-async fn an_unreachable_origin_reports_a_redacted_request_failure() {
-    let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
-        .await
-        .expect("bind loopback server");
-    let address = listener.local_addr().expect("loopback address");
-    drop(listener);
+async fn a_broken_transport_reports_a_redacted_request_failure() {
+    // The origin must fail for a transport reason that is not a timeout, so
+    // that the non-timeout arm of the send-error mapping is the one measured.
+    // The server accepts, reads the request, then closes without answering.
+    // Binding a port and dropping it instead would make the failure mode
+    // platform-dependent — Windows reported a different variant here.
+    let (address, server) = spawn_server(vec![ResponseSpec::immediate(Vec::new())]).await;
 
     let url = format!("http://alice:secret@{address}/secret/path?passkey=source-token");
     let error = fetch_torrent_source(&url, short_limits(), false)
         .await
-        .expect_err("closed port must fail");
-    assert!(matches!(
-        &error,
-        TorrentError::TorrentSourceRequestFailed { .. }
-    ));
+        .expect_err("a closed connection must fail");
+    assert!(
+        matches!(&error, TorrentError::TorrentSourceRequestFailed { .. }),
+        "a non-timeout transport failure must not be reported as another \
+         variant, got: {error:?}"
+    );
     let shown = error.to_string();
     assert_eq!(
         shown,
@@ -481,6 +483,11 @@ async fn an_unreachable_origin_reports_a_redacted_request_failure() {
     for secret in ["alice", "secret", "path", "passkey", "source-token"] {
         assert!(!shown.contains(secret), "leaked {secret:?}: {shown}");
     }
+
+    // The request really reached the wire, so this covers the send-error arm
+    // rather than one of the pre-flight rejections.
+    let requests = server.await.expect("server task");
+    assert_eq!(requests.len(), 1, "the request must have been sent");
 }
 
 #[tokio::test]
