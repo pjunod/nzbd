@@ -29,7 +29,7 @@ fn import_config_writes_the_conversion_and_reports_every_disposition() {
         "{stdout}"
     );
     assert!(
-        stdout.contains("mapped ") && stdout.contains("skipped 1"),
+        stdout.contains("mapped ") && stdout.contains("skipped 1 (recognized)"),
         "{stdout}"
     );
     assert!(stdout.contains("warning:"), "{stdout}");
