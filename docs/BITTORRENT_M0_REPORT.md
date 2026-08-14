@@ -126,11 +126,23 @@ code. The daemon does not depend on it. The boundary currently provides:
   non-test build; normal admission still forces `storage_factory: None` and
   requires one explicit non-zero listen port. This proves containment of an
   injected write-time fault and a future interception point, not general
-  ENOSPC behavior. In particular it does not exercise initialization-time
-  `ensure_file_length` failure, and that stable-engine path remains explicit
-  M2 work. There is no daemon disk-guard latch, API responsiveness proof,
-  new-request pause, or continued-upload proof, and stable rqbit currently
-  reports the affected torrent as an error rather than a paused download;
+  ENOSPC behavior. There is no daemon disk-guard latch, API responsiveness
+  proof, new-request pause, or continued-upload proof, and stable rqbit
+  currently reports the affected torrent as an error rather than a paused
+  download;
+- a second ignored, crate-private unit probe injects `ErrorKind::StorageFull`
+  from `ensure_file_length` while adding a paused, peerless 256 KiB torrent.
+  The probe fails unless the current stable engine exhibits the unsafe behavior
+  being guarded: initialization returns success, the torrent reports `Paused`
+  with no stats error and zero progress, the requested file remains zero bytes,
+  and resume moves it to `Live` without putting the sizing failure into torrent
+  stats or retrying it before that observation. Stable rqbit emits a warning log
+  at the failure site, but that is not durable control-plane state. The probe
+  also requires exactly one 262,144-byte sizing request and zero piece writes.
+  This converts the previously unproved path into a deterministic fail-open
+  regression witness; it does not satisfy the M2 disk-full contract.
+  The [2026-08-13 replacement run](https://github.com/pjunod/nzbd/actions/runs/31654021866)
+  reproduced this second proof on every native M0 target;
 - explicit peer lifetimes: the dormant session pins stable 8.1.1's effective
   10-second connect and read/write timeouts and 120-second keepalive interval;
   per-add options inherit this reviewed session policy instead of introducing
@@ -669,7 +681,22 @@ control demonstrated that the discovery guard rejects a non-matching line.
 
 This evidence remains deliberately narrow: it proves the injected write-time
 path and an already-active sibling's containment, not durable persistence of
-the accepted chunk or initialization-time `ensure_file_length` behavior.
+the accepted chunk.
+
+The follow-on initialization-time proof injects `StorageFull` into
+`ensure_file_length` for a paused, peerless 262,144-byte torrent. The
+[replacement storage-fault run](https://github.com/pjunod/nzbd/actions/runs/31654021866)
+passed both exact ignored proofs and the shared runner's discriminating
+discovery negative control on all five native targets on 2026-08-13 UTC.
+Every target observed exactly one 262,144-byte sizing request, a zero-byte
+filesystem object, zero piece writes, successful initialization into `Paused`,
+a subsequent transition to `Live`, no stats-visible error, and no sizing retry
+before that observation. Every target returned the stats response in 0 ms and
+completed the sizing witness in about one second. This is adverse evidence:
+stable rqbit emits a warning log but continues without durable control-plane
+fault state after the allocation failure. The M2 storage-full row therefore
+remains blocked. Neither injected path simulates every real-filesystem ENOSPC
+or allocation policy.
 
 The 2026-08-07 review remediation refreshed these measurements after adding
 `icu_casemap 2.1.1` and `icu_casemap_data 2.1.1` for Unicode simple case

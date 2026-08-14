@@ -16,6 +16,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 const FAULT_FILE_NAME: &str = "storage-full.bin";
+const SIZING_FILE_NAME: &str = "storage-sizing-full.bin";
 const CONTROL_FILE_NAME: &str = "storage-control.bin";
 const PIECE_LENGTH: usize = 16 * 1024;
 const FAULT_PAYLOAD_BYTES: usize = 256 * 1024;
@@ -27,12 +28,21 @@ const CONTROL_DEADLINE: Duration = Duration::from_secs(30);
 const SHUTDOWN_DEADLINE: Duration = Duration::from_secs(10);
 const STATS_DEADLINE: Duration = Duration::from_secs(1);
 const INJECTED_ERROR: &str = "injected M0 storage-full fault";
+const INJECTED_SIZING_ERROR: &str = "injected M0 storage sizing-full fault";
+
+#[derive(Clone, Copy)]
+enum FaultPoint {
+    WriteAfter { successful_writes: usize },
+    EnsureFileLength,
+}
 
 #[derive(Clone)]
 struct StorageFullFactory {
+    fault_point: FaultPoint,
     write_attempts: Arc<AtomicUsize>,
     successful_bytes: Arc<AtomicUsize>,
-    successful_writes: usize,
+    ensure_length_attempts: Arc<AtomicUsize>,
+    requested_length: Arc<AtomicUsize>,
 }
 
 impl StorageFactory for StorageFullFactory {
@@ -45,9 +55,11 @@ impl StorageFactory for StorageFullFactory {
     ) -> Result<Self::Storage> {
         Ok(StorageFullStorage {
             inner: Box::new(FilesystemStorageFactory::default().create(shared, metadata)?),
+            fault_point: self.fault_point,
             write_attempts: self.write_attempts.clone(),
             successful_bytes: self.successful_bytes.clone(),
-            successful_writes: self.successful_writes,
+            ensure_length_attempts: self.ensure_length_attempts.clone(),
+            requested_length: self.requested_length.clone(),
         })
     }
 
@@ -58,9 +70,11 @@ impl StorageFactory for StorageFullFactory {
 
 struct StorageFullStorage {
     inner: Box<dyn TorrentStorage>,
+    fault_point: FaultPoint,
     write_attempts: Arc<AtomicUsize>,
     successful_bytes: Arc<AtomicUsize>,
-    successful_writes: usize,
+    ensure_length_attempts: Arc<AtomicUsize>,
+    requested_length: Arc<AtomicUsize>,
 }
 
 impl TorrentStorage for StorageFullStorage {
@@ -74,7 +88,10 @@ impl TorrentStorage for StorageFullStorage {
 
     fn pwrite_all(&self, file_id: usize, offset: u64, buffer: &[u8]) -> Result<()> {
         let attempt = self.write_attempts.fetch_add(1, Ordering::SeqCst);
-        if attempt >= self.successful_writes {
+        if matches!(
+            self.fault_point,
+            FaultPoint::WriteAfter { successful_writes } if attempt >= successful_writes
+        ) {
             return Err(io::Error::new(io::ErrorKind::StorageFull, INJECTED_ERROR).into());
         }
         self.inner.pwrite_all(file_id, offset, buffer)?;
@@ -92,15 +109,23 @@ impl TorrentStorage for StorageFullStorage {
     }
 
     fn ensure_file_length(&self, file_id: usize, length: u64) -> Result<()> {
+        self.ensure_length_attempts.fetch_add(1, Ordering::SeqCst);
+        self.requested_length
+            .store(length.try_into()?, Ordering::SeqCst);
+        if matches!(self.fault_point, FaultPoint::EnsureFileLength) {
+            return Err(io::Error::new(io::ErrorKind::StorageFull, INJECTED_SIZING_ERROR).into());
+        }
         self.inner.ensure_file_length(file_id, length)
     }
 
     fn take(&self) -> Result<Box<dyn TorrentStorage>> {
         Ok(Box::new(Self {
             inner: self.inner.take()?,
+            fault_point: self.fault_point,
             write_attempts: self.write_attempts.clone(),
             successful_bytes: self.successful_bytes.clone(),
-            successful_writes: self.successful_writes,
+            ensure_length_attempts: self.ensure_length_attempts.clone(),
+            requested_length: self.requested_length.clone(),
         }))
     }
 }
@@ -164,6 +189,112 @@ fn stats_with_deadline(
         ))
     })?;
     Ok((stats, started.elapsed()))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "native M0 storage sizing-fault control-plane probe; run explicitly"]
+async fn storage_full_during_file_sizing_does_not_reach_stats() -> Result<(), Box<dyn Error>> {
+    let sizing_payload = payload(FAULT_PAYLOAD_BYTES, 13);
+    let sizing_metainfo = metainfo(&sizing_payload, SIZING_FILE_NAME);
+    let download_root = tempfile::tempdir()?;
+    let downloader =
+        TorrentSession::start(download_root.path().to_path_buf(), Default::default()).await?;
+    let write_attempts = Arc::new(AtomicUsize::new(0));
+    let successful_bytes = Arc::new(AtomicUsize::new(0));
+    let ensure_length_attempts = Arc::new(AtomicUsize::new(0));
+    let requested_length = Arc::new(AtomicUsize::new(0));
+
+    let sizing = downloader
+        .add_metainfo_with_storage_for_m0(
+            sizing_metainfo,
+            TorrentAddConfig {
+                paused: true,
+                overwrite: true,
+                ..Default::default()
+            },
+            StorageFullFactory {
+                fault_point: FaultPoint::EnsureFileLength,
+                write_attempts: write_attempts.clone(),
+                successful_bytes: successful_bytes.clone(),
+                ensure_length_attempts: ensure_length_attempts.clone(),
+                requested_length: requested_length.clone(),
+            }
+            .boxed(),
+        )
+        .await?;
+
+    tokio::time::timeout(FAULT_DEADLINE, sizing.wait_until_initialized())
+        .await
+        .map_err(|_| io::Error::other("sizing-fault initialization exceeded 20 seconds"))??;
+    let (paused_stats, stats_elapsed) = stats_with_deadline(&sizing, "sizing-fault torrent")?;
+    let payload_path = download_root.path().join(SIZING_FILE_NAME);
+    let observed_file_bytes = std::fs::metadata(&payload_path)?.len();
+    if paused_stats.phase != TorrentPhase::Paused
+        || paused_stats.finished
+        || paused_stats.progress_bytes != 0
+        || paused_stats.error.is_some()
+        || ensure_length_attempts.load(Ordering::SeqCst) != 1
+        || requested_length.load(Ordering::SeqCst) != FAULT_PAYLOAD_BYTES
+        || write_attempts.load(Ordering::SeqCst) != 0
+        || successful_bytes.load(Ordering::SeqCst) != 0
+        || observed_file_bytes != 0
+    {
+        return Err(io::Error::other(format!(
+            "stable rqbit sizing-fault behavior changed: stats={paused_stats:?}, ensure_length_attempts={}, requested_length={}, write_attempts={}, successful_bytes={}, observed_file_bytes={observed_file_bytes}",
+            ensure_length_attempts.load(Ordering::SeqCst),
+            requested_length.load(Ordering::SeqCst),
+            write_attempts.load(Ordering::SeqCst),
+            successful_bytes.load(Ordering::SeqCst)
+        ))
+        .into());
+    }
+
+    downloader.resume(&sizing).await?;
+    let resumed_stats = tokio::time::timeout(FAULT_DEADLINE, async {
+        loop {
+            let (stats, _) = stats_with_deadline(&sizing, "resumed sizing-fault torrent")?;
+            if stats.phase == TorrentPhase::Live {
+                break Ok::<_, Box<dyn Error>>(stats);
+            }
+            if stats.phase == TorrentPhase::Error {
+                break Err(io::Error::other(format!(
+                    "sizing fault became visible only after resume: {stats:?}"
+                ))
+                .into());
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .map_err(|_| io::Error::other("sizing-fault torrent did not resume within 20 seconds"))??;
+    if resumed_stats.error.is_some()
+        || resumed_stats.progress_bytes != 0
+        || std::fs::metadata(&payload_path)?.len() != 0
+        || ensure_length_attempts.load(Ordering::SeqCst) != 1
+        || write_attempts.load(Ordering::SeqCst) != 0
+    {
+        return Err(io::Error::other(format!(
+            "resumed sizing-fault torrent did not preserve the stats-visible behavior: stats={resumed_stats:?}, ensure_length_attempts={}, write_attempts={}, observed_file_bytes={}",
+            ensure_length_attempts.load(Ordering::SeqCst),
+            write_attempts.load(Ordering::SeqCst),
+            std::fs::metadata(&payload_path)?.len()
+        ))
+        .into());
+    }
+
+    stop_with_deadline(downloader, "sizing-fault downloader").await?;
+    println!(
+        "bittorrent_storage_sizing_full injected_fault_kind=StorageFull ensure_length_attempts={} requested_bytes={} observed_file_bytes={} initialized_phase={:?} resumed_phase={:?} write_attempts={} stats_error_visible={} stats_ms={}",
+        ensure_length_attempts.load(Ordering::SeqCst),
+        requested_length.load(Ordering::SeqCst),
+        observed_file_bytes,
+        paused_stats.phase,
+        resumed_stats.phase,
+        write_attempts.load(Ordering::SeqCst),
+        paused_stats.error.is_some() || resumed_stats.error.is_some(),
+        stats_elapsed.as_millis()
+    );
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -250,6 +381,8 @@ async fn storage_full_write_is_torrent_scoped() -> Result<(), Box<dyn Error>> {
 
     let write_attempts = Arc::new(AtomicUsize::new(0));
     let successful_bytes = Arc::new(AtomicUsize::new(0));
+    let ensure_length_attempts = Arc::new(AtomicUsize::new(0));
+    let requested_length = Arc::new(AtomicUsize::new(0));
     let fault = downloader
         .add_metainfo_with_storage_for_m0(
             fault_metainfo,
@@ -259,9 +392,13 @@ async fn storage_full_write_is_torrent_scoped() -> Result<(), Box<dyn Error>> {
                 ..Default::default()
             },
             StorageFullFactory {
+                fault_point: FaultPoint::WriteAfter {
+                    successful_writes: 1,
+                },
                 write_attempts: write_attempts.clone(),
                 successful_bytes: successful_bytes.clone(),
-                successful_writes: 1,
+                ensure_length_attempts: ensure_length_attempts.clone(),
+                requested_length: requested_length.clone(),
             }
             .boxed(),
         )

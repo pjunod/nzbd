@@ -2078,11 +2078,28 @@ involved. The custom-storage and broad-listen helpers are absent from non-test
 builds; the normal adapter still forbids custom storage and accepts only one
 explicit non-zero listen port. This pins a write-time engine seam and current
 containment behavior, but deliberately does not call the §14 ENOSPC row green:
-initialization-time `ensure_file_length` failure remains unproved, rqbit transitions the affected
-torrent to `Error`, and M2 must latch nzbd's multi-root disk guard, stop new
-piece requests, expose the limiting root, and choose the documented
-pause/upload fallback. No daemon API or production torrent writer exists to
-prove those outcomes yet.
+rqbit transitions the write-faulted torrent to `Error`, and M2 must latch
+nzbd's multi-root disk guard, stop new piece requests, expose the limiting root,
+and choose the documented pause/upload fallback. No daemon API or production
+torrent writer exists to prove those outcomes yet.
+
+A second ignored crate-private probe now covers the initialization-time path.
+It injects `StorageFull` from `ensure_file_length` while adding a paused,
+peerless 262,144-byte torrent and requires exactly one sizing request, zero
+piece writes, and a zero-byte filesystem object. Stable rqbit emits a warning
+log, returns successful initialization into `Paused` with no stats error, and
+then moves the torrent to `Live` on resume without retrying the failed sizing
+operation before that observation. The test intentionally passes only while
+that control-plane fail-open behavior remains visible; it is a release blocker
+and a regression witness, not successful ENOSPC handling. The shared runner
+must discover and execute exactly one instance of both ignored storage proofs.
+The
+[2026-08-13 replacement run](https://github.com/pjunod/nzbd/actions/runs/31654021866)
+passed both exact proofs and the runner's discriminating discovery negative
+control on Linux x86_64 GNU, Linux x86_64 musl, Linux aarch64 musl, macOS
+aarch64, and Windows x86_64. Every target observed the same sizing result:
+one 262,144-byte request, a zero-byte file, zero piece writes, `Paused` then
+`Live`, no stats-visible error, and no retry before observation.
 
 The
 [hardened native run](https://github.com/pjunod/nzbd/actions/runs/31345445318)
@@ -2095,8 +2112,9 @@ already-live control active and incomplete at the boundary, completed all
 67,108,864 control bytes under the deterministic seed cap, and reasserted
 unchanged fault state and write accounting afterward. The runner first proved
 that its discovery guard rejects a benchmark-classified non-test line and then
-required discovery and execution of exactly the one ignored proof test. This
-evidence does not broaden the proof beyond the limitations above.
+required discovery and execution of exactly the one ignored write-time proof
+test. This historical run predates the sizing-fault proof and does not broaden
+the proof beyond the limitations above.
 
 ### 15.8 M6 — cluster torrent leases (separate approval)
 

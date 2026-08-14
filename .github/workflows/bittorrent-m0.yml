@@ -101,7 +101,7 @@ jobs:
         run: >-
           cargo run --locked -p nzbd-torrent --release --features fuzzing
           --target ${{ matrix.target }} --example m0_metainfo_pressure_memory
-      - name: Inject a storage-full fault and prove session isolation
+      - name: Inject write and sizing storage-full faults
         shell: bash
         run: scripts/check-bittorrent-storage-full-probe.sh "${{ matrix.target }}"
       - name: Record host filesystem name behavior
@@ -144,6 +144,6 @@ jobs:
         run: >-
           cargo run --locked -p nzbd-torrent --release --features fuzzing
           --target ${{ matrix.target }} --example m0_metainfo_pressure_memory
-      - name: Inject a storage-full fault and prove session isolation
+      - name: Inject write and sizing storage-full faults
         shell: bash
         run: scripts/check-bittorrent-storage-full-probe.sh "${{ matrix.target }}"
