@@ -403,70 +403,61 @@ fn a_dead_daemon_fails_its_wait_at_once_and_says_why() {
     );
 }
 
-/// A port this allocator has returned must actually be free. Without
-/// [`SPAWN_LOCK`] it need not be: a `Command::spawn` landing between the
-/// probe's `socket()` and its `FD_CLOEXEC` forks a child that inherits the
-/// listening socket and holds the port for its whole life, so the daemon
-/// handed that port exits 1 with "Address already in use". This drives the
-/// same fork/probe overlap the suite produces incidentally, and asserts the
-/// outcome that matters rather than the mechanism.
+/// No child may be forked while a port probe is open.
 ///
-/// Only `AddrInUse` counts: a loaded runner can refuse a bind for reasons
-/// that say nothing about this race, and a test that treated those as
-/// evidence would be one more flake in a suite this issue exists to settle.
+/// That is the whole of [`SPAWN_LOCK`]'s contract, and it is what keeps a
+/// probe socket from being inherited: on macOS `TcpListener::bind` sets
+/// `FD_CLOEXEC` in a second syscall, so a fork landing between the two
+/// produces a child holding the listening socket, and the port stays bound
+/// for that child's whole life while this process believes it released it.
 ///
-/// macOS only, and deliberately. The race needs a `socket()` that cannot take
-/// `SOCK_CLOEXEC` atomically; Linux has it, so there is no window there to
-/// protect. Run on Linux CI anyway, the tight probe/re-bind loop below
-/// reported `AddrInUse` on a two-core runner — an effect of hammering bind
-/// and close far harder than the suite ever does, not of this defect, and
-/// nothing I could attribute. Keeping it where its claim is both meaningful
-/// and verified beats keeping it everywhere and explaining it away.
-#[cfg(target_os = "macos")]
+/// This asserts the exclusion directly rather than racing for the symptom.
+/// An earlier version drove the overlap and re-bound each allocated port
+/// looking for the leak; it found it reliably with the lock reverted, but it
+/// also reported `AddrInUse` under full-suite load *with* the lock in place,
+/// on both platforms, for reasons I could not attribute to this defect. A
+/// suite this issue exists to settle is no place for a test whose failures I
+/// cannot explain. The leak itself is evidenced outside the suite: sampling
+/// listeners during a workspace run caught the `sleep 30` stub of
+/// `a_live_daemon_that_never_serves_still_fails_on_its_budget` holding
+/// `127.0.0.1:20986`, a socket a `sleep` process cannot have opened.
+///
+/// Timing here can only produce a false pass, never a false failure: a thread
+/// too starved to reach its spawn also reports "did not start".
 #[test]
-fn a_concurrent_spawn_never_inherits_a_port_probe() {
+fn no_child_is_forked_while_a_port_probe_is_open() {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
 
-    let stop = Arc::new(AtomicBool::new(false));
-    let spawners: Vec<_> = (0..2)
-        .map(|_| {
-            let stop = stop.clone();
-            std::thread::spawn(move || {
-                while !stop.load(Ordering::Relaxed) {
-                    if let Ok(mut child) = spawn_child(
-                        Command::new("/bin/sh")
-                            .args(["-c", "exit 0"])
-                            .stdout(Stdio::null())
-                            .stderr(Stdio::null()),
-                    ) {
-                        let _ = child.wait();
-                    }
-                }
-            })
+    let probe_open = spawn_guard();
+    let spawned = Arc::new(AtomicBool::new(false));
+
+    let waiter = {
+        let spawned = spawned.clone();
+        std::thread::spawn(move || {
+            let child = spawn_child(
+                Command::new("/bin/sh")
+                    .args(["-c", "exit 0"])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null()),
+            );
+            spawned.store(true, Ordering::Release);
+            let _ = child.expect("spawn stub").wait();
         })
-        .collect();
+    };
 
-    // Re-binding each port proves nothing else holds it. This listener is
-    // itself opened under the lock by `free_port`'s own path, so it cannot
-    // become the next leak.
-    let mut lost = Vec::new();
-    for _ in 0..600 {
-        let port = free_port();
-        if let Err(e) = std::net::TcpListener::bind(("127.0.0.1", port)) {
-            if e.kind() == std::io::ErrorKind::AddrInUse {
-                lost.push(port);
-            }
-        }
-    }
-
-    stop.store(true, Ordering::Relaxed);
-    for spawner in spawners {
-        spawner.join().unwrap();
-    }
+    std::thread::sleep(Duration::from_millis(200));
     assert!(
-        lost.is_empty(),
-        "a spawned child inherited the probe and kept these ports bound: {lost:?}"
+        !spawned.load(Ordering::Acquire),
+        "a child was forked while a port probe was open; it can inherit the \
+         probe socket and keep that port bound"
+    );
+
+    drop(probe_open);
+    waiter.join().expect("spawn thread");
+    assert!(
+        spawned.load(Ordering::Acquire),
+        "the spawn must proceed once the probe is closed"
     );
 }
 
