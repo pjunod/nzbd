@@ -9,7 +9,7 @@ use nzbd_nserv::{build_post, prng_bytes, NservBuilder};
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Output, Stdio};
 use std::time::{Duration, Instant};
 
 fn http(addr: &str, method: &str, path: &str, body: &[u8]) -> (u16, String) {
@@ -130,10 +130,7 @@ fn free_port() -> u16 {
         // Binding proves it is free right now. The probe and its close both
         // happen under the lock, so no concurrent spawn can fork a child
         // holding this socket.
-        let taken = {
-            let _guard = spawn_guard();
-            std::net::TcpListener::bind(("127.0.0.1", port as u16)).is_ok()
-        };
+        let taken = bind_listener(("127.0.0.1", port as u16)).is_ok();
         if taken {
             return port as u16;
         }
@@ -144,12 +141,19 @@ fn free_port() -> u16 {
 /// Serializes opening a listening socket against forking a child.
 ///
 /// macOS has no `SOCK_CLOEXEC`, so `TcpListener::bind` creates the socket and
-/// only *then* sets `FD_CLOEXEC`. A `Command::spawn` on another test thread
-/// inside that window forks a child that inherits the listening socket, and
-/// `exec` no longer closes it — so the port stays bound for the child's whole
-/// life even though this process has closed its own copy. `free_port` then
-/// reports a port free that is not, and the daemon exits 1 with "Address
-/// already in use".
+/// only *then* sets `FD_CLOEXEC`. A child forked on another test thread
+/// inside that window inherits the listening socket, and `exec` no longer
+/// closes it — so the port stays bound for the child's whole life even though
+/// this process has closed its own copy. `free_port` then reports a port free
+/// that is not, and the daemon exits 1 with "Address already in use".
+///
+/// The invariant is only as good as its coverage, so it is stated in terms of
+/// what actually forks rather than which API was called: `Command::output`
+/// and `Command::status` fork exactly as `spawn` does, and a call site using
+/// either of them bypassed this lock just as completely. Every listener goes
+/// through [`bind_listener`] and every child through [`spawn_child`],
+/// [`child_output`], or [`child_status`]; nothing in this file may call
+/// `TcpListener::bind`, `spawn`, `output`, or `status` directly.
 ///
 /// That is not a theory about this file: sampling listeners during a
 /// workspace run caught the `sleep 30` stub of
@@ -163,10 +167,41 @@ fn spawn_guard() -> std::sync::MutexGuard<'static, ()> {
     SPAWN_LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// The only place this file opens a listening socket, so the guard covers
+/// every one of them rather than just `free_port`'s probe.
+///
+/// Only *creation* needs the lock. Once `FD_CLOEXEC` is set, a child forked
+/// afterwards drops the fd at `exec`, so closing the listener outside the
+/// guard cannot leak the port.
+fn bind_listener<A: std::net::ToSocketAddrs>(addr: A) -> std::io::Result<std::net::TcpListener> {
+    let _guard = spawn_guard();
+    std::net::TcpListener::bind(addr)
+}
+
 /// `Command::spawn`, serialized against every listener this file opens.
 fn spawn_child(cmd: &mut Command) -> std::io::Result<Child> {
     let _guard = spawn_guard();
     cmd.spawn()
+}
+
+/// `Command::output`, forked under the guard like every other child here.
+///
+/// The waiting is deliberately left outside the lock: `Command::output`
+/// forks *and* waits, and holding the guard for a whole CLI invocation would
+/// stall an unrelated thread's port probe for seconds. Only the fork races
+/// with a socket being created, so only the fork is serialized.
+fn child_output(cmd: &mut Command) -> std::io::Result<Output> {
+    let child = spawn_child(
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped()),
+    )?;
+    child.wait_with_output()
+}
+
+/// `Command::status`, forked under the guard and waited on without it.
+fn child_status(cmd: &mut Command) -> std::io::Result<ExitStatus> {
+    spawn_child(cmd)?.wait()
 }
 
 /// The daemon under test. Terminates it gracefully (SIGTERM) on drop so it
@@ -230,9 +265,7 @@ impl Drop for KillOnDrop {
         }
         #[cfg(unix)]
         {
-            let _ = Command::new("kill")
-                .args(["-TERM", &child.id().to_string()])
-                .status();
+            let _ = child_status(Command::new("kill").args(["-TERM", &child.id().to_string()]));
             for _ in 0..50 {
                 if matches!(child.try_wait(), Ok(Some(_))) {
                     return;
@@ -424,41 +457,74 @@ fn a_dead_daemon_fails_its_wait_at_once_and_says_why() {
 ///
 /// Timing here can only produce a false pass, never a false failure: a thread
 /// too starved to reach its spawn also reports "did not start".
+///
+/// Every launch variant is covered, not just `spawn_child`. `Command::output`
+/// and `Command::status` fork exactly like `spawn` does, so a call site
+/// reaching the fork through either of them bypassed the guard just as
+/// completely — and the port it leaked was as bound as any other.
 #[test]
 fn no_child_is_forked_while_a_port_probe_is_open() {
+    let stub = || {
+        let mut cmd = Command::new("/bin/sh");
+        cmd.args(["-c", "exit 0"]);
+        cmd
+    };
+
+    assert_serialized_by_the_lock("a child spawned with `spawn`", move || {
+        let child = spawn_child(stub().stdout(Stdio::null()).stderr(Stdio::null()));
+        let _ = child.expect("spawn stub").wait();
+    });
+    assert_serialized_by_the_lock("a child run with `output`", move || {
+        child_output(&mut stub()).expect("run stub");
+    });
+    assert_serialized_by_the_lock("a child run with `status`", move || {
+        child_status(stub().stdout(Stdio::null()).stderr(Stdio::null())).expect("run stub");
+    });
+}
+
+/// The other half of the same invariant. A listener opened outside the guard
+/// races the fork in the opposite direction — the socket is the thing caught
+/// mid-creation — so `free_port`'s probe being the only guarded bind left
+/// every other listener in this file able to leak into a concurrent child.
+#[test]
+fn no_listener_is_opened_while_a_child_is_being_forked() {
+    assert_serialized_by_the_lock("a listener", || {
+        drop(bind_listener("127.0.0.1:0").expect("bind listener"));
+    });
+}
+
+/// Runs `op` on another thread while the fork/bind window is held open, and
+/// asserts it does not get through: that is the whole of [`SPAWN_LOCK`]'s
+/// contract, asserted directly instead of racing for the symptom.
+fn assert_serialized_by_the_lock(what: &str, op: impl FnOnce() + Send + 'static) {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
 
-    let probe_open = spawn_guard();
-    let spawned = Arc::new(AtomicBool::new(false));
+    let window_open = spawn_guard();
+    let done = Arc::new(AtomicBool::new(false));
 
     let waiter = {
-        let spawned = spawned.clone();
+        let done = done.clone();
         std::thread::spawn(move || {
-            let child = spawn_child(
-                Command::new("/bin/sh")
-                    .args(["-c", "exit 0"])
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null()),
-            );
-            spawned.store(true, Ordering::Release);
-            let _ = child.expect("spawn stub").wait();
+            op();
+            done.store(true, Ordering::Release);
         })
     };
 
     std::thread::sleep(Duration::from_millis(200));
     assert!(
-        !spawned.load(Ordering::Acquire),
-        "a child was forked while a port probe was open; it can inherit the \
-         probe socket and keep that port bound"
+        !done.load(Ordering::Acquire),
+        "{what} got through while a port probe was open; a child forked there \
+         can inherit the probe socket and keep that port bound, and a listener \
+         opened there can be inherited by a child forking beside it"
     );
 
-    drop(probe_open);
-    waiter.join().expect("spawn thread");
-    assert!(
-        spawned.load(Ordering::Acquire),
-        "the spawn must proceed once the probe is closed"
-    );
+    // Joining is the positive half: it returns only once `op` has run to
+    // completion, and reports a panic inside it as a failure here.
+    drop(window_open);
+    waiter
+        .join()
+        .unwrap_or_else(|_| panic!("{what} must proceed once the probe is closed"));
 }
 
 /// The liveness assertion still holds: a daemon that is alive but never
@@ -488,7 +554,7 @@ fn a_live_daemon_that_never_serves_still_fails_on_its_budget() {
 /// budget and the timeout then blamed the daemon.
 #[test]
 fn a_probe_against_a_silent_listener_is_bounded() {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let listener = bind_listener("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap().to_string();
     std::thread::spawn(move || {
         // Accept and hold: never write a response.
@@ -540,7 +606,7 @@ fn allocated_ports_are_outside_the_ephemeral_range() {
 /// *between* attempts — never gets to run.
 #[test]
 fn a_probe_against_a_trickling_listener_is_bounded() {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let listener = bind_listener("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap().to_string();
     std::thread::spawn(move || {
         for mut stream in listener.incoming().take(4).filter_map(Result::ok) {
@@ -1486,12 +1552,13 @@ bind = "{api_addr}"
         .unwrap_or_else(|cause| panic!("{cause}"));
 
     // `nzbd add` via the real CLI.
-    let out = Command::new(bin)
-        .args(["add"])
-        .arg(&nzb_path)
-        .args(["--url", &api_addr])
-        .output()
-        .expect("run nzbd add");
+    let out = child_output(
+        Command::new(bin)
+            .args(["add"])
+            .arg(&nzb_path)
+            .args(["--url", &api_addr]),
+    )
+    .expect("run nzbd add");
     assert!(
         out.status.success(),
         "add failed: {}",
@@ -1520,10 +1587,7 @@ bind = "{api_addr}"
             break;
         }
         // `nzbd status` keeps answering while we wait (CLI liveness check).
-        let out = Command::new(bin)
-            .args(["status", "--url", &api_addr])
-            .output()
-            .unwrap();
+        let out = child_output(Command::new(bin).args(["status", "--url", &api_addr])).unwrap();
         assert!(out.status.success());
         std::thread::sleep(Duration::from_millis(200));
     }
@@ -1925,13 +1989,14 @@ fn unwritable_state_dir_names_the_path_at_startup() {
     )
     .unwrap();
 
-    let out = Command::new(env!("CARGO_BIN_EXE_nzbd"))
-        .args(["run", "--config"])
-        .arg(&cfg_path)
-        .args(["--bind", &format!("127.0.0.1:{}", free_port())])
-        .env("RUST_LOG", "info")
-        .output()
-        .expect("spawn nzbd");
+    let out = child_output(
+        Command::new(env!("CARGO_BIN_EXE_nzbd"))
+            .args(["run", "--config"])
+            .arg(&cfg_path)
+            .args(["--bind", &format!("127.0.0.1:{}", free_port())])
+            .env("RUST_LOG", "info"),
+    )
+    .expect("spawn nzbd");
 
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
@@ -1985,12 +2050,13 @@ fn permission_denied_state_dir_suggests_the_fix() {
     )
     .unwrap();
 
-    let out = Command::new(env!("CARGO_BIN_EXE_nzbd"))
-        .args(["run", "--config"])
-        .arg(&cfg_path)
-        .args(["--bind", &format!("127.0.0.1:{}", free_port())])
-        .output()
-        .expect("spawn nzbd");
+    let out = child_output(
+        Command::new(env!("CARGO_BIN_EXE_nzbd"))
+            .args(["run", "--config"])
+            .arg(&cfg_path)
+            .args(["--bind", &format!("127.0.0.1:{}", free_port())]),
+    )
+    .expect("spawn nzbd");
 
     // Restore before asserting so tempdir cleanup always succeeds.
     std::fs::set_permissions(&queue_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
