@@ -88,12 +88,85 @@ fn http_settled(addr: &str, method: &str, path: &str, deadline: Duration) -> (u1
     }
 }
 
+/// Ports at or above this belong to the kernel's ephemeral pool — the range
+/// it hands out for `bind(":0")`. Linux starts at 32768, macOS at 49152.
+const EPHEMERAL_FIRST: u16 = 32_768;
+
+/// A port the daemon can still bind a moment from now.
+///
+/// `bind(":0")` and dropping the listener returns the number to the ephemeral
+/// pool, so any other `bind(":0")` on the machine — including the ~30 other
+/// test binaries a workspace run has in flight — can be handed it before the
+/// daemon reaches its own bind. The daemon then exits 1 with "Address already
+/// in use", which is what a full-suite run actually produced here (#107):
+/// the startup flake this branch chased is a port collision, not a slow
+/// start. Ports below the ephemeral range cannot be handed out that way, so
+/// the only remaining competitor is another caller of this function: a
+/// monotonic cursor separates calls within a process and a per-process start
+/// separates concurrent test binaries.
+///
+/// The probe itself is taken under [`SPAWN_LOCK`], because an inherited probe
+/// socket keeps a port bound long after this process has closed it.
 fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    const FIRST: u32 = 20_000;
+    const SPAN: u32 = 12_000; // 20000..32000, clear of both ephemeral ranges
+    static CURSOR: AtomicU32 = AtomicU32::new(0);
+    static START: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+
+    let start = *START.get_or_init(|| {
+        let pid = u64::from(std::process::id());
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| u64::from(d.subsec_nanos()))
+            .unwrap_or(0);
+        (pid.wrapping_mul(2_654_435_761).wrapping_add(nanos) % u64::from(SPAN)) as u32
+    });
+
+    for _ in 0..SPAN {
+        let n = CURSOR.fetch_add(1, Ordering::Relaxed);
+        let port = FIRST + (start.wrapping_add(n) % SPAN);
+        // Binding proves it is free right now. The probe and its close both
+        // happen under the lock, so no concurrent spawn can fork a child
+        // holding this socket.
+        let taken = {
+            let _guard = spawn_guard();
+            std::net::TcpListener::bind(("127.0.0.1", port as u16)).is_ok()
+        };
+        if taken {
+            return port as u16;
+        }
+    }
+    panic!("no free port below the ephemeral range");
+}
+
+/// Serializes opening a listening socket against forking a child.
+///
+/// macOS has no `SOCK_CLOEXEC`, so `TcpListener::bind` creates the socket and
+/// only *then* sets `FD_CLOEXEC`. A `Command::spawn` on another test thread
+/// inside that window forks a child that inherits the listening socket, and
+/// `exec` no longer closes it — so the port stays bound for the child's whole
+/// life even though this process has closed its own copy. `free_port` then
+/// reports a port free that is not, and the daemon exits 1 with "Address
+/// already in use".
+///
+/// That is not a theory about this file: sampling listeners during a
+/// workspace run caught the `sleep 30` stub of
+/// `a_live_daemon_that_never_serves_still_fails_on_its_budget` holding
+/// `127.0.0.1:20986`, a socket a `sleep` process cannot possibly have opened.
+/// It is also why plain port churn never reproduced these failures — the race
+/// needs a concurrent fork, not a busy allocator.
+static SPAWN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn spawn_guard() -> std::sync::MutexGuard<'static, ()> {
+    SPAWN_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// `Command::spawn`, serialized against every listener this file opens.
+fn spawn_child(cmd: &mut Command) -> std::io::Result<Child> {
+    let _guard = spawn_guard();
+    cmd.spawn()
 }
 
 /// The daemon under test. Terminates it gracefully (SIGTERM) on drop so it
@@ -284,12 +357,13 @@ fn request(
 /// A stub daemon: a process the test controls, plus its stderr log.
 fn stub_daemon(dir: &Path, script: &str) -> KillOnDrop {
     let (stderr, stderr_path) = daemon_stderr(dir);
-    let child = Command::new("/bin/sh")
-        .args(["-c", script])
-        .stdout(Stdio::null())
-        .stderr(stderr)
-        .spawn()
-        .expect("spawn stub");
+    let child = spawn_child(
+        Command::new("/bin/sh")
+            .args(["-c", script])
+            .stdout(Stdio::null())
+            .stderr(stderr),
+    )
+    .expect("spawn stub");
     KillOnDrop::new(child, stderr_path)
 }
 
@@ -326,6 +400,58 @@ fn a_dead_daemon_fails_its_wait_at_once_and_says_why() {
     assert!(
         message.contains("exit status: 1"),
         "and its status: {message}"
+    );
+}
+
+/// A port this allocator has returned must actually be free. Without
+/// [`SPAWN_LOCK`] it need not be: a `Command::spawn` landing between the
+/// probe's `socket()` and its `FD_CLOEXEC` forks a child that inherits the
+/// listening socket and holds the port for its whole life, so the daemon
+/// handed that port exits 1 with "Address already in use". This drives the
+/// same fork/probe overlap the suite produces incidentally, and asserts the
+/// outcome that matters rather than the mechanism.
+#[test]
+fn a_concurrent_spawn_never_inherits_a_port_probe() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let spawners: Vec<_> = (0..4)
+        .map(|_| {
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    if let Ok(mut child) = spawn_child(
+                        Command::new("/bin/sh")
+                            .args(["-c", "exit 0"])
+                            .stdout(Stdio::null())
+                            .stderr(Stdio::null()),
+                    ) {
+                        let _ = child.wait();
+                    }
+                }
+            })
+        })
+        .collect();
+
+    // Re-binding each port proves nothing else holds it. This listener is
+    // itself opened under the lock by `free_port`'s own path, so it cannot
+    // become the next leak.
+    let mut lost = Vec::new();
+    for _ in 0..600 {
+        let port = free_port();
+        if std::net::TcpListener::bind(("127.0.0.1", port)).is_err() {
+            lost.push(port);
+        }
+    }
+
+    stop.store(true, Ordering::Relaxed);
+    for spawner in spawners {
+        spawner.join().unwrap();
+    }
+    assert!(
+        lost.is_empty(),
+        "a spawned child inherited the probe and kept these ports bound: {lost:?}"
     );
 }
 
@@ -376,6 +502,28 @@ fn a_probe_against_a_silent_listener_is_bounded() {
         "one probe must stay near its bound, took {:?}",
         start.elapsed()
     );
+}
+
+/// The daemon binds its port a moment after `free_port` chose it, so the
+/// number has to come from outside the range the kernel hands to `bind(":0")`
+/// — otherwise a concurrent bind anywhere on the machine can be given it
+/// first and the daemon exits 1 with "Address already in use". That is not
+/// hypothetical: it is what one full-suite run of this branch produced, and
+/// no readiness budget can fix a daemon that is already dead.
+#[test]
+fn allocated_ports_are_outside_the_ephemeral_range() {
+    let mut seen = std::collections::HashSet::new();
+    for _ in 0..256 {
+        let port = free_port();
+        assert!(
+            port < EPHEMERAL_FIRST,
+            "{port} is in the ephemeral pool, so bind(\":0\") elsewhere can be handed it"
+        );
+        assert!(
+            seen.insert(port),
+            "two allocations returned {port}; concurrent tests would collide"
+        );
+    }
 }
 
 /// A peer that makes *progress* without ever finishing is the case a
@@ -438,13 +586,14 @@ fn https_selfsigned_serves_healthz_and_pwa_assets() {
 
     let bin = env!("CARGO_BIN_EXE_nzbd");
     let (stderr, stderr_path) = daemon_stderr(tmp.path());
-    let child = Command::new(bin)
-        .args(["run", "--config"])
-        .arg(&cfg_path)
-        .stdout(Stdio::null())
-        .stderr(stderr)
-        .spawn()
-        .expect("spawn nzbd");
+    let child = spawn_child(
+        Command::new(bin)
+            .args(["run", "--config"])
+            .arg(&cfg_path)
+            .stdout(Stdio::null())
+            .stderr(stderr),
+    )
+    .expect("spawn nzbd");
     let daemon = KillOnDrop::new(child, stderr_path);
 
     // A TLS client that accepts any certificate (it's self-signed).
@@ -605,13 +754,14 @@ fn restart_completes_with_an_open_sse_stream() {
 
     let bin = env!("CARGO_BIN_EXE_nzbd");
     let (stderr, stderr_path) = daemon_stderr(tmp.path());
-    let child = Command::new(bin)
-        .args(["run", "--config"])
-        .arg(&cfg_path)
-        .stdout(Stdio::null())
-        .stderr(stderr)
-        .spawn()
-        .expect("spawn nzbd");
+    let child = spawn_child(
+        Command::new(bin)
+            .args(["run", "--config"])
+            .arg(&cfg_path)
+            .stdout(Stdio::null())
+            .stderr(stderr),
+    )
+    .expect("spawn nzbd");
     let daemon = KillOnDrop::new(child, stderr_path);
     wait_healthy(&daemon, &addr, Duration::from_secs(15)).unwrap_or_else(|cause| panic!("{cause}"));
 
@@ -730,13 +880,14 @@ scripts_dir = "{scripts}"
     let daemon_log_path = tmp.path().join("daemon.log");
     let daemon_log = std::fs::File::create(&daemon_log_path).unwrap();
     let stderr_path = daemon_log_path.clone();
-    let child = Command::new(bin)
-        .args(["run", "--config"])
-        .arg(&cfg_path)
-        .stdout(daemon_log.try_clone().unwrap())
-        .stderr(daemon_log)
-        .spawn()
-        .expect("spawn nzbd");
+    let child = spawn_child(
+        Command::new(bin)
+            .args(["run", "--config"])
+            .arg(&cfg_path)
+            .stdout(daemon_log.try_clone().unwrap())
+            .stderr(daemon_log),
+    )
+    .expect("spawn nzbd");
     let daemon = KillOnDrop::new(child, stderr_path);
     wait_healthy(&daemon, &api_addr, Duration::from_secs(15))
         .unwrap_or_else(|cause| panic!("{cause}"));
@@ -803,13 +954,14 @@ fn settings_live_apply_restart_flow_keeps_secrets() {
 
     let bin = env!("CARGO_BIN_EXE_nzbd");
     let (stderr, stderr_path) = daemon_stderr(tmp.path());
-    let child = Command::new(bin)
-        .args(["run", "--config"])
-        .arg(&cfg_path)
-        .stdout(Stdio::null())
-        .stderr(stderr)
-        .spawn()
-        .expect("spawn nzbd");
+    let child = spawn_child(
+        Command::new(bin)
+            .args(["run", "--config"])
+            .arg(&cfg_path)
+            .stdout(Stdio::null())
+            .stderr(stderr),
+    )
+    .expect("spawn nzbd");
     let daemon = KillOnDrop::new(child, stderr_path);
     wait_healthy(&daemon, &addr, Duration::from_secs(15)).unwrap_or_else(|cause| panic!("{cause}"));
 
@@ -966,22 +1118,23 @@ fn setup_unwritable_config_offers_copyable_toml() {
     let addr = format!("127.0.0.1:{port}");
     let bin = env!("CARGO_BIN_EXE_nzbd");
     let (stderr, stderr_path) = daemon_stderr(tmp.path());
-    let child = Command::new(bin)
-        .args(["run", "--config"])
-        .arg(&cfg_path)
-        .args(["--bind", &addr])
-        // First-run mode boots with Config::default() until setup writes the
-        // real file. Keep that default state under this test's tempdir rather
-        // than touching the invoking user's ~/downloads tree.
-        .env("HOME", tmp.path())
-        .env(
-            nzbd_config::durable::MAIN_DIR_ENV,
-            tmp.path().join("isolated-main"),
-        )
-        .stdout(Stdio::null())
-        .stderr(stderr)
-        .spawn()
-        .expect("spawn nzbd");
+    let child = spawn_child(
+        Command::new(bin)
+            .args(["run", "--config"])
+            .arg(&cfg_path)
+            .args(["--bind", &addr])
+            // First-run mode boots with Config::default() until setup writes the
+            // real file. Keep that default state under this test's tempdir rather
+            // than touching the invoking user's ~/downloads tree.
+            .env("HOME", tmp.path())
+            .env(
+                nzbd_config::durable::MAIN_DIR_ENV,
+                tmp.path().join("isolated-main"),
+            )
+            .stdout(Stdio::null())
+            .stderr(stderr),
+    )
+    .expect("spawn nzbd");
     let daemon = KillOnDrop::new(child, stderr_path);
     wait_healthy(&daemon, &addr, Duration::from_secs(15)).unwrap_or_else(|cause| panic!("{cause}"));
 
@@ -1072,18 +1225,19 @@ fn a_missing_config_is_recovered_from_the_data_volume_not_replaced_by_the_wizard
 
     let bin = env!("CARGO_BIN_EXE_nzbd");
     let (stderr, stderr_path) = daemon_stderr(tmp.path());
-    let child = Command::new(bin)
-        .args(["run", "--config"])
-        .arg(&cfg_path)
-        .args(["--bind", &api_addr])
-        // How recovery finds the data volume with no config to read it from
-        // — set by the image, so a container needs no extra wiring.
-        .env(nzbd_config::durable::MAIN_DIR_ENV, &main_dir)
-        .env("HOME", tmp.path())
-        .stdout(Stdio::null())
-        .stderr(stderr)
-        .spawn()
-        .expect("spawn nzbd");
+    let child = spawn_child(
+        Command::new(bin)
+            .args(["run", "--config"])
+            .arg(&cfg_path)
+            .args(["--bind", &api_addr])
+            // How recovery finds the data volume with no config to read it from
+            // — set by the image, so a container needs no extra wiring.
+            .env(nzbd_config::durable::MAIN_DIR_ENV, &main_dir)
+            .env("HOME", tmp.path())
+            .stdout(Stdio::null())
+            .stderr(stderr),
+    )
+    .expect("spawn nzbd");
     let daemon = KillOnDrop::new(child, stderr_path);
     wait_healthy(&daemon, &api_addr, Duration::from_secs(15))
         .unwrap_or_else(|cause| panic!("{cause}"));
@@ -1148,22 +1302,23 @@ fn first_run_setup_wizard_writes_config_and_reloads() {
 
     let bin = env!("CARGO_BIN_EXE_nzbd");
     let (stderr, stderr_path) = daemon_stderr(tmp.path());
-    let child = Command::new(bin)
-        .args(["run", "--config"])
-        .arg(&cfg_path)
-        .args(["--bind", &api_addr])
-        // First-run mode boots with Config::default() until setup writes the
-        // real file. Keep that default state under this test's tempdir rather
-        // than touching the invoking user's ~/downloads tree.
-        .env("HOME", tmp.path())
-        .env(
-            nzbd_config::durable::MAIN_DIR_ENV,
-            tmp.path().join("isolated-main"),
-        )
-        .stdout(Stdio::null())
-        .stderr(stderr)
-        .spawn()
-        .expect("spawn nzbd");
+    let child = spawn_child(
+        Command::new(bin)
+            .args(["run", "--config"])
+            .arg(&cfg_path)
+            .args(["--bind", &api_addr])
+            // First-run mode boots with Config::default() until setup writes the
+            // real file. Keep that default state under this test's tempdir rather
+            // than touching the invoking user's ~/downloads tree.
+            .env("HOME", tmp.path())
+            .env(
+                nzbd_config::durable::MAIN_DIR_ENV,
+                tmp.path().join("isolated-main"),
+            )
+            .stdout(Stdio::null())
+            .stderr(stderr),
+    )
+    .expect("spawn nzbd");
     let daemon = KillOnDrop::new(child, stderr_path);
     wait_healthy(&daemon, &api_addr, Duration::from_secs(15))
         .unwrap_or_else(|cause| panic!("{cause}"));
@@ -1312,13 +1467,14 @@ bind = "{api_addr}"
     let daemon_log_path = tmp.path().join("daemon.log");
     let daemon_log = std::fs::File::create(&daemon_log_path).unwrap();
     let stderr_path = daemon_log_path.clone();
-    let child = Command::new(bin)
-        .args(["run", "--config"])
-        .arg(&cfg_path)
-        .stdout(daemon_log.try_clone().unwrap())
-        .stderr(daemon_log)
-        .spawn()
-        .expect("spawn nzbd");
+    let child = spawn_child(
+        Command::new(bin)
+            .args(["run", "--config"])
+            .arg(&cfg_path)
+            .stdout(daemon_log.try_clone().unwrap())
+            .stderr(daemon_log),
+    )
+    .expect("spawn nzbd");
     let daemon = KillOnDrop::new(child, stderr_path);
     wait_healthy(&daemon, &api_addr, Duration::from_secs(15))
         .unwrap_or_else(|cause| panic!("{cause}"));
@@ -1485,13 +1641,14 @@ bind = "{api_addr}"
     let post = build_post("park me", &[("payload.bin", prng_bytes(9, 40_000))], 20_000);
     let bin = env!("CARGO_BIN_EXE_nzbd");
     let (stderr, stderr_path) = daemon_stderr(tmp.path());
-    let child = Command::new(bin)
-        .args(["run", "--config"])
-        .arg(&cfg_path)
-        .stdout(Stdio::null())
-        .stderr(stderr)
-        .spawn()
-        .expect("spawn nzbd");
+    let child = spawn_child(
+        Command::new(bin)
+            .args(["run", "--config"])
+            .arg(&cfg_path)
+            .stdout(Stdio::null())
+            .stderr(stderr),
+    )
+    .expect("spawn nzbd");
     let daemon = KillOnDrop::new(child, stderr_path);
     wait_healthy(&daemon, &api_addr, Duration::from_secs(15))
         .unwrap_or_else(|cause| panic!("{cause}"));
@@ -1644,13 +1801,14 @@ bind = "{api_addr}"
     let daemon_log_path = tmp.path().join("daemon.log");
     let daemon_log = std::fs::File::create(&daemon_log_path).unwrap();
     let stderr_path = daemon_log_path.clone();
-    let child = Command::new(bin)
-        .args(["run", "--config"])
-        .arg(&cfg_path)
-        .stdout(daemon_log.try_clone().unwrap())
-        .stderr(daemon_log)
-        .spawn()
-        .expect("spawn nzbd");
+    let child = spawn_child(
+        Command::new(bin)
+            .args(["run", "--config"])
+            .arg(&cfg_path)
+            .stdout(daemon_log.try_clone().unwrap())
+            .stderr(daemon_log),
+    )
+    .expect("spawn nzbd");
     let daemon = KillOnDrop::new(child, stderr_path);
     wait_healthy(&daemon, &api_addr, Duration::from_secs(15))
         .unwrap_or_else(|cause| panic!("{cause}"));
