@@ -124,22 +124,27 @@ impl KillOnDrop {
         self.child.borrow().id()
     }
 
-    /// `Some(reason)` once the daemon has exited: it is never coming up, and
-    /// the reason quotes its status and the tail of its stderr.
-    fn died(&self) -> Option<String> {
-        let status = self.child.borrow_mut().try_wait().ok().flatten()?;
+    /// The tail of what the daemon said, so any wait on it can fail with a
+    /// cause rather than a symptom.
+    fn stderr_tail(&self) -> String {
         let log = std::fs::read_to_string(&self.stderr).unwrap_or_default();
-        let tail = log
-            .lines()
+        log.lines()
             .rev()
             .take(20)
             .collect::<Vec<_>>()
             .into_iter()
             .rev()
             .collect::<Vec<_>>()
-            .join("\n");
+            .join("\n")
+    }
+
+    /// `Some(reason)` once the daemon has exited: it is never coming up, and
+    /// the reason quotes its status and the tail of its stderr.
+    fn died(&self) -> Option<String> {
+        let status = self.child.borrow_mut().try_wait().ok().flatten()?;
         Some(format!(
-            "exited with {status}\n--- daemon stderr (tail) ---\n{tail}"
+            "exited with {status}\n--- daemon stderr (tail) ---\n{}",
+            self.stderr_tail()
         ))
     }
 }
@@ -1408,14 +1413,24 @@ bind = "{api_addr}"
     unsafe {
         libc_kill(pid as i32, 2 /* SIGINT */);
     }
+    // Pure liveness. Graceful shutdown flushes journals — and, under an
+    // instrumented build, the daemon's coverage profile — so a loaded machine
+    // can legitimately take seconds, and the old 10s bound was seen to expire
+    // once in 48 runs at 32x oversubscription (#107). The claim under test is
+    // the unclean-marker assertion below; a daemon that never exits still
+    // fails here, and now says what it was doing instead of only that it did
+    // not exit.
+    const SIGINT_EXIT_BUDGET: Duration = Duration::from_secs(30);
     let start = Instant::now();
     loop {
         if daemon.died().is_some() {
             break;
         }
         assert!(
-            start.elapsed() < Duration::from_secs(10),
-            "daemon did not exit on SIGINT"
+            start.elapsed() < SIGINT_EXIT_BUDGET,
+            "daemon did not exit on SIGINT within {SIGINT_EXIT_BUDGET:?}\n\
+             --- daemon stderr (tail) ---\n{}",
+            daemon.stderr_tail()
         );
         std::thread::sleep(Duration::from_millis(100));
     }
