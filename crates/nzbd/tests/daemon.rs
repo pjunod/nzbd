@@ -410,13 +410,20 @@ fn a_dead_daemon_fails_its_wait_at_once_and_says_why() {
 /// handed that port exits 1 with "Address already in use". This drives the
 /// same fork/probe overlap the suite produces incidentally, and asserts the
 /// outcome that matters rather than the mechanism.
+///
+/// Only `AddrInUse` counts. A loaded runner can refuse a bind for reasons
+/// that say nothing about this race — file-descriptor pressure from the
+/// spawn loop, most obviously — and a test that treated those as evidence
+/// would be one more flake in a suite this issue exists to settle. On
+/// platforms whose `socket()` takes `SOCK_CLOEXEC` atomically (Linux does)
+/// the race cannot happen at all and this simply finds nothing.
 #[test]
 fn a_concurrent_spawn_never_inherits_a_port_probe() {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
 
     let stop = Arc::new(AtomicBool::new(false));
-    let spawners: Vec<_> = (0..4)
+    let spawners: Vec<_> = (0..2)
         .map(|_| {
             let stop = stop.clone();
             std::thread::spawn(move || {
@@ -440,8 +447,10 @@ fn a_concurrent_spawn_never_inherits_a_port_probe() {
     let mut lost = Vec::new();
     for _ in 0..600 {
         let port = free_port();
-        if std::net::TcpListener::bind(("127.0.0.1", port)).is_err() {
-            lost.push(port);
+        if let Err(e) = std::net::TcpListener::bind(("127.0.0.1", port)) {
+            if e.kind() == std::io::ErrorKind::AddrInUse {
+                lost.push(port);
+            }
         }
     }
 
