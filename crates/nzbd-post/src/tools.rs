@@ -561,6 +561,12 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 
+    // These subprocess cases assert parsing, fallback, and filesystem
+    // behavior rather than scheduler latency. Keep a generous hard ceiling so
+    // a loaded runner cannot turn a successful one-line fixture into the
+    // timeout outcome the assertion is deliberately not testing.
+    const SUBPROCESS_TEST_TIMEOUT: Duration = Duration::from_secs(10);
+
     fn write_tool(path: &Path, body: &str) {
         std::fs::write(path, body).unwrap();
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -742,7 +748,7 @@ mod tests {
         );
         let par2 = Par2Tool {
             cmd: tool.to_string_lossy().into_owned(),
-            timeout: Duration::from_secs(2),
+            timeout: SUBPROCESS_TEST_TIMEOUT,
         };
 
         assert_eq!(
@@ -826,7 +832,7 @@ mod tests {
         let extractors = Extractors {
             unrar_cmd: unrar_ok.to_string_lossy().into_owned(),
             sevenzip_cmd: unused.to_string_lossy().into_owned(),
-            timeout: Duration::from_secs(2),
+            timeout: SUBPROCESS_TEST_TIMEOUT,
         };
         let dest = tmp.path().join("single-out");
         let outcome = extractors
@@ -844,7 +850,7 @@ mod tests {
         let extractors = Extractors {
             unrar_cmd: bad_password.to_string_lossy().into_owned(),
             sevenzip_cmd: unused.to_string_lossy().into_owned(),
-            timeout: Duration::from_secs(2),
+            timeout: SUBPROCESS_TEST_TIMEOUT,
         };
         let outcome = extractors
             .extract(
@@ -881,7 +887,7 @@ mod tests {
         let extractors = Extractors {
             unrar_cmd: short_unrar.to_string_lossy().into_owned(),
             sevenzip_cmd: good_7z.to_string_lossy().into_owned(),
-            timeout: Duration::from_secs(2),
+            timeout: SUBPROCESS_TEST_TIMEOUT,
         };
         let dest = tmp.path().join("fallback-out");
         let outcome = extractors
@@ -926,7 +932,7 @@ mod tests {
         let extractors = Extractors {
             unrar_cmd: short_unrar.to_string_lossy().into_owned(),
             sevenzip_cmd: lying_7z.to_string_lossy().into_owned(),
-            timeout: Duration::from_secs(2),
+            timeout: SUBPROCESS_TEST_TIMEOUT,
         };
         let dest = tmp.path().join("both-short-out");
         let outcome = extractors
@@ -966,7 +972,7 @@ mod tests {
         let extractors = Extractors {
             unrar_cmd: disk_full_unrar.to_string_lossy().into_owned(),
             sevenzip_cmd: failed.to_string_lossy().into_owned(),
-            timeout: Duration::from_secs(2),
+            timeout: SUBPROCESS_TEST_TIMEOUT,
         };
         let outcome = extractors
             .extract(
@@ -992,7 +998,7 @@ mod tests {
                 .to_string_lossy()
                 .into_owned(),
             sevenzip_cmd: good_7z.to_string_lossy().into_owned(),
-            timeout: Duration::from_secs(2),
+            timeout: SUBPROCESS_TEST_TIMEOUT,
         };
         let outcome = missing_unrar
             .extract(
@@ -1013,7 +1019,7 @@ mod tests {
         let extractors = Extractors {
             unrar_cmd: failed.to_string_lossy().into_owned(),
             sevenzip_cmd: disk_full.to_string_lossy().into_owned(),
-            timeout: Duration::from_secs(2),
+            timeout: SUBPROCESS_TEST_TIMEOUT,
         };
         let outcome = extractors
             .extract(
