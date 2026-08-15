@@ -250,4 +250,88 @@ mod tests {
             .collect();
         assert_eq!(names, vec!["legacy.sh", "main.sh"]);
     }
+
+    #[tokio::test]
+    async fn protocol_ignores_malformed_commands_and_bounds_runtime() {
+        let tmp = tempfile::tempdir().unwrap();
+        let script = tmp.path().join("all-lines.sh");
+        write_script(
+            &script,
+            "#!/bin/sh\n\
+             echo '[ERROR] error'\n\
+             echo '[WARNING] warning'\n\
+             echo '[INFO] info'\n\
+             echo '[DETAIL] detail'\n\
+             echo '[DEBUG] debug'\n\
+             echo 'plain output'\n\
+             echo '[NZB] malformed'\n\
+             echo '[NZB] KEY = value'\n",
+        );
+        let host = ScriptHost {
+            timeout: Duration::from_secs(2),
+        };
+        let out = host.run(&script, tmp.path(), &[]).await.unwrap();
+        assert_eq!(out.exit_code, 0);
+        assert_eq!(out.commands, vec![("KEY".into(), "value".into())]);
+
+        let noisy = tmp.path().join("noisy.sh");
+        write_script(
+            &noisy,
+            "#!/bin/sh\nyes plain | head -n 100000\necho '[NZB] LATE=1'\n",
+        );
+        let host = ScriptHost {
+            timeout: Duration::from_secs(10),
+        };
+        let out = host.run(&noisy, tmp.path(), &[]).await.unwrap();
+        assert_eq!(out.exit_code, 0);
+        assert!(out.commands.is_empty());
+
+        let hangs = tmp.path().join("hangs.sh");
+        write_script(&hangs, "#!/bin/sh\nwhile :; do :; done\n");
+        let host = ScriptHost {
+            timeout: Duration::from_millis(20),
+        };
+        let err = host.run(&hangs, tmp.path(), &[]).await.unwrap_err();
+        assert!(matches!(err, PostError::Subprocess(message) if message.contains("timed out")));
+    }
+
+    #[test]
+    fn discovery_skips_missing_malformed_and_incomplete_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(discover(&tmp.path().join("missing")).is_empty());
+
+        let malformed = tmp.path().join("malformed");
+        std::fs::create_dir(&malformed).unwrap();
+        std::fs::write(malformed.join("manifest.json"), b"not json").unwrap();
+
+        let missing_entry = tmp.path().join("missing-entry");
+        std::fs::create_dir(&missing_entry).unwrap();
+        std::fs::write(
+            missing_entry.join("manifest.json"),
+            br#"{"main":"absent.sh"}"#,
+        )
+        .unwrap();
+
+        // Non-UTF-8 *contents*: the header probe reads the file as a string,
+        // so this one fails to decode rather than failing to match. Both
+        // arms must skip the file; neither may abort the scan.
+        std::fs::write(tmp.path().join("undecodable-contents"), [0xff, 0xfe]).unwrap();
+        std::fs::write(tmp.path().join("ordinary.txt"), "ordinary").unwrap();
+
+        assert!(discover(tmp.path()).is_empty());
+
+        // Every rejection above has to be a rejection of that entry and not
+        // of the scan: a v2 extension directory sitting among them is still
+        // found. Its name is deliberately non-ASCII — the manifest's `main`
+        // is joined onto a `Path`, never round-tripped through `str`.
+        //
+        // (A name that is not valid UTF-8 at all would test the same join
+        // more sharply, but APFS refuses to create one — `mkdir` fails
+        // EILSEQ — so it cannot be exercised portably.)
+        let extension = tmp.path().join("séparé-ext");
+        std::fs::create_dir(&extension).unwrap();
+        write_script(&extension.join("main.sh"), "#!/bin/sh\nexit 0\n");
+        std::fs::write(extension.join("manifest.json"), br#"{"main":"main.sh"}"#).unwrap();
+        assert_eq!(discover(tmp.path()), vec![extension.join("main.sh")]);
+    }
 }

@@ -2146,3 +2146,612 @@ fn script_env(
     }
     env
 }
+
+/// The manager's decision helpers, exercised directly.
+///
+/// These are the parts of the orchestrator that decide *what* happens —
+/// which failure action an operator's spelling means, where a failed job's
+/// files end up, which restart points a stage still permits, what a script
+/// is told about the run. Reaching them through `process_job` needs a live
+/// engine, a history database and real archive tools, which is why they
+/// went untested: the pipeline tests that do stand all that up assert on
+/// the pipeline's outcome, not on these decisions.
+#[cfg(test)]
+mod decision_tests {
+    use super::*;
+    use nzbd_types::{DupeInfo, FileEntry, FileId, JobKind, JobTotals};
+    use std::os::unix::fs::PermissionsExt;
+
+    fn file(id: u32, name: &str, crc32: Option<u32>) -> FileEntry {
+        FileEntry {
+            id: FileId(id),
+            subject: name.into(),
+            filename: name.into(),
+            filename_confirmed: true,
+            is_par2: false,
+            paused: false,
+            groups: vec![],
+            date: None,
+            segments: vec![],
+            crc32,
+            finalized: true,
+        }
+    }
+
+    fn job(files: Vec<FileEntry>, params: Vec<(String, String)>) -> Job {
+        Job {
+            id: JobId(41),
+            kind: JobKind::Nzb,
+            name: "Some.Release".into(),
+            dir_name: "Some.Release".into(),
+            name_provisional: false,
+            queued_at_unix: 0,
+            original_name: String::new(),
+            category: Some("tv".into()),
+            priority: 0,
+            dupe: DupeInfo::default(),
+            params,
+            files,
+            totals: JobTotals::default(),
+            status: JobStatus::Completed,
+            torrent: None,
+            stages: Vec::new(),
+        }
+    }
+
+    /// `failure_action` is operator-typed, so its parse decides whether a
+    /// known-bad download is deleted or kept. An unrecognised spelling must
+    /// land on `Delete` — the documented default — and never leave the
+    /// files behind by accident, which is what filled the terabyte.
+    #[test]
+    fn failure_action_parses_every_documented_spelling_and_defaults_to_delete() {
+        for keep in ["none", "None", "NONE", "keep", "Keep", ""] {
+            assert_eq!(FailureAction::parse(keep), FailureAction::None, "{keep:?}");
+        }
+        for park in ["park", "Park", "PARK", "pause", "Pause"] {
+            assert_eq!(FailureAction::parse(park), FailureAction::Park, "{park:?}");
+        }
+        for delete in ["delete", "Delete", "remove", "yes", "   "] {
+            assert_eq!(
+                FailureAction::parse(delete),
+                FailureAction::Delete,
+                "an unrecognised value must fall to the delete default, not to keep: {delete:?}"
+            );
+        }
+        assert_eq!(FailureAction::default(), FailureAction::Delete);
+    }
+
+    #[test]
+    fn strategy_slots_and_status_names_are_stable() {
+        assert_eq!(strategy_slots("balanced"), 2);
+        assert_eq!(strategy_slots("aggressive"), 3);
+        assert_eq!(strategy_slots("rocket"), 6);
+        // Unknown strategies run one job at a time rather than guessing.
+        assert_eq!(strategy_slots("economy"), 1);
+        assert_eq!(strategy_slots(""), 1);
+
+        // These strings reach history rows, the API and NZBGet-compatible
+        // scripts, so they are a wire format, not a display detail.
+        assert_eq!(PpFinal::Success.as_str(), "SUCCESS");
+        assert_eq!(PpFinal::ParFailure.as_str(), "PAR_FAILURE");
+        assert_eq!(PpFinal::UnpackFailure.as_str(), "UNPACK_FAILURE");
+        assert_eq!(PpFinal::ScriptFailure.as_str(), "SCRIPT_FAILURE");
+
+        assert_eq!(RestartPoint::Beginning.as_str(), "beginning");
+        assert_eq!(RestartPoint::Verify.as_str(), "verify");
+        assert_eq!(RestartPoint::Unpack.as_str(), "unpack");
+        assert_eq!(RestartPoint::Cleanup.as_str(), "cleanup");
+        assert_eq!(RestartPoint::Move.as_str(), "move");
+        assert_eq!(RestartPoint::Scripts.as_str(), "scripts");
+    }
+
+    /// A restart may rewind but never skip: restarting from a point the job
+    /// has not reached would manufacture state the rest of the pipeline
+    /// cannot prove.
+    #[test]
+    fn a_stage_permits_only_restart_points_at_or_before_itself() {
+        use RestartPoint::*;
+        let all = [Beginning, Verify, Unpack, Cleanup, Move, Scripts];
+        // A limit of Beginning permits every point; a limit of Scripts
+        // permits only Scripts.
+        assert!(all.iter().all(|p| Beginning.includes(*p)));
+        assert_eq!(
+            all.iter().filter(|p| Scripts.includes(**p)).count(),
+            1,
+            "the last stage may only be restarted from itself"
+        );
+        assert!(Unpack.includes(Cleanup) && !Unpack.includes(Verify));
+
+        assert_eq!(restart_limit(JobStatus::Completed), Some(Beginning));
+        assert_eq!(restart_limit(JobStatus::PostQueued), Some(Beginning));
+        for (stage, want) in [
+            (PostStage::ParRename, Beginning),
+            (PostStage::RarRename, Beginning),
+            (PostStage::ParVerify, Verify),
+            (PostStage::ParRepair, Verify),
+            (PostStage::Unpack, Unpack),
+            (PostStage::Cleanup, Cleanup),
+            (PostStage::PostUnpackRename, Cleanup),
+            (PostStage::Move, Move),
+            (PostStage::Script, Scripts),
+        ] {
+            assert_eq!(
+                restart_limit(JobStatus::Post { stage }),
+                Some(want),
+                "{stage:?}"
+            );
+        }
+        // A job that has not finished downloading has nothing to restart.
+        for status in [
+            JobStatus::Queued,
+            JobStatus::Downloading,
+            JobStatus::Paused,
+            JobStatus::Fetching,
+            JobStatus::Failed,
+            JobStatus::Deleted,
+        ] {
+            assert_eq!(restart_limit(status), None, "{status:?}");
+        }
+    }
+
+    /// The control path is a bounded mailbox precisely so a button click is
+    /// never silently lost. During shutdown it must report that, not hang
+    /// and not succeed.
+    #[tokio::test]
+    async fn restart_after_the_manager_is_gone_reports_closed() {
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        let handle = PostManagerHandle { tx };
+        drop(rx);
+        assert_eq!(
+            handle.restart(JobId(1), RestartPoint::Verify).await,
+            Err(RestartPostError::Closed)
+        );
+
+        // A live receiver that never replies is the other half of the same
+        // guarantee: the reply channel closing must surface as Closed too.
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let handle = PostManagerHandle { tx };
+        let waiter =
+            tokio::spawn(async move { handle.restart(JobId(2), RestartPoint::Move).await });
+        let ManagerCommand::Restart { job, from, reply } = rx.recv().await.unwrap();
+        assert_eq!(job, JobId(2));
+        assert_eq!(from, RestartPoint::Move);
+        drop(reply);
+        assert_eq!(waiter.await.unwrap(), Err(RestartPostError::Closed));
+    }
+
+    /// An *arr sending "TV" must land on `name = "tv"`.
+    #[test]
+    fn category_rules_match_case_insensitively_and_ignore_blanks() {
+        let cfg = PostConfig {
+            categories: vec![CategoryRule {
+                name: "tv".into(),
+                dest_dir: Some(PathBuf::from("/library/tv")),
+                unpack: Some(false),
+                extensions: vec!["clean".into()],
+            }],
+            ..PostConfig::default()
+        };
+        assert_eq!(cfg.rule_for(Some("TV")).unwrap().name, "tv");
+        assert_eq!(cfg.rule_for(Some("  tv  ")).unwrap().name, "tv");
+        assert!(cfg.rule_for(Some("movies")).is_none());
+        assert!(cfg.rule_for(Some("   ")).is_none());
+        assert!(cfg.rule_for(Some("")).is_none());
+        assert!(cfg.rule_for(None).is_none());
+    }
+
+    /// An empty `extensions` list means "all of them", and a named one
+    /// matches the file name or its stem, case-insensitively — both
+    /// `Extensions=Clean.py` and `Extensions=clean` name the same script.
+    #[test]
+    fn category_extensions_select_scripts_by_name_or_stem() {
+        let found = vec![
+            PathBuf::from("/s/clean.py"),
+            PathBuf::from("/s/notify.sh"),
+            PathBuf::from("/s/archive"),
+        ];
+        assert_eq!(select_scripts(found.clone(), &[]), found);
+        assert_eq!(
+            select_scripts(found.clone(), &["Clean.py".into()]),
+            vec![PathBuf::from("/s/clean.py")]
+        );
+        assert_eq!(
+            select_scripts(found.clone(), &["CLEAN".into(), "archive".into()]),
+            vec![PathBuf::from("/s/clean.py"), PathBuf::from("/s/archive")]
+        );
+        assert!(select_scripts(found, &["absent".into()]).is_empty());
+    }
+
+    /// Within one volume the move is a `rename`, and scratch from an
+    /// attempt that died mid-copy must be cleared whichever path this
+    /// attempt takes — a completed move may not leave `.pp-move` behind in
+    /// the library.
+    #[test]
+    fn move_dir_renames_in_place_and_clears_stale_scratch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let from = tmp.path().join("staging/Some.Release");
+        std::fs::create_dir_all(from.join("Subs")).unwrap();
+        std::fs::write(from.join("film.mkv"), b"film").unwrap();
+        std::fs::write(from.join("Subs/en.srt"), b"subs").unwrap();
+
+        let to = tmp.path().join("library/Some.Release");
+        let scratch = tmp.path().join("library/Some.Release.pp-move.tag7");
+        std::fs::create_dir_all(&scratch).unwrap();
+        std::fs::write(scratch.join("half.mkv"), b"truncated").unwrap();
+
+        move_dir(&from, &to, "tag7").unwrap();
+
+        assert_eq!(std::fs::read(to.join("film.mkv")).unwrap(), b"film");
+        assert_eq!(std::fs::read(to.join("Subs/en.srt")).unwrap(), b"subs");
+        assert!(!from.exists(), "the source is consumed by the move");
+        assert!(
+            !scratch.exists(),
+            "a completed move must not leave scratch in the library"
+        );
+    }
+
+    /// EXDEV is the only rename error the move recovers from. Anything else
+    /// is a real failure and has to surface, not be papered over by a copy.
+    #[test]
+    fn move_dir_propagates_a_rename_error_that_is_not_a_volume_boundary() {
+        let tmp = tempfile::tempdir().unwrap();
+        let err = move_dir(
+            &tmp.path().join("no-such-source"),
+            &tmp.path().join("library/dest"),
+            "tag",
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    /// The cross-volume path: a recursive copy that fsyncs each file before
+    /// it counts as written, because the source is deleted right after.
+    #[test]
+    fn copy_dir_all_reproduces_the_whole_tree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let from = tmp.path().join("src");
+        std::fs::create_dir_all(from.join("a/b")).unwrap();
+        std::fs::write(from.join("top.bin"), b"top").unwrap();
+        std::fs::write(from.join("a/mid.bin"), b"mid").unwrap();
+        std::fs::write(from.join("a/b/deep.bin"), b"deep").unwrap();
+
+        let to = tmp.path().join("copy");
+        copy_dir_all(&from, &to).unwrap();
+
+        assert_eq!(std::fs::read(to.join("top.bin")).unwrap(), b"top");
+        assert_eq!(std::fs::read(to.join("a/mid.bin")).unwrap(), b"mid");
+        assert_eq!(std::fs::read(to.join("a/b/deep.bin")).unwrap(), b"deep");
+        assert!(std::fs::metadata(to.join("a/b")).unwrap().is_dir());
+
+        assert!(copy_dir_all(&tmp.path().join("absent"), &tmp.path().join("out")).is_err());
+    }
+
+    #[tokio::test]
+    async fn failure_action_none_keeps_the_files_where_they_are() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("dest");
+        let dir = dest.join("job");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("payload.bin"), b"bytes").unwrap();
+
+        let cfg = PostConfig {
+            failure_action: FailureAction::None,
+            ..PostConfig::default()
+        };
+        let d = dispose_failed(&cfg, JobId(3), &dir, &dest, "job", "tag").await;
+        assert_eq!(d.note, "kept");
+        assert_eq!(d.files_at.as_deref(), Some(dir.as_path()));
+        assert!(dir.join("payload.bin").exists());
+    }
+
+    #[tokio::test]
+    async fn failure_action_delete_removes_the_tree_and_reports_no_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("dest");
+        let dir = dest.join("job");
+        std::fs::create_dir_all(dir.join("Subs")).unwrap();
+        std::fs::write(dir.join("Subs/en.srt"), b"subs").unwrap();
+
+        let cfg = PostConfig {
+            failure_action: FailureAction::Delete,
+            ..PostConfig::default()
+        };
+        let d = dispose_failed(&cfg, JobId(3), &dir, &dest, "job", "tag").await;
+        assert_eq!(d.note, "deleted");
+        assert_eq!(
+            d.files_at, None,
+            "a deleted job's row must not point at a directory"
+        );
+        assert!(!dir.exists());
+
+        // Re-running the same disposition is the failover case: it must be
+        // idempotent, not a second error.
+        let again = dispose_failed(&cfg, JobId(3), &dir, &dest, "job", "tag").await;
+        assert_eq!(again.note, "already gone");
+        assert_eq!(again.files_at, None);
+    }
+
+    /// Park moves the files off the destination tree an importer watches,
+    /// and defaults its target to `<dest>/.failed/<dir>` when no
+    /// `failed_dir` is configured.
+    #[tokio::test]
+    async fn failure_action_park_moves_the_files_and_is_idempotent_after_a_lost_fence() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("dest");
+        let dir = dest.join("job");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("payload.bin"), b"bytes").unwrap();
+
+        let cfg = PostConfig {
+            failure_action: FailureAction::Park,
+            ..PostConfig::default()
+        };
+        let parked = dest.join(".failed/job");
+        let d = dispose_failed(&cfg, JobId(3), &dir, &dest, "job", "tag").await;
+        assert_eq!(d.note, format!("parked at {}", parked.display()));
+        assert_eq!(d.files_at.as_deref(), Some(parked.as_path()));
+        assert_eq!(std::fs::read(parked.join("payload.bin")).unwrap(), b"bytes");
+        assert!(!dir.exists());
+
+        // A prior attempt completed the move and then lost its fence. The
+        // successor sees no source and must recognise the existing target
+        // as the witness rather than reporting the files gone.
+        let successor = dispose_failed(&cfg, JobId(3), &dir, &dest, "job", "tag").await;
+        assert_eq!(successor.note, d.note);
+        assert_eq!(successor.files_at, d.files_at);
+
+        // With neither source nor target, the files really are gone.
+        std::fs::remove_dir_all(&parked).unwrap();
+        let gone = dispose_failed(&cfg, JobId(3), &dir, &dest, "job", "tag").await;
+        assert_eq!(gone.note, "already gone");
+        assert_eq!(gone.files_at, None);
+    }
+
+    /// An explicit `failed_dir` overrides the default location.
+    #[tokio::test]
+    async fn park_honours_a_configured_failed_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("dest");
+        let dir = dest.join("job");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("payload.bin"), b"bytes").unwrap();
+        let quarantine = tmp.path().join("quarantine");
+
+        let cfg = PostConfig {
+            failure_action: FailureAction::Park,
+            failed_dir: Some(quarantine.clone()),
+            ..PostConfig::default()
+        };
+        let d = dispose_failed(&cfg, JobId(3), &dir, &dest, "job", "tag").await;
+        assert_eq!(
+            d.files_at.as_deref(),
+            Some(quarantine.join("job").as_path())
+        );
+        assert!(!dest.join(".failed").exists());
+        assert_eq!(
+            std::fs::read(quarantine.join("job/payload.bin")).unwrap(),
+            b"bytes"
+        );
+    }
+
+    /// A delete the filesystem refuses must leave the files and say so. The
+    /// history row claiming "deleted" over files still on the volume is
+    /// exactly the report an operator would act on wrongly.
+    #[tokio::test]
+    async fn a_refused_delete_keeps_the_files_and_names_the_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("dest");
+        let dir = dest.join("job");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("payload.bin"), b"bytes").unwrap();
+
+        // Take write permission off the job directory so its entries cannot
+        // be unlinked. Root ignores the bit, so probe before relying on it.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        if std::fs::remove_file(dir.join("payload.bin")).is_ok() {
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+            eprintln!("SKIPPED: this user unlinks through a read-only directory (running as root)");
+            return;
+        }
+
+        let cfg = PostConfig {
+            failure_action: FailureAction::Delete,
+            ..PostConfig::default()
+        };
+        let d = dispose_failed(&cfg, JobId(3), &dir, &dest, "job", "tag").await;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(
+            d.note.starts_with("delete failed: "),
+            "the note must carry the reason, was {:?}",
+            d.note
+        );
+        assert_eq!(
+            d.files_at.as_deref(),
+            Some(dir.as_path()),
+            "files that survived a failed delete must still be findable"
+        );
+        assert!(dir.join("payload.bin").exists());
+    }
+
+    /// Quick verification is handed the engine's own file list, remapped
+    /// through de-obfuscation renames — a rename that happened before
+    /// verification would otherwise point every piece of evidence at a path
+    /// that no longer exists.
+    #[test]
+    fn evidence_follows_deobfuscation_renames() {
+        let dir = Path::new("/downloads/Some.Release");
+        let j = job(
+            vec![
+                file(1, "abc123.bin", Some(0xdead)),
+                file(2, "plain.mkv", None),
+            ],
+            vec![],
+        );
+        let mut renames = HashMap::new();
+        renames.insert(dir.join("abc123.bin"), dir.join("Some.Release.mkv"));
+
+        let evidence = evidence_of(&j, dir, &renames);
+        assert_eq!(evidence.len(), 2);
+        assert_eq!(evidence[0].path, dir.join("Some.Release.mkv"));
+        assert_eq!(evidence[0].crc32, Some(0xdead));
+        assert_eq!(
+            evidence[1].path,
+            dir.join("plain.mkv"),
+            "a file nothing renamed keeps its original path"
+        );
+        assert!(evidence.iter().all(|e| e.segment_crcs.is_empty()));
+    }
+
+    /// The `*`-prefixed params are nzbd's own bookkeeping (the PP-done
+    /// stamp, the unpack password). They must not reach history rows or
+    /// script environments as user params.
+    #[test]
+    fn internal_params_stay_out_of_history_and_script_environments() {
+        let j = job(
+            vec![],
+            vec![
+                ("mykey".into(), "myval".into()),
+                (PP_DONE_PARAM.into(), "SUCCESS".into()),
+                ("*Unpack:Password".into(), "hunter2".into()),
+            ],
+        );
+        assert_eq!(user_params(&j), vec![("mykey".into(), "myval".into())]);
+        assert!(
+            pp_done(&j),
+            "the stamp is what stops a re-run after a restart"
+        );
+
+        let env = script_env(&j, Path::new("/downloads/job"), true, false, true, true);
+        assert!(env.iter().any(|(k, v)| k == "NZBPR_mykey" && v == "myval"));
+        assert!(
+            !env.iter()
+                .any(|(k, v)| k.contains("Password") || v == "hunter2"),
+            "the unpack password must never be exported to an operator script"
+        );
+
+        let clean = job(vec![], vec![]);
+        assert!(!pp_done(&clean));
+    }
+
+    /// The NZBGet-compatible status codes existing scripts branch on.
+    #[test]
+    fn script_environment_reports_nzbget_status_codes() {
+        let j = job(vec![], vec![]);
+        let dir = Path::new("/downloads/Some.Release");
+        let get = |env: &Vec<(String, String)>, key: &str| {
+            env.iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.clone())
+                .unwrap_or_else(|| panic!("{key} missing"))
+        };
+
+        // par repair failed → 4, and the run as a whole is a FAILURE.
+        let env = script_env(&j, dir, false, false, true, true);
+        assert_eq!(get(&env, "NZBPP_PARSTATUS"), "4");
+        assert_eq!(get(&env, "NZBPP_TOTALSTATUS"), "FAILURE");
+        assert_eq!(get(&env, "NZBPP_STATUS"), "FAILURE/ALL");
+
+        // repaired → 2; unpack failed → 1.
+        let env = script_env(&j, dir, true, true, false, false);
+        assert_eq!(get(&env, "NZBPP_PARSTATUS"), "2");
+        assert_eq!(get(&env, "NZBPP_UNPACKSTATUS"), "1");
+        assert_eq!(get(&env, "NZBPP_TOTALSTATUS"), "FAILURE");
+
+        // checked and clean → 1; nothing to unpack → 0; overall SUCCESS.
+        let env = script_env(&j, dir, true, false, true, false);
+        assert_eq!(get(&env, "NZBPP_PARSTATUS"), "1");
+        assert_eq!(get(&env, "NZBPP_UNPACKSTATUS"), "0");
+        assert_eq!(get(&env, "NZBPP_TOTALSTATUS"), "SUCCESS");
+
+        // unpacked → 2.
+        let env = script_env(&j, dir, true, false, true, true);
+        assert_eq!(get(&env, "NZBPP_UNPACKSTATUS"), "2");
+
+        assert_eq!(get(&env, "NZBPP_DIRECTORY"), dir.to_string_lossy());
+        assert_eq!(get(&env, "NZBOP_DESTDIR"), "/downloads");
+        assert_eq!(get(&env, "NZBPP_NZBNAME"), "Some.Release");
+        assert_eq!(get(&env, "NZBPP_NZBFILENAME"), "Some.Release.nzb");
+        assert_eq!(get(&env, "NZBPP_CATEGORY"), "tv");
+        assert_eq!(get(&env, "NZBPP_NZBID"), "41");
+        assert_eq!(get(&env, "NZBOP_VERSION"), env!("CARGO_PKG_VERSION"));
+    }
+
+    /// Cleanup removes the archive scaffolding and nothing else. A media
+    /// file that happens to sit beside it is the whole point of the job.
+    #[test]
+    fn cleanup_removes_archive_scaffolding_and_keeps_the_payload() {
+        let tmp = tempfile::tempdir().unwrap();
+        let junk = [
+            "set.par2",
+            "set.vol00+01.PAR2",
+            "set.rar",
+            "set.part2.rar",
+            "set.zip",
+            "set.7z",
+            "set.sfv",
+            "set.001",
+        ];
+        // `set.r00` is deliberately in the keep list: the numeric rule
+        // matches a three-character all-digit extension, so old-style RAR
+        // volumes survive cleanup today. Recorded here as the behavior it
+        // is — changing it is a cleanup decision, not a test fix.
+        let keep = [
+            "film.mkv",
+            "readme.nfo",
+            "cover.jpg",
+            "notes.1234",
+            "set.r00",
+        ];
+        for n in junk.iter().chain(keep.iter()) {
+            std::fs::write(tmp.path().join(n), b"x").unwrap();
+        }
+        cleanup_dir(tmp.path());
+        for n in junk {
+            assert!(!tmp.path().join(n).exists(), "{n} should have been cleaned");
+        }
+        for n in keep {
+            assert!(tmp.path().join(n).exists(), "{n} must survive cleanup");
+        }
+        // A directory that cannot be read is not an error worth failing on.
+        cleanup_dir(&tmp.path().join("absent"));
+    }
+
+    /// Staged output is published by rename, replacing whatever the earlier
+    /// attempt left at the target.
+    #[test]
+    fn commit_staging_replaces_existing_targets() {
+        let tmp = tempfile::tempdir().unwrap();
+        let staging = tmp.path().join("staging");
+        let dir = tmp.path().join("job");
+        std::fs::create_dir_all(staging.join("Subs")).unwrap();
+        std::fs::write(staging.join("Subs/en.srt"), b"new subs").unwrap();
+        std::fs::write(staging.join("film.mkv"), b"new film").unwrap();
+        // Stale output from an earlier attempt, both shapes.
+        std::fs::create_dir_all(dir.join("Subs")).unwrap();
+        std::fs::write(dir.join("Subs/old.srt"), b"stale").unwrap();
+        std::fs::write(dir.join("film.mkv"), b"stale").unwrap();
+
+        commit_staging(&staging, &dir).unwrap();
+
+        assert_eq!(std::fs::read(dir.join("film.mkv")).unwrap(), b"new film");
+        assert_eq!(std::fs::read(dir.join("Subs/en.srt")).unwrap(), b"new subs");
+        assert!(
+            !dir.join("Subs/old.srt").exists(),
+            "a replaced directory must not keep the old attempt's entries"
+        );
+        assert!(commit_staging(&tmp.path().join("absent"), &dir).is_err());
+    }
+
+    /// The block size prices a hash-named recovery volume. Anything that is
+    /// not a readable par2 index has no price, and must say so rather than
+    /// guess one.
+    #[tokio::test]
+    async fn par2_block_size_declines_anything_that_is_not_a_par2_index() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(par2_block_size(&tmp.path().join("absent.par2")).await, None);
+        let garbage = tmp.path().join("garbage.par2");
+        std::fs::write(&garbage, vec![0u8; 4096]).unwrap();
+        assert_eq!(par2_block_size(&garbage).await, None);
+    }
+}

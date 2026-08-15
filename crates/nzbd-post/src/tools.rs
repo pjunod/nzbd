@@ -178,7 +178,7 @@ pub struct Extractors {
 
 /// The volume of a multi-volume set this file is, if it is one.
 ///
-/// `name.part07.rar` → 7, `name.r05` → 6 (old-style counts the bare `.rar` as
+/// `name.part07.rar` → 7, `name.r05` → 7 (old-style counts the bare `.rar` as
 /// volume 1 and `.r00` as volume 2), `name.rar` → 1. Anything else → None.
 fn volume_number(name: &str) -> Option<u32> {
     if let Some(idx) = name.rfind(".part") {
@@ -434,11 +434,28 @@ impl Extractors {
             let second = self
                 .extract_once(archive, ArchiveKind::SevenZip, dest, password)
                 .await;
-            return match second {
-                Ok(o) if o.success => Ok(o),
-                // Neither worked: report the first attempt's outcome, which
-                // is the one whose password/disk flags mean something.
-                other => first.or(other),
+            // The fallback gets the same delivery check the first attempt
+            // got. "Everything is Ok" over a short extraction is the exact
+            // lie this path exists to catch, and exempting the second tool
+            // from the test would leave `extract` returning success for an
+            // archive nothing read — the `unrar-free` failure again, one
+            // tool along.
+            let delivered = match &second {
+                Ok(o) => o.success && unpack_shortfall(dir, archive, dest).is_none(),
+                Err(_) => false,
+            };
+            if delivered {
+                return second;
+            }
+            // Neither delivered. Report the first attempt's outcome, which
+            // is the one whose password/disk flags mean something, but never
+            // as a success: no tool produced the set.
+            return match first.or(second) {
+                Ok(o) => Ok(ExtractOutcome {
+                    success: false,
+                    ..o
+                }),
+                Err(e) => Err(e),
             };
         }
         self.extract_once(archive, kind, dest, password).await
@@ -542,6 +559,18 @@ pub(crate) fn require_tool(tool: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    // These subprocess cases assert parsing, fallback, and filesystem
+    // behavior rather than scheduler latency. Keep a generous hard ceiling so
+    // a loaded runner cannot turn a successful one-line fixture into the
+    // timeout outcome the assertion is deliberately not testing.
+    const SUBPROCESS_TEST_TIMEOUT: Duration = Duration::from_secs(10);
+
+    fn write_tool(path: &Path, body: &str) {
+        std::fs::write(path, body).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
 
     #[test]
     fn verify_output_parsing() {
@@ -672,5 +701,346 @@ mod tests {
         .await
         .unwrap_err();
         assert!(matches!(err, PostError::ToolMissing(_)));
+    }
+
+    #[tokio::test]
+    async fn tool_runner_caps_output_and_kills_a_timed_out_child() {
+        let tmp = tempfile::tempdir().unwrap();
+        let out = run_tool(
+            "/bin/sh",
+            &["-c", "dd if=/dev/zero bs=300000 count=1 2>/dev/null"],
+            tmp.path(),
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.code, 0);
+        assert_eq!(out.stdout.len(), OUTPUT_CAP);
+
+        let err = run_tool(
+            "/bin/sh",
+            &["-c", "while :; do :; done"],
+            tmp.path(),
+            Duration::from_millis(20),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, PostError::Subprocess(message) if message.contains("timed out")));
+    }
+
+    #[tokio::test]
+    async fn par2_tool_reports_verify_and_repair_failures() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tool = tmp.path().join("fake-par2");
+        write_tool(
+            &tool,
+            "#!/bin/sh\n\
+             if [ \"$1\" = verify ]; then\n\
+               echo 'You need 4 more recovery blocks to repair these files.'\n\
+               exit 1\n\
+             fi\n\
+             if [ \"$3\" = good.par2 ]; then\n\
+               echo 'All files are correct'\n\
+               exit 0\n\
+             fi\n\
+             echo 'repair failed' >&2\n\
+             exit 2\n",
+        );
+        let par2 = Par2Tool {
+            cmd: tool.to_string_lossy().into_owned(),
+            timeout: SUBPROCESS_TEST_TIMEOUT,
+        };
+
+        assert_eq!(
+            par2.verify_full(&tmp.path().join("set.par2"))
+                .await
+                .unwrap(),
+            VerifyResult::NeedMoreBlocks { blocks_needed: 4 }
+        );
+        assert_eq!(
+            par2.repair(&tmp.path().join("good.par2")).await.unwrap(),
+            RepairResult::Repaired
+        );
+        assert_eq!(
+            par2.repair(&tmp.path().join("bad.par2")).await.unwrap(),
+            RepairResult::Failed
+        );
+        assert_eq!(
+            parse_verify_output("Repair is not possible", 1),
+            VerifyResult::Unrepairable
+        );
+        assert_eq!(
+            parse_verify_output("unrecognised tool output", 1),
+            VerifyResult::Unrepairable
+        );
+    }
+
+    #[test]
+    fn volume_sets_name_gaps_and_reject_short_extraction() {
+        let missing = tempfile::tempdir().unwrap().path().join("missing");
+        assert!(missing_volumes(&missing, &missing.join("set.part01.rar")).is_empty());
+        assert!(detect_archives(&missing).is_empty());
+        assert_eq!(tree_bytes(&missing), 0);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let first = tmp.path().join("set.part01.rar");
+        std::fs::write(&first, vec![0u8; 100]).unwrap();
+        std::fs::write(tmp.path().join("set.part03.rar"), vec![0u8; 100]).unwrap();
+        std::fs::write(tmp.path().join("other.part02.rar"), vec![0u8; 100]).unwrap();
+        std::fs::create_dir(tmp.path().join("set.part02.rar")).unwrap();
+        assert_eq!(missing_volumes(tmp.path(), &first), vec![2]);
+        assert_eq!(volume_number("set.part07.rar"), Some(7));
+        assert_eq!(volume_number("set.rar"), Some(1));
+        assert_eq!(volume_number("set.r05"), Some(7));
+        assert_eq!(volume_number("set.part.rar"), None);
+        assert_eq!(volume_number("set.bin"), None);
+
+        let dest = tmp.path().join("out");
+        std::fs::create_dir_all(dest.join("nested")).unwrap();
+        std::fs::write(dest.join("nested/partial.bin"), vec![0u8; 20]).unwrap();
+        let shortfall = unpack_shortfall(tmp.path(), &first, &dest).unwrap();
+        assert!(shortfall.contains("2-volume set totalling 200 bytes"));
+        std::fs::write(dest.join("complete.bin"), vec![0u8; 180]).unwrap();
+        assert_eq!(unpack_shortfall(tmp.path(), &first, &dest), None);
+
+        let old_first = tmp.path().join("old.rar");
+        std::fs::write(&old_first, vec![0u8; 80]).unwrap();
+        std::fs::write(tmp.path().join("old.r00"), vec![0u8; 80]).unwrap();
+        std::fs::write(tmp.path().join("old.r02"), vec![0u8; 80]).unwrap();
+        assert_eq!(missing_volumes(tmp.path(), &old_first), vec![3]);
+        assert!(unpack_shortfall(tmp.path(), &old_first, &dest).is_some());
+        std::fs::write(dest.join("last-bytes.bin"), vec![0u8; 20]).unwrap();
+        assert_eq!(unpack_shortfall(tmp.path(), &old_first, &dest), None);
+
+        let single = tmp.path().join("single.rar");
+        std::fs::write(&single, b"one").unwrap();
+        assert_eq!(unpack_shortfall(tmp.path(), &single, &dest), None);
+    }
+
+    #[tokio::test]
+    async fn rar_extraction_falls_back_but_not_for_a_bad_password() {
+        let tmp = tempfile::tempdir().unwrap();
+        let archive = tmp.path().join("single.rar");
+        std::fs::write(&archive, b"rar data").unwrap();
+        let unrar_ok = tmp.path().join("unrar-ok");
+        write_tool(
+            &unrar_ok,
+            "#!/bin/sh\nfor dest; do :; done\nmkdir -p \"$dest\"\nprintf full > \"${dest}/payload.bin\"\necho 'All OK'\n",
+        );
+        let unused = tmp.path().join("unused-7z");
+        write_tool(&unused, "#!/bin/sh\nexit 99\n");
+        let extractors = Extractors {
+            unrar_cmd: unrar_ok.to_string_lossy().into_owned(),
+            sevenzip_cmd: unused.to_string_lossy().into_owned(),
+            timeout: SUBPROCESS_TEST_TIMEOUT,
+        };
+        let dest = tmp.path().join("single-out");
+        let outcome = extractors
+            .extract(&archive, ArchiveKind::Rar, &dest, None)
+            .await
+            .unwrap();
+        assert!(outcome.success);
+        assert_eq!(std::fs::read(dest.join("payload.bin")).unwrap(), b"full");
+
+        let bad_password = tmp.path().join("unrar-password");
+        write_tool(
+            &bad_password,
+            "#!/bin/sh\necho 'password is incorrect' >&2\nexit 11\n",
+        );
+        let extractors = Extractors {
+            unrar_cmd: bad_password.to_string_lossy().into_owned(),
+            sevenzip_cmd: unused.to_string_lossy().into_owned(),
+            timeout: SUBPROCESS_TEST_TIMEOUT,
+        };
+        let outcome = extractors
+            .extract(
+                &archive,
+                ArchiveKind::Rar,
+                &tmp.path().join("password-out"),
+                Some("wrong"),
+            )
+            .await
+            .unwrap();
+        assert!(!outcome.success);
+        assert!(outcome.password_error);
+    }
+
+    #[tokio::test]
+    async fn truncated_rar_output_retries_with_sevenzip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let first = tmp.path().join("set.part01.rar");
+        std::fs::write(&first, vec![0u8; 100]).unwrap();
+        std::fs::write(tmp.path().join("set.part02.rar"), vec![0u8; 100]).unwrap();
+        let short_unrar = tmp.path().join("short-unrar");
+        write_tool(
+            &short_unrar,
+            "#!/bin/sh\nfor dest; do :; done\nmkdir -p \"$dest\"\nprintf x > \"${dest}/partial.bin\"\necho 'All OK'\n",
+        );
+        // The fallback must actually deliver the set, not merely print the
+        // success line: 200 packed bytes put the shortfall floor at 180.
+        let good_7z = tmp.path().join("good-7z");
+        write_tool(
+            &good_7z,
+            // 7-Zip's destination is the `-oDEST` flag, argument 4.
+            "#!/bin/sh\ndest=${4#-o}\nmkdir -p \"$dest\"\nhead -c 200 /dev/zero > \"${dest}/whole.bin\"\necho 'Everything is Ok'\n",
+        );
+        let extractors = Extractors {
+            unrar_cmd: short_unrar.to_string_lossy().into_owned(),
+            sevenzip_cmd: good_7z.to_string_lossy().into_owned(),
+            timeout: SUBPROCESS_TEST_TIMEOUT,
+        };
+        let dest = tmp.path().join("fallback-out");
+        let outcome = extractors
+            .extract(&first, ArchiveKind::Rar, &dest, None)
+            .await
+            .unwrap();
+        assert!(
+            outcome.success,
+            "7-Zip fallback must replace a short extraction"
+        );
+        assert_eq!(
+            std::fs::metadata(dest.join("whole.bin")).unwrap().len(),
+            200,
+            "the reported success must be the fallback's full-size output"
+        );
+        assert!(
+            !dest.join("partial.bin").exists(),
+            "the short first attempt's output was discarded before the retry"
+        );
+    }
+
+    /// A fallback that also under-delivers is not a success.
+    ///
+    /// `Extractors::extract` used to shortfall-check only the first attempt,
+    /// so a 7-Zip run that printed "Everything is Ok" over an empty
+    /// destination was returned as a complete extraction — the whole failure
+    /// the fallback exists to catch, arriving through the fallback itself.
+    #[tokio::test]
+    async fn sevenzip_fallback_that_is_also_short_is_not_a_success() {
+        let tmp = tempfile::tempdir().unwrap();
+        let first = tmp.path().join("set.part01.rar");
+        std::fs::write(&first, vec![0u8; 100]).unwrap();
+        std::fs::write(tmp.path().join("set.part02.rar"), vec![0u8; 100]).unwrap();
+        let short_unrar = tmp.path().join("short-unrar");
+        write_tool(
+            &short_unrar,
+            "#!/bin/sh\nfor dest; do :; done\nmkdir -p \"$dest\"\nprintf x > \"${dest}/partial.bin\"\necho 'All OK'\n",
+        );
+        // Prints the success line, writes nothing.
+        let lying_7z = tmp.path().join("lying-7z");
+        write_tool(&lying_7z, "#!/bin/sh\necho 'Everything is Ok'\n");
+        let extractors = Extractors {
+            unrar_cmd: short_unrar.to_string_lossy().into_owned(),
+            sevenzip_cmd: lying_7z.to_string_lossy().into_owned(),
+            timeout: SUBPROCESS_TEST_TIMEOUT,
+        };
+        let dest = tmp.path().join("both-short-out");
+        let outcome = extractors
+            .extract(&first, ArchiveKind::Rar, &dest, None)
+            .await
+            .unwrap();
+        assert!(
+            !outcome.success,
+            "a fallback that read none of the volume set must not be reported as a complete extraction"
+        );
+        assert!(
+            unpack_shortfall(tmp.path(), &first, &dest).is_some(),
+            "the destination really is short, so the outcome above is the tool's claim being overruled"
+        );
+    }
+
+    #[tokio::test]
+    async fn extractors_preserve_the_first_failure_and_name_disk_exhaustion() {
+        let tmp = tempfile::tempdir().unwrap();
+        let archive = tmp.path().join("broken.rar");
+        std::fs::write(&archive, b"rar data").unwrap();
+        let failed = tmp.path().join("failed-tool");
+        write_tool(&failed, "#!/bin/sh\necho failed >&2\nexit 2\n");
+
+        // When both RAR attempts fail the merge keeps the FIRST outcome,
+        // because that is the attempt whose password/disk flags were set by
+        // the tool that actually understands the archive. Give the two tools
+        // different failures so the choice is observable: unrar exits 5
+        // (unrar's write/disk-error code), 7-Zip fails with no disk marker
+        // at all. Merging the other way round would silently lose the
+        // "the volume is full" diagnosis operators act on.
+        let disk_full_unrar = tmp.path().join("disk-full-unrar");
+        write_tool(
+            &disk_full_unrar,
+            "#!/bin/sh\necho 'cannot write' >&2\nexit 5\n",
+        );
+        let extractors = Extractors {
+            unrar_cmd: disk_full_unrar.to_string_lossy().into_owned(),
+            sevenzip_cmd: failed.to_string_lossy().into_owned(),
+            timeout: SUBPROCESS_TEST_TIMEOUT,
+        };
+        let outcome = extractors
+            .extract(
+                &archive,
+                ArchiveKind::Rar,
+                &tmp.path().join("failed-out"),
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(!outcome.success);
+        assert!(
+            outcome.disk_space_error,
+            "the merged outcome must carry the first attempt's disk flag; the 7-Zip fallback never set one"
+        );
+
+        let good_7z = tmp.path().join("fallback-7z");
+        write_tool(&good_7z, "#!/bin/sh\necho 'Everything is Ok'\n");
+        let missing_unrar = Extractors {
+            unrar_cmd: tmp
+                .path()
+                .join("missing-unrar")
+                .to_string_lossy()
+                .into_owned(),
+            sevenzip_cmd: good_7z.to_string_lossy().into_owned(),
+            timeout: SUBPROCESS_TEST_TIMEOUT,
+        };
+        let outcome = missing_unrar
+            .extract(
+                &archive,
+                ArchiveKind::Rar,
+                &tmp.path().join("missing-unrar-out"),
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(outcome.success, "a missing unrar must fall back to 7-Zip");
+
+        let disk_full = tmp.path().join("disk-full-7z");
+        write_tool(
+            &disk_full,
+            "#!/bin/sh\necho 'There is not enough space' >&2\nexit 2\n",
+        );
+        let extractors = Extractors {
+            unrar_cmd: failed.to_string_lossy().into_owned(),
+            sevenzip_cmd: disk_full.to_string_lossy().into_owned(),
+            timeout: SUBPROCESS_TEST_TIMEOUT,
+        };
+        let outcome = extractors
+            .extract(
+                &tmp.path().join("archive.zip"),
+                ArchiveKind::Zip,
+                &tmp.path().join("disk-out"),
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(!outcome.success);
+        assert!(outcome.disk_space_error);
+    }
+
+    #[test]
+    fn missing_required_tools_follow_the_ci_contract() {
+        let missing = "definitely-not-a-required-tool-xyz";
+        if std::env::var_os("NZBD_REQUIRE_TOOLS").is_some() {
+            assert!(std::panic::catch_unwind(|| require_tool(missing)).is_err());
+        } else {
+            assert!(!require_tool(missing));
+        }
     }
 }

@@ -191,6 +191,7 @@ pub fn quick_verify(set: &Par2Set, evidence: &[DownloadEvidence]) -> VerifyResul
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::symlink;
     use std::process::Command;
 
     fn crc(data: &[u8]) -> u32 {
@@ -273,5 +274,46 @@ mod tests {
             quick_verify(&set, &ev_none),
             VerifyResult::Repairable { .. }
         ));
+    }
+
+    #[test]
+    fn malformed_sets_and_incomplete_evidence_fail_closed() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("junk.par2"), b"not a par2 set").unwrap();
+        symlink(
+            tmp.path().join("missing-target"),
+            tmp.path().join("unreadable.par2"),
+        )
+        .unwrap();
+        assert!(load_dir(tmp.path()).unwrap().is_none());
+
+        let data = b"abc";
+        let file = Par2File {
+            id: [1; 16],
+            name: "payload.bin".into(),
+            length: data.len() as u64,
+            md5_16k: [2; 16],
+            slice_crcs: vec![crc(data)],
+        };
+        assert!(quick_check_file(&file, 3, 3, crc(data)));
+        assert!(!quick_check_file(&file, 3, 2, crc(data)));
+        assert!(!quick_check_file(&file, 0, 3, crc(data)));
+        let mut wrong_slices = file.clone();
+        wrong_slices.slice_crcs.push(crc(data));
+        assert!(!quick_check_file(&wrong_slices, 3, 3, crc(data)));
+
+        let set = Par2Set {
+            slice_size: 3,
+            files: vec![file],
+            recovery_blocks: 7,
+            main_path: None,
+        };
+        assert_eq!(
+            quick_verify(&set, &[]),
+            VerifyResult::Repairable {
+                blocks_available: 7,
+                blocks_needed: 0,
+            }
+        );
     }
 }

@@ -418,4 +418,61 @@ mod tests {
             deobfuscate_dir(tmp.path(), "cafebabecafebabecafebabe", &Default::default()).is_empty()
         );
     }
+
+    #[test]
+    fn heuristic_boundaries_preserve_human_names() {
+        assert!(is_definitely_obfuscated(
+            "deadbeef.deadbeef.deadbeef.deadbeef.deadbeef"
+        ));
+        assert!(is_definitely_obfuscated(
+            "[deadbeefdeadbeef][cafebabecafebabe]"
+        ));
+        assert!(!is_probably_obfuscated("one.two_three four"));
+        assert!(!is_probably_obfuscated("abcd.1234"));
+        assert!(!is_probably_obfuscated("Titlecaseword"));
+        assert!(!is_definitely_obfuscated("Show.S1E2"));
+    }
+
+    #[test]
+    fn nested_dominant_file_avoids_hidden_files_and_name_collisions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let nested = tmp.path().join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        std::fs::write(nested.join("a1b2c3d4e5f6a7b8.mkv"), vec![0u8; 9000]).unwrap();
+        std::fs::write(nested.join("a1b2c3d4e5f6a7b8.srt"), b"subs").unwrap();
+        std::fs::write(nested.join("Job.Name.mkv"), b"occupied").unwrap();
+        std::fs::write(tmp.path().join("root-note.txt"), b"different parent").unwrap();
+        std::fs::write(tmp.path().join(".hidden.mkv"), vec![0u8; 20_000]).unwrap();
+
+        let renames = deobfuscate_dir(tmp.path(), "Job.Name.nzb", &Default::default());
+        assert_eq!(renames.len(), 2);
+        assert!(nested.join("Job.Name (2).mkv").exists());
+        assert!(nested.join("Job.Name.srt").exists());
+        assert!(nested.join("Job.Name.mkv").exists());
+        assert!(tmp.path().join(".hidden.mkv").exists());
+        assert!(tmp.path().join("root-note.txt").exists());
+    }
+
+    #[test]
+    fn empty_or_unreadable_directories_are_noops() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(deobfuscate_dir(tmp.path(), "", &Default::default()).is_empty());
+        assert!(deobfuscate_dir(
+            &tmp.path().join("missing"),
+            "Useful.Job.Name",
+            &Default::default()
+        )
+        .is_empty());
+        std::fs::write(tmp.path().join("piece.001"), b"split volume").unwrap();
+        assert!(deobfuscate_dir(tmp.path(), "Useful.Job.Name", &Default::default()).is_empty());
+
+        let mut deep = tmp.path().to_path_buf();
+        for part in ["a", "b", "c", "d", "e", "f", "g"] {
+            deep.push(part);
+            std::fs::create_dir(&deep).unwrap();
+        }
+        std::fs::write(deep.join("deadbeefdeadbeef.mkv"), b"too deep").unwrap();
+        assert!(deobfuscate_dir(tmp.path(), "Useful.Job.Name", &Default::default()).is_empty());
+        assert!(deep.join("deadbeefdeadbeef.mkv").exists());
+    }
 }

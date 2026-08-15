@@ -471,4 +471,102 @@ mod tests {
 
         assert_eq!(rar5_volume_number(b"Rar!\x1a\x07\x00garbage"), None); // RAR4
     }
+
+    #[test]
+    fn filesystem_helpers_fail_closed_and_never_clobber() {
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("missing");
+        assert!(head(&missing, 8).is_empty());
+        assert!(md5_16k(&missing).is_none());
+        assert!(files_of(&missing).is_empty());
+        assert!(
+            head(tmp.path(), 8).is_empty(),
+            "directories are not readable payloads"
+        );
+
+        let empty = tmp.path().join("empty");
+        std::fs::write(&empty, b"").unwrap();
+        assert!(md5_16k(&empty).is_none());
+        assert!(safe_rename(&empty, empty.clone()).is_none());
+
+        let occupied = tmp.path().join("occupied");
+        std::fs::write(&occupied, b"keep").unwrap();
+        assert!(safe_rename(&empty, occupied.clone()).is_none());
+        assert_eq!(std::fs::read(&occupied).unwrap(), b"keep");
+
+        let impossible = tmp.path().join("no-parent/target");
+        assert!(safe_rename(&empty, impossible).is_none());
+        assert!(empty.exists());
+    }
+
+    #[test]
+    fn rar5_parser_rejects_malformed_and_non_volume_headers() {
+        assert_eq!(rar5_volume_number(b"short"), None);
+
+        let mut overflow = b"Rar!\x1a\x07\x01\x00".to_vec();
+        overflow.extend_from_slice(&[0, 0, 0, 0]);
+        overflow.extend_from_slice(&[0x80; 10]);
+        assert_eq!(rar5_volume_number(&overflow), None);
+
+        let mut wrong_type = b"Rar!\x1a\x07\x01\x00".to_vec();
+        wrong_type.extend_from_slice(&[0, 0, 0, 0]);
+        wrong_type.extend_from_slice(&[4, 2, 0, 0]);
+        assert_eq!(rar5_volume_number(&wrong_type), None);
+
+        let mut extra_non_volume = b"Rar!\x1a\x07\x01\x00".to_vec();
+        extra_non_volume.extend_from_slice(&[0, 0, 0, 0]);
+        extra_non_volume.extend_from_slice(&[5, 1, 1, 0, 0]);
+        assert_eq!(rar5_volume_number(&extra_non_volume), None);
+    }
+
+    #[test]
+    fn signature_rename_handles_zip_collisions_and_rar4_sets() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut zip = ZIP_MAGIC.to_vec();
+        zip.extend_from_slice(&[0u8; 32]);
+        std::fs::write(tmp.path().join("zipblob"), &zip).unwrap();
+        std::fs::write(tmp.path().join("held"), &zip).unwrap();
+        std::fs::write(tmp.path().join("held.zip"), b"keep").unwrap();
+
+        let mut rar4 = b"Rar!\x1a\x07\x00".to_vec();
+        rar4.extend_from_slice(&[0u8; 64]);
+        std::fs::write(tmp.path().join("a-hidden"), &rar4).unwrap();
+        std::fs::write(tmp.path().join("b-hidden"), &rar4).unwrap();
+
+        let renames = rar_rename(tmp.path());
+        assert!(tmp.path().join("zipblob.zip").exists());
+        assert_eq!(std::fs::read(tmp.path().join("held.zip")).unwrap(), b"keep");
+        assert!(
+            tmp.path().join("held").exists(),
+            "collision must not clobber"
+        );
+        assert!(tmp.path().join("a-hidden.part01.rar").exists());
+        assert!(tmp.path().join("a-hidden.part02.rar").exists());
+        assert_eq!(renames.len(), 3);
+    }
+
+    #[test]
+    fn rar5_volume_numbers_control_multi_volume_order() {
+        fn numbered(volume: u8) -> Vec<u8> {
+            let mut data = b"Rar!\x1a\x07\x01\x00".to_vec();
+            data.extend_from_slice(&[0, 0, 0, 0]);
+            data.extend_from_slice(&[5, 1, 0, 3, volume]);
+            data
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("a-second"), numbered(1)).unwrap();
+        std::fs::write(tmp.path().join("z-first"), numbered(0)).unwrap();
+        let renames = rar_rename(tmp.path());
+
+        assert_eq!(renames.len(), 2);
+        assert_eq!(
+            std::fs::read(tmp.path().join("a-second.part01.rar")).unwrap(),
+            numbered(0)
+        );
+        assert_eq!(
+            std::fs::read(tmp.path().join("a-second.part02.rar")).unwrap(),
+            numbered(1)
+        );
+    }
 }
