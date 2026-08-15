@@ -431,3 +431,115 @@ async fn unsupported_schemes_and_out_of_range_limits_fail_before_contact() {
         .expect_err("undersized configured limit must fail");
     assert!(matches!(error, TorrentError::InvalidTorrentSourceLimits(_)));
 }
+
+#[tokio::test]
+async fn malformed_sources_and_credentials_fail_before_any_socket() {
+    // Every one of these targets a host that must never be contacted, so a
+    // hang or a DNS error here means the check moved after the request.
+    for (source, reason) in [
+        ("not-a-url", "URL syntax is not valid"),
+        (
+            "http://%FF@source.invalid/a.torrent",
+            "username must contain valid UTF-8",
+        ),
+        (
+            "http://alice:%FF@source.invalid/a.torrent",
+            "password must contain valid UTF-8",
+        ),
+    ] {
+        let error = fetch_torrent_source(source, short_limits(), false)
+            .await
+            .expect_err("malformed source must fail");
+        assert!(
+            matches!(&error, TorrentError::InvalidTorrentSource(named) if *named == reason),
+            "{source} was not rejected as {reason:?}: {error}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_broken_transport_reports_a_redacted_request_failure() {
+    // The origin must fail for a transport reason that is not a timeout, so
+    // that the non-timeout arm of the send-error mapping is the one measured.
+    // The server accepts, reads the request, then closes without answering.
+    // Binding a port and dropping it instead would make the failure mode
+    // platform-dependent — Windows reported a different variant here.
+    let (address, server) = spawn_server(vec![ResponseSpec::immediate(Vec::new())]).await;
+
+    let url = format!("http://alice:secret@{address}/secret/path?passkey=source-token");
+    let error = fetch_torrent_source(&url, short_limits(), false)
+        .await
+        .expect_err("a closed connection must fail");
+    assert!(
+        matches!(&error, TorrentError::TorrentSourceRequestFailed { .. }),
+        "a non-timeout transport failure must not be reported as another \
+         variant, got: {error:?}"
+    );
+    let shown = error.to_string();
+    assert_eq!(
+        shown,
+        format!("torrent source request failed for http://{address}")
+    );
+    for secret in ["alice", "secret", "path", "passkey", "source-token"] {
+        assert!(!shown.contains(secret), "leaked {secret:?}: {shown}");
+    }
+
+    // The request really reached the wire, so this covers the send-error arm
+    // rather than one of the pre-flight rejections.
+    let requests = server.await.expect("server task");
+    assert_eq!(requests.len(), 1, "the request must have been sent");
+}
+
+#[tokio::test]
+async fn redirects_require_a_location_header_that_resolves_to_a_url() {
+    // A redirect status with no usable target must fail instead of falling
+    // through to the redirect body as if it were metainfo.
+    let missing = response("302 Found", &[], b"");
+    let unreadable = b"HTTP/1.1 302 Found\r\nLocation: \xff\xfe\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec();
+    let unjoinable = response("302 Found", &[("Location", "http://[not-an-address")], b"");
+
+    for (raw, reason) in [
+        (missing, "Location header is missing"),
+        (unreadable, "Location header is not valid text"),
+        (unjoinable, "target URL syntax is not valid"),
+    ] {
+        let (address, server) = spawn_server(vec![ResponseSpec::immediate(raw)]).await;
+        let error = fetch_torrent_source(&source_url(address, "/start"), short_limits(), false)
+            .await
+            .expect_err("unusable redirect must fail");
+        assert!(
+            matches!(
+                &error,
+                TorrentError::InvalidTorrentSourceRedirect { origin, reason: named }
+                    if *named == reason && *origin == format!("http://{address}")
+            ),
+            "redirect was not rejected as {reason:?}: {error}"
+        );
+        assert_eq!(server.await.expect("redirect server task").len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn a_truncated_response_body_fails_instead_of_admitting_partial_metainfo() {
+    // The server announces a chunk and then closes, so the body ends without
+    // its terminating chunk. Partial bytes must never reach the preflight.
+    let mut truncated =
+        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n".to_vec();
+    truncated.extend_from_slice(format!("{:x}\r\n", VALID_METAINFO.len()).as_bytes());
+    truncated.extend_from_slice(&VALID_METAINFO[..VALID_METAINFO.len() / 2]);
+
+    let (address, server) = spawn_server(vec![ResponseSpec::immediate(truncated)]).await;
+    let url = format!("http://alice:secret@{address}/download?passkey=source-token");
+    let error = fetch_torrent_source(&url, short_limits(), false)
+        .await
+        .expect_err("truncated body must fail");
+    assert!(matches!(
+        &error,
+        TorrentError::TorrentSourceRequestFailed { .. }
+    ));
+    let shown = error.to_string();
+    for secret in ["alice", "secret", "passkey", "source-token"] {
+        assert!(!shown.contains(secret), "leaked {secret:?}: {shown}");
+    }
+    server.await.expect("truncated server task");
+}
