@@ -8,7 +8,10 @@ on:
 env:
   CARGO_TERM_COLOR: always
   # Raise only after a complete main-branch run proves the new floor.
-  MINIMUM_LINE_COVERAGE: 87.4
+  # Measured on main: 90.63% (84aa333) and 90.62% (59d5deb). 90.0 leaves
+  # ~0.6 points -- about 170 of 27,404 instrumented lines -- against a
+  # per-commit spread of at most 0.05 points since the suite was stabilized.
+  MINIMUM_LINE_COVERAGE: 90.0
   # External-tool tests (par2, 7z) self-skip on machines without the
   # binaries; in CI a missing tool must be a failure, never a skip.
   NZBD_REQUIRE_TOOLS: 1

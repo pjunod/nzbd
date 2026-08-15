@@ -282,8 +282,8 @@ fn coverage_measurement_fails_closed_and_runs_the_whole_workspace() {
     );
     // Raise this bound deliberately alongside MINIMUM_LINE_COVERAGE; never lower it.
     assert!(
-        coverage_floor >= 87.4,
-        "MINIMUM_LINE_COVERAGE must not fall below the recorded 87.4% floor, or the coverage \
+        coverage_floor >= 90.0,
+        "MINIMUM_LINE_COVERAGE must not fall below the recorded 90.0% floor, or the coverage \
          gate can be silently weakened"
     );
 
