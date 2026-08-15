@@ -608,7 +608,6 @@ async fn handle_failed_job(
                     {
                         return;
                     }
-                    last_disposition.insert(job, tokio::time::Instant::now());
 
                     let Some(finalizing) = exported.as_mut() else {
                         return;
@@ -640,6 +639,15 @@ async fn handle_failed_job(
                         Ok(true) => {}
                         Ok(false) | Err(_) => return,
                     }
+                    // Recorded only now, because the debounce stands for a
+                    // *spent* attempt. A commit that did not reach the queue
+                    // snapshot restored the previous row and spent nothing;
+                    // debouncing on the try instead would hold the row
+                    // un-retryable for half a rescan period and quietly cost
+                    // the operator a retry that never happened — the same
+                    // "retrying after a failed commit stays immediate" rule
+                    // the paragraph above states.
+                    last_disposition.insert(job, tokio::time::Instant::now());
                     if gate.as_ref().is_some_and(|claim| !claim(job)) {
                         return;
                     }
