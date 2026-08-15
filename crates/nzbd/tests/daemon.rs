@@ -31,7 +31,10 @@ fn wait_healthy(daemon: &KillOnDrop, addr: &str, deadline: Duration) -> Result<(
         if let Some(cause) = daemon.died() {
             return Err(format!("daemon is not coming up at {addr}: {cause}"));
         }
-        if let Some((200, body)) = probe(addr, "/healthz") {
+        // No attempt may outlast the wait it belongs to: near the end of the
+        // budget the probe's own bound is whatever is left of it.
+        let budget = PROBE_TIMEOUT.min(deadline.saturating_sub(start.elapsed()));
+        if let Some((200, body)) = probe_within(addr, "/healthz", budget) {
             if body == "ok" {
                 return Ok(());
             }
@@ -52,7 +55,13 @@ fn wait_healthy(daemon: &KillOnDrop, addr: &str, deadline: Duration) -> Result<(
 /// two thirds of it and the timeout then blamed a daemon that was merely
 /// slow to answer once.
 fn probe(addr: &str, path: &str) -> Option<(u16, String)> {
-    request(addr, "GET", path, b"", None, PROBE_TIMEOUT)
+    probe_within(addr, path, PROBE_TIMEOUT)
+}
+
+/// A probe under a caller-chosen bound, so a poller can shrink the last
+/// attempt to whatever is left of its own budget.
+fn probe_within(addr: &str, path: &str, budget: Duration) -> Option<(u16, String)> {
+    request(addr, "GET", path, b"", None, budget)
 }
 
 /// Bound on a single readiness probe (connect and read alike).
@@ -180,10 +189,51 @@ fn try_http(
     request(addr, method, path, body, basic, Duration::from_secs(10))
 }
 
+/// Time left before `deadline`, or `None` once it is gone. A socket timeout
+/// of zero means "block forever", so an exhausted budget must abandon the
+/// attempt rather than arm one.
+fn left_until(deadline: Instant) -> Option<Duration> {
+    let left = deadline.saturating_duration_since(Instant::now());
+    (!left.is_zero()).then_some(left)
+}
+
+/// Write every byte, re-arming the socket bound from the same absolute
+/// deadline before each attempt.
+fn write_all_by(sock: &mut TcpStream, mut buf: &[u8], deadline: Instant) -> Option<()> {
+    while !buf.is_empty() {
+        sock.set_write_timeout(Some(left_until(deadline)?)).ok()?;
+        match sock.write(buf) {
+            Ok(0) => return None,
+            Ok(n) => buf = &buf[n..],
+            Err(_) => return None,
+        }
+    }
+    Some(())
+}
+
+/// Read to EOF under the same absolute deadline. `read_to_end` cannot be
+/// used here: it re-arms nothing, so a per-read idle timeout only bounds one
+/// read of a loop that runs until EOF, and a peer trickling one byte inside
+/// every idle window keeps the whole attempt alive indefinitely.
+fn read_to_end_by(sock: &mut TcpStream, out: &mut Vec<u8>, deadline: Instant) -> Option<()> {
+    let mut buf = [0u8; 8 * 1024];
+    loop {
+        sock.set_read_timeout(Some(left_until(deadline)?)).ok()?;
+        match sock.read(&mut buf) {
+            Ok(0) => return Some(()),
+            Ok(n) => out.extend_from_slice(&buf[..n]),
+            Err(_) => return None,
+        }
+    }
+}
+
 /// One HTTP/1.1 request with an explicit per-attempt bound. Every wait in
 /// this file polls, so no single attempt may be allowed to consume the
 /// caller's whole budget — an unbounded connect or read turns "the daemon
 /// never came up" into a claim the test cannot actually support.
+///
+/// `timeout` bounds the whole exchange, not each syscall in it: connect,
+/// write and read all draw down one absolute deadline.
 fn request(
     addr: &str,
     method: &str,
@@ -192,10 +242,9 @@ fn request(
     basic: Option<&str>,
     timeout: Duration,
 ) -> Option<(u16, String)> {
+    let deadline = Instant::now().checked_add(timeout)?;
     let target = addr.parse().ok()?;
-    let mut sock = TcpStream::connect_timeout(&target, timeout).ok()?;
-    sock.set_read_timeout(Some(timeout)).ok()?;
-    sock.set_write_timeout(Some(timeout)).ok()?;
+    let mut sock = TcpStream::connect_timeout(&target, left_until(deadline)?).ok()?;
     let auth = basic
         .map(|cred| {
             use base64::Engine as _;
@@ -209,10 +258,10 @@ fn request(
         "{method} {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Length: {}\r\nContent-Type: application/json\r\n{auth}Connection: close\r\n\r\n",
         body.len()
     );
-    sock.write_all(req.as_bytes()).ok()?;
-    sock.write_all(body).ok()?;
+    write_all_by(&mut sock, req.as_bytes(), deadline)?;
+    write_all_by(&mut sock, body, deadline)?;
     let mut resp = Vec::new();
-    sock.read_to_end(&mut resp).ok()?;
+    read_to_end_by(&mut sock, &mut resp, deadline)?;
     let text = String::from_utf8_lossy(&resp).into_owned();
     let status: u16 = text.split_whitespace().nth(1)?.parse().ok()?;
     let payload = text
@@ -320,6 +369,47 @@ fn a_probe_against_a_silent_listener_is_bounded() {
     assert!(
         start.elapsed() < PROBE_TIMEOUT * 2,
         "one probe must stay near its bound, took {:?}",
+        start.elapsed()
+    );
+}
+
+/// A peer that makes *progress* without ever finishing is the case a
+/// per-read idle timeout cannot catch: `read_to_end` loops until EOF, so one
+/// byte inside every idle window keeps a single attempt alive for as long as
+/// the peer cares to trickle. The bound has to be absolute over the whole
+/// exchange, or the caller's poll loop — which only checks its deadline
+/// *between* attempts — never gets to run.
+#[test]
+fn a_probe_against_a_trickling_listener_is_bounded() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    std::thread::spawn(move || {
+        for mut stream in listener.incoming().take(4).filter_map(Result::ok) {
+            std::thread::spawn(move || {
+                // Never a complete response, never EOF: 40 dribbles at a
+                // quarter of the bound is 10x the budget one attempt may
+                // spend, so an unbounded read is unmistakable.
+                for _ in 0..40 {
+                    if stream.write_all(b"H").is_err() {
+                        return;
+                    }
+                    let _ = stream.flush();
+                    std::thread::sleep(PROBE_TIMEOUT / 4);
+                }
+            });
+        }
+    });
+
+    let start = Instant::now();
+    assert_eq!(
+        probe(&addr, "/healthz"),
+        None,
+        "an answer that never completes is not ready"
+    );
+    assert!(
+        start.elapsed() < PROBE_TIMEOUT * 2,
+        "one probe must stay near its bound even against a peer that keeps \
+         making progress, took {:?}",
         start.elapsed()
     );
 }
