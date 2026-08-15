@@ -275,7 +275,10 @@ mod tests {
         assert_eq!(out.commands, vec![("KEY".into(), "value".into())]);
 
         let noisy = tmp.path().join("noisy.sh");
-        write_script(&noisy, "#!/bin/sh\nyes plain | head -n 100001\n");
+        write_script(
+            &noisy,
+            "#!/bin/sh\nyes plain | head -n 100000\necho '[NZB] LATE=1'\n",
+        );
         let host = ScriptHost {
             timeout: Duration::from_secs(10),
         };
