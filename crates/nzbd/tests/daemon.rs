@@ -527,6 +527,90 @@ fn assert_serialized_by_the_lock(what: &str, op: impl FnOnce() + Send + 'static)
         .unwrap_or_else(|_| panic!("{what} must proceed once the probe is closed"));
 }
 
+/// The tests above prove the guard excludes what goes *through* it. This one
+/// proves nothing goes *around* it.
+///
+/// `ed91522` introduced [`SPAWN_LOCK`] and left seven call sites bypassing it
+/// in the very same commit, which is the whole argument for checking this
+/// mechanically instead of trusting the comment on [`SPAWN_LOCK`]: a rule that
+/// easy to forget is one every future edit would otherwise have to re-derive.
+/// No runtime test can assert "nothing anywhere does X" — it cannot observe a
+/// fork that has not been written yet — so this reads the file's own source.
+/// Only whole-line comments are stripped; a forbidden pattern in a trailing
+/// inline comment is intentionally rejected too, so code cannot hide beside it.
+#[test]
+fn no_call_site_reaches_a_fork_or_a_listener_around_the_guard() {
+    let stripped: String = include_str!("daemon.rs")
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    // This test names the very patterns it forbids, so its own body has to come
+    // out first or it would convict itself.
+    let own = body_of(
+        &stripped,
+        "fn no_call_site_reaches_a_fork_or_a_listener_around_the_guard",
+    )
+    .to_string();
+    let code = stripped.replace(&own, "");
+
+    for (pattern, sanctioned_in, what_it_does) in [
+        (
+            "TcpListener::bind",
+            Some("fn bind_listener"),
+            "opens a listening socket that a concurrent fork can inherit",
+        ),
+        (
+            ".spawn()",
+            Some("fn spawn_child"),
+            "forks a child that can inherit a listening socket",
+        ),
+        (".output()", None, "forks a child; use `child_output`"),
+        (".status()", None, "forks a child; use `child_status`"),
+    ] {
+        let sanctioned =
+            sanctioned_in.map_or(0, |sig| body_of(&code, sig).matches(pattern).count());
+        let bypasses = code.matches(pattern).count() - sanctioned;
+        assert_eq!(
+            bypasses,
+            0,
+            "`{pattern}` is called {bypasses} time(s) outside {}: it {what_it_does}. \
+             Route it through `bind_listener`, `spawn_child`, `child_output`, or \
+             `child_status`, so it is serialized against every other one.",
+            sanctioned_in.unwrap_or("any sanctioned wrapper"),
+        );
+    }
+}
+
+/// The `{ .. }` body of the named function, as a slice of `src`.
+///
+/// Brace counting is enough here because the only functions it is asked for
+/// contain no braces inside string or character literals.
+fn body_of<'a>(src: &'a str, signature: &str) -> &'a str {
+    let start = src.find(signature).unwrap_or_else(|| {
+        panic!("`{signature}` is gone; the spawn guard's wrappers were renamed")
+    });
+    let open = start
+        + src[start..]
+            .find('{')
+            .unwrap_or_else(|| panic!("`{signature}` has no body"));
+    let mut depth = 0usize;
+    for (offset, ch) in src[open..].char_indices() {
+        match ch {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return &src[open..open + offset + 1];
+                }
+            }
+            _ => {}
+        }
+    }
+    panic!("`{signature}` has an unterminated body");
+}
+
 /// The liveness assertion still holds: a daemon that is alive but never
 /// serves must fail on its budget, so widening the wait can never turn a
 /// daemon that does not come up into a pass.
