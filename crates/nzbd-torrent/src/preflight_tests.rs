@@ -1159,3 +1159,341 @@ fn exact_magnet_uri_limit_is_accepted_and_first_excess_is_named() {
             if size == MAX_MAGNET_URI_BYTES + 1 && limit == MAX_MAGNET_URI_BYTES
     ));
 }
+
+#[test]
+fn display_safe_errors_drop_control_bytes_and_separate_a_truncated_token() {
+    // `split_whitespace` does not split on non-whitespace control bytes, so the
+    // normalizer has to strip them itself and drop a token that was nothing but
+    // control bytes instead of emitting an empty word.
+    assert_eq!(
+        display_safe_error("visible\u{7}context \u{1}\u{2} tail"),
+        "visiblecontext tail"
+    );
+
+    // Truncation that starts on a later token still separates it from the text
+    // already accepted and still ends on the truncation marker.
+    let overflow = display_safe_error(&format!(
+        "head {}",
+        "x".repeat(DISPLAY_SAFE_ERROR_MAX_BYTES)
+    ));
+    assert!(overflow.starts_with("head x"));
+    assert_eq!(overflow.len(), DISPLAY_SAFE_ERROR_MAX_BYTES);
+    assert!(overflow.ends_with(ERROR_TRUNCATION_MARKER));
+}
+
+#[test]
+fn redacted_urls_keep_ipv6_authorities_and_name_hostless_and_windows_forms() {
+    // An IPv6 authority keeps exactly one pair of brackets, so the surviving
+    // origin is still a parseable URL.
+    let ipv6 = display_safe_error("tracker=https://alice:secret@[2001:db8::1]:8080/announce?key=x");
+    assert_eq!(ipv6, "tracker=https://[2001:db8::1]:8080/<redacted>");
+    assert!(url::Url::parse(ipv6.trim_start_matches("tracker=")).is_ok());
+
+    // A `://` token that carries no authority cannot be reduced to a safe
+    // origin, so the whole value disappears instead of leaking its path.
+    assert_eq!(
+        display_safe_error("socket=unix:///run/nzbd/private.sock"),
+        "socket=<redacted-url>"
+    );
+
+    // Windows absolute paths are redacted like POSIX ones even though their
+    // drive prefix also looks like a `key:value` separator.
+    assert_eq!(
+        display_safe_error("open C:\\Users\\alice\\payload.bin failed"),
+        "open <redacted-path> failed"
+    );
+
+    // A drive letter alone is not a path, so a `X:` token that carries no
+    // separator keeps its diagnostic value instead of being over-redacted.
+    assert_eq!(
+        display_safe_error("engine C:relative done"),
+        "engine C:relative done"
+    );
+}
+
+#[test]
+fn proxy_urls_name_syntax_authority_and_credential_character_failures() {
+    for (url, reason) in [
+        ("not-a-url", "URL is not valid"),
+        ("http://127.0.0.1:1080", "URL scheme must be socks5"),
+        ("socks5://127.0.0.1", "URL must contain a host and port"),
+    ] {
+        let proxy = TorrentProxyConfig {
+            url: url.into(),
+            ..Default::default()
+        };
+        assert!(
+            matches!(proxy.engine_url(), Err(TorrentError::InvalidProxy(named)) if named == reason),
+            "{url} was not rejected as {reason:?}"
+        );
+    }
+
+    // Credentials are placed in the URL userinfo, so anything outside the
+    // URL-unreserved set is rejected instead of being percent-encoded into a
+    // different credential than the operator configured.
+    for (username, password) in [("al ice", "hunter2"), ("alice", "hunt@r2")] {
+        let proxy = TorrentProxyConfig {
+            url: "socks5://127.0.0.1:1080".into(),
+            username: Some(username.into()),
+            password: Some(password.into()),
+        };
+        assert!(matches!(
+            proxy.engine_url(),
+            Err(TorrentError::InvalidProxy(
+                "credentials may contain only URL-unreserved ASCII characters"
+            ))
+        ));
+    }
+}
+
+#[test]
+fn existing_path_preflight_reports_parse_and_root_name_failures() {
+    let root = tempfile::tempdir().unwrap();
+    assert!(matches!(
+        validate_existing_filesystem_paths(b"not bencode", root.path()),
+        Err(TorrentError::Engine(_))
+    ));
+
+    let non_utf8_root = metainfo(&multi_file_info(
+        Some(b"\xff\xfe"),
+        &[b"payload.bin"],
+        None,
+        None,
+    ));
+    assert!(matches!(
+        validate_existing_filesystem_paths(&non_utf8_root, root.path()),
+        Err(TorrentError::UnsafeMetainfoPath(
+            "path components must contain valid UTF-8"
+        ))
+    ));
+}
+
+#[test]
+fn existing_path_preflight_stops_at_a_missing_prefix_and_walks_existing_ones() {
+    let nested = metainfo(&multi_file_info(
+        Some(b"release"),
+        &[b"sub", b"payload.bin"],
+        None,
+        None,
+    ));
+
+    // A missing multi-file root proves no deeper existing symlink can exist,
+    // so the walk stops before touching any component below it.
+    let missing_root = tempfile::tempdir().unwrap();
+    assert!(validate_existing_filesystem_paths(&nested, missing_root.path()).is_ok());
+
+    // When the root and the intermediate directory both exist the walk keeps
+    // checking each interior component as a directory and the leaf as a file.
+    let existing_root = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(existing_root.path().join("release").join("sub")).unwrap();
+    assert!(validate_existing_filesystem_paths(&nested, existing_root.path()).is_ok());
+
+    // The leaf keeps its own type check once every prefix already exists.
+    std::fs::create_dir(
+        existing_root
+            .path()
+            .join("release")
+            .join("sub")
+            .join("payload.bin"),
+    )
+    .unwrap();
+    assert!(matches!(
+        validate_existing_filesystem_paths(&nested, existing_root.path()),
+        Err(TorrentError::ExistingPathType(
+            "a payload leaf is not a regular file"
+        ))
+    ));
+
+    // An intermediate directory that turned into a regular file is named as a
+    // prefix conflict rather than being followed.
+    let file_prefix = tempfile::tempdir().unwrap();
+    std::fs::create_dir(file_prefix.path().join("release")).unwrap();
+    std::fs::write(file_prefix.path().join("release").join("sub"), [0]).unwrap();
+    assert!(matches!(
+        validate_existing_filesystem_paths(&nested, file_prefix.path()),
+        Err(TorrentError::ExistingPathType(
+            "a payload prefix is not a directory"
+        ))
+    ));
+}
+
+#[test]
+fn path_components_reject_platform_separators_and_invalid_utf8() {
+    for component in [b"a/b".as_slice(), b"a\\b".as_slice()] {
+        assert!(matches!(
+            validate_path_component(component),
+            Err(TorrentError::UnsafeMetainfoPath(
+                "path components cannot contain platform separators"
+            ))
+        ));
+    }
+
+    // These bytes clear every byte-level rule above the UTF-8 check, so the
+    // decode is what has to reject them.
+    assert!(matches!(
+        validate_path_component(b"\xff\xfe"),
+        Err(TorrentError::UnsafeMetainfoPath(
+            "path components must contain valid UTF-8"
+        ))
+    ));
+}
+
+#[test]
+fn scanner_rejects_truncated_and_overflowing_info_dictionaries() {
+    // The info dictionary ends where the input does, so the key scan itself has
+    // to fail instead of reading past the buffer.
+    assert!(matches!(
+        validate_metainfo_version(b"d4:infod"),
+        Err(TorrentError::Engine(message)) if message == "metainfo is truncated"
+    ));
+
+    // A declared byte-string length larger than the address space must fail on
+    // the length arithmetic, before it is used to slice the buffer.
+    assert!(matches!(
+        validate_metainfo_version(b"d4:infod99999999999999999999:xe"),
+        Err(TorrentError::Engine(message))
+            if message == "metainfo byte string length overflows"
+    ));
+
+    // An info dictionary with no direct keys declares neither version marker,
+    // so the scanner exits its key loop cleanly and leaves the rejection to the
+    // metainfo parser rather than guessing a version.
+    assert!(validate_metainfo_version(b"d4:infodee").is_ok());
+    assert!(matches!(
+        validate_metainfo_contract(b"d4:infodee", false),
+        Err(TorrentError::Engine(_))
+    ));
+}
+
+#[test]
+fn base32_magnet_topics_are_validated_and_normalized_to_uppercase() {
+    const LOWER_BASE32: &str = "abcdefghijklmnopqrstuvwxyz234567";
+
+    // A 32-character base32 btih is accepted and normalized so the same
+    // torrent is never admitted twice under two spellings, while every other
+    // parameter is carried through unchanged.
+    let normalized = validate_magnet_contract(
+        &format!("magnet:?xt=urn:btih:{LOWER_BASE32}&dn=release-name"),
+        false,
+    )
+    .expect("lowercase base32 btih");
+    assert!(!normalized.contains(LOWER_BASE32));
+    let parsed = url::Url::parse(&normalized).expect("normalized magnet stays a URI");
+    assert_eq!(
+        parsed
+            .query_pairs()
+            .map(|(key, value)| (key.into_owned(), value.into_owned()))
+            .collect::<Vec<_>>(),
+        vec![
+            (
+                "xt".to_owned(),
+                format!("urn:btih:{}", LOWER_BASE32.to_ascii_uppercase())
+            ),
+            ("dn".to_owned(), "release-name".to_owned()),
+        ]
+    );
+
+    // Base32 accepts only letters and the digits 2-7; `1` and `8` are excluded
+    // by the alphabet even though they are alphanumeric.
+    for hash in [
+        "1bcdefghijklmnopqrstuvwxyz234567",
+        "8bcdefghijklmnopqrstuvwxyz234567",
+    ] {
+        assert!(matches!(
+            validate_magnet_contract(&format!("magnet:?xt=urn:btih:{hash}"), false),
+            Err(TorrentError::InvalidMagnet(
+                "btih must be 40 hexadecimal or 32 base32 characters"
+            ))
+        ));
+    }
+}
+
+#[test]
+fn magnet_preflight_rejects_input_that_is_not_a_uri() {
+    assert!(matches!(
+        validate_magnet_contract("magnet", false),
+        Err(TorrentError::InvalidMagnet("URI syntax is not valid"))
+    ));
+}
+
+#[test]
+fn engine_rate_conversion_rounds_and_fails_closed_on_unusable_input() {
+    assert_eq!(mib_per_second_to_bps(1.0), 1024 * 1024);
+    assert_eq!(mib_per_second_to_bps(0.5), 512 * 1024);
+    // rqbit reports a float, so the conversion rounds rather than truncating.
+    assert_eq!(mib_per_second_to_bps(1.0 / (1024.0 * 1024.0) * 1.5), 2);
+
+    for unusable in [0.0, -1.0, f64::NAN, f64::NEG_INFINITY] {
+        assert_eq!(mib_per_second_to_bps(unusable), 0);
+    }
+}
+
+#[test]
+fn existing_path_preflight_rejects_components_the_engine_cannot_project() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir(root.path().join("release")).unwrap();
+
+    // The root exists, so the walk reaches the per-component decode instead of
+    // stopping at a missing prefix. A component that carries a separator can
+    // never be projected into one portable name.
+    let separator = metainfo(&multi_file_info(
+        Some(b"release"),
+        &[b"sub/payload.bin"],
+        None,
+        None,
+    ));
+    assert!(matches!(
+        validate_existing_filesystem_paths(&separator, root.path()),
+        Err(TorrentError::UnsafeMetainfoPath(
+            "components must be portable UTF-8 names without traversal or separators"
+        ))
+    ));
+
+    let traversal = metainfo(&multi_file_info(
+        Some(b"release"),
+        &[b"..", b"escape.bin"],
+        None,
+        None,
+    ));
+    assert!(matches!(
+        validate_existing_filesystem_paths(&traversal, root.path()),
+        Err(TorrentError::UnsafeMetainfoPath(
+            "components must be portable UTF-8 names without traversal or separators"
+        ))
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn existing_path_preflight_fails_closed_on_an_unreadable_prefix() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = tempfile::tempdir().unwrap();
+    let release = root.path().join("release");
+    std::fs::create_dir(&release).unwrap();
+    std::fs::set_permissions(&release, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+    // A process with CAP_DAC_OVERRIDE (root in most containers) can still walk
+    // the directory, which would make the assertion below meaningless.
+    let denied = std::fs::symlink_metadata(release.join("probe"))
+        .err()
+        .is_some_and(|error| error.kind() != std::io::ErrorKind::NotFound);
+
+    if denied {
+        let nested = metainfo(&multi_file_info(
+            Some(b"release"),
+            &[b"sub", b"payload.bin"],
+            None,
+            None,
+        ));
+        // An unreadable prefix is not evidence that the payload path is absent,
+        // so it must surface as an error rather than as a clean walk.
+        assert!(matches!(
+            validate_existing_filesystem_paths(&nested, root.path()),
+            Err(TorrentError::Engine(_))
+        ));
+    }
+
+    std::fs::set_permissions(&release, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(denied, "test process bypassed directory permissions");
+}

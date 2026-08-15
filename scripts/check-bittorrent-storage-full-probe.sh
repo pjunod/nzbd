@@ -8,8 +8,8 @@ if [[ $# -ne 1 ]]; then
 fi
 
 readonly target="$1"
-readonly write_test='m0_storage_full_probe::storage_full_write_is_torrent_scoped'
-readonly sizing_test='m0_storage_full_probe::storage_full_during_file_sizing_is_fail_closed'
+readonly write_test='m0_storage_full_probe_tests::storage_full_write_is_torrent_scoped'
+readonly sizing_test='m0_storage_full_probe_tests::storage_full_during_file_sizing_is_fail_closed'
 export CARGO_TERM_COLOR=never
 
 contains_exact_ignored_test() {
