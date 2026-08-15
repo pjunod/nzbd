@@ -25,22 +25,22 @@ fn http(addr: &str, method: &str, path: &str, body: &[u8]) -> (u16, String) {
 /// A daemon that has *exited* is a different thing from a slow one, and it
 /// fails here immediately: waiting out the budget to report "did not become
 /// healthy" names the symptom and discards the cause.
-fn wait_healthy(daemon: &KillOnDrop, addr: &str, deadline: Duration) {
+fn wait_healthy(daemon: &KillOnDrop, addr: &str, deadline: Duration) -> Result<(), String> {
     let start = Instant::now();
     loop {
         if let Some(cause) = daemon.died() {
-            panic!("daemon is not coming up at {addr}: {cause}");
+            return Err(format!("daemon is not coming up at {addr}: {cause}"));
         }
         if let Some((200, body)) = probe(addr, "/healthz") {
             if body == "ok" {
-                return;
+                return Ok(());
             }
         }
         if start.elapsed() > deadline {
-            panic!(
+            return Err(format!(
                 "daemon did not become healthy at {addr} within {deadline:?} \
                  (process still alive)"
-            );
+            ));
         }
         std::thread::sleep(Duration::from_millis(100));
     }
@@ -239,21 +239,6 @@ fn stub_daemon(dir: &Path, script: &str) -> KillOnDrop {
     KillOnDrop::new(child, stderr_path)
 }
 
-/// `KillOnDrop` holds a `RefCell`, so the wait is not `UnwindSafe`; nothing
-/// here observes the daemon after the panic beyond dropping it.
-fn panic_message<F: FnOnce()>(f: F) -> String {
-    let hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(|_| {}));
-    let payload =
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).expect_err("must panic");
-    std::panic::set_hook(hook);
-    payload
-        .downcast_ref::<String>()
-        .cloned()
-        .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
-        .unwrap_or_default()
-}
-
 /// A daemon that died must fail its wait *immediately* and quote the cause.
 /// Reported as a plain budget timeout instead, a dead daemon is
 /// indistinguishable from a slow one — which is how a startup failure
@@ -273,7 +258,8 @@ fn a_dead_daemon_fails_its_wait_at_once_and_says_why() {
     let addr = format!("127.0.0.1:{}", free_port());
 
     let start = Instant::now();
-    let message = panic_message(|| wait_healthy(&daemon, &addr, Duration::from_secs(60)));
+    let message = wait_healthy(&daemon, &addr, Duration::from_secs(60))
+        .expect_err("a dead daemon must fail its readiness wait");
     assert!(
         start.elapsed() < Duration::from_secs(5),
         "a dead daemon must not be waited out: took {:?}",
@@ -299,7 +285,8 @@ fn a_live_daemon_that_never_serves_still_fails_on_its_budget() {
     let addr = format!("127.0.0.1:{}", free_port());
 
     let start = Instant::now();
-    let message = panic_message(|| wait_healthy(&daemon, &addr, Duration::from_secs(1)));
+    let message = wait_healthy(&daemon, &addr, Duration::from_secs(1))
+        .expect_err("a daemon that never serves must fail its readiness wait");
     assert!(message.contains("did not become healthy"), "{message}");
     assert!(
         (Duration::from_secs(1)..Duration::from_secs(10)).contains(&start.elapsed()),
@@ -531,7 +518,7 @@ fn restart_completes_with_an_open_sse_stream() {
         .spawn()
         .expect("spawn nzbd");
     let daemon = KillOnDrop::new(child, stderr_path);
-    wait_healthy(&daemon, &addr, Duration::from_secs(15));
+    wait_healthy(&daemon, &addr, Duration::from_secs(15)).unwrap_or_else(|cause| panic!("{cause}"));
 
     // Open an SSE stream and HOLD it open (like a browser tab): read the
     // response head, then keep the socket alive across the restart.
@@ -579,7 +566,7 @@ fn restart_completes_with_an_open_sse_stream() {
     drop(sse);
 
     // And the daemon is serving again.
-    wait_healthy(&daemon, &addr, Duration::from_secs(10));
+    wait_healthy(&daemon, &addr, Duration::from_secs(10)).unwrap_or_else(|cause| panic!("{cause}"));
 }
 
 /// Regression (field report 2026-07-25, #2 of the day): a restart clicked
@@ -656,7 +643,8 @@ scripts_dir = "{scripts}"
         .spawn()
         .expect("spawn nzbd");
     let daemon = KillOnDrop::new(child, stderr_path);
-    wait_healthy(&daemon, &api_addr, Duration::from_secs(15));
+    wait_healthy(&daemon, &api_addr, Duration::from_secs(15))
+        .unwrap_or_else(|cause| panic!("{cause}"));
 
     let (code, _) = http(
         &api_addr,
@@ -686,7 +674,8 @@ scripts_dir = "{scripts}"
     // the script finished (10 minutes here); the page just never loaded.
     let (code, _) = http(&api_addr, "POST", "/api/v1/restart", b"");
     assert_eq!(code, 200);
-    wait_healthy(&daemon, &api_addr, Duration::from_secs(20));
+    wait_healthy(&daemon, &api_addr, Duration::from_secs(20))
+        .unwrap_or_else(|cause| panic!("{cause}"));
 
     // Serving real state again, and the interrupted job survived into the
     // restarted queue (unstamped, so PP will pick it back up).
@@ -727,7 +716,7 @@ fn settings_live_apply_restart_flow_keeps_secrets() {
         .spawn()
         .expect("spawn nzbd");
     let daemon = KillOnDrop::new(child, stderr_path);
-    wait_healthy(&daemon, &addr, Duration::from_secs(15));
+    wait_healthy(&daemon, &addr, Duration::from_secs(15)).unwrap_or_else(|cause| panic!("{cause}"));
 
     let auth = Some("nzbd:pw1");
     let json = |s: &str| -> serde_json::Value {
@@ -899,7 +888,7 @@ fn setup_unwritable_config_offers_copyable_toml() {
         .spawn()
         .expect("spawn nzbd");
     let daemon = KillOnDrop::new(child, stderr_path);
-    wait_healthy(&daemon, &addr, Duration::from_secs(15));
+    wait_healthy(&daemon, &addr, Duration::from_secs(15)).unwrap_or_else(|cause| panic!("{cause}"));
 
     let json = |s: &str| -> serde_json::Value {
         let (start, end) = (s.find('{').unwrap(), s.rfind('}').unwrap());
@@ -1001,7 +990,8 @@ fn a_missing_config_is_recovered_from_the_data_volume_not_replaced_by_the_wizard
         .spawn()
         .expect("spawn nzbd");
     let daemon = KillOnDrop::new(child, stderr_path);
-    wait_healthy(&daemon, &api_addr, Duration::from_secs(15));
+    wait_healthy(&daemon, &api_addr, Duration::from_secs(15))
+        .unwrap_or_else(|cause| panic!("{cause}"));
 
     // Auth is on, which can only come from the recovered config.
     let (code, _) = try_http(&api_addr, "GET", "/api/v1/status", b"", None).unwrap();
@@ -1080,7 +1070,8 @@ fn first_run_setup_wizard_writes_config_and_reloads() {
         .spawn()
         .expect("spawn nzbd");
     let daemon = KillOnDrop::new(child, stderr_path);
-    wait_healthy(&daemon, &api_addr, Duration::from_secs(15));
+    wait_healthy(&daemon, &api_addr, Duration::from_secs(15))
+        .unwrap_or_else(|cause| panic!("{cause}"));
 
     let (code, body) = http(&api_addr, "GET", "/api/v1/setup", b"");
     assert_eq!(code, 200);
@@ -1234,7 +1225,8 @@ bind = "{api_addr}"
         .spawn()
         .expect("spawn nzbd");
     let daemon = KillOnDrop::new(child, stderr_path);
-    wait_healthy(&daemon, &api_addr, Duration::from_secs(15));
+    wait_healthy(&daemon, &api_addr, Duration::from_secs(15))
+        .unwrap_or_else(|cause| panic!("{cause}"));
 
     // `nzbd add` via the real CLI.
     let out = Command::new(bin)
@@ -1396,7 +1388,8 @@ bind = "{api_addr}"
         .spawn()
         .expect("spawn nzbd");
     let daemon = KillOnDrop::new(child, stderr_path);
-    wait_healthy(&daemon, &api_addr, Duration::from_secs(15));
+    wait_healthy(&daemon, &api_addr, Duration::from_secs(15))
+        .unwrap_or_else(|cause| panic!("{cause}"));
 
     let (code, body) = http(
         &api_addr,
@@ -1554,7 +1547,8 @@ bind = "{api_addr}"
         .spawn()
         .expect("spawn nzbd");
     let daemon = KillOnDrop::new(child, stderr_path);
-    wait_healthy(&daemon, &api_addr, Duration::from_secs(15));
+    wait_healthy(&daemon, &api_addr, Duration::from_secs(15))
+        .unwrap_or_else(|cause| panic!("{cause}"));
 
     // 1. Version gate (Sonarr requires >= 12).
     let v = jsonrpc(&api_addr, serde_json::json!({"method": "version", "id": 1}));
