@@ -191,6 +191,8 @@ fn workflow_job_body(workflow: &str, job: &str) -> String {
 /// Regression (2026-08-14): the instrumented command was piped through `tee`
 /// without `pipefail`, which discarded Cargo's failing exit status. It also
 /// stopped at the first failing target, then published partial measurements.
+/// A later audit found that only the final enforcement step rejected
+/// `continue-on-error`, leaving every other coverage step able to fail open.
 /// Keep the CI and local entry points pinned to the same fail-closed contract.
 #[test]
 fn coverage_measurement_fails_closed_and_runs_the_whole_workspace() {
@@ -202,6 +204,13 @@ fn coverage_measurement_fails_closed_and_runs_the_whole_workspace() {
     let job_uses_continue_on_error = |job: &str| {
         job.lines().any(|line| {
             line.strip_prefix("    ")
+                .is_some_and(|line| line.starts_with("continue-on-error:"))
+        })
+    };
+    let step_uses_continue_on_error = |job: &str| {
+        job.lines().any(|line| {
+            line.strip_prefix("      - ")
+                .or_else(|| line.strip_prefix("        "))
                 .is_some_and(|line| line.starts_with("continue-on-error:"))
         })
     };
@@ -293,6 +302,34 @@ fn coverage_measurement_fails_closed_and_runs_the_whole_workspace() {
         "the coverage gate must not use continue-on-error, or a coverage regression can report \
          success"
     );
+    assert!(
+        !step_uses_continue_on_error(&coverage_job),
+        "coverage steps must not use continue-on-error, or a failing coverage step can publish \
+         partial coverage as success"
+    );
+    for (placement, step) in [
+        (
+            "after another step key",
+            "      - name: run instrumented test suite\n        continue-on-error: true",
+        ),
+        (
+            "as the first step key",
+            "      - continue-on-error: true\n        name: run instrumented test suite",
+        ),
+    ] {
+        let fixture = format!(
+            "\njobs:\n  coverage:\n    steps:\n{step}\n        run: cargo test\n  next:\n    name: next"
+        );
+        let fixture_job = workflow_job_body(&fixture, "coverage");
+        assert!(
+            step_uses_continue_on_error(&fixture_job),
+            "the coverage-step guard must detect continue-on-error {placement}"
+        );
+        assert!(
+            !fixture_job.contains("name: next"),
+            "the coverage-step guard must stay inside the coverage job"
+        );
+    }
     assert!(
         workflow.contains("if-no-files-found: error"),
         "the coverage artifact must fail loudly when lcov.info is missing"
