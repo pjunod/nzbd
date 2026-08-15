@@ -991,19 +991,22 @@ async fn permanently_undeletable_failed_job_retires_after_durable_retry_bound() 
     engine.shutdown().await;
 
     let recovered = spawn_engine(tmp.path()).await;
-    assert!(recovered
-        .export_job(JobId(95))
-        .await
-        .unwrap()
-        .unwrap()
-        .params
-        .iter()
-        .any(|(key, value)| key == ATTEMPTS_PARAM && value == "1"));
+    // Exactly one attempt: the import's `JobFinished` event and the manager's
+    // startup scan both observe this row, but they are one retry occasion.
+    let durable = recovered.export_job(JobId(95)).await.unwrap().unwrap();
+    assert!(
+        durable
+            .params
+            .iter()
+            .any(|(key, value)| key == ATTEMPTS_PARAM && value == "1"),
+        "one occasion must spend one attempt (durable params: {:?})",
+        durable.params
+    );
     let cancel2 = CancellationToken::new();
     let tracker2 = TaskTracker::new();
     spawn_post_manager(
         recovered.clone(),
-        config,
+        config.clone(),
         hist.clone(),
         tmp.path().join("dest"),
         None,
@@ -1032,12 +1035,28 @@ async fn permanently_undeletable_failed_job_retires_after_durable_retry_bound() 
         );
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
-    recovered.emit(nzbd_engine::Event::JobFinished {
-        job: JobId(95),
-        name: "undeletable".into(),
-        status: JobStatus::Failed,
-        health: 0,
-    });
+    assert!(hist.list(10).unwrap().is_empty());
+    cancel2.cancel();
+    tracker2.close();
+    tracker2.wait().await;
+    recovered.shutdown().await;
+
+    // Third occasion — again a restart, so each attempt is a distinct one.
+    // (Un-restarted, the remaining attempts arrive on the next 30s rescans;
+    // driving them with extra `JobFinished` emits would model one occasion as
+    // several and is exactly the miscount this bound is meant to resist.)
+    let recovered = spawn_engine(tmp.path()).await;
+    let cancel3 = CancellationToken::new();
+    let tracker3 = TaskTracker::new();
+    spawn_post_manager(
+        recovered.clone(),
+        config,
+        hist.clone(),
+        tmp.path().join("dest"),
+        None,
+        cancel3.clone(),
+        &tracker3,
+    );
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {
@@ -1088,11 +1107,287 @@ async fn permanently_undeletable_failed_job_retires_after_durable_retry_bound() 
         .any(|(key, value)| key == ATTEMPTS_PARAM && value == "3"));
     assert_eq!(hist.list(10).unwrap().len(), 1);
 
-    cancel2.cancel();
-    tracker2.close();
-    tracker2.wait().await;
+    cancel3.cancel();
+    tracker3.close();
+    tracker3.wait().await;
     recovered.shutdown().await;
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// Regression (#107): the queue scan and a `JobFinished` event routinely
+/// observe the *same* still-retryable failed row — a retryable row carries no
+/// `*PP:done` stamp, so the overlap guard cannot collapse them. Counting both
+/// spends two of the three attempts in one instant, which contradicts
+/// ARCHITECTURE.md §9 ("immediately, then on the next two 30-second rescans",
+/// ~60s) and silently halves the operator's retry window.
+///
+/// Ordering here is forced, not slept on: job 95 is in the queue before the
+/// manager starts, so the startup scan is its first observation, and job 96 is
+/// imported *after* that scan so its own event is always a first observation.
+/// The manager awaits each `JobFinished` arm before receiving the next, so job
+/// 96's attempt landing proves job 95's duplicate event was already handled.
+#[cfg(unix)]
+#[tokio::test]
+async fn one_failed_row_seen_by_both_scan_and_event_spends_one_attempt() {
+    use std::os::unix::fs::PermissionsExt;
+
+    const ATTEMPTS_PARAM: &str = "*PP:failure-disposition-attempts";
+
+    let attempts = |engine: EngineHandle, job: u32| async move {
+        engine
+            .export_job(JobId(job))
+            .await
+            .unwrap()
+            .and_then(|job| {
+                job.params
+                    .into_iter()
+                    .find(|(key, _)| key == ATTEMPTS_PARAM)
+                    .map(|(_, value)| value)
+            })
+    };
+
+    let tmp = tempfile::tempdir().unwrap();
+    let undeletable = |name: &str| {
+        let dir = tmp.path().join("dest").join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("partial.bin"), b"known bad bytes").unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        dir
+    };
+    let dir_a = undeletable("seen-twice");
+    let dir_b = undeletable("barrier");
+
+    let config = PostConfig {
+        failure_action: FailureAction::Delete,
+        ..PostConfig::default()
+    };
+    let hist = history(tmp.path());
+    let engine = spawn_engine(tmp.path()).await;
+
+    // In the queue *before* the manager exists: the startup scan is this
+    // row's first observation, and no event was ever emitted for it.
+    let mut job = completed_job(
+        95,
+        "seen-twice",
+        vec![file_entry(1, "partial.bin", None, false)],
+    );
+    job.status = JobStatus::Failed;
+    engine.import_job(job, false, false).await.unwrap();
+
+    let cancel = CancellationToken::new();
+    let tracker = TaskTracker::new();
+    spawn_post_manager(
+        engine.clone(),
+        config,
+        hist.clone(),
+        tmp.path().join("dest"),
+        None,
+        cancel.clone(),
+        &tracker,
+    );
+
+    // These two waits are pure liveness — they poll for a step to happen, and
+    // the bound only decides how long a genuinely stuck manager hangs before
+    // reporting. Neither carries any part of the claim under test, which is
+    // the *count* asserted below. 10s rather than this file's usual 5s
+    // because instrumentation widens exactly these windows (#107), and a
+    // deadline that fires early would redden the fail-closed Coverage gate
+    // without anything being wrong.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while attempts(engine.clone(), 95).await.as_deref() != Some("1") {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the startup scan never made the first disposition attempt"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    // Imported after that scan, so job 96 is unobserved until its own event.
+    let mut barrier = completed_job(
+        96,
+        "barrier",
+        vec![file_entry(2, "partial.bin", None, false)],
+    );
+    barrier.status = JobStatus::Failed;
+    engine.import_job(barrier, false, false).await.unwrap();
+
+    // The duplicate observation of job 95, then the barrier.
+    engine.emit(nzbd_engine::Event::JobFinished {
+        job: JobId(95),
+        name: "seen-twice".into(),
+        status: JobStatus::Failed,
+        health: 0,
+    });
+    engine.emit(nzbd_engine::Event::JobFinished {
+        job: JobId(96),
+        name: "barrier".into(),
+        status: JobStatus::Failed,
+        health: 0,
+    });
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while attempts(engine.clone(), 96).await.as_deref() != Some("1") {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the barrier job's own first observation was dropped"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    assert_eq!(
+        attempts(engine.clone(), 95).await.as_deref(),
+        Some("1"),
+        "the scan and the event are one retry occasion, not two attempts"
+    );
+    assert!(
+        hist.list(10).unwrap().is_empty(),
+        "no row may retire while its budget is unspent"
+    );
+
+    cancel.cancel();
+    tracker.close();
+    tracker.wait().await;
+    engine.shutdown().await;
+    for dir in [dir_a, dir_b] {
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+}
+
+/// Regression (#107): the debounce above stands for a *spent* attempt, so it
+/// may only be recorded once the increment reaches the queue snapshot.
+/// `import_job_if_present` deliberately reports `false` and restores the
+/// previous row when persistence fails, and an attempt that never became
+/// durable has cost the operator nothing — suppressing the next observation
+/// for half a rescan period would delete a retry that was never made, against
+/// the adjacent rule that a retry after a failed commit stays immediate.
+///
+/// The failure injected is an ordinary state-volume I/O error: the queue
+/// snapshot directory is unwritable across the startup scan, so every commit
+/// in it fails. Ordering is forced rather than slept on — the scan awaits each
+/// failed row in turn, so the gate being consulted for the barrier row (96)
+/// proves row 95's whole pass has already returned with its commit refused.
+#[cfg(unix)]
+#[tokio::test]
+async fn an_uncommitted_attempt_does_not_debounce_the_next_observation() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    const ATTEMPTS_PARAM: &str = "*PP:failure-disposition-attempts";
+    const FAILURE_AT_PARAM: &str = "*PP:failure-at";
+
+    let attempts = |engine: EngineHandle, job: u32| async move {
+        engine
+            .export_job(JobId(job))
+            .await
+            .unwrap()
+            .and_then(|job| {
+                job.params
+                    .into_iter()
+                    .find(|(key, _)| key == ATTEMPTS_PARAM)
+                    .map(|(_, value)| value)
+            })
+    };
+
+    let tmp = tempfile::tempdir().unwrap();
+    let undeletable = |name: &str| {
+        let dir = tmp.path().join("dest").join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("partial.bin"), b"known bad bytes").unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        dir
+    };
+    let dir_a = undeletable("commit-refused");
+    let dir_b = undeletable("barrier");
+
+    let hist = history(tmp.path());
+    let engine = spawn_engine(tmp.path()).await;
+
+    // Both rows already carry the finalization key, so each pass reaches its
+    // counter commit instead of returning at the earlier `*PP:failure-at` one.
+    for (id, name) in [(95u32, "commit-refused"), (96, "barrier")] {
+        let mut job = completed_job(id, name, vec![file_entry(id, "partial.bin", None, false)]);
+        job.status = JobStatus::Failed;
+        job.params.push((FAILURE_AT_PARAM.into(), "1000".into()));
+        engine.import_job(job, false, false).await.unwrap();
+    }
+
+    // The state volume stops accepting writes. `save_snapshot` reports the
+    // I/O error and leaves persistence intact, which is exactly the
+    // "restored the old row, spent nothing" case.
+    let state = tmp.path().join("state");
+    std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+    let barrier_seen = Arc::new(AtomicUsize::new(0));
+    let seen = barrier_seen.clone();
+    let gate: PpGate = Some(Arc::new(move |job: JobId| {
+        if job == JobId(96) {
+            seen.fetch_add(1, Ordering::AcqRel);
+        }
+        true
+    }));
+
+    let config = PostConfig {
+        failure_action: FailureAction::Delete,
+        ..PostConfig::default()
+    };
+    let cancel = CancellationToken::new();
+    let tracker = TaskTracker::new();
+    spawn_post_manager(
+        engine.clone(),
+        config,
+        hist.clone(),
+        tmp.path().join("dest"),
+        gate,
+        cancel.clone(),
+        &tracker,
+    );
+
+    // Pure liveness, as elsewhere in this file: the bound only decides how
+    // long a stuck manager hangs before saying so.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while barrier_seen.load(Ordering::Acquire) == 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the startup scan never reached the barrier row"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(
+        attempts(engine.clone(), 95).await,
+        None,
+        "a counter that never committed must not appear on the durable row"
+    );
+
+    // The state volume comes back, and the row is observed again well inside
+    // the debounce window.
+    std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o755)).unwrap();
+    engine.emit(nzbd_engine::Event::JobFinished {
+        job: JobId(95),
+        name: "commit-refused".into(),
+        status: JobStatus::Failed,
+        health: 0,
+    });
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while attempts(engine.clone(), 95).await.as_deref() != Some("1") {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "an attempt that never committed suppressed the retry that replaces it"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        hist.list(10).unwrap().is_empty(),
+        "no row may retire while its budget is unspent"
+    );
+
+    cancel.cancel();
+    tracker.close();
+    tracker.wait().await;
+    engine.shutdown().await;
+    for dir in [dir_a, dir_b] {
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
 }
 
 /// Losing authority after a cross-filesystem park must not let the stale
@@ -1142,11 +1437,32 @@ async fn failed_park_losing_admission_after_move_is_fenced_and_retried() {
     );
     job.status = JobStatus::Failed;
     engine.import_job(job, false, true).await.unwrap();
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    assert!(
-        gate_checks.load(Ordering::Acquire) >= 5,
-        "the fence closed only after durable history was written"
-    );
+    // Wait for the fence to be *reached* rather than assuming a fixed budget
+    // covers reaching it (#107). Getting there means a cross-filesystem park
+    // move plus a durable history write — real filesystem work — and a 200ms
+    // sleep asserted only that a loaded machine finishes both in time, which
+    // it does not: this failed 55 of 64 runs of an oversubscribed suite.
+    //
+    // The ordering claim is untouched, and it is what the assertions below
+    // still state. `handle_failed_job` consults the gate again *after*
+    // `record_seq_durable` and before the terminal stamp, so "history written
+    // and the fence closed" is precisely the window in which a stale
+    // finalizer would wrongly stamp — waiting for that state tests the fence
+    // at its decision point instead of hoping the clock lands inside it.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let checks = gate_checks.load(Ordering::Acquire);
+        let recorded = hist.list(10).unwrap().len();
+        if checks >= 5 && recorded == 1 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the park never reached the post-history fence \
+             (gate checks: {checks}, history rows: {recorded})"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
     assert!(!dir.exists(), "the move finished before authority changed");
     assert!(
         parked_root.join("held-failure/partial.bin").is_file(),
