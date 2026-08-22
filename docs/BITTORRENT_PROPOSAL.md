@@ -225,7 +225,7 @@ compatibility boundary.
 |---|---|---|
 | Monotone lease authority | `crates/plurx-core/src/cluster/coordination.rs` and both store implementations at `d0a83eb0da10fe352da2176aa19701d95eb6c2c4` | Port the token and exact-CAS semantics behind nzbd's store boundary; do not invent a second lock protocol. |
 | Fenced publication | `crates/plurx-core/src/store/publication.rs` and both transactional implementations at `61951db0945e1a9874c8a1742154bba5da5d11bf` | Validate the live fence in the same transaction that publishes durable state. A pre-check is not fencing. |
-| Renewal loss and self-fencing | `plurxd/src/state.rs` at `038f154a1c35f1cb0afe496eddf9bd4cb6778dc0` | Cancellation and the local expiry deadline both stop the worker; renewal returns a replacement token. |
+| Renewal loss and self-fencing | `crates/plurxd/src/state.rs` at `038f154a1c35f1cb0afe496eddf9bd4cb6778dc0` | Cancellation and the local expiry deadline both stop the worker; renewal returns a replacement token. |
 | Membership and failover operations | `crates/plurx-core/src/cluster/membership.rs` and `crates/plurx-cluster-check` on the pinned baseline | Reuse identity, tombstone, degraded-quorum, and real-process test contracts. Do not copy the implementation: it depends on plurx's patched Hiqlite/WAL stack. |
 | Architecture and validation matrix | `docs/CLUSTER-MEDIA-POOL-PLAN.md` on the pinned baseline | Use its facts-versus-bytes split, transactional fence rules, and failure matrix as the starting review checklist. |
 
