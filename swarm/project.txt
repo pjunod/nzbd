@@ -1,0 +1,80 @@
+PROJECT CONTRACT — NZBD
+
+Project: nzbd
+
+PURPOSE AND AUTHORITY
+
+The project-local `.swarm/state.db` is authoritative for queue lifecycle,
+worker state, claims, and handoffs. GitHub issues and pull requests supply work
+contracts, discussion, change state, reviews, and required checks;
+`swarm:*` labels are an outbound projection after an item enters SQLite, not
+lifecycle authority. Never edit those lifecycle labels directly. Use the
+launcher-supplied `SWARMCTL_PATH` for every transition so SQLite, the delivery
+outbox, worker release, and queue wake commit together.
+
+If a GitHub issue conflicts with a checked-in product, architecture, security,
+or validation contract, stop and report the conflict. Do not silently
+reinterpret the contract to fit the requested implementation.
+
+TASK QUEUE AND CLAIM PROTOCOL
+
+An operator adds broad new work with `swarm:intake` only. The coordinator
+decomposes it into dependency-ordered children without adding a role merely to
+make the parent executable.
+
+An executable child is eligible only when its canonical SQLite lifecycle is
+`ready` and it has exactly one configured role: `lead`, `builder`, or
+`reviewer`. GitHub's `swarm:ready` plus one role label bootstraps a new issue
+into the ledger; after admission, later GitHub label edits cannot move it.
+
+Before editing shared territory, record the external claim evidence on the
+issue, then use `swarmctl transition` to move the canonical SQLite lifecycle.
+Internal ownership requests use `needs-lead`; external waits use
+`waiting-external`; only exact human actions use `needs-operator`. `blocked`
+means no runnable path remains, and new issue activity after a block is
+reconciled through SQLite before redispatch.
+
+Independent review uses `swarm:review` and a body line
+`Swarm-Author-LLM: provider/model` plus
+`Swarm-Implementation-Issue: number`. The supervisor chooses a reviewer whose
+model differs from every author in the reviewed range. Builders and reviewers
+remain fixed roles; the scheduler creates or activates another slot instead of
+borrowing a worker from a different role.
+
+READ BEFORE CHANGING CODE
+
+- `README.md` and any `AGENTS.md` or contributor guidance in scope.
+- The relevant architecture, product, security, and policy sources under
+  `docs/`.
+- The complete issue, discussion, linked plan, existing pull requests, and
+  review threads for the claimed work.
+
+QUALITY AND COMPLETION
+
+- `make test` is the configured local quality command.
+- New behavior needs a regression test that fails on revert.
+- Reviewer approval transitions the canonical item to `needs-lead`; Lead
+  verifies the exact head, required checks, and pinned independent approval
+  before merging and reconciling completion through SQLite.
+
+ADOPTION INTAKE
+
+- The configured coordinator audits project-level adoption transcripts and
+  preserved Git state before normal workers launch.
+- Reconcile one parent work item, then create role-owned children only for
+  independent remaining work; never duplicate work already represented by a
+  change request.
+- Report `done` only when SQLite fully represents the remaining work. A failed
+  or blocked intake intentionally prevents dispatch.
+
+OWNERSHIP AND INVARIANTS
+
+- Lead owns intake, decomposition, cross-cutting architecture decisions, final
+  merge, and lifecycle reconciliation.
+- Builder owns only the component, paths, and acceptance criteria explicitly
+  named by the assigned issue. Cross-surface work remains with Lead until it is
+  decomposed into non-overlapping Builder issues.
+- Reviewer is read-only and must not implement fixes or merge the author's
+  change.
+- Preserve the project's checked-in architectural contracts; architecture
+  questions become Lead decisions before implementation begins.
