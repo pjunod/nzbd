@@ -4,6 +4,7 @@
 //! maintained adapter receives only [`RestoreRequest`] values and returns
 //! engine identities, keeping raw rqbit handles and queue identities apart.
 
+use crate::backend::{BackendFact, SafeError, StopReason, TransferProgress};
 use nzbd_types::{Job, JobId, JobKind, JobStatus, TorrentPhase};
 use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
@@ -191,30 +192,194 @@ impl RuntimeAssociations {
         &self,
         identity: &EngineIdentity,
         fact: EngineStructuralFact,
-    ) -> Option<crate::backend::BackendFact> {
+    ) -> Option<BackendFact> {
         let job = *self.ids.get(&identity.id)?;
         if self.hashes.get(&identity.info_hash_v1) != Some(&job) {
             return None;
         }
         Some(match fact {
             EngineStructuralFact::Ready { content_path } => {
-                crate::backend::BackendFact::Ready { job, content_path }
+                BackendFact::Ready { job, content_path }
             }
-            EngineStructuralFact::Stopped { reason } => {
-                crate::backend::BackendFact::Stopped { job, reason }
-            }
-            EngineStructuralFact::Failed { error } => {
-                crate::backend::BackendFact::Failed { job, error }
-            }
+            EngineStructuralFact::Stopped { reason } => BackendFact::Stopped { job, reason },
+            EngineStructuralFact::StorageFull => BackendFact::Stopped {
+                job,
+                reason: StopReason::StorageFull,
+            },
+            EngineStructuralFact::MissingContent => BackendFact::Stopped {
+                job,
+                reason: StopReason::MissingContent,
+            },
+            EngineStructuralFact::Transient => BackendFact::Stopped {
+                job,
+                reason: StopReason::Transient,
+            },
+            EngineStructuralFact::Unrecoverable { error } => BackendFact::Failed { job, error },
         })
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EngineStructuralFact {
-    Ready { content_path: PathBuf },
-    Stopped { reason: crate::backend::StopReason },
-    Failed { error: crate::backend::SafeError },
+    Ready {
+        content_path: PathBuf,
+    },
+    Stopped {
+        reason: StopReason,
+    },
+    StorageFull,
+    MissingContent,
+    Transient,
+    /// The adapter must explicitly classify an error as unrecoverable before
+    /// it is allowed to cross the backend boundary as `Failed`.
+    Unrecoverable {
+        error: SafeError,
+    },
+}
+
+/// Queue-owner side effects produced while folding backend traffic. The
+/// caller persists `durable_changed` at its normal snapshot cadence and
+/// latches the shared disk guard when `storage_hold` is set.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ReconcileOutcome {
+    pub durable_changed: bool,
+    pub storage_hold: bool,
+}
+
+/// Fold a replaceable progress sample into durable queue state. Volatile
+/// rates and peer counts deliberately remain outside [`nzbd_types::Job`].
+pub fn reconcile_progress(job: &mut Job, progress: &TransferProgress) -> ReconcileOutcome {
+    let Some(torrent) = torrent_mut(job) else {
+        return ReconcileOutcome::default();
+    };
+    let downloaded = progress.downloaded_bytes.min(torrent.selected_bytes);
+    let uploaded = torrent.uploaded_bytes.max(progress.uploaded_bytes);
+    let activity = match (torrent.last_activity_unix, progress.last_activity_unix) {
+        (Some(old), Some(new)) => Some(old.max(new)),
+        (old, new) => old.or(new),
+    };
+    let changed = torrent.downloaded_bytes != downloaded
+        || torrent.uploaded_bytes != uploaded
+        || torrent.last_activity_unix != activity;
+    torrent.downloaded_bytes = downloaded;
+    torrent.uploaded_bytes = uploaded;
+    torrent.last_activity_unix = activity;
+    ReconcileOutcome {
+        durable_changed: changed,
+        storage_hold: false,
+    }
+}
+
+/// Fold one reliable structural fact. Readiness is accepted only when the
+/// latest engine sample proves every selected byte hash-verified; a bare
+/// engine "finished" phase can therefore never make queue state ready.
+pub fn reconcile_fact(
+    job: &mut Job,
+    fact: BackendFact,
+    latest: Option<&TransferProgress>,
+    now_unix: i64,
+) -> ReconcileOutcome {
+    if fact_job(&fact) != job.id {
+        return ReconcileOutcome::default();
+    }
+    if job.kind != JobKind::Torrent || job.torrent.is_none() {
+        return ReconcileOutcome::default();
+    }
+    match fact {
+        BackendFact::MetadataReady {
+            torrent: metadata, ..
+        } => {
+            let name_changed = job.name != metadata.name || job.name_provisional;
+            let torrent = job.torrent.as_mut().unwrap();
+            let changed = torrent.info_hash_v1 != metadata.info_hash_v1
+                || torrent.total_bytes != metadata.total_bytes
+                || torrent.selected_bytes != metadata.selected_bytes
+                || torrent.phase != TorrentPhase::Queued
+                || name_changed;
+            torrent.info_hash_v1 = metadata.info_hash_v1;
+            torrent.total_bytes = metadata.total_bytes;
+            torrent.selected_bytes = metadata.selected_bytes;
+            torrent.phase = TorrentPhase::Queued;
+            job.name = metadata.name;
+            job.name_provisional = false;
+            ReconcileOutcome {
+                durable_changed: changed,
+                storage_hold: false,
+            }
+        }
+        BackendFact::Ready { content_path, .. } => {
+            let torrent = job.torrent.as_mut().unwrap();
+            let verified = latest.map_or(0, |progress| progress.verified_bytes);
+            if verified < torrent.selected_bytes || torrent.selected_bytes == 0 {
+                return ReconcileOutcome::default();
+            }
+            torrent.downloaded_bytes = torrent.selected_bytes;
+            torrent.ready_at_unix.get_or_insert(now_unix);
+            torrent.content_path = Some(content_path);
+            torrent.phase = TorrentPhase::Seeding;
+            torrent.last_error = None;
+            job.status = JobStatus::Downloading;
+            ReconcileOutcome {
+                durable_changed: true,
+                storage_hold: false,
+            }
+        }
+        BackendFact::Stopped { reason, .. } => {
+            let torrent = job.torrent.as_mut().unwrap();
+            let storage_hold = reason == StopReason::StorageFull;
+            match reason {
+                StopReason::Paused | StopReason::StorageFull => {
+                    torrent.phase = if torrent.ready_at_unix.is_some() {
+                        TorrentPhase::PausedSeed
+                    } else {
+                        TorrentPhase::PausedDownload
+                    };
+                    job.status = JobStatus::Paused;
+                }
+                StopReason::MissingContent => {
+                    torrent.phase = TorrentPhase::MissingFiles;
+                    job.status = JobStatus::Paused;
+                }
+                StopReason::Transient => {
+                    torrent.phase = TorrentPhase::Downloading;
+                    job.status = JobStatus::Downloading;
+                }
+                StopReason::SeedPolicyReached => {
+                    torrent.phase = TorrentPhase::PausedSeed;
+                    job.status = JobStatus::Paused;
+                }
+                StopReason::Removed | StopReason::Shutdown => {}
+            }
+            ReconcileOutcome {
+                durable_changed: true,
+                storage_hold,
+            }
+        }
+        BackendFact::Failed { error, .. } => {
+            let torrent = job.torrent.as_mut().unwrap();
+            torrent.phase = TorrentPhase::Failed;
+            torrent.last_error = Some(error.as_str().to_owned());
+            job.status = JobStatus::Failed;
+            ReconcileOutcome {
+                durable_changed: true,
+                storage_hold: false,
+            }
+        }
+    }
+}
+
+fn torrent_mut(job: &mut Job) -> Option<&mut nzbd_types::TorrentRecord> {
+    (job.kind == JobKind::Torrent).then_some(())?;
+    job.torrent.as_mut()
+}
+
+fn fact_job(fact: &BackendFact) -> JobId {
+    match fact {
+        BackendFact::MetadataReady { job, .. }
+        | BackendFact::Ready { job, .. }
+        | BackendFact::Stopped { job, .. }
+        | BackendFact::Failed { job, .. } => *job,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -443,6 +608,161 @@ mod tests {
             ),
             Err(AssociationError::Duplicate)
         );
+    }
+
+    #[test]
+    fn completion_requires_all_selected_bytes_verified_and_ready_seed_stays_live() {
+        let hash = "0123456789abcdef0123456789abcdef01234567";
+        let mut job = job(10, hash, JobStatus::Downloading);
+        let content_path = PathBuf::from("/torrents/example");
+        let incomplete = TransferProgress {
+            downloaded_bytes: 1,
+            verified_bytes: 0,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            reconcile_fact(
+                &mut job,
+                BackendFact::Ready {
+                    job: JobId(10),
+                    content_path: content_path.clone(),
+                },
+                Some(&incomplete),
+                100,
+            ),
+            ReconcileOutcome::default(),
+            "an engine completion phase is not verification evidence"
+        );
+        assert!(!job.ready());
+
+        let verified = TransferProgress {
+            downloaded_bytes: 1,
+            verified_bytes: 1,
+            ..Default::default()
+        };
+        assert!(
+            reconcile_fact(
+                &mut job,
+                BackendFact::Ready {
+                    job: JobId(10),
+                    content_path: content_path.clone(),
+                },
+                Some(&verified),
+                101,
+            )
+            .durable_changed
+        );
+        assert!(job.ready());
+        assert_eq!(job.status, JobStatus::Downloading);
+        let torrent = job.torrent.as_ref().unwrap();
+        assert_eq!(torrent.phase, TorrentPhase::Seeding);
+        assert_eq!(torrent.ready_at_unix, Some(101));
+        assert_eq!(torrent.content_path.as_ref(), Some(&content_path));
+
+        let persisted = serde_json::to_vec(&job).unwrap();
+        let restored: Job = serde_json::from_slice(&persisted).unwrap();
+        assert!(
+            restored.ready(),
+            "the next durable snapshot keeps readiness"
+        );
+        assert_eq!(restored.torrent.unwrap().phase, TorrentPhase::Seeding);
+    }
+
+    #[test]
+    fn progress_persists_only_coalescible_counters_and_activity() {
+        let hash = "0123456789abcdef0123456789abcdef01234567";
+        let mut job = job(10, hash, JobStatus::Downloading);
+        let progress = TransferProgress {
+            downloaded_bytes: 1,
+            verified_bytes: 1,
+            uploaded_bytes: 7,
+            download_bps: 900,
+            upload_bps: 800,
+            useful_peers: 12,
+            last_activity_unix: Some(55),
+        };
+        assert!(reconcile_progress(&mut job, &progress).durable_changed);
+        let torrent = job.torrent.unwrap();
+        assert_eq!(torrent.downloaded_bytes, 1);
+        assert_eq!(torrent.uploaded_bytes, 7);
+        assert_eq!(torrent.last_activity_unix, Some(55));
+        // TorrentRecord intentionally has no rate or peer fields: those
+        // volatile values cannot force full-list structural publication.
+    }
+
+    #[test]
+    fn recoverable_engine_conditions_never_translate_to_failed() {
+        let hash = "0123456789abcdef0123456789abcdef01234567";
+        let identity = EngineIdentity {
+            id: 7,
+            info_hash_v1: hash.into(),
+        };
+        let mut associations = RuntimeAssociations::default();
+        associations.associate(JobId(10), identity.clone()).unwrap();
+
+        for (engine, expected) in [
+            (EngineStructuralFact::StorageFull, StopReason::StorageFull),
+            (
+                EngineStructuralFact::MissingContent,
+                StopReason::MissingContent,
+            ),
+            (EngineStructuralFact::Transient, StopReason::Transient),
+        ] {
+            assert_eq!(
+                associations.translate_fact(&identity, engine),
+                Some(BackendFact::Stopped {
+                    job: JobId(10),
+                    reason: expected,
+                })
+            );
+        }
+
+        let error = SafeError::from_redacted("named unrecoverable corruption");
+        assert_eq!(
+            associations.translate_fact(
+                &identity,
+                EngineStructuralFact::Unrecoverable {
+                    error: error.clone()
+                }
+            ),
+            Some(BackendFact::Failed {
+                job: JobId(10),
+                error,
+            })
+        );
+    }
+
+    #[test]
+    fn storage_full_latches_hold_and_missing_content_remains_recoverable() {
+        let hash = "0123456789abcdef0123456789abcdef01234567";
+        let mut storage = job(10, hash, JobStatus::Downloading);
+        let outcome = reconcile_fact(
+            &mut storage,
+            BackendFact::Stopped {
+                job: JobId(10),
+                reason: StopReason::StorageFull,
+            },
+            None,
+            100,
+        );
+        assert!(outcome.storage_hold);
+        assert_eq!(storage.status, JobStatus::Paused);
+        assert_ne!(storage.torrent.unwrap().phase, TorrentPhase::Failed);
+
+        let mut missing = job(10, hash, JobStatus::Downloading);
+        let outcome = reconcile_fact(
+            &mut missing,
+            BackendFact::Stopped {
+                job: JobId(10),
+                reason: StopReason::MissingContent,
+            },
+            None,
+            100,
+        );
+        assert!(!outcome.storage_hold);
+        assert_eq!(missing.status, JobStatus::Paused);
+        assert_eq!(missing.torrent.unwrap().phase, TorrentPhase::MissingFiles);
     }
 
     #[test]
