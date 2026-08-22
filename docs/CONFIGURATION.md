@@ -25,33 +25,53 @@ dest_dir = "~/downloads/complete"   # finished downloads (per-category overrides
 The watch dir is polled by the daemon; a dropped `.nzb` is queued and the
 file removed. In cluster mode only the current leader watches it.
 
-## `[torrent]` — BitTorrent session (opt-in)
+## `[torrent]` — reserved BitTorrent settings (unavailable)
 
 ```toml
-[torrent]
-enabled = false                    # mandatory feature gate; safe default
-# download_dir = "/data/torrents" # absent: use paths.dest_dir
-dht = true                         # distributed peer discovery
-# listen_port_range = { start = 6881, end = 6882 } # half-open start..end
+[paths]
+# torrent_dir = "/data/torrents"       # default: <main_dir>/torrents
+# torrent_watch_dir = "/data/watch-torrent"
 
-# [torrent.proxy]
-# url = "socks5://127.0.0.1:1080" # credential-free SOCKS5 origin
-# username = "alice"              # optional; configure both credentials
-# password = "secret"
+[torrent]
+enabled = false
+listen_port = 6881
+dht = false
+pex = true
+local_discovery = false
+upnp_port_forwarding = false
+# socks_proxy_url = "socks5://127.0.0.1:1080"
+# socks_proxy_username = "alice"
+# socks_proxy_password = "secret"
+max_peers_per_torrent = 80
+max_peers_total = 400
+max_known_peers_per_torrent = 1024
+max_known_peers_total = 4096
+upload_limit_kib = 0
+default_seed_ratio = 0
+default_seed_minutes = 0
+metainfo_max_mib = 10
+source_redirects = 5
 ```
 
 | Key | Default | Security and operational implication |
 |---|---|---|
-| `enabled` | `false` | The only safe upgrade default: no torrent session, peer listener, or peer-discovery traffic may start. |
-| `download_dir` | absent | Falls back to `[paths].dest_dir`; set it to isolate torrent payloads from Usenet output. |
-| `dht` | `true` | When the feature is enabled, permits distributed peer discovery; private-torrent handling may override it. |
-| `listen_port_range` | absent | Lets the torrent engine select an ephemeral listener; an explicit value uses TOML `{ start, end }` half-open range syntax. |
-| `proxy` | absent | Makes no SOCKS5 proxy request. Credentials, when needed, are separate from the credential-free URL. |
+| `enabled` | `false` | No session, listener, or discovery traffic starts. `true` is rejected until final M2 activation. |
+| `listen_port` | `6881` | One explicit non-zero TCP/IPv4 port; ranges and ephemeral port 0 are unsupported. |
+| `dht` / `pex` | `false` / `true` | Conservative discovery defaults; DHT is incompatible with the SOCKS proxy. |
+| `local_discovery` / `upnp_port_forwarding` | `false` / `false` | Avoids LAN disclosure and router mutation. UPnP `true` is rejected. |
+| `socks_proxy_*` | absent | URL must be a credential-free SOCKS5 origin; username/password are paired and the password is masked by Settings. |
+| peer ceilings | `80`, `400`, `1024`, `4096` | Separate live and retained per-torrent/session budgets. |
+| `upload_limit_kib` | `0` | Unlimited; this is the only torrent setting designed for live application. |
+| seed ratio/minutes | `0` | Unlimited globally; optional category values override these and per-add values override categories. |
+| `metainfo_max_mib` / `source_redirects` | `10` / `5` | Bounds hostile metadata and source fetches; metainfo accepts 1–100 MiB. |
 
-Omitting `[torrent]` is identical to setting `enabled = false`. This release
-adds the typed schema and feature gate only; daemon startup and torrent
-admission are wired in later milestones. Unknown keys in `[torrent]` and
-`[torrent.proxy]` are rejected at startup, like unknown keys elsewhere.
+This surface is reserved and unavailable until final M2 activation. Omitting
+`[torrent]` is identical to its defaults and default saves omit the section so
+older binaries remain able to read ordinary configurations. `torrent_dir`
+never falls back to Usenet `dest_dir`; when omitted it derives as
+`<main_dir>/torrents`. Optional category `torrent_dir`, `seed_ratio`, and
+`seed_minutes` follow per-add → category → global precedence. Torrent roots do
+not enter disk probes while disabled. Unknown keys fail closed.
 
 ## `[[server]]` — one block per news server
 

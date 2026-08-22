@@ -4,7 +4,6 @@ pub mod durable;
 
 use nzbd_types::{CertLevel, ServerDef, ServerId, TlsMode};
 use serde::{Deserialize, Serialize};
-use std::ops::Range;
 use std::path::PathBuf;
 
 #[derive(Debug, thiserror::Error)]
@@ -36,7 +35,7 @@ pub struct Config {
     pub history: HistorySection,
     #[serde(default)]
     pub cluster: ClusterConfig,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "TorrentConfig::is_default")]
     pub torrent: TorrentConfig,
 }
 
@@ -45,41 +44,97 @@ pub struct Config {
 /// The daemon must treat this section as inert unless [`TorrentConfig::enabled`]
 /// is explicitly enabled. Keeping the gate in the typed configuration makes an
 /// omitted section and `enabled = false` equivalent for all future wiring.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields, default)]
 pub struct TorrentConfig {
     /// Master feature gate. The safe default performs no torrent networking.
     pub enabled: bool,
-    /// Torrent payload root; absent means `[paths].dest_dir`.
-    pub download_dir: Option<PathBuf>,
+    /// The one explicit TCP/IPv4 peer listener port.
+    pub listen_port: u16,
     /// Enable distributed hash table peer discovery.
     pub dht: bool,
-    /// Optional half-open peer-listener range (`start..end`).
-    pub listen_port_range: Option<Range<u16>>,
-    /// Optional SOCKS5 proxy settings.
-    pub proxy: Option<TorrentProxyConfig>,
+    pub pex: bool,
+    pub local_discovery: bool,
+    pub upnp_port_forwarding: bool,
+    /// Credential-free `socks5://host:port` origin.
+    pub socks_proxy_url: Option<String>,
+    pub socks_proxy_username: Option<String>,
+    pub socks_proxy_password: Option<String>,
+    pub max_peers_per_torrent: u32,
+    pub max_peers_total: u32,
+    pub max_known_peers_per_torrent: u32,
+    pub max_known_peers_total: u32,
+    pub upload_limit_kib: u64,
+    pub default_seed_ratio: f64,
+    pub default_seed_minutes: u64,
+    pub metainfo_max_mib: u32,
+    pub source_redirects: u32,
 }
 
 impl Default for TorrentConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            download_dir: None,
-            dht: true,
-            listen_port_range: None,
-            proxy: None,
+            listen_port: 6881,
+            dht: false,
+            pex: true,
+            local_discovery: false,
+            upnp_port_forwarding: false,
+            socks_proxy_url: None,
+            socks_proxy_username: None,
+            socks_proxy_password: None,
+            max_peers_per_torrent: 80,
+            max_peers_total: 400,
+            max_known_peers_per_torrent: 1024,
+            max_known_peers_total: 4096,
+            upload_limit_kib: 0,
+            default_seed_ratio: 0.0,
+            default_seed_minutes: 0,
+            metainfo_max_mib: 10,
+            source_redirects: 5,
         }
     }
 }
 
-/// SOCKS5 proxy settings for a future torrent session.
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
-#[serde(deny_unknown_fields, default)]
-pub struct TorrentProxyConfig {
-    /// Credential-free `socks5://host:port` URL.
-    pub url: String,
-    pub username: Option<String>,
-    pub password: Option<String>,
+impl std::fmt::Debug for TorrentConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("TorrentConfig")
+            .field("enabled", &self.enabled)
+            .field("listen_port", &self.listen_port)
+            .field("dht", &self.dht)
+            .field("pex", &self.pex)
+            .field("local_discovery", &self.local_discovery)
+            .field("upnp_port_forwarding", &self.upnp_port_forwarding)
+            .field(
+                "socks_proxy_url",
+                &self.socks_proxy_url.as_ref().map(|_| "<redacted>"),
+            )
+            .field("socks_proxy_username", &self.socks_proxy_username)
+            .field(
+                "socks_proxy_password",
+                &self.socks_proxy_password.as_ref().map(|_| "***"),
+            )
+            .field("max_peers_per_torrent", &self.max_peers_per_torrent)
+            .field("max_peers_total", &self.max_peers_total)
+            .field(
+                "max_known_peers_per_torrent",
+                &self.max_known_peers_per_torrent,
+            )
+            .field("max_known_peers_total", &self.max_known_peers_total)
+            .field("upload_limit_kib", &self.upload_limit_kib)
+            .field("default_seed_ratio", &self.default_seed_ratio)
+            .field("default_seed_minutes", &self.default_seed_minutes)
+            .field("metainfo_max_mib", &self.metainfo_max_mib)
+            .field("source_redirects", &self.source_redirects)
+            .finish()
+    }
+}
+
+impl TorrentConfig {
+    fn is_default(value: &Self) -> bool {
+        value == &Self::default()
+    }
 }
 
 /// One configured filesystem root the daemon writes to.
@@ -275,6 +330,8 @@ pub struct Paths {
     pub nzb_watch_dir: Option<PathBuf>,
     pub queue_dir: Option<PathBuf>,
     pub temp_dir: Option<PathBuf>,
+    pub torrent_dir: Option<PathBuf>,
+    pub torrent_watch_dir: Option<PathBuf>,
 }
 
 impl Default for Paths {
@@ -286,6 +343,8 @@ impl Default for Paths {
             nzb_watch_dir: None,
             queue_dir: None,
             temp_dir: None,
+            torrent_dir: None,
+            torrent_watch_dir: None,
         }
     }
 }
@@ -345,6 +404,9 @@ pub struct CategoryConfig {
     pub dest_dir: Option<PathBuf>,
     pub unpack: Option<bool>,
     pub extensions: Vec<String>,
+    pub torrent_dir: Option<PathBuf>,
+    pub seed_ratio: Option<f64>,
+    pub seed_minutes: Option<u64>,
 }
 
 /// `[[feed]]` — an RSS/Atom indexer feed with an NZBGet-style filter.
@@ -528,6 +590,37 @@ impl Config {
         expand_home(&self.paths.dest_dir)
     }
 
+    /// Immutable torrent payload root, independent from the Usenet handoff.
+    pub fn torrent_dir(&self) -> PathBuf {
+        self.paths
+            .torrent_dir
+            .as_ref()
+            .map(|path| expand_home(path))
+            .unwrap_or_else(|| expand_home(&self.paths.main_dir).join("torrents"))
+    }
+
+    /// Resolve seed policy in per-add → category → global order.
+    pub fn torrent_seed_limits(
+        &self,
+        category_name: Option<&str>,
+        per_add_ratio: Option<f64>,
+        per_add_minutes: Option<u64>,
+    ) -> (f64, u64) {
+        let category = category_name.and_then(|name| {
+            self.categories
+                .iter()
+                .find(|category| category.name == name)
+        });
+        (
+            per_add_ratio
+                .or_else(|| category.and_then(|category| category.seed_ratio))
+                .unwrap_or(self.torrent.default_seed_ratio),
+            per_add_minutes
+                .or_else(|| category.and_then(|category| category.seed_minutes))
+                .unwrap_or(self.torrent.default_seed_minutes),
+        )
+    }
+
     /// Every configured filesystem root the daemon can write.
     ///
     /// Exact duplicate paths are kept once with their role labels joined: they
@@ -579,6 +672,21 @@ impl Config {
                 push(format!("category: {}", category.name), expand_home(path));
             }
         }
+        if self.torrent.enabled {
+            push("torrent payloads".into(), self.torrent_dir());
+            push("torrent control".into(), self.state_dir().join("torrents"));
+            if let Some(path) = &self.paths.torrent_watch_dir {
+                push("torrent watch".into(), expand_home(path));
+            }
+            for category in &self.categories {
+                if let Some(path) = &category.torrent_dir {
+                    push(
+                        format!("torrent category: {}", category.name),
+                        expand_home(path),
+                    );
+                }
+            }
+        }
         roots
     }
 
@@ -628,6 +736,9 @@ impl Config {
         if masked(&self.cluster.secret) {
             mask_hit("[cluster] secret".into())?;
         }
+        if masked(&self.torrent.socks_proxy_password) {
+            mask_hit("[torrent] socks_proxy_password".into())?;
+        }
         for s in &self.servers {
             if s.host.is_empty() {
                 return Err(ConfigError::Invalid(format!(
@@ -675,6 +786,99 @@ impl Config {
                 ));
             }
         }
+        self.validate_torrent()?;
+        Ok(())
+    }
+
+    fn validate_torrent(&self) -> Result<(), ConfigError> {
+        let torrent = &self.torrent;
+        if torrent.listen_port == 0 {
+            return Err(ConfigError::Invalid(
+                "[torrent] listen_port must be one explicit non-zero port".into(),
+            ));
+        }
+        if torrent.upnp_port_forwarding {
+            return Err(ConfigError::Invalid(
+                "[torrent] upnp_port_forwarding is unavailable in the maintained backend".into(),
+            ));
+        }
+        if torrent.max_peers_per_torrent == 0
+            || torrent.max_peers_total == 0
+            || torrent.max_known_peers_per_torrent == 0
+            || torrent.max_known_peers_total == 0
+        {
+            return Err(ConfigError::Invalid(
+                "[torrent] peer ceilings must be greater than zero".into(),
+            ));
+        }
+        if torrent.max_peers_per_torrent > torrent.max_peers_total
+            || torrent.max_known_peers_per_torrent > torrent.max_known_peers_total
+            || torrent.max_peers_per_torrent > torrent.max_known_peers_per_torrent
+            || torrent.max_peers_total > torrent.max_known_peers_total
+        {
+            return Err(ConfigError::Invalid(
+                "[torrent] peer ceilings must satisfy live-per-torrent <= live-total and live <= retained".into(),
+            ));
+        }
+        if !torrent.default_seed_ratio.is_finite() || torrent.default_seed_ratio < 0.0 {
+            return Err(ConfigError::Invalid(
+                "[torrent] default_seed_ratio must be a finite non-negative number".into(),
+            ));
+        }
+        if !(1..=100).contains(&torrent.metainfo_max_mib) {
+            return Err(ConfigError::Invalid(
+                "[torrent] metainfo_max_mib must be between 1 and 100".into(),
+            ));
+        }
+        match (
+            &torrent.socks_proxy_url,
+            &torrent.socks_proxy_username,
+            &torrent.socks_proxy_password,
+        ) {
+            (None, None, None) => {}
+            (Some(origin), None, None) => validate_proxy_origin(origin)?,
+            (Some(origin), Some(username), Some(password)) => {
+                validate_proxy_origin(origin)?;
+                if username.is_empty()
+                    || !username.bytes().all(is_url_unreserved)
+                    || !password.bytes().all(is_url_unreserved)
+                {
+                    return Err(ConfigError::Invalid(
+                        "[torrent] proxy credentials must be non-empty URL-unreserved ASCII".into(),
+                    ));
+                }
+            }
+            _ => {
+                return Err(ConfigError::Invalid(
+                    "[torrent] proxy username and password must be set together with socks_proxy_url".into(),
+                ));
+            }
+        }
+        if torrent.socks_proxy_url.is_some() && torrent.dht {
+            return Err(ConfigError::Invalid(
+                "[torrent] dht must be false when a SOCKS proxy is configured".into(),
+            ));
+        }
+        for category in &self.categories {
+            if let Some(ratio) = category.seed_ratio {
+                if !ratio.is_finite() || ratio < 0.0 {
+                    return Err(ConfigError::Invalid(format!(
+                        "category '{}' seed_ratio must be a finite non-negative number",
+                        category.name
+                    )));
+                }
+            }
+        }
+        if torrent.enabled && self.cluster.enabled {
+            return Err(ConfigError::Invalid(
+                "[torrent] cannot be enabled while [cluster] is enabled; M6 is not approved".into(),
+            ));
+        }
+        if torrent.enabled {
+            return Err(ConfigError::Invalid(
+                "[torrent] backend not activated; enabled must remain false until final M2 activation".into(),
+            ));
+        }
         Ok(())
     }
 
@@ -705,6 +909,29 @@ impl Config {
             })
             .collect()
     }
+}
+
+fn is_url_unreserved(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~')
+}
+
+fn validate_proxy_origin(origin: &str) -> Result<(), ConfigError> {
+    let url = url::Url::parse(origin)
+        .map_err(|_| ConfigError::Invalid("[torrent] socks_proxy_url is not valid".into()))?;
+    if url.scheme() != "socks5"
+        || url.host_str().is_none()
+        || url.port().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || !matches!(url.path(), "" | "/")
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(ConfigError::Invalid(
+            "[torrent] socks_proxy_url must be a credential-free socks5://host:port origin".into(),
+        ));
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1300,43 +1527,83 @@ bind = "0.0.0.0:6789"
     fn torrent_section_parses_with_safe_defaults_and_rejects_unknown_keys() {
         let disabled = Config::from_toml("[torrent]\nenabled = false").unwrap();
         assert!(!disabled.torrent.enabled);
-        assert!(disabled.torrent.dht);
-        assert_eq!(disabled.torrent.download_dir, None);
-        assert_eq!(disabled.torrent.listen_port_range, None);
-        assert_eq!(disabled.torrent.proxy, None);
+        assert!(!disabled.torrent.dht);
+        assert_eq!(disabled.torrent.listen_port, 6881);
+        assert!(disabled.torrent.pex);
 
         let configured = Config::from_toml(
             r#"
-[torrent]
-enabled = true
-download_dir = "/data/torrents"
-dht = false
-listen_port_range = { start = 6881, end = 6882 }
+[paths]
+main_dir = "/data"
+torrent_dir = "/data/torrents"
+torrent_watch_dir = "/data/watch-torrent"
 
-[torrent.proxy]
-url = "socks5://127.0.0.1:1080"
-username = "alice"
-password = "secret"
+[torrent]
+enabled = false
+listen_port = 6881
+dht = false
+pex = true
+local_discovery = false
+upnp_port_forwarding = false
+socks_proxy_url = "socks5://127.0.0.1:1080"
+socks_proxy_username = "alice"
+socks_proxy_password = "secret"
+max_peers_per_torrent = 80
+max_peers_total = 400
+max_known_peers_per_torrent = 1024
+max_known_peers_total = 4096
+upload_limit_kib = 0
+default_seed_ratio = 2.5
+default_seed_minutes = 10080
+metainfo_max_mib = 10
+source_redirects = 5
+
+[[category]]
+name = "tv"
+torrent_dir = "/data/torrents/tv"
+seed_ratio = 2.0
+seed_minutes = 1440
 "#,
         )
         .unwrap();
-        assert!(configured.torrent.enabled);
-        assert_eq!(
-            configured.torrent.download_dir,
-            Some(PathBuf::from("/data/torrents"))
-        );
+        assert!(!configured.torrent.enabled);
         assert!(!configured.torrent.dht);
-        assert_eq!(configured.torrent.listen_port_range, Some(6881..6882));
+        assert_eq!(configured.torrent.default_seed_ratio, 2.5);
         assert_eq!(
-            configured.torrent.proxy.unwrap().url,
-            "socks5://127.0.0.1:1080"
+            configured.torrent.socks_proxy_password.as_deref(),
+            Some("secret")
         );
+        assert_eq!(configured.categories[0].seed_minutes, Some(1440));
+        assert_eq!(configured.torrent_dir(), PathBuf::from("/data/torrents"));
+        let rendered = to_toml(&configured).unwrap();
+        assert_eq!(Config::from_toml(&rendered).unwrap(), configured);
 
         assert!(Config::from_toml("[torrent]\nenabled = false\ntyop = true").is_err());
-        assert!(Config::from_toml(
-            "[torrent.proxy]\nurl = \"socks5://127.0.0.1:1080\"\ntyop = true"
-        )
-        .is_err());
+        assert!(Config::from_toml("[paths]\ntorrent_typo = \"/tmp\"").is_err());
+        assert!(Config::from_toml("[[category]]\nname = \"tv\"\ntorrent_typo = 1").is_err());
+
+        let exact_defaults = r#"
+[torrent]
+enabled = false
+listen_port = 6881
+dht = false
+pex = true
+local_discovery = false
+upnp_port_forwarding = false
+max_peers_per_torrent = 80
+max_peers_total = 400
+max_known_peers_per_torrent = 1024
+max_known_peers_total = 4096
+upload_limit_kib = 0
+default_seed_ratio = 0
+default_seed_minutes = 0
+metainfo_max_mib = 10
+source_redirects = 5
+"#;
+        assert_eq!(
+            Config::from_toml(exact_defaults).unwrap().torrent,
+            TorrentConfig::default()
+        );
     }
 
     #[test]
@@ -1345,8 +1612,68 @@ password = "secret"
         assert_eq!(config.torrent, TorrentConfig::default());
 
         let rendered = to_toml(&config).unwrap();
+        assert!(!rendered.contains("[torrent]"));
         let reparsed = Config::from_toml(&rendered).unwrap();
         assert_eq!(reparsed, config);
+    }
+
+    #[test]
+    fn torrent_negative_contract_is_named_and_fail_closed() {
+        let invalid = [
+            ("listen_port = 0", "listen_port"),
+            ("upnp_port_forwarding = true", "upnp_port_forwarding"),
+            ("metainfo_max_mib = 0", "metainfo_max_mib"),
+            ("metainfo_max_mib = 101", "metainfo_max_mib"),
+            ("default_seed_ratio = -1", "default_seed_ratio"),
+            ("default_seed_ratio = nan", "default_seed_ratio"),
+            ("max_peers_per_torrent = 0", "peer ceilings"),
+            ("max_peers_per_torrent = 401", "peer ceilings"),
+            (
+                "listen_port_range = { start = 6881, end = 6882 }",
+                "listen_port_range",
+            ),
+            ("upload_limit_kib = -1", "upload_limit_kib"),
+            ("source_redirects = -1", "source_redirects"),
+            ("default_seed_minutes = -1", "default_seed_minutes"),
+            (
+                "socks_proxy_url = \"socks5://user:pw@localhost:1080\"",
+                "credential-free",
+            ),
+            ("socks_proxy_password = \"secret\"", "username and password"),
+            (
+                "socks_proxy_url = \"socks5://localhost:1080\"\ndht = true",
+                "dht must be false",
+            ),
+            ("enabled = true", "backend not activated"),
+        ];
+        for (body, expected) in invalid {
+            let error = Config::from_toml(&format!("[torrent]\n{body}\n"))
+                .expect_err(body)
+                .to_string();
+            assert!(error.contains(expected), "{body}: {error}");
+        }
+
+        let cluster_error = Config::from_toml(
+            "[torrent]\nenabled = true\n\
+             [cluster]\nenabled = true\nnode_name = \"a\"\nshared_dir = \"/shared\"\n\
+             advertise_url = \"http://a\"\nsecret = \"secret\"\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(cluster_error.contains("cannot be enabled while [cluster]"));
+    }
+
+    #[test]
+    fn torrent_debug_redacts_proxy_material() {
+        let torrent = TorrentConfig {
+            socks_proxy_url: Some("socks5://private.example:1080".into()),
+            socks_proxy_username: Some("alice".into()),
+            socks_proxy_password: Some("hunter2".into()),
+            ..Default::default()
+        };
+        let shown = format!("{torrent:?}");
+        assert!(!shown.contains("private.example"), "{shown}");
+        assert!(!shown.contains("hunter2"), "{shown}");
     }
 
     #[test]
@@ -1684,6 +2011,53 @@ Server2.Connections=0
         assert!(error.contains("write-root count"), "{error}");
         assert!(error.contains(&MAX_STORAGE_ROOTS.to_string()), "{error}");
     }
+
+    #[test]
+    fn torrent_storage_is_conditional_complete_and_deduplicated() {
+        let mut cfg = Config::default();
+        cfg.paths.main_dir = PathBuf::from("/data");
+        cfg.paths.torrent_watch_dir = Some(PathBuf::from("/watch"));
+        cfg.categories.push(CategoryConfig {
+            name: "tv".into(),
+            torrent_dir: Some(PathBuf::from("/data/torrents/tv")),
+            ..Default::default()
+        });
+        assert_eq!(cfg.torrent_dir(), PathBuf::from("/data/torrents"));
+        assert!(cfg
+            .storage_roots()
+            .iter()
+            .all(|root| !root.label.contains("torrent")));
+
+        cfg.torrent.enabled = true;
+        let roots = cfg.storage_roots();
+        for expected in [
+            "torrent payloads",
+            "torrent control",
+            "torrent watch",
+            "torrent category: tv",
+        ] {
+            assert!(roots.iter().any(|root| root.label.contains(expected)));
+        }
+    }
+
+    #[test]
+    fn torrent_seed_policy_uses_per_add_then_category_then_global() {
+        let mut cfg = Config::default();
+        cfg.torrent.default_seed_ratio = 1.0;
+        cfg.torrent.default_seed_minutes = 60;
+        cfg.categories.push(CategoryConfig {
+            name: "tv".into(),
+            seed_ratio: Some(2.0),
+            seed_minutes: Some(120),
+            ..Default::default()
+        });
+        assert_eq!(cfg.torrent_seed_limits(None, None, None), (1.0, 60));
+        assert_eq!(cfg.torrent_seed_limits(Some("tv"), None, None), (2.0, 120));
+        assert_eq!(
+            cfg.torrent_seed_limits(Some("tv"), Some(3.0), Some(180)),
+            (3.0, 180)
+        );
+    }
 }
 
 /// Did any server's `connections` count move?
@@ -1796,6 +2170,22 @@ mod live_settings_tests {
     }
 
     #[test]
+    fn torrent_upload_limit_is_live_and_every_other_torrent_key_restarts() {
+        let old = base();
+        let mut upload = old.clone();
+        upload.torrent.upload_limit_kib = 1024;
+        let (live, restart) = diff_sections(&old, &upload);
+        assert_eq!(live, ["torrent upload limit"]);
+        assert!(!restart.contains(&"torrent"));
+
+        let mut discovery = old.clone();
+        discovery.torrent.pex = false;
+        let (live, restart) = diff_sections(&old, &discovery);
+        assert!(live.is_empty());
+        assert!(restart.contains(&"torrent"));
+    }
+
+    #[test]
     fn the_configured_cap_is_clamped() {
         let mut c = Config::default();
         c.queue.max_active_downloads = 0;
@@ -1866,6 +2256,16 @@ pub fn diff_sections(old: &Config, new: &Config) -> (Vec<&'static str>, Vec<&'st
     if old.cluster != new.cluster {
         restart.push("cluster");
     }
+    if old.torrent.upload_limit_kib != new.torrent.upload_limit_kib {
+        live.push("torrent upload limit");
+    }
+    let mut old_torrent = old.torrent.clone();
+    let mut new_torrent = new.torrent.clone();
+    old_torrent.upload_limit_kib = 0;
+    new_torrent.upload_limit_kib = 0;
+    if old_torrent != new_torrent {
+        restart.push("torrent");
+    }
     (live, restart)
 }
 
@@ -1891,6 +2291,9 @@ pub fn mask_secrets(cfg: &Config) -> Config {
     }
     if c.cluster.secret.is_some() {
         c.cluster.secret = Some(SECRET_MASK.into());
+    }
+    if c.torrent.socks_proxy_password.is_some() {
+        c.torrent.socks_proxy_password = Some(SECRET_MASK.into());
     }
     c
 }
@@ -1939,6 +2342,11 @@ pub fn merge_masked_secrets(new: &mut Config, old: &Config) -> Vec<String> {
         &old.cluster.secret,
         "[cluster] secret",
     );
+    restore(
+        &mut new.torrent.socks_proxy_password,
+        &old.torrent.socks_proxy_password,
+        "[torrent] socks_proxy_password",
+    );
     unresolved
 }
 
@@ -1964,6 +2372,11 @@ password = "api-secret"
 
 [cluster]
 secret = "cluster-secret"
+
+[torrent]
+socks_proxy_url = "socks5://127.0.0.1:1080"
+socks_proxy_username = "alice"
+socks_proxy_password = "proxy-secret"
 "#;
         let cfg = Config::from_toml(toml).unwrap();
         let masked = mask_secrets(&cfg);
@@ -1971,6 +2384,7 @@ secret = "cluster-secret"
         assert!(!shown.contains("real-secret"));
         assert!(!shown.contains("api-secret"));
         assert!(!shown.contains("cluster-secret"));
+        assert!(!shown.contains("proxy-secret"));
         assert!(shown.contains(SECRET_MASK));
 
         // User edits something unrelated and saves the masked text back.
@@ -1982,6 +2396,10 @@ secret = "cluster-secret"
         assert_eq!(new_cfg.servers[0].password.as_deref(), Some("real-secret"));
         assert_eq!(new_cfg.api.password.as_deref(), Some("api-secret"));
         assert_eq!(new_cfg.cluster.secret.as_deref(), Some("cluster-secret"));
+        assert_eq!(
+            new_cfg.torrent.socks_proxy_password.as_deref(),
+            Some("proxy-secret")
+        );
         assert_eq!(new_cfg.paths.main_dir, PathBuf::from("/mnt/big"));
         // …and the merged result is a config the strict validator accepts.
         new_cfg.validate().unwrap();
