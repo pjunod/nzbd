@@ -2209,8 +2209,8 @@ types/screens/document picker/magnet add · configuration editor and warnings.
 
 **Prerequisite:** the mobile P0 release-signing and non-Latin-1 Basic-auth
 fixes from [`MOBILE_REVIEW.md`](MOBILE_REVIEW.md) are implemented and guarded
-in CI. M3 remains dependent on the M2 engine decision, but no longer inherits
-those two defects.
+in CI. M3 remains downstream of completing the tracked M2 slices #153–#160 and
+final activation #163, but no longer inherits those two defects.
 
 **Acceptance:** DOM and mobile unit tests cover every new state; an old mobile
 client fixture receives only existing top-level status values; an idle seed
