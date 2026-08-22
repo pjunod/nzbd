@@ -18,6 +18,7 @@ pub mod fetch;
 pub mod queue;
 pub mod rate;
 pub mod snapshot;
+pub mod torrent_runtime;
 pub mod volumes;
 
 mod owner;
