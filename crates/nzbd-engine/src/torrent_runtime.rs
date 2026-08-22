@@ -77,7 +77,7 @@ pub fn plan_restore(
         if record
             .content_path
             .as_ref()
-            .is_some_and(|path| !path.starts_with(torrent_root))
+            .is_some_and(|path| !payload_is_within_root(path, torrent_root))
         {
             push_diagnostic(&mut plan, RestoreDiagnostic::UnsafePayloadRoot);
             continue;
@@ -235,6 +235,58 @@ fn safe_relative_path(path: &Path) -> bool {
         && path
             .components()
             .all(|component| matches!(component, Component::Normal(_)))
+}
+
+/// Resolve the existing portion of a payload path so a symlink cannot make a
+/// lexically contained path escape. The leaf may not exist yet during restore,
+/// so canonicalization deliberately stops at its nearest existing ancestor.
+fn payload_is_within_root(path: &Path, root: &Path) -> bool {
+    let Some(path) = normalize_absolute(path) else {
+        return false;
+    };
+    let Some(root) = normalize_absolute(root) else {
+        return false;
+    };
+    if !path.starts_with(&root) {
+        return false;
+    }
+
+    let Ok(canonical_root) = root.canonicalize() else {
+        return false;
+    };
+    let mut existing = path.as_path();
+    loop {
+        match existing.canonicalize() {
+            Ok(canonical_existing) => return canonical_existing.starts_with(&canonical_root),
+            Err(_) => {
+                let Some(parent) = existing.parent() else {
+                    return false;
+                };
+                existing = parent;
+            }
+        }
+    }
+}
+
+fn normalize_absolute(path: &Path) -> Option<PathBuf> {
+    if !path.is_absolute() {
+        return None;
+    }
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::Normal(part) => normalized.push(part),
+            Component::ParentDir => {
+                if !normalized.pop() {
+                    return None;
+                }
+            }
+        }
+    }
+    Some(normalized)
 }
 
 fn push_diagnostic(plan: &mut RestorePlan, diagnostic: RestoreDiagnostic) {
@@ -400,5 +452,49 @@ mod tests {
             refuse_disabled_with_live_torrents(&[job(10, hash, JobStatus::Paused)]),
             Err(DisabledWithLiveTorrents { count: 1 })
         );
+    }
+
+    #[test]
+    fn restore_rejects_parent_escape_from_payload_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("torrents");
+        std::fs::create_dir(&root).unwrap();
+        let mut escaped = job(
+            10,
+            "0123456789abcdef0123456789abcdef01234567",
+            JobStatus::Paused,
+        );
+        escaped.torrent.as_mut().unwrap().content_path =
+            Some(root.join("category").join("..").join("..").join("outside"));
+
+        let plan = plan_restore(&[escaped], &HashMap::new(), &root, &HashSet::new());
+
+        assert!(plan.requests.is_empty());
+        assert_eq!(plan.diagnostics, vec![RestoreDiagnostic::UnsafePayloadRoot]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_rejects_symlink_escape_from_payload_root() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("torrents");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        symlink(&outside, root.join("redirect")).unwrap();
+        let mut escaped = job(
+            10,
+            "0123456789abcdef0123456789abcdef01234567",
+            JobStatus::Paused,
+        );
+        escaped.torrent.as_mut().unwrap().content_path =
+            Some(root.join("redirect").join("not-created-yet"));
+
+        let plan = plan_restore(&[escaped], &HashMap::new(), &root, &HashSet::new());
+
+        assert!(plan.requests.is_empty());
+        assert_eq!(plan.diagnostics, vec![RestoreDiagnostic::UnsafePayloadRoot]);
     }
 }
