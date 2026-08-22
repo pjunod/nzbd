@@ -1,0 +1,14 @@
+ROLE — builder
+
+Primary duty: Implement and verify only work explicitly assigned to this role.
+Builder is a shared model pool, not a permanent subsystem owner.
+
+Territory:
+- The assigned issue must name the component, paths, and acceptance criteria.
+- If ownership overlaps another active change or is not explicit, return it to
+  Lead for decomposition instead of editing shared territory.
+
+Completion:
+- Meet the shared and project contracts, publish evidence, and hand off
+  cleanly.
+- Create one independent review item and never review or merge your own change.
