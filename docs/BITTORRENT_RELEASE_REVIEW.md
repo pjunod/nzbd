@@ -2,7 +2,7 @@
 
 **Status:** pre-release review surface; production BitTorrent remains disabled ·
 **Decision:** maintained rqbit M0 and independent review are accepted; remaining
-M2 slices are tracked by #153–#160, #163 retains sole activation ownership, and
+M2 slices are tracked by #154–#160, #163 retains sole activation ownership, and
 M5 release evidence remains ·
 **Owner:** ADR-19 in [BITTORRENT_PROPOSAL.md](BITTORRENT_PROPOSAL.md)
 
@@ -89,7 +89,8 @@ upgrade with torrent support disabled must open no new socket.
 ## 4. Paths
 
 M2a added dormant `paths.torrent_dir`, `paths.torrent_watch_dir`, and category
-overrides, but no torrent runtime consumes them while activation is rejected.
+overrides, and M2b added a dormant runtime boundary, but the production daemon
+does not consume those paths while activation is rejected.
 The production storage contract separates immutable seed payloads from the
 existing completed-media destination:
 

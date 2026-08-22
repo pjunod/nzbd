@@ -1,8 +1,8 @@
 # BitTorrent support — one queue, two transfer protocols
 
 **Status:** ADR-19 amended; maintained rqbit M0 accepted; M1b merged; M2a #152
-merged via PR #161; remaining M2 slices tracked by #153–#160; final activation
-#163 retains sole activation ownership; production wiring remains disabled ·
+and M2b #153 merged via PRs #161/#181; remaining M2 slices tracked by #154–#160;
+final activation #163 retains sole activation ownership; production wiring remains disabled ·
 **Decision:** pin the reproducibly derived nine-patch rqbit v8.1.1 engine;
 complete single-node M2–M5 before separately approving M6 ·
 **Written:** 2026-08-05 · **Revised:** 2026-08-22 ·
@@ -53,9 +53,9 @@ and fake backend were useful for any embedded engine and started no peer
 session, so they proceeded independently. The maintained-engine proof and its
 independent review have since accepted all eleven M0 gates. M2 was decomposed
 on 2026-08-22 and corrected after an adversarial plan review. M2a's dormant
-`[torrent]` config and fail-closed activation guard have since merged, but no
-admission route, listener, or daemon session is present merely because that
-planning gate and first implementation slice have cleared.
+`[torrent]` config and fail-closed activation guard and M2b's dormant selective
+runtime ownership have since merged, but no production admission route,
+listener, or daemon session is present merely because those slices cleared.
 
 The Fable review later that day found a real proxy leak boundary and several
 plan inconsistencies. This revision rejects proxy+DHT and proxy+UDP trackers,
@@ -2198,10 +2198,10 @@ F1–F3 landed on 2026-07-31, and
 JSONL tombstones. M2 may rely on the enforcing disk guard and terminal-history
 delete semantics; neither is still a reason to start production networking.
 The complete M0 matrix and independent review of the maintained engine are
-accepted. M2a #152 merged via PR #161; remaining M2 slices are tracked by
-#153–#160 under the corrected dependency graph, and final activation #163
-retains sole activation ownership. That graph authorizes milestone work and
-review in dependency order, not an incomplete production switch.
+accepted. M2a #152 and M2b #153 merged via PRs #161/#181; remaining M2 slices
+are tracked by #154–#160 under the corrected dependency graph, and final
+activation #163 retains sole activation ownership. That graph authorizes
+milestone work and review in dependency order, not an incomplete production switch.
 
 Keep native UI changes minimal in this milestone; the API and logs must make
 every state observable.
@@ -2219,7 +2219,7 @@ types/screens/document picker/magnet add · configuration editor and warnings.
 
 **Prerequisite:** the mobile P0 release-signing and non-Latin-1 Basic-auth
 fixes from [`MOBILE_REVIEW.md`](MOBILE_REVIEW.md) are implemented and guarded
-in CI. M3 remains downstream of completing the tracked M2 slices #153–#160 and
+in CI. M3 remains downstream of completing the tracked M2 slices #154–#160 and
 final activation #163, but no longer inherits those two defects.
 
 **Acceptance:** DOM and mobile unit tests cover every new state; an old mobile
@@ -2685,9 +2685,10 @@ The review authorized groundwork and the M0 spike, not a production torrent
 listener. ADR-19 now records the maintained engine/API resolution, and the
 local and native proofs pass all eleven gates; independent review is complete.
 The engine-neutral M1b seam is already implemented. Disk-guard F1–F3 and
-durable history deletion are complete. M2a #152 merged via PR #161; remaining
-M2 slices are tracked by #153–#160 under the corrected dependency graph. Only
-#163 may activate the composed backend. No daemon wiring is implied by that status.
+durable history deletion are complete. M2a #152 and M2b #153 merged via PRs
+#161/#181; remaining M2 slices are tracked by #154–#160 under the corrected
+dependency graph. Only #163 may activate the composed backend. No production
+daemon wiring is implied by that status.
 The mobile P0 prerequisites are complete;
 M3 remains downstream of M2.
 

@@ -8,8 +8,10 @@ M1b added the protocol-neutral state and message boundary needed by any future
 embedded BitTorrent engine. At that milestone the daemon had no torrent
 configuration, admission route, listener, DHT node, tracker task, or dependency
 on `nzbd-torrent`. Later M2a work added dormant `[torrent]` configuration and a
-named guard that rejects `enabled = true`; BitTorrent remains unusable, with no
-production admission route, listener, session, DHT node, or tracker task.
+named guard that rejects `enabled = true`; M2b then added dormant
+selective-session and queue-adjacent runtime ownership without wiring the
+production daemon. BitTorrent remains unusable, with no production admission
+route, listener, daemon session, DHT node, or tracker task.
 
 This milestone was originally blocked with M2 after stable `librqbit` failed
 the authoritative-resume and discovery-health gates. A re-check found the same
@@ -145,7 +147,8 @@ M1b did not soften any M0 stop condition. The two conditions were:
    Windows, including private-mode capture and dependency review.
 
 Both conditions and independent review completed on 2026-08-14; the status was
-reconciled here on 2026-08-22. Remaining M2 slices are tracked by #153–#160,
+reconciled here on 2026-08-22. M2a and M2b have since merged; remaining M2
+slices are tracked by #154–#160,
 and #163 retains sole activation ownership; this report still authorizes no
 production networking by itself.
 

@@ -1,7 +1,7 @@
 # BitTorrent M0 report — maintained rqbit v8.1.1 closes the engine boundary
 
 **Status:** all eleven gates pass locally and on the native matrix; independent
-review complete; remaining M2 slices tracked by #153–#160 with activation owned
+review complete; remaining M2 slices tracked by #154–#160 with activation owned
 solely by #163; daemon wiring remains disabled ·
 **Original run:** 2026-08-05 · **Amended:** 2026-08-14 ·
 **Accepted:** 2026-08-14 · **Status reconciled:** 2026-08-22 ·
@@ -32,11 +32,12 @@ required. Tracker/DHT detail is diagnostic only and is explicitly `unknown`
 when unavailable; peer availability is never used to invent discovery health
 or a health percentage.
 
-The maintained-engine implementation stops at the isolated `nzbd-torrent`
+The maintained-engine implementation stopped at the isolated `nzbd-torrent`
 boundary and queue schema-version groundwork. Later M2a work added dormant
-`[torrent]` configuration, but validation rejects `enabled = true`; no torrent
-admission API, daemon session dependency, peer listener, or production torrent
-admission path has been added.
+`[torrent]` configuration, and M2b added dormant selective-session and
+queue-adjacent runtime ownership, but validation still rejects `enabled = true`;
+no torrent admission API, production daemon session dependency, peer listener,
+or production torrent admission path has been added.
 
 The exact maintained-engine head received
 [independent approval on PR #101](https://github.com/pjunod/nzbd/pull/101#issuecomment-5298914349)
@@ -672,10 +673,10 @@ documented-main-base legs plus an advisory moving-main drift leg; pushes and
 the weekly schedule require all three.
 
 The exact-stable patch is part of the maintained series. Current-main remains
-contribution material. M2a now defines dormant torrent storage paths, but no
-torrent runtime consumes them while `enabled = true` is rejected; the M2
-storage-full row remains dependency-gated, and production wiring remains
-disabled.
+contribution material. M2a defines dormant torrent storage paths and M2b adds a
+dormant runtime boundary, but the production daemon does not consume those
+config paths while `enabled = true` is rejected; the M2 storage-full row remains
+dependency-gated, and production wiring remains disabled.
 
 ---
 
