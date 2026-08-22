@@ -2187,6 +2187,16 @@ checkpoint or readiness disagreement forces recheck, and later bytes on disk
 cannot advance the durable trusted checkpoint by themselves. The production
 `nzbd` dependency graph remains isolated until final M2 activation.
 
+M2d folds maintained-engine observations through the M1b backend contract.
+Rate and useful-peer samples remain replaceable progress; only verified and
+uploaded checkpoints plus useful activity reach durable queue state. A
+`Ready` fact is accepted only after every selected byte is reported verified,
+and its canonical content path means the adapter has completed the payload and
+directory durability barrier. The queue persists readiness while the job stays
+live in `seeding`. ENOSPC/EDQUOT, missing payload, and transient discovery are
+classified as recoverable `Stopped` facts; only an explicitly classified,
+display-safe unrecoverable error may become `Failed`.
+
 **Work:** add `[torrent]` and paths · start one session only when enabled · raw
 metainfo/magnet/URL admission · durable descriptor before start · handle map ·
 stats coalescing · readiness · pause/resume/delete · seed policy · download and
