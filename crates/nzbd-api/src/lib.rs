@@ -12,6 +12,7 @@ use base64::Engine as _;
 
 pub mod eventhub;
 pub mod logbuf;
+pub mod torrent_admission;
 pub mod version;
 pub use eventhub::{EventHub, Replay};
 pub use logbuf::{LogBuffer, LogBufferLayer};
@@ -2497,6 +2498,30 @@ mod tests {
 <groups><group>a.b</group></groups>
 <segments><segment bytes="1000" number="1">m1@x</segment></segments>
 </file></nzb>"#;
+
+    #[tokio::test]
+    async fn production_router_keeps_torrent_admission_unmounted_without_side_effects() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = test_engine(&tmp).await;
+        let response = router(engine.clone())
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/jobs")
+                    .header("content-type", "application/x-bittorrent")
+                    .body(axum::body::Body::from("d4:infode"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(engine.snapshot().jobs.is_empty());
+        let store =
+            nzbd_state::torrent_sources::PendingSourceStore::open(&tmp.path().join("state"))
+                .unwrap();
+        assert!(store.inventory().unwrap().is_empty());
+        engine.shutdown().await;
+    }
 
     fn summary(id: u32, status: JobStatus) -> JobSummary {
         JobSummary {

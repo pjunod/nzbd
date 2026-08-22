@@ -1939,15 +1939,18 @@ dependencies = [
  "nzbd-nzb",
  "nzbd-post",
  "nzbd-state",
+ "nzbd-torrent",
  "nzbd-types",
  "serde",
  "serde_json",
  "tempfile",
+ "thiserror 2.0.18",
  "tokio",
  "tokio-stream",
  "tower",
  "tracing",
  "tracing-subscriber",
+ "url",
 ]
 
 [[package]]

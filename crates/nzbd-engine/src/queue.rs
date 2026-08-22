@@ -9,16 +9,17 @@
 use crate::backend::torrent_wants_download_slot;
 use crate::failover::{Candidates, Ladder, SegmentAttempt};
 use nzbd_nzb::ParsedNzb;
-use nzbd_state::{QueueSnapshotDoc, QUEUE_SCHEMA_VERSION};
+use nzbd_state::{PendingAdmission, QueueSnapshotDoc, QUEUE_SCHEMA_VERSION};
 use nzbd_types::{
     DupeInfo, FileEntry, FileId, Health, Job, JobId, JobKind, JobStatus, Segment, SegmentState,
-    ServerDef, ServerId,
+    ServerDef, ServerId, TorrentRecord, TorrentSource,
 };
 use std::collections::HashMap;
 
 #[derive(Debug)]
 pub struct QueueState {
     pub jobs: Vec<Job>,
+    pub pending_admissions: Vec<PendingAdmission>,
     pub next_job_id: u32,
     pub next_file_id: u32,
     pub download_paused: bool,
@@ -32,6 +33,16 @@ pub struct QueueState {
     /// it is the sort of thing you change *because* of what the queue is
     /// doing right now, which is exactly when a restart is unwelcome.
     pub max_active_downloads: u32,
+}
+
+#[derive(Debug)]
+pub(crate) struct TorrentAdmissionCommit {
+    pub name: String,
+    pub category: Option<String>,
+    pub priority: i32,
+    pub paused: bool,
+    pub params: Vec<(String, String)>,
+    pub record: TorrentRecord,
 }
 
 /// The floor and ceiling for [`QueueState::max_active_downloads`]. Zero
@@ -54,6 +65,7 @@ impl Default for QueueState {
     fn default() -> QueueState {
         QueueState {
             jobs: Vec::new(),
+            pending_admissions: Vec::new(),
             next_job_id: 0,
             next_file_id: 0,
             download_paused: false,
@@ -74,28 +86,18 @@ pub struct SegRef {
 impl QueueState {
     // -- persistence ---------------------------------------------------------
 
-    /// Production recovery boundary for M1b. Schema 3 can represent and test
-    /// torrent control state, but no daemon backend exists yet, so accepting
-    /// such a row would let generic Usenet recovery mutate it dishonestly.
+    /// Production recovery boundary. Torrent rows remain inert in the generic
+    /// owner until the separately injected torrent runtime restores them.
     pub(crate) fn from_runtime_doc(
         doc: QueueSnapshotDoc,
     ) -> Result<QueueState, nzbd_state::StateError> {
-        if doc
-            .jobs
-            .iter()
-            .any(|job| matches!(job.kind, JobKind::Torrent))
-        {
-            return Err(nzbd_state::StateError::Corrupt(
-                "queue.json contains BitTorrent jobs, but this M1b build has no production torrent backend; no peer session was started and the queue was left unchanged"
-                    .into(),
-            ));
-        }
         Ok(Self::from_doc(doc))
     }
 
     pub fn from_doc(doc: QueueSnapshotDoc) -> QueueState {
         let mut state = QueueState {
             jobs: doc.jobs,
+            pending_admissions: doc.pending_admissions,
             next_job_id: doc.next_job_id,
             next_file_id: doc.next_file_id,
             download_paused: doc.download_paused,
@@ -174,6 +176,7 @@ impl QueueState {
     pub fn to_doc(&self) -> QueueSnapshotDoc {
         QueueSnapshotDoc {
             schema_version: QUEUE_SCHEMA_VERSION,
+            pending_admissions: self.pending_admissions.clone(),
             jobs: self.jobs.clone(),
             next_job_id: self.next_job_id,
             next_file_id: self.next_file_id,
@@ -205,6 +208,93 @@ impl QueueState {
     }
 
     // -- admission -----------------------------------------------------------
+
+    pub fn reserve_torrent_admission(
+        &mut self,
+        source: TorrentSource,
+        secret_ref: std::path::PathBuf,
+    ) -> JobId {
+        self.next_job_id += 1;
+        let job_id = JobId(self.next_job_id);
+        self.pending_admissions.push(PendingAdmission {
+            job_id,
+            source,
+            secret_ref,
+        });
+        job_id
+    }
+
+    pub fn cancel_torrent_admission(&mut self, id: JobId) -> bool {
+        let before = self.pending_admissions.len();
+        self.pending_admissions
+            .retain(|pending| pending.job_id != id);
+        before != self.pending_admissions.len()
+    }
+
+    pub(crate) fn commit_torrent_admission(
+        &mut self,
+        id: JobId,
+        commit: TorrentAdmissionCommit,
+    ) -> Option<Result<JobId, JobId>> {
+        let TorrentAdmissionCommit {
+            name,
+            category,
+            priority,
+            paused,
+            params,
+            record,
+        } = commit;
+        self.pending_admissions
+            .iter()
+            .any(|p| p.job_id == id)
+            .then_some(())?;
+        if let Some(position) = self.jobs.iter().position(|job| {
+            job.torrent
+                .as_ref()
+                .is_some_and(|torrent| torrent.info_hash_v1 == record.info_hash_v1)
+                && !matches!(job.status, JobStatus::Failed | JobStatus::Deleted)
+        }) {
+            let existing_id = self.jobs[position].id;
+            let existing = &mut self.jobs[position];
+            for (key, value) in params {
+                match existing.params.iter_mut().find(|(k, _)| *k == key) {
+                    Some(slot) => slot.1 = value,
+                    None => existing.params.push((key, value)),
+                }
+            }
+            self.cancel_torrent_admission(id);
+            return Some(Err(existing_id));
+        }
+        self.cancel_torrent_admission(id);
+        let dir_name = self.unique_dir_name(id, sanitize_name(&name));
+        let total = record.total_bytes;
+        self.jobs.push(Job {
+            id,
+            kind: JobKind::Torrent,
+            name,
+            dir_name,
+            name_provisional: false,
+            queued_at_unix: unix_now(),
+            original_name: String::new(),
+            category,
+            priority,
+            dupe: DupeInfo::default(),
+            params,
+            files: Vec::new(),
+            totals: nzbd_types::JobTotals {
+                size: total,
+                ..Default::default()
+            },
+            status: if paused {
+                JobStatus::Paused
+            } else {
+                JobStatus::Queued
+            },
+            torrent: Some(record),
+            stages: Vec::new(),
+        });
+        Some(Ok(id))
+    }
 
     /// Add a parsed NZB as a job. `pause_extra_pars` queues `*.volNNN+MM.par2`
     /// files paused (delayed-par download, §3.2 — unpaused by the repair
@@ -1784,7 +1874,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_recovery_refuses_dormant_torrent_rows() {
+    fn runtime_recovery_keeps_dormant_torrent_control_rows() {
         let mut queue = QueueState::default();
         admit_fake_torrent(
             &mut queue,
@@ -1793,11 +1883,13 @@ mod tests {
             None,
         );
 
-        let error = QueueState::from_runtime_doc(queue.to_doc())
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("this M1b build has no production torrent backend"));
-        assert!(error.contains("no peer session was started"));
+        let recovered = QueueState::from_runtime_doc(queue.to_doc()).unwrap();
+        assert_eq!(recovered.jobs.len(), 1);
+        assert_eq!(recovered.jobs[0].kind, JobKind::Torrent);
+        assert_eq!(
+            recovered.jobs[0].torrent.as_ref().unwrap().phase,
+            nzbd_types::TorrentPhase::PausedDownload
+        );
     }
 
     #[test]
@@ -1876,6 +1968,7 @@ mod tests {
         // the field as 0; loading it must not stop the daemon.
         let doc = nzbd_state::QueueSnapshotDoc {
             schema_version: nzbd_state::QUEUE_SCHEMA_VERSION,
+            pending_admissions: Vec::new(),
             jobs: vec![],
             next_job_id: 1,
             next_file_id: 1,
@@ -2603,5 +2696,65 @@ mod tests {
             None
         );
         assert_eq!(name_from_files(&[]), None);
+    }
+
+    #[test]
+    fn torrent_pending_intent_is_structurally_replaced_and_live_hash_deduplicates() {
+        let mut queue = QueueState::default();
+        let first = queue
+            .reserve_torrent_admission(TorrentSource::Magnet, "torrents/pending/1.source".into());
+        assert!(queue.jobs.is_empty());
+        let record = TorrentRecord {
+            info_hash_v1: "0123456789abcdef0123456789abcdef01234567".into(),
+            source: TorrentSource::Magnet,
+            metadata_file: "torrents/sources/hash.torrent".into(),
+            phase: nzbd_types::TorrentPhase::Queued,
+            files: vec![],
+            total_bytes: 42,
+            selected_bytes: 42,
+            downloaded_bytes: 0,
+            uploaded_bytes: 0,
+            seeding_seconds: 0,
+            ready_at_unix: None,
+            content_path: None,
+            seed_policy: Default::default(),
+            last_activity_unix: None,
+            last_error: None,
+        };
+        assert_eq!(
+            queue.commit_torrent_admission(
+                first,
+                TorrentAdmissionCommit {
+                    name: "one".into(),
+                    category: None,
+                    priority: 0,
+                    paused: false,
+                    params: vec![],
+                    record: record.clone()
+                }
+            ),
+            Some(Ok(first))
+        );
+        assert!(queue.pending_admissions.is_empty());
+        assert_eq!(queue.jobs[0].id, first);
+
+        let retry =
+            queue.reserve_torrent_admission(TorrentSource::Url, "torrents/pending/2.source".into());
+        assert_eq!(
+            queue.commit_torrent_admission(
+                retry,
+                TorrentAdmissionCommit {
+                    name: "two".into(),
+                    category: None,
+                    priority: 0,
+                    paused: false,
+                    params: vec![],
+                    record
+                }
+            ),
+            Some(Err(first))
+        );
+        assert_eq!(queue.jobs.len(), 1);
+        assert!(queue.pending_admissions.is_empty());
     }
 }

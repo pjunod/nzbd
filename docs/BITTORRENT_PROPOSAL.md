@@ -1,7 +1,8 @@
 # BitTorrent support — one queue, two transfer protocols
 
 **Status:** ADR-19 amended; maintained rqbit M0 accepted; M1b merged; M2a #152
-and M2b #153 merged via PRs #161/#181; remaining M2 slices tracked by #154–#160;
+and M2b #153 merged via PRs #161/#181; M2c #154 implemented as an unmounted
+admission/watch boundary with queue schema 4; remaining M2 slices are #156–#160;
 final activation #163 retains sole activation ownership; production wiring remains disabled ·
 **Decision:** pin the reproducibly derived nine-patch rqbit v8.1.1 engine;
 complete single-node M2–M5 before separately approving M6 ·
