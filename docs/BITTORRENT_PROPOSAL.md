@@ -2188,7 +2188,7 @@ cannot advance the durable trusted checkpoint by themselves. The production
 `nzbd` dependency graph remains isolated until final M2 activation.
 
 M2d folds maintained-engine observations through the M1b backend contract.
-Rate and useful-peer samples remain replaceable progress; only downloaded and
+Rate and useful-peer samples remain replaceable progress; only verified and
 uploaded checkpoints plus useful activity reach durable queue state. A
 `Ready` fact is accepted only after every selected byte is reported verified,
 and its canonical content path means the adapter has completed the payload and

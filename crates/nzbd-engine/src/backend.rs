@@ -259,7 +259,7 @@ mod tests {
 
     #[tokio::test]
     async fn progress_flood_cannot_delay_a_control_command() {
-        let (owner, mut adapter) = backend_channel(1, 1);
+        let (mut owner, mut adapter) = backend_channel(1, 1);
         for n in 0..50_000 {
             adapter.progress(
                 JobId(7),
@@ -269,6 +269,7 @@ mod tests {
                 },
             );
         }
+        assert_eq!(owner.latest_progress()[&JobId(7)].downloaded_bytes, 49_999);
 
         owner
             .try_command(BackendCommand::Remove {
