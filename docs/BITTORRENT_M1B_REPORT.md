@@ -131,22 +131,26 @@ matrix.
 
 ---
 
-## 4. What remains blocked
+## 4. What remains before M2
 
-M1b does not soften any M0 stop condition. Before M2:
+M1b did not soften any M0 stop condition. The two conditions were:
 
-1. ADR-19 selects the maintained rqbit v8.1.1 derivation; M2 remains blocked
-   until #85 proves all eleven M0 gates on the native matrix. Required transfer
-   facts must remain public and bounded, while unavailable detailed
-   tracker/DHT diagnostics stay explicit `unknown` rather than inferred;
+1. ADR-19 selects the maintained rqbit v8.1.1 derivation and proves all eleven
+   M0 gates on the native matrix. Required transfer facts remain public and
+   bounded, while unavailable detailed tracker/DHT diagnostics stay explicit
+   `unknown` rather than inferred;
 2. all eleven M0 gates must pass on native macOS, Linux glibc/musl, and
    Windows, including private-mode capture and dependency review.
+
+Both conditions and independent review completed on 2026-08-14; the status was
+reconciled here on 2026-08-22. The corrected M2 issue graph is open; this report
+still authorizes no production networking by itself.
 
 The two repository prerequisites named in the original report are complete:
 [`REGRAB_LOOP_PLAN.md`](REGRAB_LOOP_PLAN.md) F1–F3 landed on 2026-07-31, and
 [`DEFECT_HISTORY_DELETE.md`](DEFECT_HISTORY_DELETE.md) now makes forget durable
-across the shared JSONL. They no longer block M2; the engine decision still
-does.
+across the shared JSONL. They no longer block M2. The engine decision completed
+separately and is now accepted.
 
 No production BitTorrent networking should appear in review of this milestone.
 If it does, that is a scope and safety defect, not an optional follow-up.

@@ -1,11 +1,13 @@
 # BitTorrent support — one queue, two transfer protocols
 
-**Status:** ADR-19 amended; maintained rqbit M0 candidate selected; M1b merged;
-production wiring remains disabled ·
+**Status:** ADR-19 amended; maintained rqbit M0 accepted; M1b merged; corrected
+M2 issues #152–#160 and final activation #163 are open; production wiring
+remains disabled ·
 **Decision:** pin the reproducibly derived nine-patch rqbit v8.1.1 engine;
-complete M0 before decomposing M2 ·
-**Written:** 2026-08-05 · **Revised:** 2026-08-14 ·
+complete single-node M2–M5 before separately approving M6 ·
+**Written:** 2026-08-05 · **Revised:** 2026-08-22 ·
 **Verified against:** rqbit v8.1.1 (`00b97485160ff5b5aa2b379ea0815d568ec665f0`) ·
+**Cluster reuse baseline:** plurx `7c781e5f5e28ac8114bacb1919a463a6a18e2680` ·
 **Scope:** architecture, contracts, milestones, and review questions; no
 production BitTorrent path is authorized before the gates below pass
 
@@ -21,8 +23,9 @@ cannot mean “move, rename, clean up, and forget the job” as it does for
 Usenet. The implementation plan is §15. Work milestone by milestone; every
 milestone preserves the existing NZBGet surface and the current Usenet test
 suite. Re-verify every source anchor against HEAD before building. If the
-dependency spike in M0 cannot prove the gates in §4.3, stop and return to the
-engine decision instead of coding around a missing capability.
+maintained derivation or a future dependency change stops proving the gates in
+§4.3, stop and return to the engine decision instead of coding around a
+missing capability.
 
 The first 2026-08-05 review accepted the architecture and found that the original
 draft had attributed uTP and IPv6 support from the 9.x development line to
@@ -36,19 +39,22 @@ in [BITTORRENT_M0_REPORT.md](BITTORRENT_M0_REPORT.md). It proved the core data
 path but also found two stable-API gaps: fast-resume persistence restores its
 own complete torrent list before nzbd can reconcile it, and tracker/DHT health
 is not available through the public per-torrent stats model. The isolated
-adapter and schema groundwork may remain; production session wiring stops here
-until ADR-19 is amended with a maintained fix or a different engine. The
+adapter and schema groundwork remained; production session wiring stopped here
+until ADR-19 was amended with a maintained fix or a different engine. The
 2026-08-14 amendment in §4.3.3 makes that decision: nzbd derives a pinned local
 rqbit v8.1.1 vendor from the immutable release archive plus exactly nine small,
 ordered patches. This is an explicit dependency boundary, not permission to
 wire a daemon session.
 
 A same-day re-check of stable 8.1.1 and rqbit's unreleased 9.0 branch found
-that both M0 blockers remain. That result changes the milestone dependency,
-not the production gate: M1b's queue schema, scheduler boundary, and fake
-backend are useful for any embedded engine and start no peer session, so they
-may proceed independently. M2 still cannot add config, admission, a listener,
-or daemon wiring until the engine gates pass.
+that both original M0 blockers remained. That result changed the milestone
+dependency, not the production gate: M1b's queue schema, scheduler boundary,
+and fake backend were useful for any embedded engine and started no peer
+session, so they proceeded independently. The maintained-engine proof and its
+independent review have since accepted all eleven M0 gates. M2 was decomposed
+on 2026-08-22 and corrected after an adversarial plan review, but no config,
+admission route, listener, or daemon session is present merely because that
+planning gate has cleared.
 
 The Fable review later that day found a real proxy leak boundary and several
 plan inconsistencies. This revision rejects proxy+DHT and proxy+UDP trackers,
@@ -56,8 +62,9 @@ rejects privacy-unknown magnets in a DHT-enabled session, disables
 process-global DHT persistence, completes v2/hybrid admission checks
 for metainfo, reserves schema version 3 for torrent job records, defines how a
 stalled torrent yields the shared slot, and originally split completed M1a
-schema work from then-blocked M1b routing. The §4.3.2 amendment now permits
-that dormant routing seam; gates 7 and 8 still block production wiring.
+schema work from then-blocked M1b routing. The §4.3.2 amendment then permitted
+that dormant routing seam while gates 7 and 8 still blocked production wiring.
+The maintained-engine amendment in §4.3.3 supersedes that gate state.
 
 > BitTorrent publishes the client’s IP address to peers and may upload data
 > after the download completes. nzbd can provide controls and honest status;
@@ -204,6 +211,29 @@ The proposed qBittorrent shim is parallel to `nzbd-compat`:
 The native surface is the product API. Both compatibility surfaces are
 projections for a named ecosystem client; neither gets to redefine the
 domain model.
+
+### 2.4 Plurx is the cluster reuse baseline, not a dependency
+
+Cluster work must begin by reusing the merged contracts already proven in
+plurx, pinned here to `7c781e5f5e28ac8114bacb1919a463a6a18e2680`.
+Re-verify these anchors with `git show`, not a developer's checked-out plurx
+branch. The baseline is semantic: nzbd must not take a direct `plurx-core`
+dependency. Extracting a shared crate or protocol requires its own ADR and
+compatibility boundary.
+
+| Concern | Merged plurx source | nzbd reuse rule |
+|---|---|---|
+| Monotone lease authority | `crates/plurx-core/src/cluster/coordination.rs` and both store implementations at `d0a83eb0da10fe352da2176aa19701d95eb6c2c4` | Port the token and exact-CAS semantics behind nzbd's store boundary; do not invent a second lock protocol. |
+| Fenced publication | `crates/plurx-core/src/store/publication.rs` and both transactional implementations at `61951db0945e1a9874c8a1742154bba5da5d11bf` | Validate the live fence in the same transaction that publishes durable state. A pre-check is not fencing. |
+| Renewal loss and self-fencing | `plurxd/src/state.rs` at `038f154a1c35f1cb0afe496eddf9bd4cb6778dc0` | Cancellation and the local expiry deadline both stop the worker; renewal returns a replacement token. |
+| Membership and failover operations | `crates/plurx-core/src/cluster/membership.rs` and `crates/plurx-cluster-check` on the pinned baseline | Reuse identity, tombstone, degraded-quorum, and real-process test contracts. Do not copy the implementation: it depends on plurx's patched Hiqlite/WAL stack. |
+| Architecture and validation matrix | `docs/CLUSTER-MEDIA-POOL-PLAN.md` on the pinned baseline | Use its facts-versus-bytes split, transactional fence rules, and failure matrix as the starting review checklist. |
+
+Only merged baseline code counts as prior art. In particular,
+`origin/agent/builder/issue-417-cluster-activity-transport` is unmerged and is
+not an accepted dependency or design premise. Plurx also does not yet prove
+every torrent-session takeover or remote-placement behavior; those remain
+nzbd acceptance work in §12.
 
 ---
 
@@ -646,8 +676,11 @@ starvation the owner design exists to prevent.
 
 Run one `librqbit::Session` per nzbd process, not one session per job. A single
 session owns the listen port, DHT node, rate limits, and peer id. The adapter
-holds the in-memory `JobId ↔ info hash ↔ ManagedTorrent` map. Only `JobId` and
-the serializable torrent record cross into the queue owner.
+holds engine handles keyed only by engine identity/info hash and never owns an
+nzbd `JobId`. A daemon/backend runtime module holds the
+`JobId ↔ engine identity` association and translates protocol-neutral M1b
+commands/facts. Raw library handles do not cross that boundary; only `JobId`
+and the serializable torrent record reach the queue owner.
 
 The intended contract is for library persistence to be an optimization beneath
 that map. On boot, nzbd must enumerate its durable torrent jobs and explicitly
@@ -687,7 +720,7 @@ This makes old snapshots load with `torrent = None` and leaves compat code’s
 existing field reads intact. A later schema cleanup may introduce a fully
 tagged `TransferRecord`; it is not required to ship the feature safely.
 
-### 6.2 Version 2 is the envelope; torrent jobs require version 3
+### 6.2 Version 2 is the envelope; M1b uses 3 and M2 admission uses 4
 
 An additive `Job` field is backward-readable, but `JobKind::Torrent` is not.
 Today one unknown enum value makes the whole `queue.json` fail to deserialize
@@ -728,6 +761,14 @@ This makes a future *version* fail by name; it cannot retrofit an older binary.
 A pre-torrent nzbd still fails its entire startup when it sees a live torrent
 row. The drain/export procedure in §17.2 is therefore mandatory before a
 downgrade, not optional release-note advice.
+
+M2 cannot add its top-level pending-admission collection while continuing to
+write version 3: the existing schema-3 reader accepts unknown fields and could
+rewrite the queue without those intents. Issue #154 therefore advances the
+writer to version 4, treats version 3 as an empty-pending migration input, and
+retains unconditional version emission. A captured exact schema-3 reader is a
+required negative fixture: it must reject a version-4 document by version
+before it can serve or save.
 
 ### 6.3 Proposed durable torrent record
 
@@ -775,6 +816,28 @@ pub struct SeedPolicy {
 }
 ```
 
+Magnet and HTTP(S) sources also need a durable pre-descriptor state because a
+crash may occur before validated metainfo exists. M2 therefore bumps the queue
+to schema 4 and adds a defaulted queue-owned pending-admission collection whose
+record contains only the reserved `JobId`, non-secret source class, phase, and
+an opaque relative secret reference. Schema 3 migrates forward with an empty
+collection; every later save emits schema 4 even when the collection is empty.
+The exact pre-M2 schema-3 reader must reject schema 4 by future-version name
+before serving or writing, so it cannot silently drop an unknown field. The
+original magnet or URL is atomically written and fsynced at
+`queue/torrents/pending/<job-id>.source` with mode 0600 or an equivalent
+platform-secret ACL. It never enters `queue.json`, history, logs, events,
+errors, debug output, or API snapshots.
+
+Admission recovers as an ordered state machine: protected source artifact →
+durable pending intent → bounded fetch/list-only metadata resolution → durable
+validated `sources/<infohash>.torrent` → structural replacement with the full
+`TorrentRecord` preserving `JobId` → pending-secret removal → managed payload
+start. Restart reconciles every edge idempotently, including an artifact left
+before its queue intent. The secret is removed only after descriptor plus queue
+transition are durable or the pending admission has a confirmed terminal
+outcome.
+
 Re-verify field types against `librqbit` in M0. The contract is what each
 field means:
 
@@ -804,10 +867,12 @@ safe direction for tracker obligations.
 The v1 info hash is the transfer identity. Admission follows this sequence:
 
 ```
- source parsed? ── no ──▶ reject without creating a job
+ source syntax valid? ── no ──▶ reject without creating an intent
        │ yes
- v1 info hash known? ── no ──▶ provisional magnet job, keyed by btih
-       │ yes
+ persist secret + pending intent ──▶ fetch/resolve bounded metainfo
+       │
+ validate and durably persist v1 descriptor
+       │
  hash already live? ── yes ──▶ return existing JobId, apply safe new params
        │ no
  hash in terminal history? ── yes ──▶ follow dupe mode / explicit force
@@ -815,23 +880,27 @@ The v1 info hash is the transfer identity. Admission follows this sequence:
  persist descriptor + queue job ────▶ start only after durable commit
 ```
 
-A magnet’s `btih` gives the identity before metadata arrives. A `.torrent`
-gives it after bounded bencode parsing. Two adds of the same hash must not
-create two sessions writing the same payload. The existing dupe key/score may
-still be carried for *arr semantics; it does not replace the info-hash
-invariant.
+A magnet’s `btih` gives the identity before metadata arrives; an HTTP source
+may not reveal it until bounded fetch and parse. A `.torrent` gives it after
+bounded bencode parsing. Pending-intent reconciliation and final hash
+deduplication must not create two sessions writing the same payload. The
+existing dupe key/score may still be carried for *arr semantics; it does not
+replace the info-hash invariant.
 
 ### 6.6 Crash recovery order
 
-1. Load the nzbd queue snapshot and structural journal.
-2. Validate every torrent descriptor and ensure its paths remain under the
+1. Load the nzbd queue snapshot, structural journal, and protected pending
+   source inventory; safely reconcile queue-linked and orphan artifacts.
+2. Resume each pending source idempotently without disclosing it or starting
+   payload work before its durable descriptor transition.
+3. Validate every torrent descriptor and ensure its paths remain under the
    configured torrent root.
-3. Start the library session paused.
-4. Explicitly restore each durable torrent job, using fast resume only when
+4. Start the library session paused.
+5. Explicitly restore each durable torrent job, using fast resume only when
    the library validates it against the stored metainfo and paths.
-5. Recheck any job whose ready stamp, file state, and resume state disagree.
-6. Publish the first combined snapshot.
-7. Resume only jobs allowed by queue policy.
+6. Recheck any job whose ready stamp, file state, and resume state disagree.
+7. Publish the first combined snapshot.
+8. Resume only jobs allowed by queue policy.
 
 No API response may show `Seeding` merely because an old snapshot said so.
 The process must first re-establish that the payload is present and trusted.
@@ -881,6 +950,12 @@ Success remains `201 {"id": <JobId>}` and may add `info_hash`. A duplicate
 live hash returns `200` with the existing id and `created: false`. Malformed or
 unsupported metainfo returns `422`; source fetch failures become a visible
 failed job only after a valid request was durably admitted.
+
+For magnet/URL input, “durably admitted” means the protected source artifact
+and queue-owned pending intent above both exist. The source can then resume
+after a kill during metadata resolution or HTTP fetch without putting its
+query, tracker passkey, or credentials in the public queue snapshot. The
+production route and watch task remain unmounted until final M2 activation.
 
 ### 7.2 Native read model
 
@@ -1202,6 +1277,7 @@ limitation and the safe fallback pauses the whole torrent.
   queue/                              existing queue + history state
     torrents/
       sources/<infohash>.torrent      retained metainfo, mode 0600
+      pending/<job-id>.source         transient secret source, mode 0600
       resume/                          library fast-resume data
       torrent-categories.json         compat-created category overlay
 
@@ -1565,11 +1641,11 @@ timeout, or redaction policy.
 Tracker input limits do not bound tracker responses. Stable 8.1.1 and the
 pinned rqbit-main snapshot issue HTTP announces without a tracker-owned
 deadline, buffer the complete response, and accept zero-second HTTP intervals;
-UDP accepts five seconds. Production requires an accepted engine release that
-bounds the complete HTTP request and decoded body and enforces a polite minimum
-unforced HTTP/UDP interval. The contribution kit's reviewed candidate uses 30
-seconds, 1 MiB, and 60 seconds respectively; those values remain proposal
-evidence until upstream accepts and releases a contract.
+UDP accepts five seconds. The selected maintained engine closes that boundary
+with patch 2 in §4.3.3: it bounds the complete HTTP request and decoded body
+and enforces a polite minimum unforced HTTP/UDP interval. The accepted values
+are 30 seconds, 1 MiB, and 60 seconds respectively. Upstream acceptance remains
+optional follow-through, not a production prerequisite.
 
 ---
 
@@ -1796,6 +1872,14 @@ and upload accounting. Those need an explicit lease design.
 
 ### 12.2 Later cluster contract
 
+M6 begins with a storage/topology ADR, reviewed before implementation work is
+decomposed. The current nzbd shared-filesystem lease has a documented residual
+fencing window that is acceptable for idempotent article writes and journal
+union. It is not sufficient for a stateful torrent session. The ADR must choose
+a coordination store that can perform a linearizable fence comparison in the
+same transaction as publication, and must state its quorum-loss and rollback
+behavior. It must also decide which bytes are shared, replicated, or local.
+
 Add `LeaseKind::Torrent`, distinct from NNTP `Download` and `Post`:
 
 ```rust
@@ -1812,43 +1896,97 @@ numeric slots:
 whichever roadmap lands second must preserve the first and add its own named
 variant. M6 contract fixtures include both names if C3 has landed by then.
 
-One node holds the torrent lease and runs its peer session. The shared volume
-contains metainfo, payload, nzbd control record, and lease-fenced resume
-checkpoint. The worker heartbeat reports protocol-neutral bytes plus torrent
-upload and peer facts. Provider connection budgets do not apply; torrent peer
-and upload caps do.
+Port plurx's monotone lease token and exact-CAS behavior rather than extending
+the current lease with an ad hoc flag:
+
+```rust
+pub struct TorrentLease {
+    pub resource: String,
+    pub owner_node_id: String,
+    pub fence: u64,
+    pub revision: u64,
+    pub expires_at_unix_ms: i64,
+}
+```
+
+The durable row is never deleted while its resource identity can be reused.
+Acquiring an expired or explicitly released lease increments the fence. Renew
+and release compare the owner, fence, revision, and previous expiry exactly; a
+successful renew returns a replacement token. Delayed, duplicated, and
+reordered requests therefore cannot revive an older authority or create an ABA
+hole. The ADR must choose either a stable per-job-incarnation resource key or a
+per-info-hash tombstone, then define forget/re-add behavior, safe retirement or
+retention, counter exhaustion, migration, and rollback. A retired row may be
+garbage-collected only if its resource identity can never be issued again.
+
+One node holds the torrent lease and runs its peer session. Durable queue
+facts, the live lease, and the pointer to the current resume generation live
+in the linearizable coordination store. Payload and checkpoint bytes may live
+on a shared volume or a named node, as selected by the ADR, but they are not a
+transactional database mutation. Each owner writes a fence-scoped generation;
+only an exact-fence transaction can publish that generation as current. A
+stale generation may remain on disk for recovery or cleanup, but must never
+become authoritative. The adapter cancels and self-fences no later than its
+local lease deadline when renewal fails or cannot reach quorum.
+
+The worker heartbeat reports protocol-neutral bytes plus torrent upload and
+peer facts. Provider connection budgets do not apply; torrent peer and upload
+caps do. A heartbeat is observability, not write authority.
 
 ### 12.3 Failure sequence
 
 ```
- worker lease expires
+ worker stops renewing or lease expires
         │
         ▼
- leader cancels authority in durable lease state
+ durable lease CAS advances the fence
         │
-        ├── old worker sees cancel/shared epoch ──▶ stops torrent session
-        │
-        ▼
- new worker receives descriptor + new lease id
+        ├── old worker sees cancel/deadline ──────▶ stops and self-fences
         │
         ▼
- validates payload/resume under the new fence
+ new worker receives descriptor + new lease token
+        │
+        ▼
+ validates payload + selected resume generation
+        │
+        ▼
+ writes a new generation; fenced transaction publishes its pointer
         │
         ▼
  reconnects to swarm; never trusts old unverified pieces
 ```
 
-The residual split window is safe only if two sessions cannot commit divergent
-resume state or delete/move data. Piece writes of hash-identical bytes may be
-idempotent in theory; the design does not rely on that theory. The adapter’s
-storage factory or a lease guard must reject writes once authority is lost.
+Database fencing does not magically fence filesystem writes, open sockets, or
+peer uploads. Piece writes of hash-identical bytes may be idempotent in theory;
+the design does not rely on that theory. A resumed process that was stopped
+past its TTL must not mutate the authoritative/current namespace or publish a
+current pointer. A late physical write is tolerable only inside its isolated
+generation, which must remain permanently unreachable after the fence changes.
+The adapter's storage guard rejects work after cancellation or the local
+deadline. If the ADR instead requires zero physical writes or packets after
+resume, it must select and prove a storage/network-level fencing primitive;
+plurx's user-space cancellation contract does not provide that guarantee.
 
 ### 12.4 Cluster acceptance gate
 
-Kill leader and worker independently during metadata fetch, piece download,
-hash check, readiness commit, and seeding. Every case must converge to one live
-session, correct payload, monotone upload accounting, and no false-ready
-event. Until that harness is green, cluster+torrent stays a config error.
+Use real processes and a controllable coordination store. The gate must cover:
+
+- delayed and reordered renew/release calls, lost acknowledgements, repeated
+  acquire, and ABA attempts against a durable row whose fence never resets;
+- two takeover candidates, leader loss, worker loss, majority loss, and
+  recovery without granting authority while the store is non-linearizable;
+- `SIGSTOP` beyond TTL followed by `SIGCONT` during metadata fetch, piece
+  download, hash check, readiness publication, and seeding, proving the stale
+  process cannot mutate the current namespace or publish a current pointer;
+  any late write must stay in a permanently unreachable stale generation;
+- stale resume generations, stale payload writes, peer termination, monotone
+  upload accounting, and no false-ready event;
+- mixed-version startup, migration rollback, and parity of data before and
+  after enabling the new coordination topology.
+
+Every case must converge to one live session and correct payload. Until the
+matrix is green, cluster+torrent stays a config error. A unit test of a lease
+guard or an in-process task cancellation is not a substitute for this harness.
 
 ---
 
@@ -1967,8 +2105,7 @@ swarm is not evidence of terminal failure.
 
 ## 15. Implementation plan — each milestone leaves a usable truth
 
-### 15.1 M0 — maintained dependency and interoperability spike (local and
-native pass; independent review pending)
+### 15.1 M0 — maintained dependency and interoperability spike (accepted)
 
 The checked-in adapter remains isolated from the daemon; there is no production
 config, API, or peer listener.
@@ -2048,8 +2185,10 @@ F1–F3 landed on 2026-07-31, and
 [`DEFECT_HISTORY_DELETE.md`](DEFECT_HISTORY_DELETE.md) is resolved with shared
 JSONL tombstones. M2 may rely on the enforcing disk guard and terminal-history
 delete semantics; neither is still a reason to start production networking.
-The complete M0 matrix and independent review of the maintained engine remain
-the blocking prerequisites.
+The complete M0 matrix and independent review of the maintained engine are
+accepted. The corrected M2 graph is tracked by #152–#160 and final activation
+#163. That status authorizes dependency-gated milestone work and review, not
+an incomplete production switch.
 
 Keep native UI changes minimal in this milestone; the API and logs must make
 every state observable.
@@ -2218,13 +2357,27 @@ the proof beyond the limitations above.
 
 ### 15.8 M6 — cluster torrent leases (separate approval)
 
-**Work:** implement §12 only after single-node field data exists · lease kind ·
-fenced resume/write authority · heartbeat stats · leader proxying · failover
-harness · config compatibility removal.
+**Entry gate:** single-node field data exists and a storage/topology ADR has
+selected the linearizable coordination store, facts-versus-bytes placement,
+quorum-loss behavior, migration, and rollback. A different-model adversarial
+reviewer posts numbered findings on that architecture change; the lead records
+Accept, Reject, or Defer with evidence and resolves every critical/high finding
+before implementation children are created.
+
+**Work:** port the pinned plurx lease and publication contract behind nzbd's
+store interfaces · add the lease kind and durable monotone fence · add
+generation-scoped resume/payload writes plus same-transaction pointer
+publication · add bounded self-fencing on renewal loss · expose heartbeat facts
+and leader proxying · run the real-process failover harness · remove the config
+compatibility error only after the complete gate passes.
 
 **Acceptance:** the §12.4 kill matrix converges with one session and correct
-bytes, and enabling torrent+cluster no longer weakens any existing single-node
-or Usenet cluster invariant.
+bytes; delayed same-token operations, acknowledgement loss, ABA, majority loss,
+two-candidate takeover, stale generations, mixed versions, and rollback are
+covered; and enabling torrent+cluster no longer weakens any existing
+single-node or Usenet cluster invariant. In particular, `SIGCONT` after a TTL
+cannot let the stale owner mutate the authoritative namespace or publish a
+current generation; any late bytes remain permanently unreachable.
 
 ### 15.9 Milestone commit rule
 
@@ -2415,7 +2568,8 @@ measurements on its own build.
 
 ### 17.2 Upgrade behavior
 
-- Existing config: torrent disabled, no new port, no DHT, no behavior change.
+- Existing config: torrent disabled, no new port, no DHT, and no transfer or
+  disk-probe behavior change. The queue-format boundary below is still real.
 - Enabling torrent: startup validates path, port, library state, and cluster
   exclusion before serving the API as healthy. The settings UI also warns
   that the existing default `max_active_downloads = 1` is shared by Usenet
@@ -2423,6 +2577,13 @@ measurements on its own build.
 - Disabling with live torrents: startup refuses and names the live job count,
   unless an explicit `allow_paused_state = true` migration option is designed.
   Silently forgetting seeds is not a safe default.
+- M2 writes schema 4 unconditionally once #154 lands. The exact pre-M2
+  schema-3 binary rejects it before serving or writing; direct downgrade is
+  unsupported. Pause/export and drain every live torrent and pending
+  admission, stop the daemon, preserve payload/metainfo, restore a known-good
+  schema-3 backup captured before M2, reconcile or re-import newer Usenet work,
+  and only then install that binary. No schema-4-to-3 converter exists; without
+  the backup, use a rollback build that still reads schema 4.
 - Downgrade from schema 3 to this schema-2 binary: it reports that version 3
   is newer than supported and aborts the entire queue load before serving.
   Schema 3 is emitted for every queue snapshot, including a pure-Usenet queue,
@@ -2431,12 +2592,16 @@ measurements on its own build.
   Downgrade to a pre-envelope binary: its single typed `queue.json` decode
   sees unknown `JobKind::Torrent`, reports an unknown-variant error, and also
   aborts startup. Neither binary isolates or skips the torrent row; Usenet
-  jobs are unavailable too. Before downgrade, pause and export torrent
-  metainfo, let the importer finish, remove/drain every live torrent record,
-  verify a torrent-free snapshot written in the target schema, and only then
-  install the old binary. This drain/export procedure is mandatory. The
-  version fallback added in M1a makes future-version failures clearer in new
-  binaries but cannot change already released old binaries.
+  jobs are unavailable too. Direct downgrade after any schema-3 save is
+  unsupported because the current writer cannot emit schema 2 and no in-place
+  converter exists. The supported old-binary procedure is to pause/export and
+  drain every live torrent, stop the daemon, preserve payload/metainfo, restore
+  a known-good schema-2 backup captured before upgrade, reconcile or re-import
+  newer Usenet work, and only then install the old binary. Without that backup,
+  use a rollback build that still reads schema 3. This procedure is mandatory;
+  no migration may silently drop live jobs. The version fallback added in M1a
+  makes future-version failures clearer in new binaries but cannot change
+  already released old binaries.
 
 ### 17.3 Rollback
 
@@ -2489,7 +2654,7 @@ both review passes as follows:
 | Engine | Pin the exact rqbit v8.1.1 archive plus the ordered nine-patch maintained series, generated vendor, and integrity CI. Evaluate `libtorrent-rasterbar` only if that bounded maintenance model cannot pass M0. |
 | Transport | Accept TCP/IPv4-only for the first release; uTP and IPv6 wait for a stable 9.x line and repeatable resume/interop proof. |
 | Torrent format | Accept v1 `.torrent`/`btih` magnets only; the M0 adapter rejects v2-only and hybrid metainfo/magnets with distinct named errors. |
-| Queue schema | Version 2 is the torrent-free envelope; M1b writes version 3 with the torrent variant and defaulted record. |
+| Queue schema | Version 2 is the torrent-free envelope; M1b writes version 3 with the torrent variant and defaulted record; M2 writes version 4 for protected pending admissions, with schema-3 migration and exact old-reader rejection. |
 | Compatibility | qBittorrent Web API 2.8.1 is the one supported *arr surface; do not also build Transmission RPC. |
 | Post-processing | No torrent PP in v1; future PP operates on a reflink-or-copy derivative, never a hardlinked seed tree. |
 | Seeding | Unlimited default; per-add/category limits pause and retain data rather than deleting it. |
@@ -2505,10 +2670,51 @@ both review passes as follows:
 
 The review authorized groundwork and the M0 spike, not a production torrent
 listener. ADR-19 now records the maintained engine/API resolution, and the
-local combined proof passes all gates. The engine-neutral M1b seam is already
-implemented. Disk-guard F1–F3 and durable history deletion are complete; M2
-remains blocked until the native M0 rerun and independent review complete. The
-mobile P0 prerequisites are complete; M3 remains downstream of M2.
+local and native proofs pass all eleven gates; independent review is complete.
+The engine-neutral M1b seam is already implemented. Disk-guard F1–F3 and
+durable history deletion are complete. The corrected M2 graph is open, and
+only #163 may activate its composed backend. No daemon wiring is implied by
+that status. The mobile P0 prerequisites are complete;
+M3 remains downstream of M2.
+
+The 2026-08-22 cross-project adversarial review also rejected transplanting
+plurx's cluster implementation or treating nzbd's residual shared-filesystem
+window as sufficient for torrents. Its findings are dispositioned in §2.4,
+§12, and §15.8: use a pinned merged baseline, exclude unmerged activity work,
+require same-transaction publication fencing and generation-scoped bytes,
+prove stale-owner self-fencing with `SIGSTOP`/`SIGCONT`, and land a separately
+reviewed storage/topology ADR before M6 implementation. No product runtime code
+is authorized by this documentation change.
+
+The final 2026-08-22 adversarial pass raised five numbered findings; all were
+accepted and resolved: stale M0 statements were reconciled to the 2026-08-14
+approval, the stale-owner guarantee was narrowed from impossible zero physical
+I/O to authoritative-namespace exclusion, the exact PR #101 approval is cited,
+lease-resource retirement and forget/re-add are now ADR decisions, and the
+SwarmDeck contract opens the standard review item so the supervisor—not the
+lead—selects an eligible different-model reviewer.
+
+The subsequent M2 decomposition review raised eight more findings and blocked
+dispatch until their contracts were corrected. Admission remains unmounted
+until final activation; magnet resolution has a durable staged boundary before
+payload start; delete/history recovery is an idempotent state machine rather
+than a false cross-store atomic claim; inactive torrent paths do not affect
+Usenet disk probes; existing stopped/error facts and disk roles remain the sole
+owners; explicit dependency markers match the graph; and #163 owns the stated
+schema-4-to-3 rollback boundary plus HTTP and mixed-protocol daemon evidence.
+
+The final ownership/recovery re-review found two remaining gaps and blocked
+dispatch again. They are resolved above: `nzbd-torrent` owns only
+engine-identity handles while the daemon/backend runtime owns the JobId
+association, and protected pending source artifacts make magnet/HTTP admission
+resumable without leaking secrets or starting payload work before durable
+validated metainfo.
+
+One final durability pass found that a top-level pending collection could not
+safely reuse schema 3 because its existing reader ignores unknown fields. M2
+now bumps the queue to schema 4, migrates schema 3 forward with no pending
+intents, and requires the captured schema-3 reader to reject schema 4 before
+serving or rewriting it.
 
 ---
 

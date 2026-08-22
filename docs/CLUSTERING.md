@@ -323,6 +323,17 @@ Revisit later: segment-split downloads (C3); weighted/affinity scheduling
 (CPU class, per-node link speed); observed-latency-based provider budget
 rebalancing; WAN-separated nodes.
 
+**Stateful, non-idempotent workloads.** This shared-filesystem protocol is not
+a generic template for torrent sessions or other work whose late writes cannot
+be made harmless by journal union or isolated staging. BitTorrent M6 follows
+the separately approved contract in
+[BITTORRENT_PROPOSAL.md](BITTORRENT_PROPOSAL.md#12-clustering--exclusive-whole-torrent-leases-after-single-node):
+start from the pinned merged plurx monotone-lease and transactional-publication
+semantics, select a linearizable coordination topology in an ADR, store bytes
+in fence-scoped generations, and prove deadline self-fencing with real stopped
+and resumed processes. The current residual leader window is explicitly not
+evidence that torrent clustering is safe.
+
 **Filesystem portability.** Nothing here is Gluster-specific. The
 protocol needs exactly: atomic same-directory rename, create-exclusive
 (`O_EXCL`), and bounded cross-client visibility lag — and it deliberately

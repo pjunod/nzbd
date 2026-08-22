@@ -1,8 +1,8 @@
 # BitTorrent release review — prove the boundary before enabling it
 
 **Status:** pre-release review surface; production BitTorrent remains disabled ·
-**Decision:** maintained rqbit M0 passes locally and natively; independent
-review and M2/M5 remain ·
+**Decision:** maintained rqbit M0 and independent review are accepted; the
+corrected M2 issue graph is open and M5 release evidence remains ·
 **Owner:** ADR-19 in [BITTORRENT_PROPOSAL.md](BITTORRENT_PROPOSAL.md)
 
 This is the short operations and release-review surface for nzbd's proposed
