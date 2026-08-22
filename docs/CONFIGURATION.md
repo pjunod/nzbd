@@ -25,6 +25,34 @@ dest_dir = "~/downloads/complete"   # finished downloads (per-category overrides
 The watch dir is polled by the daemon; a dropped `.nzb` is queued and the
 file removed. In cluster mode only the current leader watches it.
 
+## `[torrent]` — BitTorrent session (opt-in)
+
+```toml
+[torrent]
+enabled = false                    # mandatory feature gate; safe default
+# download_dir = "/data/torrents" # absent: use paths.dest_dir
+dht = true                         # distributed peer discovery
+# listen_port_range = { start = 6881, end = 6882 } # half-open start..end
+
+# [torrent.proxy]
+# url = "socks5://127.0.0.1:1080" # credential-free SOCKS5 origin
+# username = "alice"              # optional; configure both credentials
+# password = "secret"
+```
+
+| Key | Default | Security and operational implication |
+|---|---|---|
+| `enabled` | `false` | The only safe upgrade default: no torrent session, peer listener, or peer-discovery traffic may start. |
+| `download_dir` | absent | Falls back to `[paths].dest_dir`; set it to isolate torrent payloads from Usenet output. |
+| `dht` | `true` | When the feature is enabled, permits distributed peer discovery; private-torrent handling may override it. |
+| `listen_port_range` | absent | Lets the torrent engine select an ephemeral listener; an explicit value uses TOML `{ start, end }` half-open range syntax. |
+| `proxy` | absent | Makes no SOCKS5 proxy request. Credentials, when needed, are separate from the credential-free URL. |
+
+Omitting `[torrent]` is identical to setting `enabled = false`. This release
+adds the typed schema and feature gate only; daemon startup and torrent
+admission are wired in later milestones. Unknown keys in `[torrent]` and
+`[torrent.proxy]` are rejected at startup, like unknown keys elsewhere.
+
 ## `[[server]]` — one block per news server
 
 ```toml

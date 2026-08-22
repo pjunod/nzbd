@@ -4,6 +4,7 @@ pub mod durable;
 
 use nzbd_types::{CertLevel, ServerDef, ServerId, TlsMode};
 use serde::{Deserialize, Serialize};
+use std::ops::Range;
 use std::path::PathBuf;
 
 #[derive(Debug, thiserror::Error)]
@@ -35,6 +36,50 @@ pub struct Config {
     pub history: HistorySection,
     #[serde(default)]
     pub cluster: ClusterConfig,
+    #[serde(default)]
+    pub torrent: TorrentConfig,
+}
+
+/// `[torrent]` — opt-in BitTorrent session settings.
+///
+/// The daemon must treat this section as inert unless [`TorrentConfig::enabled`]
+/// is explicitly enabled. Keeping the gate in the typed configuration makes an
+/// omitted section and `enabled = false` equivalent for all future wiring.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields, default)]
+pub struct TorrentConfig {
+    /// Master feature gate. The safe default performs no torrent networking.
+    pub enabled: bool,
+    /// Torrent payload root; absent means `[paths].dest_dir`.
+    pub download_dir: Option<PathBuf>,
+    /// Enable distributed hash table peer discovery.
+    pub dht: bool,
+    /// Optional half-open peer-listener range (`start..end`).
+    pub listen_port_range: Option<Range<u16>>,
+    /// Optional SOCKS5 proxy settings.
+    pub proxy: Option<TorrentProxyConfig>,
+}
+
+impl Default for TorrentConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            download_dir: None,
+            dht: true,
+            listen_port_range: None,
+            proxy: None,
+        }
+    }
+}
+
+/// SOCKS5 proxy settings for a future torrent session.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(deny_unknown_fields, default)]
+pub struct TorrentProxyConfig {
+    /// Credential-free `socks5://host:port` URL.
+    pub url: String,
+    pub username: Option<String>,
+    pub password: Option<String>,
 }
 
 /// One configured filesystem root the daemon writes to.
@@ -1249,6 +1294,59 @@ bind = "0.0.0.0:6789"
     fn rejects_bad_config() {
         assert!(Config::from_toml("[[server]]\nname = \"x\"").is_err()); // no host
         assert!(Config::from_toml("nonsense_key = 1").is_err()); // unknown field
+    }
+
+    #[test]
+    fn torrent_section_parses_with_safe_defaults_and_rejects_unknown_keys() {
+        let disabled = Config::from_toml("[torrent]\nenabled = false").unwrap();
+        assert!(!disabled.torrent.enabled);
+        assert!(disabled.torrent.dht);
+        assert_eq!(disabled.torrent.download_dir, None);
+        assert_eq!(disabled.torrent.listen_port_range, None);
+        assert_eq!(disabled.torrent.proxy, None);
+
+        let configured = Config::from_toml(
+            r#"
+[torrent]
+enabled = true
+download_dir = "/data/torrents"
+dht = false
+listen_port_range = { start = 6881, end = 6882 }
+
+[torrent.proxy]
+url = "socks5://127.0.0.1:1080"
+username = "alice"
+password = "secret"
+"#,
+        )
+        .unwrap();
+        assert!(configured.torrent.enabled);
+        assert_eq!(
+            configured.torrent.download_dir,
+            Some(PathBuf::from("/data/torrents"))
+        );
+        assert!(!configured.torrent.dht);
+        assert_eq!(configured.torrent.listen_port_range, Some(6881..6882));
+        assert_eq!(
+            configured.torrent.proxy.unwrap().url,
+            "socks5://127.0.0.1:1080"
+        );
+
+        assert!(Config::from_toml("[torrent]\nenabled = false\ntyop = true").is_err());
+        assert!(Config::from_toml(
+            "[torrent.proxy]\nurl = \"socks5://127.0.0.1:1080\"\ntyop = true"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn empty_config_with_torrent_defaults_round_trips() {
+        let config = Config::from_toml("").unwrap();
+        assert_eq!(config.torrent, TorrentConfig::default());
+
+        let rendered = to_toml(&config).unwrap();
+        let reparsed = Config::from_toml(&rendered).unwrap();
+        assert_eq!(reparsed, config);
     }
 
     #[test]
