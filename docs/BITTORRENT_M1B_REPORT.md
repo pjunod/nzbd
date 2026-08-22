@@ -4,10 +4,14 @@
 **Historical branch:** `codex/bittorrent-engine-unblock` ·
 **Decision owner:** ADR-19 in [BITTORRENT_PROPOSAL.md](BITTORRENT_PROPOSAL.md)
 
-M1b adds the protocol-neutral state and message boundary needed by any future
-embedded BitTorrent engine. It does not make BitTorrent usable yet. The daemon
-still has no torrent configuration, admission route, listener, DHT node,
-tracker task, or dependency on `nzbd-torrent`.
+M1b added the protocol-neutral state and message boundary needed by any future
+embedded BitTorrent engine. At that milestone the daemon had no torrent
+configuration, admission route, listener, DHT node, tracker task, or dependency
+on `nzbd-torrent`. Later M2a work added dormant `[torrent]` configuration and a
+named guard that rejects `enabled = true`; M2b then added dormant
+selective-session and queue-adjacent runtime ownership without wiring the
+production daemon. BitTorrent remains unusable, with no production admission
+route, listener, daemon session, DHT node, or tracker task.
 
 This milestone was originally blocked with M2 after stable `librqbit` failed
 the authoritative-resume and discovery-health gates. A re-check found the same
@@ -131,22 +135,28 @@ matrix.
 
 ---
 
-## 4. What remains blocked
+## 4. What remains before M2
 
-M1b does not soften any M0 stop condition. Before M2:
+M1b did not soften any M0 stop condition. The two conditions were:
 
-1. ADR-19 selects the maintained rqbit v8.1.1 derivation; M2 remains blocked
-   until #85 proves all eleven M0 gates on the native matrix. Required transfer
-   facts must remain public and bounded, while unavailable detailed
-   tracker/DHT diagnostics stay explicit `unknown` rather than inferred;
+1. ADR-19 selects the maintained rqbit v8.1.1 derivation and proves all eleven
+   M0 gates on the native matrix. Required transfer facts remain public and
+   bounded, while unavailable detailed tracker/DHT diagnostics stay explicit
+   `unknown` rather than inferred;
 2. all eleven M0 gates must pass on native macOS, Linux glibc/musl, and
    Windows, including private-mode capture and dependency review.
+
+Both conditions and independent review completed on 2026-08-14; the status was
+reconciled here on 2026-08-22. M2a and M2b have since merged; remaining M2
+slices are tracked by #154–#160,
+and #163 retains sole activation ownership; this report still authorizes no
+production networking by itself.
 
 The two repository prerequisites named in the original report are complete:
 [`REGRAB_LOOP_PLAN.md`](REGRAB_LOOP_PLAN.md) F1–F3 landed on 2026-07-31, and
 [`DEFECT_HISTORY_DELETE.md`](DEFECT_HISTORY_DELETE.md) now makes forget durable
-across the shared JSONL. They no longer block M2; the engine decision still
-does.
+across the shared JSONL. They no longer block M2. The engine decision completed
+separately and is now accepted.
 
 No production BitTorrent networking should appear in review of this milestone.
 If it does, that is a scope and safety defect, not an optional follow-up.
