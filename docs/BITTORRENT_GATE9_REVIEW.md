@@ -1,8 +1,9 @@
 # BitTorrent gate 9 review — accept measured cost, not silent risk drift
 
 **Status:** all eleven dispositions recorded; maintained implementation and
-refreshed native measurements pass; independent review pending ·
+refreshed native measurements pass; independent review complete ·
 **Date:** 2026-08-07 · **Disposition and amendment recorded:** 2026-08-14 ·
+**Accepted:** 2026-08-14 · **Status reconciled:** 2026-08-22 ·
 **Engine:** rqbit v8.1.1 archive plus the ordered nine-patch maintained series ·
 **Decision owner:** ADR-19 in
 [BITTORRENT_PROPOSAL.md](BITTORRENT_PROPOSAL.md)
@@ -312,9 +313,10 @@ What the disposition does **not** do:
 
 Gate 9 passes because the maintained engine enforces every applicable boundary
 in this table, the combined proof is green, and the documented native matrix
-has refreshed the measurements. Independent review remains before the M0
-evidence is final. The final daemon must be remeasured during M2. Under item 5,
-any input change reopens this disposition rather than inheriting it.
+has refreshed the measurements. Independent review approved the exact
+maintained-engine head on 2026-08-14; the final daemon must still be remeasured
+during M2. Under item 5, any input change reopens this disposition rather than
+inheriting it.
 
 ## 5. Non-goals — this review cannot authorize M2
 

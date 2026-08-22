@@ -1,8 +1,10 @@
 # BitTorrent M0 report — maintained rqbit v8.1.1 closes the engine boundary
 
 **Status:** all eleven gates pass locally and on the native matrix; independent
-review pending; daemon wiring remains disabled · **Original run:** 2026-08-05 ·
-**Amended:** 2026-08-14 ·
+review complete; remaining M2 slices tracked by #154–#160 with activation owned
+solely by #163; daemon wiring remains disabled ·
+**Original run:** 2026-08-05 · **Amended:** 2026-08-14 ·
+**Accepted:** 2026-08-14 · **Status reconciled:** 2026-08-22 ·
 **Engine:** rqbit v8.1.1 archive plus the ordered nine-patch maintained series,
 `default-features = false`, `rust-tls` ·
 **Host:** macOS 26.6 arm64 · **Decision owner:** ADR-19 in
@@ -30,9 +32,17 @@ required. Tracker/DHT detail is diagnostic only and is explicitly `unknown`
 when unavailable; peer availability is never used to invent discovery health
 or a health percentage.
 
-The implementation therefore stops at the isolated `nzbd-torrent` boundary
-and queue schema-version groundwork. No config switch, API, daemon dependency,
-peer listener, or production torrent admission path has been added.
+The maintained-engine implementation stopped at the isolated `nzbd-torrent`
+boundary and queue schema-version groundwork. Later M2a work added dormant
+`[torrent]` configuration, and M2b added dormant selective-session and
+queue-adjacent runtime ownership, but validation still rejects `enabled = true`;
+no torrent admission API, production daemon session dependency, peer listener,
+or production torrent admission path has been added.
+
+The exact maintained-engine head received
+[independent approval on PR #101](https://github.com/pjunod/nzbd/pull/101#issuecomment-5298914349)
+and merged on 2026-08-14. This report's status was reconciled on 2026-08-22;
+that later date is not a second M0 acceptance event.
 
 The [pre-release operations review](BITTORRENT_RELEASE_REVIEW.md) collects the
 current traffic, port, path, seeding, deletion, evidence, and sign-off contract
@@ -63,10 +73,10 @@ ahead of that allocation. This still does not authorize production wiring.
 | 10. One explicit rustls provider | **Pass** | The process starts without a provider, explicitly installs aws-lc, and constructs librqbit’s rustls client without the mixed-provider panic. |
 | 11. v1-only boundary | **Pass** | Stable input uses v1 pieces/`btih`; v2-only and hybrid `.torrent` files and magnets return separate named errors before managed-torrent admission. Magnet classification reads decoded `xt` query parameters rather than searching the whole URI, so version-looking text in a display name or tracker URL cannot create a false v2/hybrid result. The adapter accepts one valid 40-hex or 32-base32 `btih`, rejects missing, malformed, or duplicate v1 topics by name, and rechecks the resolved info dictionary before storage exists. |
 
-The local proof and native rerun pass every gate. Independent review is still
-required before the M0 work item is complete. This result authorizes M2
-planning only after that review; it does not add daemon networking or payload
-I/O.
+The local proof and native rerun pass every gate. Independent review completed
+on the exact maintained-engine head in PR #101. This result authorized M2
+planning; each later milestone still requires its own exact-head review, and
+none of this M0 evidence adds daemon networking or production payload I/O.
 
 ---
 
@@ -663,8 +673,10 @@ documented-main-base legs plus an advisory moving-main drift leg; pushes and
 the weekly schedule require all three.
 
 The exact-stable patch is part of the maintained series. Current-main remains
-contribution material. The daemon still has no torrent storage policy; the M2
-storage-full row remains blocked, and production wiring remains disabled.
+contribution material. M2a defines dormant torrent storage paths and M2b adds a
+dormant runtime boundary, but the production daemon does not consume those
+config paths while `enabled = true` is rejected; the M2 storage-full row remains
+dependency-gated, and production wiring remains disabled.
 
 ---
 
@@ -833,9 +845,9 @@ report states the outcome and does not widen it.
 
 ---
 
-## 5. Recommended next decision
+## 5. Recorded acceptance path and result
 
-Preferred path:
+The accepted path was:
 
 1. derive the exact vendor from the checked v8.1.1 archive and nine-patch
    series, then reject any checksum, membership, order, application, vendor, or
@@ -848,6 +860,11 @@ Preferred path:
    disposition requires; and
 4. obtain independent review, then decompose M2 without adding daemon wiring
    to this M0 change.
+
+**Result (2026-08-14):** all four steps are complete for the maintained-engine
+baseline. M2 was dependency-decomposed from current main on 2026-08-22 and its
+contracts were corrected after adversarial review. This result does not add a
+daemon dependency, listener, admission route, or production feature switch.
 
 The human-review checklist, submission order, issue draft, PR draft, exact
 patch mapping, and reproduction commands are collected in the
@@ -867,9 +884,10 @@ The later ADR-19 re-check separated M1b from this engine gate: a fake-only,
 protocol-neutral queue/backend seam is useful for either engine and starts no
 networking, so it may proceed under the dormant limits recorded in
 [BITTORRENT_M1B_REPORT.md](BITTORRENT_M1B_REPORT.md). Until the native M0
-evidence and independent review complete, keep `nzbd-torrent` as a tested spike
-boundary and do not expose a half-wired feature flag, admission route, or peer
-listener.
+evidence and independent review completed, `nzbd-torrent` remained a tested
+spike boundary. They are now accepted; M2 still must land as complete,
+reviewed milestone slices rather than exposing a half-wired feature flag,
+admission route, or peer listener.
 
 ---
 

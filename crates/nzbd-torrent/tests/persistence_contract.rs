@@ -2,7 +2,10 @@ use librqbit::{
     AddTorrent, AddTorrentOptions, ManagedTorrent, Session, SessionOptions,
     SessionPersistenceConfig,
 };
-use nzbd_torrent::install_process_crypto_provider;
+use nzbd_torrent::{
+    install_process_crypto_provider, RestoreDescriptor, TorrentRegistry, TorrentSession,
+    TorrentSessionConfig,
+};
 use sha1::{Digest, Sha1};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -164,37 +167,44 @@ async fn nzbd_authoritative_restore_survives_process_kill_without_promoting_unve
 
     let second_payload = payload(29);
     std::fs::write(output.join("second.bin"), &second_payload).unwrap();
-    let authoritative = Session::new_with_opts(output, options(persistence, true))
-        .await
-        .unwrap();
-    assert_eq!(
-        authoritative.with_torrents(|torrents| torrents.count()),
-        0,
-        "session construction must not admit either library record"
+    let second_metainfo = metainfo("second.bin", &second_payload);
+    let expected_hash = format!(
+        "{:x}",
+        Sha1::digest(&second_metainfo[7..second_metainfo.len() - 1])
     );
-
+    let session = TorrentSession::start(
+        output,
+        TorrentSessionConfig {
+            persistence_dir: Some(persistence),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let mut authoritative = TorrentRegistry::new(session);
+    assert!(authoritative.identities().is_empty());
     let restored = authoritative
-        .add_torrent(
-            AddTorrent::from_bytes(metainfo("second.bin", &second_payload)),
-            Some(AddTorrentOptions {
-                paused: true,
-                overwrite: true,
-                preferred_id: Some(preferred_id),
-                ..Default::default()
-            }),
-        )
+        .restore_selected([RestoreDescriptor {
+            metainfo: second_metainfo,
+            expected_info_hash_v1: expected_hash,
+            preferred_id: Some(preferred_id),
+            selected_files: None,
+        }])
         .await
-        .unwrap()
-        .into_handle()
         .unwrap();
-    restored.wait_until_initialized().await.unwrap();
-    let stats = restored.stats();
+    assert_eq!(restored.len(), 1);
+    let identity = &restored[0];
+    authoritative
+        .wait_until_initialized(identity)
+        .await
+        .unwrap();
+    assert_eq!(identity.id, preferred_id);
+    assert_eq!(authoritative.is_paused(identity), Some(true));
+    let stats = authoritative.stats(identity).unwrap();
     assert_eq!(stats.progress_bytes, PIECE_LENGTH as u64);
     assert!(!stats.finished);
-    assert_eq!(
-        authoritative.with_torrents(|torrents| torrents.count()),
-        1,
-        "only nzbd's selected authoritative torrent may be restored"
-    );
-    authoritative.stop().await;
+    assert_eq!(authoritative.identities().len(), 1);
+    tokio::time::timeout(Duration::from_secs(10), authoritative.stop())
+        .await
+        .expect("maintained session shutdown exceeded ten seconds");
 }
