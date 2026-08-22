@@ -1,8 +1,8 @@
 # BitTorrent support — one queue, two transfer protocols
 
-**Status:** ADR-19 amended; maintained rqbit M0 accepted; M1b merged; corrected
-M2 issues #152–#160 and final activation #163 are open; production wiring
-remains disabled ·
+**Status:** ADR-19 amended; maintained rqbit M0 accepted; M1b merged; M2a #152
+merged via PR #161; M2b #153 ready; #154–#160 and final activation #163
+dependency-gated; production wiring remains disabled ·
 **Decision:** pin the reproducibly derived nine-patch rqbit v8.1.1 engine;
 complete single-node M2–M5 before separately approving M6 ·
 **Written:** 2026-08-05 · **Revised:** 2026-08-22 ·
@@ -52,9 +52,10 @@ dependency, not the production gate: M1b's queue schema, scheduler boundary,
 and fake backend were useful for any embedded engine and started no peer
 session, so they proceeded independently. The maintained-engine proof and its
 independent review have since accepted all eleven M0 gates. M2 was decomposed
-on 2026-08-22 and corrected after an adversarial plan review, but no config,
+on 2026-08-22 and corrected after an adversarial plan review. M2a's dormant
+`[torrent]` config and fail-closed activation guard have since merged, but no
 admission route, listener, or daemon session is present merely because that
-planning gate has cleared.
+planning gate and first implementation slice have cleared.
 
 The Fable review later that day found a real proxy leak boundary and several
 plan inconsistencies. This revision rejects proxy+DHT and proxy+UDP trackers,
@@ -2186,9 +2187,9 @@ F1–F3 landed on 2026-07-31, and
 JSONL tombstones. M2 may rely on the enforcing disk guard and terminal-history
 delete semantics; neither is still a reason to start production networking.
 The complete M0 matrix and independent review of the maintained engine are
-accepted. The corrected M2 graph is tracked by #152–#160 and final activation
-#163. That status authorizes dependency-gated milestone work and review, not
-an incomplete production switch.
+accepted. M2a #152 merged via PR #161; M2b #153 is ready; #154–#160 and final
+activation #163 remain dependency-gated. That status authorizes the next
+eligible milestone's work and review, not an incomplete production switch.
 
 Keep native UI changes minimal in this milestone; the API and logs must make
 every state observable.
@@ -2672,9 +2673,10 @@ The review authorized groundwork and the M0 spike, not a production torrent
 listener. ADR-19 now records the maintained engine/API resolution, and the
 local and native proofs pass all eleven gates; independent review is complete.
 The engine-neutral M1b seam is already implemented. Disk-guard F1–F3 and
-durable history deletion are complete. The corrected M2 graph is open, and
-only #163 may activate its composed backend. No daemon wiring is implied by
-that status. The mobile P0 prerequisites are complete;
+durable history deletion are complete. M2a #152 merged via PR #161, M2b #153
+is ready, and #154–#160 plus #163 remain dependency-gated. Only #163 may
+activate the composed backend. No daemon wiring is implied by that status.
+The mobile P0 prerequisites are complete;
 M3 remains downstream of M2.
 
 The 2026-08-22 cross-project adversarial review also rejected transplanting

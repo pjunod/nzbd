@@ -31,9 +31,11 @@ required. Tracker/DHT detail is diagnostic only and is explicitly `unknown`
 when unavailable; peer availability is never used to invent discovery health
 or a health percentage.
 
-The implementation therefore stops at the isolated `nzbd-torrent` boundary
-and queue schema-version groundwork. No config switch, API, daemon dependency,
-peer listener, or production torrent admission path has been added.
+The maintained-engine implementation stops at the isolated `nzbd-torrent`
+boundary and queue schema-version groundwork. Later M2a work added dormant
+`[torrent]` configuration, but validation rejects `enabled = true`; no torrent
+admission API, daemon session dependency, peer listener, or production torrent
+admission path has been added.
 
 The exact maintained-engine head received
 [independent approval on PR #101](https://github.com/pjunod/nzbd/pull/101#issuecomment-5298914349)
@@ -69,10 +71,10 @@ ahead of that allocation. This still does not authorize production wiring.
 | 10. One explicit rustls provider | **Pass** | The process starts without a provider, explicitly installs aws-lc, and constructs librqbit’s rustls client without the mixed-provider panic. |
 | 11. v1-only boundary | **Pass** | Stable input uses v1 pieces/`btih`; v2-only and hybrid `.torrent` files and magnets return separate named errors before managed-torrent admission. Magnet classification reads decoded `xt` query parameters rather than searching the whole URI, so version-looking text in a display name or tracker URL cannot create a false v2/hybrid result. The adapter accepts one valid 40-hex or 32-base32 `btih`, rejects missing, malformed, or duplicate v1 topics by name, and rechecks the resolved info dictionary before storage exists. |
 
-The local proof and native rerun pass every gate. Independent review is still
-required before the M0 work item is complete. This result authorizes M2
-planning only after that review; it does not add daemon networking or payload
-I/O.
+The local proof and native rerun pass every gate. Independent review completed
+on the exact maintained-engine head in PR #101. This result authorized M2
+planning; each later milestone still requires its own exact-head review, and
+none of this M0 evidence adds daemon networking or production payload I/O.
 
 ---
 
