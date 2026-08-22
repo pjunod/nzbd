@@ -4,10 +4,12 @@
 **Historical branch:** `codex/bittorrent-engine-unblock` ·
 **Decision owner:** ADR-19 in [BITTORRENT_PROPOSAL.md](BITTORRENT_PROPOSAL.md)
 
-M1b adds the protocol-neutral state and message boundary needed by any future
-embedded BitTorrent engine. It does not make BitTorrent usable yet. The daemon
-still has no torrent configuration, admission route, listener, DHT node,
-tracker task, or dependency on `nzbd-torrent`.
+M1b added the protocol-neutral state and message boundary needed by any future
+embedded BitTorrent engine. At that milestone the daemon had no torrent
+configuration, admission route, listener, DHT node, tracker task, or dependency
+on `nzbd-torrent`. Later M2a work added dormant `[torrent]` configuration and a
+named guard that rejects `enabled = true`; BitTorrent remains unusable, with no
+production admission route, listener, session, DHT node, or tracker task.
 
 This milestone was originally blocked with M2 after stable `librqbit` failed
 the authoritative-resume and discovery-health gates. A re-check found the same
@@ -143,8 +145,9 @@ M1b did not soften any M0 stop condition. The two conditions were:
    Windows, including private-mode capture and dependency review.
 
 Both conditions and independent review completed on 2026-08-14; the status was
-reconciled here on 2026-08-22. The corrected M2 issue graph is open; this report
-still authorizes no production networking by itself.
+reconciled here on 2026-08-22. Remaining M2 slices are tracked by #153–#160,
+and #163 retains sole activation ownership; this report still authorizes no
+production networking by itself.
 
 The two repository prerequisites named in the original report are complete:
 [`REGRAB_LOOP_PLAN.md`](REGRAB_LOOP_PLAN.md) F1–F3 landed on 2026-07-31, and

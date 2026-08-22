@@ -1,20 +1,22 @@
 # BitTorrent release review — prove the boundary before enabling it
 
 **Status:** pre-release review surface; production BitTorrent remains disabled ·
-**Decision:** maintained rqbit M0 and independent review are accepted; the
-corrected M2 issue graph is open and M5 release evidence remains ·
+**Decision:** maintained rqbit M0 and independent review are accepted; remaining
+M2 slices are tracked by #153–#160, #163 retains sole activation ownership, and
+M5 release evidence remains ·
 **Owner:** ADR-19 in [BITTORRENT_PROPOSAL.md](BITTORRENT_PROPOSAL.md)
 
 This is the short operations and release-review surface for nzbd's proposed
 BitTorrent backend. It tells a reviewer what network traffic, ports, storage,
 seeding, and deletion behavior must be true before the feature can ship. It is
-not an operator setup guide: the daemon has no torrent configuration, API,
-listener, admission route, or session lifecycle today.
+not an operator setup guide: the daemon accepts dormant `[torrent]`
+configuration, but validation rejects `enabled = true`; it has no torrent
+admission API, listener, or session lifecycle today.
 
 > **No production wiring:** do not add a production switch or weaken the
-> daemon-isolation check in this M0 change. A green maintained-engine spike is
-> permission to decompose and review M2, not proof that daemon lifecycle,
-> storage, API, or operator behavior exists.
+> daemon-isolation check before final activation #163. Accepted M0 evidence
+> permits dependency-ordered M2 work; it does not prove that production daemon
+> lifecycle, storage, admission, or operator behavior exists.
 
 ## 1. Decision at a glance
 
@@ -25,7 +27,7 @@ listener, admission route, or session lifecycle today.
 | Authoritative restore | **M0 pass** — automatic restore is disabled and the kill/restart proof admits only the selected durable record | M2 must connect selective restore to nzbd's durable queue |
 | Resource and dependency decision | **M0 pass** — accepted limits and refreshed measurements are green on all five native targets | The maintained series and accepted limits in [BITTORRENT_GATE9_REVIEW.md](BITTORRENT_GATE9_REVIEW.md) must stay green across the native matrix |
 | Adversarial M5 work | In progress | The remaining resource, mounted-filesystem, production shutdown, auth-limiting, and sustained-fuzz evidence is green |
-| Operator action today | None | Do not publish torrent ports, paths, or config; they are proposal contracts, not supported settings |
+| Operator action today | Leave the dormant section disabled; `enabled = true` fails closed | Do not publish a peer port or claim the reserved settings are usable before final activation #163 |
 
 The release decision is conjunctive. Passing one row never compensates for a
 failed row, and a green workflow never changes the recorded gate state by
@@ -86,9 +88,10 @@ upgrade with torrent support disabled must open no new socket.
 
 ## 4. Paths
 
-There is no production `torrent_dir` setting today. The proposed storage
-contract separates immutable seed payloads from the existing completed-media
-destination:
+M2a added dormant `paths.torrent_dir`, `paths.torrent_watch_dir`, and category
+overrides, but no torrent runtime consumes them while activation is rejected.
+The production storage contract separates immutable seed payloads from the
+existing completed-media destination:
 
 | Path role | Required behavior |
 |---|---|
@@ -143,8 +146,8 @@ mount guarantee.
 
 ## 5. Seeding
 
-No production seed policy exists today because no production torrent can be
-admitted.
+Dormant configuration reserves the default seed ratio and time contract, but no
+production seed policy executes because no production torrent can be admitted.
 
 The first-release contract marks a verified torrent `ready` while it may still
 seed. The default seed ratio and seed time are unlimited until the caller or

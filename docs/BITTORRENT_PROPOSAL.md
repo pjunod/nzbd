@@ -2170,9 +2170,10 @@ bounded test threshold.
 **Result:** implemented for review. The queue writer emits schema 3, schema-2
 Usenet rows retain their meaning, the combined active set accounts for fake
 torrent work, and backend progress cannot consume control/structural FIFO
-capacity. The daemon has no torrent config or admission path and rejects a
-persisted torrent row with a named M1b error before starting any peer session.
-See [BITTORRENT_M1B_REPORT.md](BITTORRENT_M1B_REPORT.md).
+capacity. At M1b merge the daemon had no torrent config or admission path and
+rejected a persisted torrent row with a named M1b error before starting any
+peer session. M2a later added dormant config and retained the fail-closed
+activation boundary. See [BITTORRENT_M1B_REPORT.md](BITTORRENT_M1B_REPORT.md).
 
 ### 15.4 M2 — single-node torrent download, resume, and seeding
 

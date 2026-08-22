@@ -1,7 +1,8 @@
 # BitTorrent M0 report — maintained rqbit v8.1.1 closes the engine boundary
 
 **Status:** all eleven gates pass locally and on the native matrix; independent
-review complete; corrected M2 issue graph open; daemon wiring remains disabled ·
+review complete; remaining M2 slices tracked by #153–#160 with activation owned
+solely by #163; daemon wiring remains disabled ·
 **Original run:** 2026-08-05 · **Amended:** 2026-08-14 ·
 **Accepted:** 2026-08-14 · **Status reconciled:** 2026-08-22 ·
 **Engine:** rqbit v8.1.1 archive plus the ordered nine-patch maintained series,
@@ -671,8 +672,10 @@ documented-main-base legs plus an advisory moving-main drift leg; pushes and
 the weekly schedule require all three.
 
 The exact-stable patch is part of the maintained series. Current-main remains
-contribution material. The daemon still has no torrent storage policy; the M2
-storage-full row remains blocked, and production wiring remains disabled.
+contribution material. M2a now defines dormant torrent storage paths, but no
+torrent runtime consumes them while `enabled = true` is rejected; the M2
+storage-full row remains dependency-gated, and production wiring remains
+disabled.
 
 ---
 
