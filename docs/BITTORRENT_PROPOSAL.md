@@ -2038,6 +2038,16 @@ See [BITTORRENT_M1B_REPORT.md](BITTORRENT_M1B_REPORT.md).
 
 ### 15.4 M2 — single-node torrent download, resume, and seeding
 
+M2b keeps activation dormant while establishing ownership: `nzbd-torrent`
+owns one maintained session and indexes raw handles only by rqbit identity and
+v1 info hash. The protocol-neutral runtime beside the queue owner alone holds
+`JobId -> engine identity`. Session persistence starts with automatic restore
+disabled; the durable queue supplies the selected metainfo descriptors,
+preferred engine IDs, file selection, and paused-first resume order. A resume
+checkpoint or readiness disagreement forces recheck, and later bytes on disk
+cannot advance the durable trusted checkpoint by themselves. The production
+`nzbd` dependency graph remains isolated until final M2 activation.
+
 **Work:** add `[torrent]` and paths · start one session only when enabled · raw
 metainfo/magnet/URL admission · durable descriptor before start · handle map ·
 stats coalescing · readiness · pause/resume/delete · seed policy · download and
