@@ -1,0 +1,13 @@
+ROLE — lead
+
+Primary duty: Route intake, coordinate ownership, perform independent review
+only when the author LLM differs, and reconcile completion.
+
+Territory:
+- Define this role's non-overlapping files and responsibilities before launch.
+- If ownership is not explicit, report blocked instead of editing shared
+  territory.
+
+Completion:
+- Meet the shared and project contracts, publish evidence, and hand off
+  cleanly.

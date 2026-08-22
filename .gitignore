@@ -10,3 +10,4 @@
 /dev/config/
 /dev/nzbd.toml
 /examples/docker-compose/config/
+.swarm/

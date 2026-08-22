@@ -1,0 +1,193 @@
+{
+  "project": {
+    "branch_prefix": "agent",
+    "coordinator_role": "lead",
+    "default_branch": "main",
+    "git_remote": "origin",
+    "name": "nzbd",
+    "project_prompt": "swarm/project.txt",
+    "quality_command": "make test",
+    "shared_prompt": "builtin:common"
+  },
+  "providers": {
+    "claude": {
+      "adapter": "command",
+      "arguments": [
+        "-p",
+        "--permission-mode",
+        "auto",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "{prompt}"
+      ],
+      "default_flags": [],
+      "executable": "claude",
+      "flags_env": "SWARM_CLAUDE_FLAGS",
+      "model_arguments": [
+        "-p",
+        "--permission-mode",
+        "auto",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--model",
+        "{model}",
+        "{prompt}"
+      ],
+      "output_adapter": "claude-stream-json",
+      "unset_env": [
+        "ANTHROPIC_API_KEY"
+      ]
+    },
+    "codex": {
+      "adapter": "command",
+      "arguments": [
+        "exec",
+        "-C",
+        "{clone}",
+        "--add-dir",
+        "{clone}/.git",
+        "--add-dir",
+        "{control}/.swarm",
+        "{prompt}"
+      ],
+      "default_flags": [],
+      "executable": "codex",
+      "flags_env": "SWARM_CODEX_FLAGS",
+      "model_arguments": [
+        "exec",
+        "-C",
+        "{clone}",
+        "--add-dir",
+        "{clone}/.git",
+        "--add-dir",
+        "{control}/.swarm",
+        "--model",
+        "{model}",
+        "{prompt}"
+      ],
+      "session_import_adapter": "codex-rollout"
+    }
+  },
+  "queue": {
+    "active_label": "swarm:active",
+    "adapter": "github-issues",
+    "auto_merge": true,
+    "blocked_label": "swarm:blocked",
+    "intake_label": "swarm:intake",
+    "limit": 100,
+    "merge_method": "merge",
+    "needs_lead_label": "swarm:needs-lead",
+    "needs_operator_label": "swarm:needs-operator",
+    "poll_seconds": 30,
+    "prefer_expiring_quota": true,
+    "ready_label": "swarm:ready",
+    "retry_seconds": 120,
+    "review_label": "swarm:review",
+    "reviewers": [
+      {
+        "model": "opus",
+        "provider": "claude"
+      },
+      {
+        "model": "gpt-5.6-sol",
+        "provider": "codex"
+      },
+      {
+        "model": "gpt-5.6-terra",
+        "provider": "codex"
+      }
+    ],
+    "reasoning_routes": {
+      "deep": {
+        "model": "fable",
+        "provider": "claude"
+      }
+    },
+    "role_labels": {
+      "builder": "swarm:builder",
+      "lead": "swarm:lead",
+      "reviewer": "swarm:reviewer"
+    },
+    "waiting_external_label": "swarm:waiting-external"
+  },
+  "requirements": {
+    "checks": [
+      {
+        "command": [
+          "gh",
+          "auth",
+          "status"
+        ],
+        "name": "gh auth"
+      }
+    ],
+    "executables": [
+      "gh"
+    ]
+  },
+  "roles": {
+    "builder": {
+      "prompt": "swarm/builder.txt"
+    },
+    "lead": {
+      "prompt": "swarm/lead.txt"
+    },
+    "reviewer": {
+      "prompt": "swarm/reviewer.txt"
+    }
+  },
+  "runtime": {
+    "clone_root": "..",
+    "directory": ".swarm",
+    "heartbeat_seconds": 30,
+    "stuck_after_seconds": 2700,
+    "worker_network_access": true
+  },
+  "schema_version": 3,
+  "workers": {
+    "builder": {
+      "clone": "nzbd-builder",
+      "model": "gpt-5.6-sol",
+      "provider": "codex",
+      "role": "builder"
+    },
+    "builder-sol-2": {
+      "clone": "nzbd-builder-sol-2",
+      "model": "gpt-5.6-sol",
+      "provider": "codex",
+      "role": "builder"
+    },
+    "builder-opus-1": {
+      "clone": "nzbd-builder-opus-1",
+      "model": "opus",
+      "provider": "claude",
+      "role": "builder"
+    },
+    "builder-opus-2": {
+      "clone": "nzbd-builder-opus-2",
+      "model": "opus",
+      "provider": "claude",
+      "role": "builder"
+    },
+    "lead": {
+      "clone": "nzbd-lead",
+      "model": "opus",
+      "provider": "claude",
+      "role": "lead"
+    },
+    "reviewer-sol": {
+      "clone": "nzbd-reviewer-sol",
+      "model": "gpt-5.6-sol",
+      "provider": "codex",
+      "role": "reviewer"
+    },
+    "reviewer-opus": {
+      "clone": "nzbd-reviewer-opus",
+      "model": "opus",
+      "provider": "claude",
+      "role": "reviewer"
+    }
+  }
+}
