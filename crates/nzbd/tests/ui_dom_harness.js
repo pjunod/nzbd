@@ -229,10 +229,13 @@ const models = (jobs) => jobs.map((j, i) => T.rowModel(j, { idx: i, count: jobs.
   eq(d.appearance, "auto", "appearance follows the system by default");
   ok(T.DISPLAY_LAYOUTS.includes("plex") && T.DISPLAY_LAYOUTS.includes("theater"),
     "both opt-in layouts are registered");
-  ok(T.DISPLAY_PALETTES.includes("terminal") && T.DISPLAY_PALETTES.includes("tide"),
+  ok(T.DISPLAY_PALETTES.includes("terminal") && T.DISPLAY_PALETTES.includes("tide") &&
+    T.DISPLAY_PALETTES.includes("panoptic") && T.DISPLAY_PALETTES.includes("redline"),
     "the palette catalogue is registered");
   eq(T.displayMode("void", "light"), "dark", "Void stays midnight-only");
   eq(T.displayMode("vhs", "light"), "dark", "VHS stays midnight-only");
+  eq(T.displayMode("panoptic", "light"), "dark", "Panoptic stays midnight-only");
+  eq(T.displayMode("redline", "light"), "dark", "Redline stays midnight-only");
 }
 
 // --- 1. rowModel is pure: no DOM, strings and flags only -------------------

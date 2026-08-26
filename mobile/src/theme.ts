@@ -33,7 +33,9 @@ export type PalettePreference =
   | 'void'
   | 'vhs'
   | 'paper'
-  | 'tide';
+  | 'tide'
+  | 'panoptic'
+  | 'redline';
 
 export const LAYOUT_OPTIONS: ReadonlyArray<{ id: LayoutPreference; name: string }> = [
   { id: 'classic', name: 'Classic' },
@@ -52,6 +54,8 @@ export const PALETTE_OPTIONS: ReadonlyArray<{ id: PalettePreference; name: strin
   { id: 'vhs', name: 'VHS', darkOnly: true },
   { id: 'paper', name: 'Paper' },
   { id: 'tide', name: 'Tide' },
+  { id: 'panoptic', name: 'Panoptic', darkOnly: true },
+  { id: 'redline', name: 'Redline', darkOnly: true },
 ];
 
 export interface Theme {
@@ -206,6 +210,20 @@ const palettes: Record<PalettePreference, PaletteThemes> = {
       success: '#196b48', warning: '#735b0b', danger: '#b33a32',
     }),
   },
+  panoptic: {
+    dark: makeTheme(true, {
+      background: '#0a0a0f', panel: '#10131b', panelAlt: '#171c25', border: '#293e48',
+      text: '#e8eaed', textMuted: '#9eaab2', accent: '#00d4ff', onAccent: '#001014',
+      success: '#5ce1b4', warning: '#ffd178', danger: '#ff8191',
+    }),
+  },
+  redline: {
+    dark: makeTheme(true, {
+      background: '#070708', panel: '#111214', panelAlt: '#191a1d', border: '#44282c',
+      text: '#f0eded', textMuted: '#aaa1a3', accent: '#ff5964', onAccent: '#170204',
+      success: '#6ccf9a', warning: '#f6c760', danger: '#ff9f70',
+    }),
+  },
 };
 
 interface ThemeContextValue {
@@ -272,7 +290,7 @@ export function ThemeProvider({ children }: PropsWithChildren) {
 }
 
 export function isDarkOnlyPalette(palette: PalettePreference): boolean {
-  return palette === 'void' || palette === 'vhs';
+  return PALETTE_OPTIONS.find((option) => option.id === palette)?.darkOnly === true;
 }
 
 export function resolveTheme(
