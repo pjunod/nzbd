@@ -38,10 +38,14 @@ test('the native app ships the shared display catalogue', () => {
     'vhs',
     'paper',
     'tide',
+    'panoptic',
+    'redline',
   ]);
 });
 
 test('midnight-only palettes ignore light appearance', () => {
   expect(resolveTheme('light', 'light', 'void').dark).toBe(true);
   expect(resolveTheme('system', 'light', 'vhs').dark).toBe(true);
+  expect(resolveTheme('light', 'light', 'panoptic').dark).toBe(true);
+  expect(resolveTheme('system', 'light', 'redline').dark).toBe(true);
 });
