@@ -76,7 +76,7 @@ export function ThemeSwitcher({ compact = false }: { compact?: boolean }) {
                 ))}
               </ChoiceSection>
 
-              <ChoiceSection title="Color scheme" hint="Void and VHS are midnight-only.">
+              <ChoiceSection title="Color scheme" hint="Void, VHS, Panoptic, Redline, and Panovic are midnight-only.">
                 {PALETTE_OPTIONS.map((option) => (
                   <Choice
                     key={option.id}

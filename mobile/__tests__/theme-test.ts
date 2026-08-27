@@ -40,6 +40,7 @@ test('the native app ships the shared display catalogue', () => {
     'tide',
     'panoptic',
     'redline',
+    'panovic',
   ]);
 });
 
@@ -48,4 +49,18 @@ test('midnight-only palettes ignore light appearance', () => {
   expect(resolveTheme('system', 'light', 'vhs').dark).toBe(true);
   expect(resolveTheme('light', 'light', 'panoptic').dark).toBe(true);
   expect(resolveTheme('system', 'light', 'redline').dark).toBe(true);
+  expect(resolveTheme('light', 'light', 'panovic')).toMatchObject({
+    dark: true,
+    background: '#000000',
+    panel: '#181818',
+    panelAlt: '#242424',
+    border: 'rgba(255, 255, 255, 0.06)',
+    text: '#e8e6e1',
+    textMuted: '#9a9aa0',
+    accent: '#f0723b',
+    onAccent: '#140a00',
+    success: '#5fb582',
+    warning: '#d9a05b',
+    danger: '#ff7a66',
+  });
 });
