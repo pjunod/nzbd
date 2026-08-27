@@ -230,12 +230,18 @@ const models = (jobs) => jobs.map((j, i) => T.rowModel(j, { idx: i, count: jobs.
   ok(T.DISPLAY_LAYOUTS.includes("plex") && T.DISPLAY_LAYOUTS.includes("theater"),
     "both opt-in layouts are registered");
   ok(T.DISPLAY_PALETTES.includes("terminal") && T.DISPLAY_PALETTES.includes("tide") &&
-    T.DISPLAY_PALETTES.includes("panoptic") && T.DISPLAY_PALETTES.includes("redline"),
+    T.DISPLAY_PALETTES.includes("panoptic") && T.DISPLAY_PALETTES.includes("redline") &&
+    T.DISPLAY_PALETTES.includes("panovic"),
     "the palette catalogue is registered");
   eq(T.displayMode("void", "light"), "dark", "Void stays midnight-only");
   eq(T.displayMode("vhs", "light"), "dark", "VHS stays midnight-only");
   eq(T.displayMode("panoptic", "light"), "dark", "Panoptic stays midnight-only");
   eq(T.displayMode("redline", "light"), "dark", "Redline stays midnight-only");
+  eq(T.displayMode("panovic", "light"), "dark", "Panovic stays midnight-only");
+  ok(/:root\[data-palette="panovic"\]\s*\{[^}]*--bg:#000000;[^}]*--accent:#f0723b;--accent2:#8e4a1e;[^}]*--on-accent:#140a00;/s.test(html),
+    "Panovic keeps the shared true-black, orange, and warm button-ink palette");
+  ok(!/:root:is\(\[data-palette="panoptic"\],\[data-palette="redline"\]\)/.test(html),
+    "Panovic receives every cockpit-family rule");
 }
 
 // --- 1. rowModel is pure: no DOM, strings and flags only -------------------

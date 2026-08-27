@@ -35,7 +35,8 @@ export type PalettePreference =
   | 'paper'
   | 'tide'
   | 'panoptic'
-  | 'redline';
+  | 'redline'
+  | 'panovic';
 
 export const LAYOUT_OPTIONS: ReadonlyArray<{ id: LayoutPreference; name: string }> = [
   { id: 'classic', name: 'Classic' },
@@ -56,6 +57,7 @@ export const PALETTE_OPTIONS: ReadonlyArray<{ id: PalettePreference; name: strin
   { id: 'tide', name: 'Tide' },
   { id: 'panoptic', name: 'Panoptic', darkOnly: true },
   { id: 'redline', name: 'Redline', darkOnly: true },
+  { id: 'panovic', name: 'Panovic', darkOnly: true },
 ];
 
 export interface Theme {
@@ -222,6 +224,13 @@ const palettes: Record<PalettePreference, PaletteThemes> = {
       background: '#070708', panel: '#111214', panelAlt: '#191a1d', border: '#44282c',
       text: '#f0eded', textMuted: '#aaa1a3', accent: '#ff5964', onAccent: '#170204',
       success: '#6ccf9a', warning: '#f6c760', danger: '#ff9f70',
+    }),
+  },
+  panovic: {
+    dark: makeTheme(true, {
+      background: '#000000', panel: '#181818', panelAlt: '#242424', border: 'rgba(255, 255, 255, 0.06)',
+      text: '#e8e6e1', textMuted: '#9a9aa0', accent: '#f0723b', onAccent: '#140a00',
+      success: '#5fb582', warning: '#d9a05b', danger: '#ff7a66',
     }),
   },
 };
