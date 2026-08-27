@@ -31,7 +31,7 @@ env:
 jobs:
   metainfo-preflight:
     name: input preflight (libFuzzer)
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON((vars.CI_RUNNER_MODE == 'github' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && '["ubuntu-24.04"]' || '["self-hosted","Linux","X64","lab","general"]') }}
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v5
