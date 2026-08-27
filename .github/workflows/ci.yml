@@ -14,7 +14,9 @@ env:
 jobs:
   mobile:
     name: mobile quality + release guard
-    runs-on: ${{ fromJSON((vars.CI_RUNNER_MODE == 'github' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && '["ubuntu-24.04"]' || '["self-hosted","Linux","X64","lab","general"]') }}
+    # The signing guard configures the Android Gradle project and depends on
+    # the hosted image's preinstalled Android SDK.
+    runs-on: ubuntu-24.04
     defaults:
       run:
         working-directory: mobile
