@@ -51,7 +51,7 @@ permissions:
 jobs:
   maintained-series:
     name: "blocking: maintained rqbit v8.1.1 series / Rust 1.85"
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON((vars.CI_RUNNER_MODE == 'github' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && '["ubuntu-24.04"]' || '["self-hosted","Linux","X64","lab","general"]') }}
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@v5
@@ -76,7 +76,7 @@ jobs:
 
   authoritative-restore:
     name: ${{ matrix.name }} / authoritative restore
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON((vars.CI_RUNNER_MODE == 'github' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && '["ubuntu-24.04"]' || '["self-hosted","Linux","X64","lab","general"]') }}
     timeout-minutes: 20
     # Stable evidence blocks PRs. Upstream main still runs so drift is visible,
     # but it cannot block a PR when the independently moving branch changes.
@@ -109,7 +109,7 @@ jobs:
 
   discovery-health:
     name: ${{ matrix.name }} / discovery health
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON((vars.CI_RUNNER_MODE == 'github' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && '["ubuntu-24.04"]' || '["self-hosted","Linux","X64","lab","general"]') }}
     timeout-minutes: 30
     # Match the restore job: test current main on PRs without letting upstream
     # drift veto a change whose stable evidence remains reproducible.
@@ -142,7 +142,7 @@ jobs:
 
   metadata-size-limit:
     name: ${{ matrix.name }} / metadata size limit
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON((vars.CI_RUNNER_MODE == 'github' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && '["ubuntu-24.04"]' || '["self-hosted","Linux","X64","lab","general"]') }}
     timeout-minutes: 20
     continue-on-error: ${{ github.event_name == 'pull_request' && !matrix.blocking_on_pr }}
     strategy:
@@ -176,7 +176,7 @@ jobs:
 
   file-sizing-error:
     name: ${{ matrix.name }} / file sizing error propagation
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON((vars.CI_RUNNER_MODE == 'github' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && '["ubuntu-24.04"]' || '["self-hosted","Linux","X64","lab","general"]') }}
     timeout-minutes: 20
     continue-on-error: ${{ github.event_name == 'pull_request' && !matrix.blocking_on_pr }}
     strategy:
@@ -216,7 +216,7 @@ jobs:
 
   tracker-request-budget:
     name: ${{ matrix.name }} / tracker request budget
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON((vars.CI_RUNNER_MODE == 'github' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && '["ubuntu-24.04"]' || '["self-hosted","Linux","X64","lab","general"]') }}
     timeout-minutes: 20
     continue-on-error: ${{ github.event_name == 'pull_request' && !matrix.blocking_on_pr }}
     strategy:
@@ -250,7 +250,7 @@ jobs:
 
   session-peer-budget:
     name: ${{ matrix.name }} / session peer budget
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON((vars.CI_RUNNER_MODE == 'github' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && '["ubuntu-24.04"]' || '["self-hosted","Linux","X64","lab","general"]') }}
     timeout-minutes: 20
     continue-on-error: ${{ github.event_name == 'pull_request' && !matrix.blocking_on_pr }}
     strategy:
@@ -284,7 +284,7 @@ jobs:
 
   pending-handshake-budget:
     name: ${{ matrix.name }} / pending handshake budget
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON((vars.CI_RUNNER_MODE == 'github' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && '["ubuntu-24.04"]' || '["self-hosted","Linux","X64","lab","general"]') }}
     timeout-minutes: 20
     continue-on-error: ${{ github.event_name == 'pull_request' && !matrix.blocking_on_pr }}
     strategy:
@@ -318,7 +318,7 @@ jobs:
 
   known-peer-budget:
     name: ${{ matrix.name }} / known peer budget
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON((vars.CI_RUNNER_MODE == 'github' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && '["ubuntu-24.04"]' || '["self-hosted","Linux","X64","lab","general"]') }}
     timeout-minutes: 30
     continue-on-error: ${{ github.event_name == 'pull_request' && !matrix.blocking_on_pr }}
     strategy:
@@ -352,7 +352,7 @@ jobs:
 
   peer-response-budget:
     name: ${{ matrix.name }} / peer response budget
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON((vars.CI_RUNNER_MODE == 'github' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && '["ubuntu-24.04"]' || '["self-hosted","Linux","X64","lab","general"]') }}
     timeout-minutes: 20
     continue-on-error: ${{ github.event_name == 'pull_request' && !matrix.blocking_on_pr }}
     strategy:
@@ -386,7 +386,7 @@ jobs:
 
   discovery-pressure-budget:
     name: ${{ matrix.name }} / discovery pressure budget
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON((vars.CI_RUNNER_MODE == 'github' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && '["ubuntu-24.04"]' || '["self-hosted","Linux","X64","lab","general"]') }}
     timeout-minutes: 30
     continue-on-error: ${{ github.event_name == 'pull_request' && !matrix.blocking_on_pr }}
     strategy:
