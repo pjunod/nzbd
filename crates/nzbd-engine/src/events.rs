@@ -10,6 +10,9 @@ pub enum Event {
         job: JobId,
         name: String,
     },
+    /// The article-download phase ended. This is not payload readiness:
+    /// Usenet jobs may still verify, repair, unpack, move and run scripts.
+    /// Native consumers finish the handoff on [`Event::JobPpFinished`].
     JobFinished {
         job: JobId,
         name: String,

@@ -13,6 +13,9 @@ pub struct JobSummary {
     pub id: JobId,
     pub kind: JobKind,
     pub name: String,
+    /// Coarse transfer lifecycle. `Completed` says the article download is
+    /// complete; it does not by itself say post-processing is complete. Use
+    /// `ready` for that integration boundary.
     pub status: JobStatus,
     pub category: Option<String>,
     pub priority: i32,
@@ -40,9 +43,9 @@ pub struct JobSummary {
     pub assigned_node: Option<String>,
     /// Post-processing already finished (the `*PP:done` stamp is present).
     pub pp_done: bool,
-    /// Protocol-neutral content readiness. For Usenet this is the durable
-    /// post-processing completion stamp; for torrents it is set only after
-    /// selected payload bytes pass piece verification.
+    /// Protocol-neutral successful-payload readiness. For Usenet this is a
+    /// successful durable post-processing completion stamp; for torrents it
+    /// is set only after selected payload bytes pass piece verification.
     pub ready: bool,
     pub ready_at_unix: Option<i64>,
     /// Duplicate-detection metadata (empty key = no dupe tracking).

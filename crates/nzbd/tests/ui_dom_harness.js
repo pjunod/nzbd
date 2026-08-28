@@ -1490,6 +1490,14 @@ const models = (jobs) => jobs.map((j, i) => T.rowModel(j, { idx: i, count: jobs.
     eq(pq.st, "WAITING TO POST-PROCESS", "the pill says it in words");
     eq(pq.barHidden, true, "its download is finished, so its bar says nothing");
     eq(T.statusLabel("post_queued"), "waiting to post-process", "");
+    eq(T.statusLabel("completed", null, false), "download complete",
+      "completed names the download phase, not payload readiness");
+    eq(T.statusLabel("completed", null, true), "ready",
+      "durable post-processing completion is labeled as readiness");
+    eq(T.rowModel(job(8, { status: "completed", ready: false }), {}).st,
+      "DOWNLOAD COMPLETE", "the queue row names which phase completed");
+    eq(T.rowModel(job(9, { status: "completed", ready: true }), {}).st,
+      "READY", "a ready queue row does not understate final completion");
     eq(T.statusName("post_queued"), "post_queued",
       "…while the wire name is unchanged, because pending-ops compare on it");
     eq(T.statusLabel({ post: { stage: "par_repair" } }), "repairing", "");

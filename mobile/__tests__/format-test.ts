@@ -32,6 +32,8 @@ const job = (changes: Partial<JobSummary> = {}): JobSummary => ({
   retried_articles: 0,
   assigned_node: null,
   pp_done: false,
+  ready: false,
+  ready_at_unix: null,
   dupe_key: '',
   dupe_score: 0,
   params: [],
@@ -129,6 +131,8 @@ describe('API presentation helpers', () => {
     expect(jobStatusKey('paused')).toBe('paused');
     expect(jobStatusKey({ post: { stage: 'par_repair' } })).toBe('post:par_repair');
     expect(jobStatusLabel({ post: { stage: 'par_repair' } })).toBe('par repair');
+    expect(jobStatusLabel('completed', false)).toBe('download complete');
+    expect(jobStatusLabel('completed', true)).toBe('ready');
   });
 
   test('calculates bounded byte progress and formats binary units', () => {
