@@ -45,8 +45,14 @@ cd mobile                 # enter the React Native package
 npm install               # install the lockfile-pinned dependencies
 npm run ios               # build and run the iPhone/iPad simulator app
 npm run android           # build and run an Android emulator or device
-npm run ios:device        # choose and build for a connected Apple device
+npm run ios:device        # install a self-contained build on an Apple device
 ```
+
+`npm run ios:device` uses Xcode's Release configuration so the installed app
+embeds its JavaScript bundle and keeps working when this Mac and Metro are
+offline. Xcode and `expo run:ios` otherwise default to Debug; a Debug build is
+only for active development and stops at the splash screen with “No script
+URL provided” whenever Metro is not running.
 
 The `ios/` and `android/` projects are committed so they open directly in
 Xcode and Android Studio. `app.json` plus its Expo config plugins are the

@@ -201,6 +201,14 @@ the engine does. Two events cover the handoff:
   that the older `job_finished` fires when the *download* ends, before
   any of this.
 
+For NZB and URL jobs, live `status: "completed"` establishes only that the
+article-download phase ended. The row keeps that status after post-processing,
+so the status alone is not permission to use the payload. Native consumers
+must wait for `ready: true` and obtain the path from `job_pp_finished` or the
+corresponding history row's `final_dir`. A failed job can be `pp_done: true` and
+have a parked `final_dir`, but remains `ready: false`; that directory is for
+diagnosis or requeue, not import.
+
 ```bash
 curl -N -H 'Authorization: Bearer <token>' \
      -H 'X-Nzbd-Client: myapp/1.0' \

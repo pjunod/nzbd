@@ -14,7 +14,9 @@ env:
 jobs:
   mobile:
     name: mobile quality + release guard
-    runs-on: ubuntu-latest
+    # The signing guard configures the Android Gradle project and depends on
+    # the hosted image's preinstalled Android SDK.
+    runs-on: ubuntu-24.04
     defaults:
       run:
         working-directory: mobile
@@ -66,13 +68,20 @@ jobs:
 
   test:
     name: unit + e2e
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON((vars.CI_RUNNER_MODE == 'github' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && '["ubuntu-24.04"]' || '["self-hosted","Linux","X64","lab","general"]') }}
     steps:
       - uses: actions/checkout@v5
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: install PP tools (par2, 7z)
+        if: vars.CI_RUNNER_MODE == 'github' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)
         run: sudo apt-get update && sudo apt-get install -y par2 p7zip-full
+      - name: verify self-hosted PP tools
+        if: vars.CI_RUNNER_MODE != 'github' && !(github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)
+        run: command -v par2 && command -v 7z
       # The whole pyramid: parser/codec/ladder unit tests, engine e2e
       # against the mock NNTP server (incl. kill-and-resume), multi-node
       # cluster tests (election, failover, reclaim), and the whole-daemon
@@ -82,7 +91,7 @@ jobs:
 
   msrv:
     name: MSRV check (1.85)
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON((vars.CI_RUNNER_MODE == 'github' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && '["ubuntu-24.04"]' || '["self-hosted","Linux","X64","lab","general"]') }}
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@master

@@ -47,6 +47,8 @@ export interface JobSummary {
   retried_articles: number;
   assigned_node: string | null;
   pp_done: boolean;
+  ready: boolean;
+  ready_at_unix: number | null;
   dupe_key: string;
   dupe_score: number;
   params: [string, string][];

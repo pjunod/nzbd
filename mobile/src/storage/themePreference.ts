@@ -35,7 +35,7 @@ export async function saveLayoutPreference(layout: LayoutPreference): Promise<vo
 export async function loadPalettePreference(): Promise<PalettePreference | null> {
   if (!(await SecureStore.isAvailableAsync())) return null;
   const stored = await SecureStore.getItemAsync(PALETTE_KEY);
-  return ['classic', 'terminal', 'noirr', 'amber', 'giallo', 'silver', 'void', 'vhs', 'paper', 'tide'].includes(stored ?? '')
+  return ['classic', 'terminal', 'noirr', 'amber', 'giallo', 'silver', 'void', 'vhs', 'paper', 'tide', 'panoptic', 'redline', 'panovic', 'copper'].includes(stored ?? '')
     ? stored as PalettePreference
     : null;
 }

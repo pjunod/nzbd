@@ -4,36 +4,40 @@
   "main": "index.ts",
   "dependencies": {
     "@inthepocket/react-native-service-discovery": "^0.2.9",
-    "expo": "~57.0.10",
-    "expo-build-properties": "~57.0.8",
-    "expo-constants": "~57.0.9",
+    "expo": "~57.0.17",
+    "expo-build-properties": "~57.0.15",
+    "expo-constants": "~57.0.15",
     "expo-document-picker": "~57.0.1",
-    "expo-file-system": "~57.0.1",
-    "expo-secure-store": "~57.0.1",
+    "expo-file-system": "~57.0.6",
+    "expo-secure-store": "~57.0.2",
     "expo-status-bar": "~57.0.1",
     "react": "19.2.3",
-    "react-native": "0.86.2",
+    "react-native": "0.86.3",
     "react-native-safe-area-context": "~5.7.0"
   },
   "devDependencies": {
+    "@react-native/jest-preset": "0.86.3",
     "@types/jest": "^29.5.14",
     "@types/react": "~19.2.2",
     "expo-doctor": "^1.20.1",
     "jest": "^29.7.0",
-    "jest-expo": "~57.0.3",
+    "jest-expo": "~57.0.5",
     "typescript": "~6.0.3"
   },
   "scripts": {
     "start": "expo start",
     "android": "expo run:android",
     "ios": "expo run:ios",
-    "ios:device": "expo run:ios --device",
+    "ios:device": "expo run:ios --configuration Release --device",
     "web": "expo start --web",
     "typecheck": "tsc --noEmit",
     "test": "jest --runInBand",
     "test:watch": "jest --watch",
     "doctor": "expo-doctor",
     "export": "expo export --platform all"
+  },
+  "overrides": {
+    "uuid": "11.1.1"
   },
   "expo": {
     "doctor": {

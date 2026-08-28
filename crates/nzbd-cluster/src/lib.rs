@@ -125,6 +125,7 @@ impl ClusterRuntime {
         let guard = persist_guard(layout.clone(), view.clone(), cfg.node_name.clone());
         let engine = Engine::spawn(EngineConfig {
             servers: servers.clone(),
+            download_enabled: cfg.download,
             state_dir: layout.state_dir(),
             dest_dir: dest_dir.clone(),
             disk_guard_roots: cfg.disk_guard_roots.clone(),
@@ -137,14 +138,12 @@ impl ClusterRuntime {
         })
         .await?;
 
-        // A non-downloading node must never open provider connections —
-        // even for the moment a queued job sits local before the scheduler
-        // delegates it. Zero budgets park every connection task.
-        if !cfg.download {
-            let zero: std::collections::HashMap<_, _> =
-                servers.iter().map(|s| (s.id, 0u16)).collect();
-            let _ = engine.set_server_budgets(zero).await;
-        }
+        // Cluster engines start fail-closed. A grant/heartbeat from a leader
+        // that understands provider partitioning must explicitly enable
+        // connections. This also makes a new PP worker safe under an older
+        // leader, whose PP grants carried no budget capability at all.
+        let zero: std::collections::HashMap<_, _> = servers.iter().map(|s| (s.id, 0u16)).collect();
+        let _ = engine.set_server_budgets(zero).await;
 
         let client = ClusterClient::new(cfg.secret.clone());
         let leader_shared = LeaderShared::new(

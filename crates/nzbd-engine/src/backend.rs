@@ -52,6 +52,14 @@ pub enum StopReason {
     SeedPolicyReached,
     Removed,
     Shutdown,
+    /// The write path hit ENOSPC or EDQUOT. This is a live hold, not a
+    /// terminal engine failure.
+    StorageFull,
+    /// Previously admitted payload is absent or no longer matches metadata.
+    /// The job remains recoverable through restore/recheck.
+    MissingContent,
+    /// Discovery or peer availability temporarily cannot make progress.
+    Transient,
 }
 
 /// A display-safe backend failure. The adapter must redact passkeys, query
@@ -89,6 +97,10 @@ pub enum BackendFact {
     },
     Ready {
         job: JobId,
+        /// Canonical payload path. Emitting this fact is the adapter's
+        /// assertion that all selected pieces are hash-verified and the
+        /// payload plus containing directory have completed their durability
+        /// barrier. The owner independently checks verified byte counts.
         content_path: PathBuf,
     },
     Stopped {
@@ -247,7 +259,7 @@ mod tests {
 
     #[tokio::test]
     async fn progress_flood_cannot_delay_a_control_command() {
-        let (owner, mut adapter) = backend_channel(1, 1);
+        let (mut owner, mut adapter) = backend_channel(1, 1);
         for n in 0..50_000 {
             adapter.progress(
                 JobId(7),
@@ -257,6 +269,7 @@ mod tests {
                 },
             );
         }
+        assert_eq!(owner.latest_progress()[&JobId(7)].downloaded_bytes, 49_999);
 
         owner
             .try_command(BackendCommand::Remove {
@@ -269,6 +282,26 @@ mod tests {
             Some(BackendCommand::Remove {
                 job: JobId(7),
                 delete_data: false,
+            })
+        );
+        owner
+            .try_command(BackendCommand::Pause { job: JobId(7) })
+            .unwrap();
+        assert_eq!(
+            adapter.next_command().await,
+            Some(BackendCommand::Pause { job: JobId(7) })
+        );
+        owner
+            .try_command(BackendCommand::SetPriority {
+                job: JobId(7),
+                priority: 100,
+            })
+            .unwrap();
+        assert_eq!(
+            adapter.next_command().await,
+            Some(BackendCommand::SetPriority {
+                job: JobId(7),
+                priority: 100,
             })
         );
     }

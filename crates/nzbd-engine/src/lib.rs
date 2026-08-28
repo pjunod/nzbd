@@ -18,6 +18,7 @@ pub mod fetch;
 pub mod queue;
 pub mod rate;
 pub mod snapshot;
+pub mod torrent_runtime;
 pub mod volumes;
 
 mod owner;
@@ -121,6 +122,10 @@ impl Default for Tuning {
 #[derive(Clone)]
 pub struct EngineConfig {
     pub servers: Vec<ServerDef>,
+    /// Whether ordinary queued jobs may use provider connections. Cluster
+    /// post-processing-only nodes set this false: their connection pool is
+    /// available solely to the explicit delayed-PAR recovery lane.
+    pub download_enabled: bool,
     /// Journal + snapshots live here (the shared volume in cluster mode).
     pub state_dir: PathBuf,
     /// Completed jobs are written to `<dest_dir>/<job name>/`.
@@ -157,6 +162,7 @@ impl EngineConfig {
     ) -> EngineConfig {
         EngineConfig {
             servers,
+            download_enabled: true,
             state_dir,
             disk_guard_roots: vec![DiskGuardRoot {
                 label: "downloads".into(),
@@ -208,6 +214,7 @@ impl Engine {
             cfg.dest_dir.clone(),
             servers.clone(),
             cfg.tuning.clone(),
+            cfg.download_enabled,
             cfg.persist_queue,
             &cfg.journal_suffix,
             cfg.persist_guard.clone(),

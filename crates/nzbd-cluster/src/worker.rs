@@ -100,6 +100,8 @@ fn progress_of(engine: &EngineHandle, job: JobId) -> MirrorStats {
             failed_articles: j.failed_articles,
             downloaded_bytes: j.downloaded_bytes,
             health: j.health,
+            remaining_bytes: Some(j.remaining_bytes),
+            stages: j.stages.clone(),
         })
         .unwrap_or_default()
 }
@@ -134,6 +136,7 @@ async fn heartbeat_and_cancel(
         .await
     {
         Ok(resp) => {
+            let post_fetch_budgeted = resp.post_fetch_budgeted;
             for lease_id in resp.cancel {
                 let st = active.lock().unwrap().remove(&lease_id);
                 if let Some(st) = st {
@@ -142,7 +145,20 @@ async fn heartbeat_and_cancel(
                 }
             }
             if let Some(budgets) = resp.server_budgets {
-                apply_budgets(engine, servers, &budgets).await;
+                let (has_download, has_post) = {
+                    let leases = active.lock().unwrap();
+                    (
+                        leases
+                            .values()
+                            .any(|lease| lease.kind == LeaseKind::Download),
+                        leases.values().any(|lease| lease.kind == LeaseKind::Post),
+                    )
+                };
+                if has_post && pp_budget_must_park(post_fetch_budgeted, has_download) {
+                    apply_budgets(engine, servers, &HashMap::new()).await;
+                } else {
+                    apply_budgets(engine, servers, &budgets).await;
+                }
             }
         }
         Err(e) => tracing::debug!(error = %e, "heartbeat failed (election in progress?)"),
@@ -276,6 +292,20 @@ async fn poll_for_work(
             LeaseKind::Post => {
                 let Some(setup) = pp else { continue };
                 tracing::info!(job = job_id.0, lease = %grant.lease_id, "pp lease received");
+                if grant.post_fetch_budgeted {
+                    apply_budgets(engine, servers, &grant.server_budgets).await;
+                } else if !active
+                    .lock()
+                    .unwrap()
+                    .values()
+                    .any(|lease| lease.kind == LeaseKind::Download)
+                {
+                    // Old leaders sent an empty PP grant and did not count PP
+                    // in heartbeat budgets. Keep a PP-only recovery lane
+                    // parked. A concurrent Download lease is safe: the old
+                    // leader already counts this node through that lease.
+                    apply_budgets(engine, servers, &HashMap::new()).await;
+                }
                 if engine.import_job(grant.job, false, false).await.is_ok() {
                     if engine.snapshot().disk_low {
                         let _ = engine.remove_job_silent(job_id).await;
@@ -398,13 +428,27 @@ async fn apply_budgets(
     servers: &[ServerDef],
     by_name: &HashMap<String, u16>,
 ) {
-    let by_id: HashMap<nzbd_types::ServerId, u16> = servers
-        .iter()
-        .filter_map(|s| by_name.get(&s.name).map(|b| (s.id, *b)))
-        .collect();
+    // Missing is zero, not "keep whatever the previous leader granted".
+    // Old leaders send an empty map on PP grants; failing closed is what
+    // keeps a rolling-upgrade PP worker inside the account connection cap.
+    let by_id = budgets_by_id(servers, by_name);
     if !by_id.is_empty() {
         let _ = engine.set_server_budgets(by_id).await;
     }
+}
+
+fn budgets_by_id(
+    servers: &[ServerDef],
+    by_name: &HashMap<String, u16>,
+) -> HashMap<nzbd_types::ServerId, u16> {
+    servers
+        .iter()
+        .map(|s| (s.id, by_name.get(&s.name).copied().unwrap_or(0)))
+        .collect()
+}
+
+fn pp_budget_must_park(post_fetch_budgeted: bool, has_download: bool) -> bool {
+    !post_fetch_budgeted && !has_download
 }
 
 #[cfg(test)]
@@ -414,7 +458,7 @@ mod tests {
     use axum::routing::post;
     use axum::{Json, Router};
     use nzbd_engine::{Engine, EngineConfig, Tuning};
-    use nzbd_types::{DupeInfo, Job, JobKind, JobTotals};
+    use nzbd_types::{CertLevel, DupeInfo, Job, JobKind, JobTotals, PostStage, ServerId, TlsMode};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[derive(Clone)]
@@ -435,6 +479,7 @@ mod tests {
                 kind: LeaseKind::Download,
                 job: state.job,
                 server_budgets: HashMap::new(),
+                post_fetch_budgeted: false,
             }],
         })
     }
@@ -468,6 +513,71 @@ mod tests {
             torrent: None,
             stages: Vec::new(),
         }
+    }
+
+    #[tokio::test]
+    async fn heartbeat_progress_carries_the_remote_post_stage() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = Engine::spawn(EngineConfig::single_node(
+            Vec::new(),
+            tmp.path().join("state"),
+            tmp.path().join("dest"),
+            Tuning::default(),
+            None,
+        ))
+        .await
+        .unwrap();
+        engine
+            .import_job(queued_test_job(), false, false)
+            .await
+            .unwrap();
+        assert!(engine
+            .enter_post_stage(JobId(77), PostStage::ParVerify, 1_000, None)
+            .await
+            .unwrap());
+
+        let progress = progress_of(&engine, JobId(77));
+        assert_eq!(progress.remaining_bytes, Some(0));
+        assert_eq!(progress.stages.len(), 1);
+        assert_eq!(progress.stages[0].stage, PostStage::ParVerify);
+        assert!(progress.stages[0].ms.is_none());
+
+        engine.shutdown().await;
+    }
+
+    #[test]
+    fn legacy_pp_budget_messages_fail_closed() {
+        let legacy: HeartbeatResponse = serde_json::from_value(serde_json::json!({
+            "cancel": [],
+            "server_budgets": {"provider": 8}
+        }))
+        .unwrap();
+        assert!(!legacy.post_fetch_budgeted);
+
+        let provider = ServerDef {
+            id: ServerId(1),
+            name: "provider".into(),
+            host: "127.0.0.1".into(),
+            port: 119,
+            tls: TlsMode::None,
+            username: None,
+            password: None,
+            active: true,
+            tier: 0,
+            group: 0,
+            fill: false,
+            max_connections: 8,
+            pipeline_depth: 1,
+            retention_days: 0,
+            cert_verification: CertLevel::Strict,
+        };
+        assert_eq!(budgets_by_id(&[provider], &HashMap::new())[&ServerId(1)], 0);
+        assert!(pp_budget_must_park(false, false));
+        assert!(
+            !pp_budget_must_park(false, true),
+            "an old leader already budgets a node that holds a Download lease"
+        );
+        assert!(!pp_budget_must_park(true, false));
     }
 
     #[tokio::test]

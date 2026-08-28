@@ -19,7 +19,7 @@ use librqbit::{
     Session, SessionOptions, TorrentStats as EngineTorrentStats, TorrentStatsState,
 };
 use std::borrow::Cow;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::num::NonZeroU32;
 use std::ops::Range;
@@ -179,6 +179,10 @@ pub enum TorrentError {
     ExistingPathType(&'static str),
     #[error("invalid torrent piece geometry: {0}")]
     InvalidMetainfoGeometry(&'static str),
+    #[error("duplicate engine identity in the authorized restore set")]
+    DuplicateEngineIdentity,
+    #[error("restored torrent info hash does not match its durable descriptor")]
+    RestoreHashMismatch,
 }
 
 fn engine_error(error: impl std::fmt::Display) -> TorrentError {
@@ -511,6 +515,8 @@ pub struct TorrentSessionConfig {
     pub dht: bool,
     pub listen_port_range: Option<Range<u16>>,
     pub proxy: Option<TorrentProxyConfig>,
+    /// Engine resume state is an accelerator; construction never restores it.
+    pub persistence_dir: Option<PathBuf>,
 }
 
 #[derive(Clone, Default)]
@@ -592,6 +598,8 @@ pub struct TorrentAddConfig {
     pub paused: bool,
     pub overwrite: bool,
     pub initial_peers: Vec<SocketAddr>,
+    pub only_files: Option<Vec<usize>>,
+    pub preferred_id: Option<usize>,
 }
 
 #[derive(Clone)]
@@ -620,7 +628,12 @@ impl TorrentSession {
             .transpose()?;
         std::fs::create_dir_all(&output_root).map_err(engine_error)?;
         let output_root = std::fs::canonicalize(output_root).map_err(engine_error)?;
-        let options = session_options(config.dht, config.listen_port_range, socks_proxy_url);
+        let options = session_options(
+            config.dht,
+            config.listen_port_range,
+            socks_proxy_url,
+            config.persistence_dir,
+        );
         let inner = Session::new_with_opts(output_root.clone(), options)
             .await
             .map_err(engine_error)?;
@@ -659,7 +672,7 @@ impl TorrentSession {
         install_process_crypto_provider()?;
         std::fs::create_dir_all(&output_root).map_err(engine_error)?;
         let output_root = std::fs::canonicalize(output_root).map_err(engine_error)?;
-        let options = session_options(false, Some(listen_port_range), None);
+        let options = session_options(false, Some(listen_port_range), None, None);
         let inner = Session::new_with_opts(output_root.clone(), options)
             .await
             .map_err(engine_error)?;
@@ -800,12 +813,170 @@ impl TorrentSession {
     }
 }
 
+/// Engine-owned identity. This deliberately contains no nzbd queue identity.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct EngineIdentity {
+    pub id: usize,
+    pub info_hash_v1: String,
+}
+
+/// One queue-authorized engine restore descriptor. Metainfo is supplied by
+/// nzbd's durable state boundary; rqbit's persistence file is never enumerated
+/// as an admission source.
+#[derive(Debug, Clone)]
+pub struct RestoreDescriptor {
+    pub metainfo: Vec<u8>,
+    pub expected_info_hash_v1: String,
+    pub preferred_id: Option<usize>,
+    pub selected_files: Option<Vec<usize>>,
+}
+
+/// Owns all raw handles for one maintained session, indexed only by engine
+/// identity and info hash. Raw handles never need to cross this boundary.
+pub struct TorrentRegistry {
+    session: TorrentSession,
+    by_hash: HashMap<String, TorrentHandle>,
+    id_to_hash: HashMap<usize, String>,
+}
+
+impl TorrentRegistry {
+    pub fn new(session: TorrentSession) -> Self {
+        Self {
+            session,
+            by_hash: HashMap::new(),
+            id_to_hash: HashMap::new(),
+        }
+    }
+
+    /// Restore only caller-authorized descriptors, always paused. Duplicate
+    /// durable identities fail before a second wrapper can be admitted.
+    pub async fn restore_selected(
+        &mut self,
+        descriptors: impl IntoIterator<Item = RestoreDescriptor>,
+    ) -> Result<Vec<EngineIdentity>, TorrentError> {
+        let mut restored = Vec::new();
+        for descriptor in descriptors {
+            if self.by_hash.contains_key(&descriptor.expected_info_hash_v1)
+                || descriptor
+                    .preferred_id
+                    .is_some_and(|id| self.id_to_hash.contains_key(&id))
+            {
+                return Err(TorrentError::DuplicateEngineIdentity);
+            }
+            let handle = self
+                .session
+                .add_metainfo(
+                    descriptor.metainfo,
+                    TorrentAddConfig {
+                        paused: true,
+                        overwrite: true,
+                        only_files: descriptor.selected_files,
+                        preferred_id: descriptor.preferred_id,
+                        ..Default::default()
+                    },
+                )
+                .await?;
+            let identity = EngineIdentity {
+                id: handle.id(),
+                info_hash_v1: handle.info_hash(),
+            };
+            if identity.info_hash_v1 != descriptor.expected_info_hash_v1 {
+                self.session.delete(&handle, false).await?;
+                return Err(TorrentError::RestoreHashMismatch);
+            }
+            if self.id_to_hash.contains_key(&identity.id)
+                || self.by_hash.contains_key(&identity.info_hash_v1)
+            {
+                self.session.delete(&handle, false).await?;
+                return Err(TorrentError::DuplicateEngineIdentity);
+            }
+            self.id_to_hash
+                .insert(identity.id, identity.info_hash_v1.clone());
+            self.by_hash.insert(identity.info_hash_v1.clone(), handle);
+            restored.push(identity);
+        }
+        Ok(restored)
+    }
+
+    pub fn identities(&self) -> Vec<EngineIdentity> {
+        let mut identities: Vec<_> = self
+            .id_to_hash
+            .iter()
+            .map(|(&id, hash)| EngineIdentity {
+                id,
+                info_hash_v1: hash.clone(),
+            })
+            .collect();
+        identities.sort_by_key(|identity| identity.id);
+        identities
+    }
+
+    pub fn identity_by_hash(&self, hash: &str) -> Option<EngineIdentity> {
+        self.by_hash.get(hash).map(|handle| EngineIdentity {
+            id: handle.id(),
+            info_hash_v1: handle.info_hash(),
+        })
+    }
+
+    pub async fn resume(&self, identity: &EngineIdentity) -> Result<(), TorrentError> {
+        let handle = self
+            .by_hash
+            .get(&identity.info_hash_v1)
+            .filter(|handle| handle.id() == identity.id)
+            .ok_or(TorrentError::MissingHandle)?;
+        self.session.resume(handle).await
+    }
+
+    pub async fn pause(&self, identity: &EngineIdentity) -> Result<(), TorrentError> {
+        let handle = self
+            .by_hash
+            .get(&identity.info_hash_v1)
+            .filter(|handle| handle.id() == identity.id)
+            .ok_or(TorrentError::MissingHandle)?;
+        self.session.pause(handle).await
+    }
+
+    pub fn is_paused(&self, identity: &EngineIdentity) -> Option<bool> {
+        self.by_hash
+            .get(&identity.info_hash_v1)
+            .filter(|handle| handle.id() == identity.id)
+            .map(TorrentHandle::is_paused)
+    }
+
+    pub fn stats(&self, identity: &EngineIdentity) -> Option<TorrentStats> {
+        self.by_hash
+            .get(&identity.info_hash_v1)
+            .filter(|handle| handle.id() == identity.id)
+            .map(TorrentHandle::stats)
+    }
+
+    pub async fn wait_until_initialized(
+        &self,
+        identity: &EngineIdentity,
+    ) -> Result<(), TorrentError> {
+        let handle = self
+            .by_hash
+            .get(&identity.info_hash_v1)
+            .filter(|handle| handle.id() == identity.id)
+            .ok_or(TorrentError::MissingHandle)?;
+        handle.wait_until_initialized().await
+    }
+
+    pub async fn stop(self) {
+        self.session.stop().await;
+    }
+}
+
 fn magnet_resolution_options(initial_peers: Vec<SocketAddr>) -> AddTorrentOptions {
     exact_add_options(false, false, true, initial_peers)
 }
 
 fn managed_add_options(config: TorrentAddConfig) -> AddTorrentOptions {
-    exact_add_options(config.paused, config.overwrite, false, config.initial_peers)
+    let mut options =
+        exact_add_options(config.paused, config.overwrite, false, config.initial_peers);
+    options.only_files = config.only_files;
+    options.preferred_id = config.preferred_id;
+    options
 }
 
 fn exact_add_options(
@@ -843,6 +1014,7 @@ fn session_options(
     dht: bool,
     listen_port_range: Option<Range<u16>>,
     socks_proxy_url: Option<String>,
+    persistence_dir: Option<PathBuf>,
 ) -> SessionOptions {
     SessionOptions {
         disable_dht: !dht,
@@ -860,8 +1032,10 @@ fn session_options(
         // defaults. A newly added engine capability must become a compile-time
         // review event before it can affect nzbd's network or storage boundary.
         dht_config: None,
-        fastresume: false,
-        persistence: None,
+        fastresume: persistence_dir.is_some(),
+        persistence: persistence_dir.map(|folder| librqbit::SessionPersistenceConfig::Json {
+            folder: Some(folder),
+        }),
         // Even when M2 supplies an nzbd-owned persistence directory, session
         // construction must admit nothing until the queue owner explicitly
         // restores its authoritative jobs.
@@ -1923,6 +2097,16 @@ mod preflight_tests;
 mod tests {
     use super::*;
 
+    #[test]
+    fn public_adapter_boundary_cannot_import_or_own_job_ids() {
+        let manifest = include_str!("../Cargo.toml");
+        let source = include_str!("lib.rs");
+        assert!(!manifest.contains("nzbd-types"));
+        assert!(!manifest.contains(&["nzbd", "_types"].concat()));
+        assert!(!source.contains(&["Job", "Id"].concat()));
+        assert!(!source.contains(&["nzbd", "_types"].concat()));
+    }
+
     fn file_info(path: &str, len: u64, padding: bool) -> librqbit::file_info::FileInfo {
         let mut file = librqbit::file_info::FileInfo {
             relative_filename: PathBuf::from(path),
@@ -1988,7 +2172,7 @@ mod tests {
     fn session_options_are_an_explicit_dormant_boundary() {
         // This pins the helper used by TorrentSession::start. If start stops
         // delegating here, move the assertion to the replacement call path.
-        let options = session_options(false, None, None);
+        let options = session_options(false, None, None, None);
         assert!(options.disable_dht);
         assert!(options.disable_dht_persistence);
         assert!(options.dht_config.is_none());
@@ -2044,6 +2228,7 @@ mod tests {
             paused: true,
             overwrite: true,
             initial_peers: vec![peer],
+            ..Default::default()
         });
         assert!(managed.paused);
         assert!(managed.overwrite);
