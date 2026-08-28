@@ -37,9 +37,13 @@ pub struct Grant {
     pub kind: LeaseKind,
     pub job: Job,
     /// Per-server-name connection allowance (cluster-wide account cap
-    /// partitioning, §6.3). Empty for PP grants — PP opens no provider
-    /// connections.
+    /// partitioning, §6.3). PP grants carry it too because delayed PAR
+    /// recovery may fetch explicitly selected recovery volumes.
     pub server_budgets: HashMap<String, u16>,
+    /// Rolling-upgrade capability: true only when the granting leader counts
+    /// PP leases in those budgets. Missing/false must keep PP NNTP disabled.
+    #[serde(default)]
+    pub post_fetch_budgeted: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize, Default)]
@@ -66,6 +70,9 @@ pub struct HeartbeatResponse {
     pub cancel: Vec<String>,
     /// Refreshed connection budgets (membership changed since the grant).
     pub server_budgets: Option<HashMap<String, u16>>,
+    /// Same rolling-upgrade capability as [`Grant::post_fetch_budgeted`].
+    #[serde(default)]
+    pub post_fetch_budgeted: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

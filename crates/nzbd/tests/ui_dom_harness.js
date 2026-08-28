@@ -1372,6 +1372,37 @@ const models = (jobs) => jobs.map((j, i) => T.rowModel(j, { idx: i, count: jobs.
     eq(T.sectionOf(post("par_rename")), "renaming", "");
     eq(T.sectionOf(post("rar_rename")), "renaming",
       "both rename stages read as one thing to a person");
+    // Delayed PAR fetching used to overwrite the wire status with
+    // `completed` while leaving the verify span open. The timeline is the
+    // durable activity fact, so an upgraded/restored row must still live in
+    // post-processing and say what it is doing.
+    const delayedParRace = job(402, {
+      status: "completed",
+      stages: [
+        { stage: "par_rename", started_at_unix: 1000, ms: 2000 },
+        { stage: "par_verify", started_at_unix: 1002 },
+      ],
+    });
+    eq(T.currentPostStage(delayedParRace), "par_verify",
+      "an open timeline span recovers the active post stage");
+    eq(T.sectionOf(delayedParRace), "verifying",
+      "an active verify never falls into Waiting");
+    const delayedParModel = T.rowModel(delayedParRace,
+      { section: T.sectionOf(delayedParRace), nowMs: 1_542_000, movable: false });
+    eq(delayedParModel.st, "CHECKING INTEGRITY",
+      "the recovered row names its actual work");
+    eq(delayedParModel.barHidden, true,
+      "the recovered post-processing row does not show download progress");
+    eq(T.detailModel(delayedParRace, 1_542_000).st, "CHECKING INTEGRITY",
+      "the row and its detail panel agree on the active stage");
+    const fetchingDelayedPar = job(403, {
+      status: "downloading",
+      stages: [{ stage: "par_verify", started_at_unix: 1002 }],
+    });
+    eq(T.sectionOf(fetchingDelayedPar), "verifying",
+      "the download interlude remains in the post-processing section");
+    eq(T.detailModel(fetchingDelayedPar, 1_542_000).recoverHidden, true,
+      "recovery controls stay hidden while the backend rejects restarts");
     // An unknown stage from a newer daemon must land in a visible section
     // rather than vanish between the buckets.
     eq(T.sectionOf(post("teleporting")), "post_queued",

@@ -78,36 +78,54 @@ impl LeaderShared {
         format!("L{}-{}", self.epoch(), n)
     }
 
-    /// Distinct nodes currently downloading (download leases only — PP
-    /// leases open no provider connections) plus the leader itself — the
-    /// divisor for per-account connection budgets. Counting the leader
-    /// unconditionally is conservative: budgets never exceed the account
-    /// cap, at worst they under-use it while the leader idles.
-    fn budget_divisor(&self) -> u32 {
-        let nodes: HashSet<String> = self
+    /// Every remote executor that may currently use provider connections,
+    /// plus the leader as a conservative reserved share. PP leases count
+    /// because delayed PAR recovery can open NNTP connections. Remote nodes
+    /// come first so a scarce remainder is not stranded on an idle leader.
+    fn budget_nodes(&self) -> Vec<String> {
+        let mut nodes: Vec<String> = self
             .leases
             .lock()
             .unwrap()
             .values()
-            .filter(|l| l.kind == LeaseKind::Download)
             .map(|l| l.node.clone())
             .collect();
-        1 + nodes.len() as u32
+        nodes.sort();
+        nodes.dedup();
+        nodes.retain(|node| node != &self.cfg.node_name);
+        nodes.push(self.cfg.node_name.clone());
+        nodes
     }
 
-    fn budgets_by_name(&self) -> HashMap<String, u16> {
-        let n = self.budget_divisor().max(1) as u16;
+    /// This executor's exact share. Remainders go to the first stable node
+    /// names and later nodes may receive zero: unlike `.max(1)`, the issued
+    /// shares always sum to at most the provider account cap.
+    fn budgets_for_node(&self, node: &str) -> HashMap<String, u16> {
+        let nodes = self.budget_nodes();
+        let position = nodes.iter().position(|candidate| candidate == node);
+        let count = nodes.len() as u16;
         self.servers
             .iter()
-            .map(|s| (s.name.clone(), (s.max_connections / n).max(1)))
+            .map(|server| {
+                let share = match (position, count) {
+                    (Some(position), count) if count > 0 => {
+                        let base = server.max_connections / count;
+                        let remainder = server.max_connections % count;
+                        base + u16::from((position as u16) < remainder)
+                    }
+                    _ => 0,
+                };
+                (server.name.clone(), share)
+            })
             .collect()
     }
 
     async fn apply_local_budgets(&self) {
-        // A non-downloading node keeps zero budgets no matter what the
-        // divisor says — its engine must never open provider connections.
-        let by_id = if self.cfg.download {
-            let by_name = self.budgets_by_name();
+        // A PP-only leader may need NNTP for delayed PAR recovery. Its
+        // engine independently disables ordinary queued downloads, so these
+        // budgets authorize capacity without broadening file eligibility.
+        let by_id = if self.cfg.download || self.cfg.post_process {
+            let by_name = self.budgets_for_node(&self.cfg.node_name);
             self.servers
                 .iter()
                 .filter_map(|s| by_name.get(&s.name).map(|b| (s.id, *b)))
@@ -263,7 +281,8 @@ async fn work_poll(
             epoch: s.epoch(),
             kind: LeaseKind::Download,
             job,
-            server_budgets: s.budgets_by_name(),
+            server_budgets: s.budgets_for_node(&req.node),
+            post_fetch_budgeted: true,
         });
     }
 
@@ -308,7 +327,11 @@ async fn work_poll(
             epoch: s.epoch(),
             kind: LeaseKind::Post,
             job,
-            server_budgets: HashMap::new(),
+            // The divisor already includes this PP executor. It may not use
+            // the allowance for ordinary files; the engine's explicit
+            // delayed-PAR lane enforces that separate authorization.
+            server_budgets: s.budgets_for_node(&req.node),
+            post_fetch_budgeted: true,
         });
     }
 
@@ -427,12 +450,13 @@ async fn work_heartbeat(
     }
     for lp in &req.leases {
         if !cancel.contains(&lp.lease_id) {
-            s.engine.mirror_progress(lp.job, lp.stats);
+            s.engine.mirror_progress(lp.job, lp.stats.clone());
         }
     }
     Json(HeartbeatResponse {
         cancel,
-        server_budgets: Some(s.budgets_by_name()),
+        server_budgets: Some(s.budgets_for_node(&req.node)),
+        post_fetch_budgeted: true,
     })
     .into_response()
 }
@@ -732,7 +756,7 @@ mod tests {
     use crate::election::LeaderRecord;
     use axum::extract::State;
     use nzbd_engine::{Engine, EngineConfig, Tuning};
-    use nzbd_types::{DupeInfo, Job, JobKind, JobTotals};
+    use nzbd_types::{CertLevel, DupeInfo, Job, JobKind, JobTotals, ServerDef, ServerId, TlsMode};
 
     #[test]
     fn legacy_worker_without_disk_guard_capability_is_excluded() {
@@ -753,6 +777,93 @@ mod tests {
         assert!(worker_admits_new_work(&record));
         record.disk_low = true;
         assert!(!worker_admits_new_work(&record));
+    }
+
+    #[tokio::test]
+    async fn post_leases_share_the_provider_account_budget() {
+        let tmp = tempfile::tempdir().unwrap();
+        let layout = SharedLayout::new(tmp.path(), "leader").unwrap();
+        let provider = ServerDef {
+            id: ServerId(1),
+            name: "provider".into(),
+            host: "127.0.0.1".into(),
+            port: 119,
+            tls: TlsMode::None,
+            username: None,
+            password: None,
+            active: true,
+            tier: 0,
+            group: 0,
+            fill: false,
+            max_connections: 9,
+            pipeline_depth: 1,
+            retention_days: 0,
+            cert_verification: CertLevel::Strict,
+        };
+        let mut scarce = provider.clone();
+        scarce.id = ServerId(2);
+        scarce.name = "scarce".into();
+        scarce.max_connections = 1;
+        let engine = Engine::spawn(EngineConfig::single_node(
+            vec![provider.clone(), scarce.clone()],
+            layout.state_dir(),
+            tmp.path().join("dest"),
+            Tuning::default(),
+            None,
+        ))
+        .await
+        .unwrap();
+        let (_view_tx, view) = watch::channel(LeaderView {
+            record: Some(LeaderRecord {
+                epoch: 1,
+                node: "leader".into(),
+                api_url: "http://leader.invalid".into(),
+                seq: 1,
+            }),
+            is_me: true,
+        });
+        let cfg = ClusterConfig {
+            node_name: "leader".into(),
+            shared_dir: tmp.path().to_path_buf(),
+            advertise_url: "http://leader.invalid".into(),
+            secret: "secret".into(),
+            coordinator: true,
+            priority: 0,
+            download: true,
+            max_download_jobs: 1,
+            post_process: true,
+            pp_slots: 1,
+            lease_interval: std::time::Duration::from_secs(1),
+            takeover_after: std::time::Duration::from_secs(2),
+            worker_ttl: std::time::Duration::from_secs(3),
+            disk_guard_roots: Vec::new(),
+        };
+        let shared = LeaderShared::new(engine.clone(), layout, cfg, vec![provider, scarce], view);
+        for (lease, node) in [("pp-a", "worker-a"), ("pp-b", "worker-b")] {
+            shared.leases.lock().unwrap().insert(
+                lease.into(),
+                LeaseInfo {
+                    job: JobId(if node == "worker-a" { 1 } else { 2 }),
+                    node: node.into(),
+                    kind: LeaseKind::Post,
+                    last_hb: Instant::now(),
+                },
+            );
+        }
+
+        assert_eq!(shared.budget_nodes().len(), 3);
+        let shares: Vec<_> = ["leader", "worker-a", "worker-b"]
+            .iter()
+            .map(|node| shared.budgets_for_node(node))
+            .collect();
+        assert_eq!(shares.iter().map(|share| share["provider"]).sum::<u16>(), 9);
+        assert_eq!(shares.iter().map(|share| share["scarce"]).sum::<u16>(), 1);
+        assert_eq!(
+            shares.iter().filter(|share| share["scarce"] == 0).count(),
+            2,
+            "a one-connection account cannot issue one connection per executor"
+        );
+        engine.shutdown().await;
     }
 
     #[tokio::test]

@@ -170,7 +170,8 @@ pub(crate) enum QueueCommand {
         node: Option<String>,
         reply: oneshot::Sender<bool>,
     },
-    /// Overlay remote progress counters onto a delegated job's summary.
+    /// Overlay remote progress and post-processing stages onto a delegated
+    /// job's summary without changing the authority's durable control state.
     MirrorProgress { job: JobId, stats: MirrorStats },
     /// Union-fold the job's shared journal files into local state (reclaim
     /// after a worker died, or adoption after taking office).
@@ -295,13 +296,22 @@ impl JobRateMeter {
     }
 }
 
-/// Remote progress counters mirrored into a delegated job's summary.
-#[derive(Debug, Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
+/// Remote progress mirrored into a delegated job's summary. `stages` is
+/// presentation/observability state only: the authority keeps its durable
+/// `Completed` status while a remote PP lease runs, so lease adoption and
+/// scheduling continue to reason from local control state.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct MirrorStats {
     pub done_articles: u32,
     pub failed_articles: u32,
     pub downloaded_bytes: u64,
     pub health: u16,
+    /// `None` is a rolling-upgrade worker that predates exact remaining-byte
+    /// mirroring; the authority falls back to its legacy estimate.
+    #[serde(default)]
+    pub remaining_bytes: Option<u64>,
+    #[serde(default)]
+    pub stages: Vec<StageSpan>,
 }
 
 /// A granted segment lease: everything a connection task needs.
@@ -403,6 +413,10 @@ pub(crate) struct Owner {
     /// Jobs executing on another node (job → node name).
     delegated: HashMap<JobId, String>,
     mirror: HashMap<JobId, MirrorStats>,
+    /// Explicit delayed-PAR download authorization. Presence marks a job as
+    /// a post-processing recovery job; only the listed files may receive
+    /// leases, even if a user resumes another file while verification waits.
+    post_fetch_files: HashMap<JobId, HashSet<FileId>>,
     /// Per-job download-rate EMA, fed from downloaded-byte deltas at
     /// snapshot time (job id → meter).
     job_rates: HashMap<u32, JobRateMeter>,
@@ -465,6 +479,9 @@ pub(crate) struct Owner {
 
     servers: Arc<Vec<ServerDef>>,
     tuning: Tuning,
+    /// Ordinary queue downloads are disabled on cluster PP-only nodes. The
+    /// explicit `post_fetch_files` lane remains available there.
+    download_enabled: bool,
     dest_dir: PathBuf,
 
     engine_tx: mpsc::Sender<EngineMsg>,
@@ -529,6 +546,7 @@ impl Owner {
         dest_dir: PathBuf,
         servers: Arc<Vec<ServerDef>>,
         tuning: Tuning,
+        download_enabled: bool,
         persist: bool,
         journal_suffix: &str,
         persist_guard: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
@@ -626,6 +644,7 @@ impl Owner {
             write_failures: HashMap::new(),
             delegated: HashMap::new(),
             mirror: HashMap::new(),
+            post_fetch_files: HashMap::new(),
             job_rates: HashMap::new(),
             job_wire_ema: HashMap::new(),
             server_wire_ema: HashMap::new(),
@@ -646,6 +665,7 @@ impl Owner {
             limiter,
             servers,
             tuning,
+            download_enabled,
             dest_dir,
             engine_tx,
             tracker,
@@ -722,9 +742,11 @@ impl Owner {
     /// happens once per stale job — after which it is `Queued` and no
     /// longer a candidate.
     fn settle_download_labels(&mut self) {
-        let demoted = crate::queue::jobs_to_requeue(
+        let demoted = crate::queue::jobs_to_requeue_with_recovery(
             &self.state,
             &self.delegated,
+            &self.post_fetch_files,
+            self.download_enabled,
             self.quota_reached,
             unix_now(),
         );
@@ -1002,16 +1024,25 @@ impl Owner {
                 paused,
                 reply,
             } => {
-                let ok = match self.state.job_mut(job) {
-                    Some(j) => match j.files.iter_mut().find(|f| f.id == file) {
-                        Some(f) => {
-                            f.paused = paused;
-                            true
-                        }
+                // During delayed-PAR recovery, the verifier owns file
+                // eligibility. A generic FileResume must not smuggle an
+                // archive (or any other file) into the recovery lane while
+                // the job temporarily carries a download status.
+                let recovery_allows = self
+                    .post_fetch_files
+                    .get(&job)
+                    .is_none_or(|allowed| paused || allowed.contains(&file));
+                let ok = recovery_allows
+                    && match self.state.job_mut(job) {
+                        Some(j) => match j.files.iter_mut().find(|f| f.id == file) {
+                            Some(f) => {
+                                f.paused = paused;
+                                true
+                            }
+                            None => false,
+                        },
                         None => false,
-                    },
-                    None => false,
-                };
+                    };
                 if ok {
                     if let Some(j) = self.state.job_mut(job) {
                         recompute_job_totals(j);
@@ -1039,6 +1070,9 @@ impl Owner {
                 };
                 if ok {
                     self.writers.remove(&file);
+                    if let Some(allowed) = self.post_fetch_files.get_mut(&job) {
+                        allowed.remove(&file);
+                    }
                     self.dirty = true;
                     self.bump_epoch();
                     self.publish_now();
@@ -1185,7 +1219,8 @@ impl Owner {
                 let id = job.id;
                 let previous = self.state.job(id).cloned();
                 let previous_delegated = self.delegated.get(&id).cloned();
-                let previous_mirror = self.mirror.get(&id).copied();
+                let previous_mirror = self.mirror.get(&id).cloned();
+                let previous_post_fetch = self.post_fetch_files.get(&id).cloned();
                 let committed = previous.is_some() && self.import_job(*job, false, false);
                 if !committed {
                     // Atomic means memory and disk agree. A failed snapshot
@@ -1211,6 +1246,14 @@ impl Owner {
                             self.mirror.remove(&id);
                         }
                     }
+                    match previous_post_fetch {
+                        Some(files) => {
+                            self.post_fetch_files.insert(id, files);
+                        }
+                        None => {
+                            self.post_fetch_files.remove(&id);
+                        }
+                    }
                     self.publish_now();
                     self.bump_epoch();
                 }
@@ -1232,6 +1275,7 @@ impl Owner {
                         None => {
                             self.delegated.remove(&job);
                             self.mirror.remove(&job);
+                            self.post_fetch_files.remove(&job);
                         }
                     }
                     self.emit(Event::JobAssigned {
@@ -1372,6 +1416,7 @@ impl Owner {
                 }
                 self.delegated.clear();
                 self.mirror.clear();
+                self.post_fetch_files.clear();
                 self.publish_now();
                 self.bump_epoch();
                 let _ = reply.send(());
@@ -1415,6 +1460,7 @@ impl Owner {
         }
         self.delegated.remove(&job_id);
         self.mirror.remove(&job_id);
+        self.post_fetch_files.remove(&job_id);
 
         if fold_journals {
             self.fold_job_journals(job_id);
@@ -1449,6 +1495,7 @@ impl Owner {
         self.attempts.retain(|r, _| r.job != job_id);
         self.delegated.remove(&job_id);
         self.mirror.remove(&job_id);
+        self.post_fetch_files.remove(&job_id);
         self.publish_now();
         self.bump_epoch();
         true
@@ -1591,6 +1638,8 @@ impl Owner {
                 attempts: &mut self.attempts,
                 is_blocked: &is_blocked,
                 delegated: &self.delegated,
+                post_fetch_files: &self.post_fetch_files,
+                regular_downloads: self.download_enabled,
                 article_retries: self.tuning.article_retries,
                 now_unix: unix_now(),
                 propagation_delay_secs: self.tuning.propagation_delay.as_secs() as i64,
@@ -2120,6 +2169,7 @@ impl Owner {
         let file_ids: Vec<FileId> = job.files.iter().map(|f| f.id).collect();
         tracing::info!(job = job_id.0, %name, ?status, health = health.0, "job finished");
         self.attempts.retain(|r, _| r.job != job_id);
+        self.post_fetch_files.remove(&job_id);
         for fid in &file_ids {
             self.writers.remove(fid);
             self.file_sizes.remove(fid);
@@ -2250,11 +2300,13 @@ impl Owner {
         };
         let estimated = priced.iter().any(|c| c.estimated);
         let mut freed = 0u32;
+        let mut authorized = HashSet::new();
         for c in &priced {
             if candidates.contains(&c.id) {
                 if let Some(f) = job.files.iter_mut().find(|f| f.id == c.id) {
                     f.paused = false;
                     freed += c.blocks;
+                    authorized.insert(c.id);
                 }
             }
         }
@@ -2262,6 +2314,7 @@ impl Owner {
             if let Some(f) = job.files.iter_mut().find(|f| f.id == id) {
                 f.paused = false;
                 freed = freed.max(1);
+                authorized.insert(id);
             }
         }
         if freed == 0 {
@@ -2292,6 +2345,10 @@ impl Owner {
                 job.status = JobStatus::Queued;
             }
             recompute_job_totals(job);
+            self.post_fetch_files
+                .entry(job_id)
+                .or_default()
+                .extend(authorized);
             tracing::info!(job = job_id.0, freed, "delayed par files unpaused");
             self.dirty = true;
             self.bump_epoch();
@@ -2314,6 +2371,7 @@ impl Owner {
         self.attempts.retain(|r, _| r.job != job_id);
         self.delegated.remove(&job_id);
         self.mirror.remove(&job_id);
+        self.post_fetch_files.remove(&job_id);
         if self.persist {
             // A delete whose journal removal AND snapshot save both fail
             // is resurrected by the next restart's recovery. The save
@@ -2642,10 +2700,13 @@ impl Owner {
             .map(|j| {
                 let health = Health::calc(&j.totals);
                 let critical = Health::calc_critical(&j.totals, true);
+                let allowed_files = self.post_fetch_files.get(&j.id);
                 let remaining: u64 = j
                     .files
                     .iter()
-                    .filter(|f| !f.paused)
+                    .filter(|f| {
+                        !f.paused && allowed_files.is_none_or(|allowed| allowed.contains(&f.id))
+                    })
                     .flat_map(|f| &f.segments)
                     .filter(|s| {
                         matches!(s.state, SegmentState::Pending | SegmentState::Leased { .. })
@@ -2691,11 +2752,32 @@ impl Owner {
                     summary.done_articles = m.done_articles;
                     summary.failed_articles = m.failed_articles;
                     summary.downloaded_bytes = m.downloaded_bytes;
-                    summary.remaining_bytes = summary
-                        .size_bytes
-                        .saturating_sub(m.downloaded_bytes)
-                        .saturating_sub(summary.failed_bytes);
+                    summary.remaining_bytes = match m.remaining_bytes {
+                        Some(exact) => exact,
+                        None if matches!(
+                            summary.status,
+                            JobStatus::Queued | JobStatus::Downloading | JobStatus::Paused
+                        ) =>
+                        {
+                            summary
+                                .size_bytes
+                                .saturating_sub(m.downloaded_bytes)
+                                .saturating_sub(summary.failed_bytes)
+                        }
+                        // Old workers do not report exact remaining bytes.
+                        // During remote PP the authority's paused-aware zero
+                        // is more truthful than treating every delayed volume
+                        // as outstanding download work.
+                        None => summary.remaining_bytes,
+                    };
                     summary.health = m.health;
+                    // Remote PP is intentionally an overlay, not a status
+                    // mutation. The open span gives native clients the live
+                    // stage while the authority remains Completed for lease
+                    // accounting and failover adoption.
+                    if !m.stages.is_empty() {
+                        summary.stages = m.stages.clone();
+                    }
                     if m.done_articles > 0 && summary.status == JobStatus::Queued {
                         summary.status = JobStatus::Downloading;
                     }
@@ -2741,6 +2823,11 @@ impl Owner {
             self.retry_counts.retain(|id, _| live.contains(id));
             jobs
         };
+        // Summaries include executor heartbeat overlays, so the queue-wide
+        // figure must be derived from them too. Reading authority state here
+        // would drop remote delayed-PAR bytes because those files are only
+        // unpaused on the PP executor.
+        let remaining_bytes = jobs.iter().map(|job| job.remaining_bytes).sum();
         let now_block = Instant::now();
         let mut blocked_servers: Vec<u32> = self
             .blocked
@@ -2823,7 +2910,7 @@ impl Owner {
             max_active_downloads: self.state.max_active_downloads,
             download_rate_bps: rate,
             session_downloaded_bytes: self.meter.total(),
-            remaining_bytes: self.state.remaining_bytes(),
+            remaining_bytes,
             jobs,
         };
         self.shared.store(Arc::new(snap));
@@ -3023,6 +3110,7 @@ mod tests {
             tmp.path().join("dest"),
             Arc::new(Vec::new()),
             tuning,
+            true,
             false,
             "guard-test",
             None,
@@ -3161,6 +3249,12 @@ mod tests {
                 failed_articles: 1,
                 downloaded_bytes: 40,
                 health: 800,
+                remaining_bytes: Some(60),
+                stages: vec![StageSpan {
+                    stage: PostStage::ParVerify,
+                    started_at_unix: 1_000,
+                    ms: None,
+                }],
             },
         );
         let mut replacement = original;
@@ -3178,6 +3272,41 @@ mod tests {
             Some("worker-a")
         );
         assert_eq!(owner.mirror[&JobId(3)].downloaded_bytes, 40);
+        assert_eq!(
+            owner.mirror[&JobId(3)].stages[0].stage,
+            PostStage::ParVerify
+        );
+    }
+
+    #[test]
+    fn legacy_remote_pp_remaining_fallback_stays_paused_aware() {
+        let (_tmp, mut owner, _epoch) = guard_test_owner(Tuning::default());
+        let mut job = pending_job(4);
+        job.status = JobStatus::Completed;
+        job.files[0].paused = true;
+        recompute_job_totals(&mut job);
+        owner.state.jobs.push(job);
+        owner.delegated.insert(JobId(4), "old-worker".into());
+        owner.mirror.insert(
+            JobId(4),
+            MirrorStats {
+                done_articles: 1,
+                failed_articles: 0,
+                downloaded_bytes: 0,
+                health: 999,
+                remaining_bytes: None,
+                stages: vec![StageSpan {
+                    stage: PostStage::ParVerify,
+                    started_at_unix: 1_000,
+                    ms: None,
+                }],
+            },
+        );
+
+        owner.publish_now();
+        let snapshot = owner.shared.load();
+        assert_eq!(snapshot.jobs[0].remaining_bytes, 0);
+        assert_eq!(snapshot.remaining_bytes, 0);
     }
 
     /// The monotonic figure the post manager measured is what lands on the
@@ -3245,6 +3374,120 @@ mod tests {
         let mut j = bare_job();
         close_span(&mut j, Some(5), 1_000);
         assert!(j.stages.is_empty());
+    }
+
+    /// Delayed PAR fetching temporarily returns the download half of the job
+    /// to Queued/Completed, but verification keeps running in parallel. Only
+    /// the verifier-selected PAR may use that lane; generic FileResume and a
+    /// PP-only node cannot broaden it to ordinary files.
+    #[test]
+    fn delayed_par_download_keeps_the_open_post_span() {
+        let (_tmp, mut owner, _epoch) = guard_test_owner(Tuning::default());
+        let mut job = pending_job(402);
+        job.status = JobStatus::Post {
+            stage: PostStage::ParVerify,
+        };
+        job.stages.push(StageSpan {
+            stage: PostStage::ParVerify,
+            started_at_unix: 1_000,
+            ms: None,
+        });
+        job.files[0].filename = "release.vol00+01.par2".into();
+        job.files[0].is_par2 = true;
+        job.files[0].paused = true;
+        let recovery_file = job.files[0].id;
+        let mut unrelated = job.files[0].clone();
+        unrelated.id = FileId(4021);
+        unrelated.filename = "release.part001.rar".into();
+        unrelated.is_par2 = false;
+        unrelated.paused = true;
+        job.files.push(unrelated);
+        recompute_job_totals(&mut job);
+        owner.state.jobs.push(job);
+
+        assert_eq!(owner.unpause_par_blocks(JobId(402), 1, None), 1);
+        assert_eq!(
+            owner.state.job(JobId(402)).unwrap().status,
+            JobStatus::Queued
+        );
+        assert!(owner.state.job(JobId(402)).unwrap().stages[0].ms.is_none());
+        assert_eq!(
+            owner.post_fetch_files[&JobId(402)],
+            HashSet::from([recovery_file])
+        );
+
+        let (reply, mut result) = oneshot::channel();
+        owner.on_command(QueueCommand::SetFilePaused {
+            job: JobId(402),
+            file: FileId(4021),
+            paused: false,
+            reply,
+        });
+        assert!(
+            !result.try_recv().unwrap(),
+            "FileResume is not recovery authority"
+        );
+
+        // Even if an unrelated file is already unpaused in imported/stale
+        // state, selector enforcement still admits only the explicit PAR.
+        owner.state.job_mut(JobId(402)).unwrap().files[1].paused = false;
+        owner.delegated.insert(JobId(402), "this-node".into());
+        owner.download_enabled = false;
+        let servers = vec![ServerDef {
+            id: ServerId(1),
+            name: "provider".into(),
+            host: "127.0.0.1".into(),
+            port: 119,
+            tls: nzbd_types::TlsMode::None,
+            username: None,
+            password: None,
+            active: true,
+            tier: 0,
+            group: 0,
+            fill: false,
+            max_connections: 1,
+            pipeline_depth: 1,
+            retention_days: 0,
+            cert_verification: nzbd_types::CertLevel::Strict,
+        }];
+        let ladder = Ladder::new(&servers);
+        let not_blocked = |_: ServerId| false;
+        let mut ctx = SelectionCtx {
+            ladder: &ladder,
+            attempts: &mut owner.attempts,
+            is_blocked: &not_blocked,
+            delegated: &owner.delegated,
+            post_fetch_files: &owner.post_fetch_files,
+            regular_downloads: owner.download_enabled,
+            article_retries: 3,
+            now_unix: 1_800_000_000,
+            propagation_delay_secs: 0,
+            soft_hold: false,
+            rotate: 0,
+        };
+        let selected = next_for_server(&owner.state, &servers[0], &mut ctx)
+            .lease
+            .unwrap();
+        assert_eq!(selected.file, recovery_file);
+        owner.delegated.remove(&JobId(402));
+
+        let job = owner.state.job_mut(JobId(402)).unwrap();
+        job.files[1].paused = true;
+        job.files[0].segments[0].state = SegmentState::Done {
+            offset: 0,
+            len: 100,
+            crc: 0,
+        };
+        job.files[0].finalized = true;
+        recompute_job_totals(job);
+        owner.check_job_complete(JobId(402));
+        let job = owner.state.job(JobId(402)).unwrap();
+        assert_eq!(job.status, JobStatus::Completed);
+        assert!(!owner.post_fetch_files.contains_key(&JobId(402)));
+        assert!(
+            job.stages[0].ms.is_none(),
+            "the post manager, not delayed download completion, closes verification"
+        );
     }
 
     #[test]

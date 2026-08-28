@@ -8,7 +8,7 @@ use nzbd_engine::{
 use nzbd_nserv::{build_post, prng_bytes, Behavior, GeneratedPost, Nserv, NservBuilder};
 use nzbd_types::{
     CertLevel, FileEntry, FileId, Job, JobId, JobKind, JobStatus, PostStage, Segment, SegmentState,
-    ServerDef, ServerId, TlsMode,
+    ServerDef, ServerId, StageSpan, TlsMode,
 };
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -465,6 +465,12 @@ async fn cluster_commands_normalize_delegate_retain_and_fence_jobs() {
             failed_articles: 2,
             downloaded_bytes: 77,
             health: 750,
+            remaining_bytes: Some(23),
+            stages: vec![StageSpan {
+                stage: PostStage::ParVerify,
+                started_at_unix: 1_000,
+                ms: None,
+            }],
         },
     );
     // A round trip behind the fire-and-forget update is a deterministic
@@ -475,7 +481,17 @@ async fn cluster_commands_normalize_delegate_retain_and_fence_jobs() {
     assert_eq!(summary.done_articles, 7);
     assert_eq!(summary.failed_articles, 2);
     assert_eq!(summary.downloaded_bytes, 77);
+    assert_eq!(summary.remaining_bytes, 23);
     assert_eq!(summary.health, 750);
+    assert_eq!(engine.snapshot().remaining_bytes, 23);
+    assert_eq!(summary.stages.len(), 1);
+    assert_eq!(summary.stages[0].stage, PostStage::ParVerify);
+    assert!(summary.stages[0].ms.is_none());
+    assert_eq!(
+        summary.status,
+        JobStatus::Downloading,
+        "mirrored stages are observability only, not authority control state"
+    );
     assert!(engine.set_delegated(JobId(40), None).await.unwrap());
     assert!(!engine
         .set_delegated(JobId(999), Some("worker".into()))
