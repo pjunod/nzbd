@@ -1431,10 +1431,11 @@ const STAGE_LABEL = {
   rar_rename: "renaming", unpack: "extracting", cleanup: "cleaning up",
   move: "moving", post_unpack_rename: "renaming", script: "running scripts",
 };
-function statusName(st) {
+function statusName(st, stageOverride) {
+  const stage = stageOverride || (st && st.post ? st.post.stage : null);
+  if (stage) return STAGE_LABEL[stage] || ("post: " + stage);
   if (typeof st === "string") return st;
-  const stage = st && st.post ? st.post.stage : null;
-  return (stage && STAGE_LABEL[stage]) || ("post: " + (stage || "…"));
+  return "post: …";
 }
 
 /// What to SHOW for a status. `statusName` returns the wire-ish name
@@ -1443,9 +1444,23 @@ function statusName(st) {
 /// person: `post_queued` is a token, not a phrase, and it was reaching
 /// the screen verbatim.
 const STATUS_HUMAN = { post_queued: "waiting to post-process" };
-function statusLabel(st) {
-  const n = statusName(st);
+function statusLabel(st, stageOverride) {
+  const n = statusName(st, stageOverride);
   return STATUS_HUMAN[n] || n;
+}
+
+/// The active post-processing stage, including recovery from an inconsistent
+/// status/timeline pair. Delayed PAR downloads used to reset `Post { stage }`
+/// to Completed while leaving its open span intact; treating the open span as
+/// the durable activity fact keeps upgraded/restored jobs out of Waiting too.
+function currentPostStage(j) {
+  if (j && j.pp_done) return null;
+  const st = j && j.status;
+  if (st && typeof st === "object" && st.post && st.post.stage)
+    return st.post.stage;
+  const spans = (j && j.stages) || [];
+  const last = spans.length ? spans[spans.length - 1] : null;
+  return last && last.ms == null ? last.stage : null;
 }
 
 // ---- sections -----------------------------------------------------------
@@ -1499,8 +1514,9 @@ const ORDERED = new Set(SECTIONS.filter(s => s.ordered).map(s => s.key));
 
 function sectionOf(j) {
   const st = j.status;
-  if (typeof st !== "string")
-    return STAGE_SECTION[st && st.post ? st.post.stage : null] || "post_queued";
+  const stage = currentPostStage(j);
+  if (stage) return STAGE_SECTION[stage] || "post_queued";
+  if (typeof st !== "string") return "post_queued";
   if (st === "downloading") return "downloading";
   if (st === "fetching") return "fetching";
   if (st === "post_queued") return "post_queued";
@@ -1556,12 +1572,13 @@ function rowModel(j, ctx) {
   const total = j.size_bytes || 0;
   const done = Math.min(j.downloaded_bytes || 0, total);
   const pct = total ? Math.floor(done * 100 / total) : 0;
-  const st = statusName(j.status);
+  const postStage = currentPostStage(j);
+  const st = statusName(j.status, postStage);
   // Everything past the download: the stages proper, and the wait for a
   // post slot. `post_queued` is a plain string status, so testing only for
   // the nested `Post { stage }` shape misses it — and its bar is just as
   // finished, and just as misleading under its own heading.
-  const isPost = typeof j.status !== "string" || st === "post_queued";
+  const isPost = postStage != null || typeof j.status !== "string" || st === "post_queued";
   const cls = isPost ? "warn" : (STATUS_CLASS[st] || "dim");
   const paused = st === "paused";
   const dl = st === "downloading";
@@ -1972,22 +1989,28 @@ function pipelineModels(j, nowMs) {
 // skip the very work being recovered and could delete its source archives.
 function recoveryMax(j) {
   if (j.pp_done) return "";
-  if (j.status === "completed") return "all";
-  if (j.status === "post_queued") return "all";
-  const stage = j.status && typeof j.status === "object" && j.status.post
-    ? j.status.post.stage : "";
+  // The open stage remains useful observability during a delayed-PAR
+  // Queued/Downloading interlude, but the post manager deliberately rejects
+  // restart requests until the recovery download returns to Completed.
+  if (typeof j.status === "string"
+      && !["completed", "post_queued"].includes(j.status)) return "";
+  const stage = currentPostStage(j);
   if (["par_rename", "rar_rename"].includes(stage)) return "all";
   if (["par_verify", "par_repair"].includes(stage)) return "verify";
   if (stage === "unpack") return "unpack";
   if (["cleanup", "post_unpack_rename"].includes(stage)) return "cleanup";
   if (stage === "move") return "move";
   if (stage === "script") return "scripts";
+  if (j.status === "completed") return "all";
+  if (j.status === "post_queued") return "all";
   return "";
 }
 
 function detailModel(j, nowMs) {
-  const st = statusName(j.status);
-  const cls = typeof j.status !== "string" ? "warn" : (STATUS_CLASS[st] || "dim");
+  const postStage = currentPostStage(j);
+  const st = statusName(j.status, postStage);
+  const cls = postStage != null || typeof j.status !== "string"
+    ? "warn" : (STATUS_CLASS[st] || "dim");
   const files = store.jobFiles && store.jobFiles.job === j.id ? store.jobFiles.files : null;
   const logs = store.jobLogs && store.jobLogs.job === j.id ? store.jobLogs.entries : null;
   // A job's own params — a consumer's transfer id among them — are the
@@ -2000,7 +2023,7 @@ function detailModel(j, nowMs) {
   return {
     key: "__detail", kind: "detail", id: j.id, name: j.name, scope: "queue",
     pipe: pipelineModels(j, nowMs),
-    st: statusLabel(j.status).toUpperCase(), stCls: "st " + cls,
+    st: statusLabel(j.status, postStage).toUpperCase(), stCls: "st " + cls,
     articles: "articles " + j.done_articles + "/" + j.total_articles +
       (j.failed_articles ? " · " + j.failed_articles + " failed" : "") +
       (j.retried_articles ? " · " + j.retried_articles + " retried" : ""),
@@ -4408,7 +4431,7 @@ function pollPass() {
   // something is actually in a stage; an idle queue stays idle.
   setInterval(() => {
     if (activeTab !== "queue" || document.hidden) return;
-    if (store.jobs && store.jobs.some(j => typeof j.status !== "string"))
+    if (store.jobs && store.jobs.some(j => currentPostStage(j) != null))
       renderQueue();
   }, 1000);
   // Coming back to the tab: repaint now, not at the next timer — and give a
@@ -4430,7 +4453,7 @@ if (typeof __nzbd_test_enable !== "undefined") {
     rowModel, reconcileRows, applyRow, differ, KINDS, store,
     histModel, fileModel, statusModels, storageModels, queueModels, detailModel,
     statusName, statusLabel, healthColor, fmtBytes, fmtRate, fmtEta, fmtDur, ppSummary,
-    sectionOf, pipelineModels, stageElapsedMs, SECTIONS, ORDERED,
+    sectionOf, currentPostStage, pipelineModels, stageElapsedMs, SECTIONS, ORDERED,
     pending, satisfied, toast, connState, pollResult,
     connFromGaps, activeWire, applyTick, applyHb, pollPass,
     startStream, ensureStream,
