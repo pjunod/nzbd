@@ -120,11 +120,12 @@ export function jobStatusKey(status: JobStatus): string {
   return status.post?.stage ? `post:${status.post.stage}` : 'post';
 }
 
-export function jobStatusLabel(status: JobStatus): string {
+export function jobStatusLabel(status: JobStatus, ready = false): string {
   const key = jobStatusKey(status);
   if (key.startsWith('post:')) {
     return key.slice(5).replaceAll('_', ' ');
   }
+  if (key === 'completed') return ready ? 'ready' : 'download complete';
   return key.replaceAll('_', ' ');
 }
 

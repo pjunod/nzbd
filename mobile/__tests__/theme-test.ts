@@ -38,10 +38,44 @@ test('the native app ships the shared display catalogue', () => {
     'vhs',
     'paper',
     'tide',
+    'panoptic',
+    'redline',
+    'panovic',
+    'copper',
   ]);
 });
 
 test('midnight-only palettes ignore light appearance', () => {
   expect(resolveTheme('light', 'light', 'void').dark).toBe(true);
   expect(resolveTheme('system', 'light', 'vhs').dark).toBe(true);
+  expect(resolveTheme('light', 'light', 'panoptic').dark).toBe(true);
+  expect(resolveTheme('system', 'light', 'redline').dark).toBe(true);
+  expect(resolveTheme('light', 'light', 'panovic')).toMatchObject({
+    dark: true,
+    background: '#000000',
+    panel: '#181818',
+    panelAlt: '#242424',
+    border: 'rgba(255, 255, 255, 0.06)',
+    text: '#e8e6e1',
+    textMuted: '#9a9aa0',
+    accent: '#e8871e',
+    onAccent: '#150b00',
+    success: '#5fb582',
+    warning: '#d9a05b',
+    danger: '#ff7a66',
+  });
+  expect(resolveTheme('light', 'light', 'copper')).toMatchObject({
+    dark: true,
+    background: '#000000',
+    panel: '#181818',
+    panelAlt: '#242424',
+    border: 'rgba(255, 255, 255, 0.06)',
+    text: '#e8e6e1',
+    textMuted: '#9a9aa0',
+    accent: '#cf7643',
+    onAccent: '#160b06',
+    success: '#5fb582',
+    warning: '#d9a05b',
+    danger: '#ff7a66',
+  });
 });

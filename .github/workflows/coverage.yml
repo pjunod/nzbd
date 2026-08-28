@@ -22,7 +22,8 @@ permissions:
 jobs:
   coverage:
     name: cargo llvm-cov
-    runs-on: ubuntu-latest
+    # Keep the badge-branch write token on a disposable GitHub runner.
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable

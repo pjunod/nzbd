@@ -14,7 +14,7 @@ use nzbd_types::{
     DupeInfo, FileEntry, FileId, Health, Job, JobId, JobKind, JobStatus, Segment, SegmentState,
     ServerDef, ServerId, TorrentRecord, TorrentSource,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Debug)]
 pub struct QueueState {
@@ -1023,6 +1023,13 @@ pub struct SelectionCtx<'a> {
     pub is_blocked: &'a dyn Fn(ServerId) -> bool,
     /// Jobs executing on another node — invisible to local selection.
     pub delegated: &'a HashMap<JobId, String>,
+    /// Delayed-PAR recovery jobs and the exact files the verifier authorized.
+    /// Presence also permits a locally assigned PP job through delegation;
+    /// the authority copy never has this executor-local entry.
+    pub post_fetch_files: &'a HashMap<JobId, HashSet<FileId>>,
+    /// False on post-processing-only cluster nodes. Those nodes can serve
+    /// only jobs present in `post_fetch_files`.
+    pub regular_downloads: bool,
     pub article_retries: u8,
     pub now_unix: i64,
     pub propagation_delay_secs: i64,
@@ -1057,13 +1064,14 @@ pub fn next_for_server(
     let mut order: Vec<&Job> = state
         .jobs
         .iter()
-        .filter(|j| !ctx.delegated.contains_key(&j.id))
+        .filter(|j| !ctx.delegated.contains_key(&j.id) || ctx.post_fetch_files.contains_key(&j.id))
+        .filter(|j| ctx.regular_downloads || ctx.post_fetch_files.contains_key(&j.id))
         .filter(|j| job_schedulable(j, state.download_paused || ctx.soft_hold))
         // A job whose every remaining segment is already leased has no
         // work to hand out. Letting it hold an active slot would spend
         // the slot on nothing, and would stall the pipe at the tail of
         // every job — which is the one place nzbd has always overlapped.
-        .filter(|j| has_backend_work(j, ctx.now_unix))
+        .filter(|j| has_backend_work(j, ctx.now_unix, ctx.post_fetch_files.get(&j.id)))
         .collect();
     // Stable sort: equal priorities keep their queue-vec order, which is
     // user-controlled (move top/up/down/bottom) and persisted.
@@ -1086,8 +1094,12 @@ pub fn next_for_server(
     }
 
     for job in order {
+        let allowed_files = ctx.post_fetch_files.get(&job.id);
         for file in &job.files {
-            if file.paused || file.is_terminal() {
+            if file.paused
+                || file.is_terminal()
+                || allowed_files.is_some_and(|allowed| !allowed.contains(&file.id))
+            {
                 continue;
             }
             if ctx.propagation_delay_secs > 0 {
@@ -1134,7 +1146,7 @@ pub fn next_for_server(
 
 /// Does this job have at least one segment that could be handed out?
 /// Short-circuits on the first hit, so the common "yes" case is cheap.
-fn has_backend_work(job: &Job, now_unix: i64) -> bool {
+fn has_backend_work(job: &Job, now_unix: i64, allowed_files: Option<&HashSet<FileId>>) -> bool {
     match job.kind {
         JobKind::Torrent => job.torrent.as_ref().is_some_and(|torrent| {
             torrent_wants_download_slot(torrent, job.queued_at_unix, now_unix)
@@ -1142,6 +1154,7 @@ fn has_backend_work(job: &Job, now_unix: i64) -> bool {
         JobKind::Nzb | JobKind::Url => job.files.iter().any(|f| {
             !f.paused
                 && !f.is_terminal()
+                && allowed_files.is_none_or(|allowed| allowed.contains(&f.id))
                 && f.segments
                     .iter()
                     .any(|s| matches!(s.state, SegmentState::Pending))
@@ -1168,12 +1181,24 @@ pub fn active_set(
     soft_hold: bool,
     now_unix: i64,
 ) -> Vec<JobId> {
+    active_set_with_recovery(state, delegated, &HashMap::new(), true, soft_hold, now_unix)
+}
+
+pub(crate) fn active_set_with_recovery(
+    state: &QueueState,
+    delegated: &HashMap<JobId, String>,
+    post_fetch_files: &HashMap<JobId, HashSet<FileId>>,
+    regular_downloads: bool,
+    soft_hold: bool,
+    now_unix: i64,
+) -> Vec<JobId> {
     let mut order: Vec<&Job> = state
         .jobs
         .iter()
-        .filter(|j| !delegated.contains_key(&j.id))
+        .filter(|j| !delegated.contains_key(&j.id) || post_fetch_files.contains_key(&j.id))
+        .filter(|j| regular_downloads || post_fetch_files.contains_key(&j.id))
         .filter(|j| job_schedulable(j, state.download_paused || soft_hold))
-        .filter(|j| has_backend_work(j, now_unix))
+        .filter(|j| has_backend_work(j, now_unix, post_fetch_files.get(&j.id)))
         .collect();
     order.sort_by_key(|j| std::cmp::Reverse(j.priority));
     order.truncate(clamp_active_downloads(state.max_active_downloads) as usize);
@@ -1192,7 +1217,25 @@ pub fn jobs_to_requeue(
     soft_hold: bool,
     now_unix: i64,
 ) -> Vec<JobId> {
-    let active: Vec<JobId> = active_set(state, delegated, soft_hold, now_unix);
+    jobs_to_requeue_with_recovery(state, delegated, &HashMap::new(), true, soft_hold, now_unix)
+}
+
+pub(crate) fn jobs_to_requeue_with_recovery(
+    state: &QueueState,
+    delegated: &HashMap<JobId, String>,
+    post_fetch_files: &HashMap<JobId, HashSet<FileId>>,
+    regular_downloads: bool,
+    soft_hold: bool,
+    now_unix: i64,
+) -> Vec<JobId> {
+    let active: Vec<JobId> = active_set_with_recovery(
+        state,
+        delegated,
+        post_fetch_files,
+        regular_downloads,
+        soft_hold,
+        now_unix,
+    );
     state
         .jobs
         .iter()
@@ -1395,7 +1438,7 @@ pub fn job_to_nzb(job: &nzbd_types::Job) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nzbd_types::{CertLevel, TlsMode};
+    use nzbd_types::{CertLevel, PostStage, TlsMode};
 
     fn nzb_with(files: &[&str], title: Option<&str>) -> nzbd_nzb::ParsedNzb {
         let mut nzb = nzbd_nzb::ParsedNzb::default();
@@ -1762,6 +1805,7 @@ mod tests {
         let mut attempts = HashMap::new();
         let not_blocked = |_: ServerId| false;
         let no_delegation: HashMap<JobId, String> = HashMap::new();
+        let no_recovery: HashMap<JobId, HashSet<FileId>> = HashMap::new();
         let mut out = Vec::new();
         for i in 0..n {
             let mut ctx = SelectionCtx {
@@ -1769,6 +1813,8 @@ mod tests {
                 attempts: &mut attempts,
                 is_blocked: &not_blocked,
                 delegated: &no_delegation,
+                post_fetch_files: &no_recovery,
+                regular_downloads: true,
                 article_retries: 3,
                 now_unix: 1_800_000_000,
                 propagation_delay_secs: 0,
@@ -1999,6 +2045,30 @@ mod tests {
         assert_eq!(served, [a, b].into_iter().collect());
     }
 
+    /// A post-processing lease is storage work, not permission to open news
+    /// server connections. In particular, resuming a file while unpack/move
+    /// is active must not let the downloader mutate that directory under PP,
+    /// and a PP-only cluster worker must not bypass provider budgets.
+    #[test]
+    fn post_processing_status_never_opens_the_downloader() {
+        for stage in [PostStage::ParVerify, PostStage::Move] {
+            let mut q = QueueState::default();
+            let id = q.admit_nzb(
+                "post".into(),
+                &sample_nzb(&[("payload.bin", 2)]),
+                None,
+                0,
+                false,
+            );
+            q.job_mut(id).unwrap().status = JobStatus::Post { stage };
+            let none: HashMap<JobId, String> = HashMap::new();
+
+            assert!(active_set(&q, &none, false, 0).is_empty());
+            assert!(grant(&mut q, &[server(1, 0)], 1).is_empty());
+            assert_eq!(q.job(id).unwrap().status, JobStatus::Post { stage });
+        }
+    }
+
     /// `Downloading` is set on a job's first lease and was never once
     /// set back, so a job that caught a single segment during the
     /// spill-over at the tail of another stayed labelled `Downloading`
@@ -2058,11 +2128,14 @@ mod tests {
         let mut attempts = HashMap::new();
         let not_blocked = |_: ServerId| false;
         let no_delegation: HashMap<JobId, String> = HashMap::new();
+        let no_recovery: HashMap<JobId, HashSet<FileId>> = HashMap::new();
         let mut ctx = SelectionCtx {
             ladder: &ladder,
             attempts: &mut attempts,
             is_blocked: &not_blocked,
             delegated: &no_delegation,
+            post_fetch_files: &no_recovery,
+            regular_downloads: true,
             article_retries: 3,
             now_unix: 1_800_000_000,
             propagation_delay_secs: 0,
@@ -2081,6 +2154,8 @@ mod tests {
             attempts: &mut attempts,
             is_blocked: &not_blocked,
             delegated: &no_delegation,
+            post_fetch_files: &no_recovery,
+            regular_downloads: true,
             article_retries: 3,
             now_unix: 1_800_000_000,
             propagation_delay_secs: 0,
@@ -2097,6 +2172,8 @@ mod tests {
             attempts: &mut attempts,
             is_blocked: &not_blocked,
             delegated: &no_delegation,
+            post_fetch_files: &no_recovery,
+            regular_downloads: true,
             article_retries: 3,
             now_unix: 1_800_000_000,
             propagation_delay_secs: 0,
@@ -2123,6 +2200,7 @@ mod tests {
         let mut attempts = HashMap::new();
         let not_blocked = |_: ServerId| false;
         let no_delegation: HashMap<JobId, String> = HashMap::new();
+        let no_recovery: HashMap<JobId, HashSet<FileId>> = HashMap::new();
 
         // Tier-1 server gets nothing while tier 0 is viable.
         let mut ctx = SelectionCtx {
@@ -2130,6 +2208,8 @@ mod tests {
             attempts: &mut attempts,
             is_blocked: &not_blocked,
             delegated: &no_delegation,
+            post_fetch_files: &no_recovery,
+            regular_downloads: true,
             article_retries: 3,
             now_unix: 1_800_000_000,
             propagation_delay_secs: 0,
@@ -2145,6 +2225,8 @@ mod tests {
             attempts: &mut attempts,
             is_blocked: &not_blocked,
             delegated: &no_delegation,
+            post_fetch_files: &no_recovery,
+            regular_downloads: true,
             article_retries: 3,
             now_unix: 1_800_000_000,
             propagation_delay_secs: 0,

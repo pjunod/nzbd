@@ -208,6 +208,15 @@ progress update per job). **`job_finished` is deliberately ignored** — it
 fires when the download ends, before post-processing, and importing then would
 import an unrepaired, unextracted directory.
 
+For NZB and URL jobs, the queue's `status: "completed"` establishes only
+**article download complete**. The row keeps that status after post-processing,
+so the status alone never establishes payload readiness. `ready` is the
+authoritative boundary. A native consumer may import only after `ready: true`,
+using `final_dir` from `job_pp_finished` or the durable history row; a queue row
+does not carry an import path. Failed post-processing is terminal (`pp_done:
+true`) but never ready; its history row may still name a parked directory, which
+is evidence for recovery, not an importable payload.
+
 **Where you see it.**
 
 - **nzbd → History tab → client strip**: the chip reads `subscribed` (or

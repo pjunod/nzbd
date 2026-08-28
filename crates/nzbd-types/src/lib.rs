@@ -486,9 +486,10 @@ impl Job {
         self.priority >= PRIORITY_FORCE
     }
 
-    /// A protocol-neutral readiness fact for native consumers. Existing
-    /// Usenet readiness remains the durable post-processing stamp; torrents
-    /// become ready only after their selected payload passes piece checks.
+    /// A protocol-neutral successful-payload readiness fact for native
+    /// consumers. Usenet jobs become ready only after a successful durable
+    /// post-processing stamp; torrents become ready only after their selected
+    /// payload passes piece checks.
     pub fn ready_at_unix(&self) -> Option<i64> {
         self.torrent
             .as_ref()
@@ -498,7 +499,10 @@ impl Job {
     pub fn ready(&self) -> bool {
         match self.kind {
             JobKind::Torrent => self.ready_at_unix().is_some(),
-            JobKind::Nzb | JobKind::Url => self.params.iter().any(|(key, _)| key == PP_DONE_PARAM),
+            JobKind::Nzb | JobKind::Url => self
+                .params
+                .iter()
+                .any(|(key, value)| key == PP_DONE_PARAM && value == "SUCCESS"),
         }
     }
 }
@@ -600,5 +604,38 @@ mod tests {
         assert!(!job.force_priority());
         job.priority = PRIORITY_FORCE;
         assert!(job.force_priority());
+    }
+
+    #[test]
+    fn usenet_ready_requires_successful_post_processing() {
+        let mut job = Job {
+            id: JobId(1),
+            kind: JobKind::Nzb,
+            name: "x".into(),
+            dir_name: String::new(),
+            name_provisional: false,
+            queued_at_unix: 0,
+            original_name: String::new(),
+            category: None,
+            priority: 0,
+            dupe: DupeInfo::default(),
+            params: vec![],
+            files: vec![],
+            totals: JobTotals::default(),
+            status: JobStatus::Completed,
+            torrent: None,
+            stages: Vec::new(),
+        };
+        for failure in ["PAR_FAILURE", "UNPACK_FAILURE", "FAILURE/HEALTH"] {
+            job.params = vec![(PP_DONE_PARAM.into(), failure.into())];
+            assert!(!job.ready(), "{failure} is terminal, not ready");
+        }
+        job.params = vec![(PP_DONE_PARAM.into(), "SUCCESS_FAILURE".into())];
+        assert!(
+            !job.ready(),
+            "a success-prefixed corrupt stamp must fail closed"
+        );
+        job.params = vec![(PP_DONE_PARAM.into(), "SUCCESS".into())];
+        assert!(job.ready());
     }
 }

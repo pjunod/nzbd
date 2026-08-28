@@ -1,4 +1,4 @@
-import { JobStatus, JobSummary, PostStage } from './api/types';
+import { JobStatus, JobSummary, PostStage, StageSpan } from './api/types';
 
 export type QueueSectionKey =
   | 'downloading'
@@ -55,10 +55,23 @@ const POST_STAGE_SECTIONS: Record<PostStage, QueueSectionKey> = {
   script: 'scripting',
 };
 
-export function queueSectionKey(status: JobStatus): QueueSectionKey {
+export function currentPostStage(
+  status: JobStatus,
+  stages: readonly StageSpan[] = [],
+): PostStage | null {
   if (typeof status !== 'string') {
-    return POST_STAGE_SECTIONS[status.post.stage] ?? 'post_queued';
+    return status.post.stage;
   }
+  const last = stages.length ? stages[stages.length - 1] : undefined;
+  return last && last.ms == null ? last.stage : null;
+}
+
+export function queueSectionKey(
+  status: JobStatus,
+  stages: readonly StageSpan[] = [],
+): QueueSectionKey {
+  const stage = currentPostStage(status, stages);
+  if (stage) return POST_STAGE_SECTIONS[stage] ?? 'post_queued';
   if (status === 'downloading' || status === 'fetching' || status === 'post_queued') {
     return status;
   }
@@ -68,7 +81,7 @@ export function queueSectionKey(status: JobStatus): QueueSectionKey {
 export function sectionQueueJobs(jobs: readonly JobSummary[]): QueueJobSection[] {
   const grouped = new Map<QueueSectionKey, SectionedJob[]>();
   jobs.forEach((job, index) => {
-    const key = queueSectionKey(job.status);
+    const key = queueSectionKey(job.status, job.stages);
     const section = grouped.get(key);
     const entry = { job, index };
     if (section) section.push(entry);

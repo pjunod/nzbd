@@ -229,10 +229,22 @@ const models = (jobs) => jobs.map((j, i) => T.rowModel(j, { idx: i, count: jobs.
   eq(d.appearance, "auto", "appearance follows the system by default");
   ok(T.DISPLAY_LAYOUTS.includes("plex") && T.DISPLAY_LAYOUTS.includes("theater"),
     "both opt-in layouts are registered");
-  ok(T.DISPLAY_PALETTES.includes("terminal") && T.DISPLAY_PALETTES.includes("tide"),
+  ok(T.DISPLAY_PALETTES.includes("terminal") && T.DISPLAY_PALETTES.includes("tide") &&
+    T.DISPLAY_PALETTES.includes("panoptic") && T.DISPLAY_PALETTES.includes("redline") &&
+    T.DISPLAY_PALETTES.includes("panovic") && T.DISPLAY_PALETTES.includes("copper"),
     "the palette catalogue is registered");
   eq(T.displayMode("void", "light"), "dark", "Void stays midnight-only");
   eq(T.displayMode("vhs", "light"), "dark", "VHS stays midnight-only");
+  eq(T.displayMode("panoptic", "light"), "dark", "Panoptic stays midnight-only");
+  eq(T.displayMode("redline", "light"), "dark", "Redline stays midnight-only");
+  eq(T.displayMode("panovic", "light"), "dark", "Burnt Pumpkin stays midnight-only");
+  eq(T.displayMode("copper", "light"), "dark", "Copper stays midnight-only");
+  ok(/:root\[data-palette="panovic"\]\s*\{[^}]*--bg:#000000;[^}]*--accent:#e8871e;--accent2:#81420b;[^}]*--on-accent:#150b00;/s.test(html),
+    "Burnt Pumpkin keeps the shared true-black cockpit palette");
+  ok(/:root\[data-palette="copper"\]\s*\{[^}]*--bg:#000000;[^}]*--accent:#cf7643;--accent2:#70402b;[^}]*--on-accent:#160b06;/s.test(html),
+    "Copper keeps the shared true-black cockpit palette");
+  ok(!/:root:is\(\[data-palette="panoptic"\],\[data-palette="redline"\],\[data-palette="panovic"\]\)/.test(html),
+    "Burnt Pumpkin and Copper receive every cockpit-family rule");
 }
 
 // --- 1. rowModel is pure: no DOM, strings and flags only -------------------
@@ -1360,6 +1372,37 @@ const models = (jobs) => jobs.map((j, i) => T.rowModel(j, { idx: i, count: jobs.
     eq(T.sectionOf(post("par_rename")), "renaming", "");
     eq(T.sectionOf(post("rar_rename")), "renaming",
       "both rename stages read as one thing to a person");
+    // Delayed PAR fetching used to overwrite the wire status with
+    // `completed` while leaving the verify span open. The timeline is the
+    // durable activity fact, so an upgraded/restored row must still live in
+    // post-processing and say what it is doing.
+    const delayedParRace = job(402, {
+      status: "completed",
+      stages: [
+        { stage: "par_rename", started_at_unix: 1000, ms: 2000 },
+        { stage: "par_verify", started_at_unix: 1002 },
+      ],
+    });
+    eq(T.currentPostStage(delayedParRace), "par_verify",
+      "an open timeline span recovers the active post stage");
+    eq(T.sectionOf(delayedParRace), "verifying",
+      "an active verify never falls into Waiting");
+    const delayedParModel = T.rowModel(delayedParRace,
+      { section: T.sectionOf(delayedParRace), nowMs: 1_542_000, movable: false });
+    eq(delayedParModel.st, "CHECKING INTEGRITY",
+      "the recovered row names its actual work");
+    eq(delayedParModel.barHidden, true,
+      "the recovered post-processing row does not show download progress");
+    eq(T.detailModel(delayedParRace, 1_542_000).st, "CHECKING INTEGRITY",
+      "the row and its detail panel agree on the active stage");
+    const fetchingDelayedPar = job(403, {
+      status: "downloading",
+      stages: [{ stage: "par_verify", started_at_unix: 1002 }],
+    });
+    eq(T.sectionOf(fetchingDelayedPar), "verifying",
+      "the download interlude remains in the post-processing section");
+    eq(T.detailModel(fetchingDelayedPar, 1_542_000).recoverHidden, true,
+      "recovery controls stay hidden while the backend rejects restarts");
     // An unknown stage from a newer daemon must land in a visible section
     // rather than vanish between the buckets.
     eq(T.sectionOf(post("teleporting")), "post_queued",
@@ -1447,6 +1490,14 @@ const models = (jobs) => jobs.map((j, i) => T.rowModel(j, { idx: i, count: jobs.
     eq(pq.st, "WAITING TO POST-PROCESS", "the pill says it in words");
     eq(pq.barHidden, true, "its download is finished, so its bar says nothing");
     eq(T.statusLabel("post_queued"), "waiting to post-process", "");
+    eq(T.statusLabel("completed", null, false), "download complete",
+      "completed names the download phase, not payload readiness");
+    eq(T.statusLabel("completed", null, true), "ready",
+      "durable post-processing completion is labeled as readiness");
+    eq(T.rowModel(job(8, { status: "completed", ready: false }), {}).st,
+      "DOWNLOAD COMPLETE", "the queue row names which phase completed");
+    eq(T.rowModel(job(9, { status: "completed", ready: true }), {}).st,
+      "READY", "a ready queue row does not understate final completion");
     eq(T.statusName("post_queued"), "post_queued",
       "…while the wire name is unchanged, because pending-ops compare on it");
     eq(T.statusLabel({ post: { stage: "par_repair" } }), "repairing", "");

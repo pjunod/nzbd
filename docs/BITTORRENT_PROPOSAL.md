@@ -9,6 +9,7 @@ complete single-node M2–M5 before separately approving M6 ·
 **Written:** 2026-08-05 · **Revised:** 2026-08-22 ·
 **Verified against:** rqbit v8.1.1 (`00b97485160ff5b5aa2b379ea0815d568ec665f0`) ·
 **Cluster reuse baseline:** plurx `7c781e5f5e28ac8114bacb1919a463a6a18e2680` ·
+**Post-baseline cluster audit:** plurx `64e96aa71f58ebb3ec2c7b71d5c36a537b50aba6` ·
 **Scope:** architecture, contracts, milestones, and review questions; no
 production BitTorrent path is authorized before the gates below pass
 
@@ -231,7 +232,20 @@ compatibility boundary.
 | Membership and failover operations | `crates/plurx-core/src/cluster/membership.rs` and `crates/plurx-cluster-check` on the pinned baseline | Reuse identity, tombstone, degraded-quorum, and real-process test contracts. Do not copy the implementation: it depends on plurx's patched Hiqlite/WAL stack. |
 | Architecture and validation matrix | `docs/CLUSTER-MEDIA-POOL-PLAN.md` on the pinned baseline | Use its facts-versus-bytes split, transactional fence rules, and failure matrix as the starting review checklist. |
 
-Only merged baseline code counts as prior art. In particular,
+Later merged plurx work hardens that baseline without changing nzbd's
+dependency boundary. The audit was performed against the accepted main tree at
+`64e96aa71f58ebb3ec2c7b71d5c36a537b50aba6`; the implementation commits below
+are subordinate anchors, not a replacement baseline. They are prior art for
+the M6 ADR, not an accepted nzbd topology or permission to implement M6 early:
+
+| Concern | Accepted plurx tree and implementation anchors | Additional M6 reuse rule |
+|---|---|---|
+| Removal and publication fencing | failover-hardening merge `0662f3768694e0bb633c4159c592702d72d328cc`; `c764d6f54320547e57d9a4e3ab8301cf1ce24b18`, `5b8019f50b5ec30784d4ca7d1cbb9854db13f9df`; harness correction `2f77fcfad54ae5e54fa24857c17b85b0ed154a05` | If the ADR allows dynamic removal, make removal intent durable before changing membership, stop new authority, invalidate the removed owner's existing tokens, and leave ambiguous outcomes fenced; otherwise reject dynamic removal for torrent-capable clusters. Check both the live lease and member eligibility in the transaction for every owner-derived authoritative mutation. The harness correction is evidence maintenance, not a new production guarantee. |
+| Topology evidence | topology-evidence merge `bec1f803c36d4cd31b7f589d67f5412cf8c7c154`; `8596336d0bf66cf432dcafc071c66e817823c031` | Make the ADR name a schema-validated, reproducible semantic workload for the chosen topology. Named-runner resource evidence is required only before making quantitative capacity claims or selecting a default because of them. |
+| Passive cluster observation | passive-metrics merge `6c187ff8bb694513fb8344bd308c547dedefe775`; `3be87ae6ed4eeff908577ba522252d5cbed19feb`, `a209533368acb2fe1a7a5c0fe4b861cfadc61952` | Metrics scrapes read a passive snapshot and perform no coordination-store work; a separate bounded background sampler may refresh that snapshot. |
+| Quorum-backed follower freshness | quorum-watermark merge `64e96aa71f58ebb3ec2c7b71d5c36a537b50aba6`; `9aad04c45711abc00487df0fe997d31411148b3b` | Only if the ADR admits bounded follower reads, require a term/leader/commit proof with a local monotonic deadline and applied-index budget. An invalid proof falls back to authority or refuses the read; it never proves payload validity or torrent readiness. |
+
+Only merged plurx code in the pinned trees counts as prior art. In particular,
 `origin/agent/builder/issue-417-cluster-activity-transport` is unmerged and is
 not an accepted dependency or design premise. Plurx also does not yet prove
 every torrent-session takeover or remote-placement behavior; those remain
@@ -1881,6 +1895,9 @@ union. It is not sufficient for a stateful torrent session. The ADR must choose
 a coordination store that can perform a linearizable fence comparison in the
 same transaction as publication, and must state its quorum-loss and rollback
 behavior. It must also decide which bytes are shared, replicated, or local.
+Whenever that store cannot establish linearizable authority, acquire, renew,
+and every owner-derived authoritative mutation fail closed.
+Raft majority-loss behavior is required only if the ADR chooses Raft or Hiqlite.
 
 Add `LeaseKind::Torrent`, distinct from NNTP `Download` and `Post`:
 
@@ -1921,19 +1938,54 @@ per-info-hash tombstone, then define forget/re-add behavior, safe retirement or
 retention, counter exhaustion, migration, and rollback. A retired row may be
 garbage-collected only if its resource identity can never be issued again.
 
+The ADR must decide whether torrent-capable clusters support dynamic member
+removal. If they do not, remove and leave requests are refused while torrent
+capability is enabled, without a partial state change. If they do, removal is a
+separate authority transition: durable intent first freezes new work and
+renewal for that identity and invalidates its live tokens; owned work is then
+drained, transferred, or the removal is refused; only then may membership
+change and the final member tombstone be materialized. A proven rejection may
+roll the intent back. A timeout, lost response, crash, or otherwise ambiguous
+commit outcome stays fenced until the new configuration is proved.
+Member-removal tombstones, retained lease-resource rows used for ABA
+prevention, and stale resume-generation retirement use separate keys and
+lifecycles.
+
 One node holds the torrent lease and runs its peer session. Durable queue
 facts, the live lease, and the pointer to the current resume generation live
 in the linearizable coordination store. Payload and checkpoint bytes may live
 on a shared volume or a named node, as selected by the ADR, but they are not a
 transactional database mutation. Each owner writes a fence-scoped generation;
-only an exact-fence transaction can publish that generation as current. A
-stale generation may remain on disk for recovery or cleanup, but must never
-become authoritative. The adapter cancels and self-fences no later than its
-local lease deadline when renewal fails or cannot reach quorum.
+only a transaction that checks the exact live fence and current member
+eligibility can publish that generation as current. The same rule covers
+readiness, durable progress and upload accounting, seed-policy transitions,
+and every other authoritative fact derived from owner work; a prior eligibility
+or lease check is not fencing. A stale generation may remain on disk for
+recovery or cleanup, but must never become authoritative. The adapter cancels
+and self-fences no later than its local lease deadline when renewal fails or
+cannot reach the selected store's authority.
+
+A successor may adopt reported progress or readiness only after proving that
+the exact published resume/payload generation is accessible and validating it
+under the new fence. Otherwise it starts a clean isolated generation with zero
+inherited readiness or progress and re-verifies or redownloads the bytes. A
+replicated path string, heartbeat, or stale local file is not proof of access.
 
 The worker heartbeat reports protocol-neutral bytes plus torrent upload and
 peer facts. Provider connection budgets do not apply; torrent peer and upload
 caps do. A heartbeat is observability, not write authority.
+
+The ADR also names the schema and acceptance use of a reproducible topology
+artifact. Semantic CI proves cardinality, quorum, workload identity, durable
+results, and failure behavior. Named-runner CPU, memory, storage, network, and
+latency samples are required only for quantitative comparisons or a
+performance-based default. If the chosen design later admits bounded follower
+reads, freshness comes from a quorum-backed term/leader/commit watermark with a
+local monotonic deadline and applied-index limit. Missing or expired proof
+falls back to authority or refuses the bounded read according to the caller's
+contract. That proof says nothing about payload readability, piece validity,
+or job readiness. Metrics scrapes remain store-free; bounded background
+sampling may perform the coordination work.
 
 ### 12.3 Failure sequence
 
@@ -1975,16 +2027,35 @@ Use real processes and a controllable coordination store. The gate must cover:
 
 - delayed and reordered renew/release calls, lost acknowledgements, repeated
   acquire, and ABA attempts against a durable row whose fence never resets;
-- two takeover candidates, leader loss, worker loss, majority loss, and
-  recovery without granting authority while the store is non-linearizable;
+- two takeover candidates, leader loss, worker loss, loss of linearizable
+  authority, and recovery without granting authority while the store cannot
+  prove a current writer; include majority loss when Raft or Hiqlite is chosen;
+- if dynamic removal is supported, removal intent before membership change;
+  crashes at every removal boundary; concurrent admission and removal; late
+  work; a restarted old identity; heartbeats that try to clear a tombstone;
+  rollback after a proven rejection; and timeout or unknown outcomes that
+  remain fenced; otherwise, stable refusal of remove and leave requests for a
+  torrent-capable cluster with no partial state change;
+- an exact published resume/payload generation that can be adopted only by a
+  survivor that proves access and validates it, plus an unavailable generation
+  that restarts clean with zero inherited readiness/progress and re-verifies or
+  redownloads instead of trusting stale state;
+- independent retention and cleanup tests for the member-removal tombstone,
+  lease-resource row, and stale resume generation so one lifecycle cannot
+  reopen another;
 - `SIGSTOP` beyond TTL followed by `SIGCONT` during metadata fetch, piece
   download, hash check, readiness publication, and seeding, proving the stale
   process cannot mutate the current namespace or publish a current pointer;
   any late write must stay in a permanently unreachable stale generation;
 - stale resume generations, stale payload writes, peer termination, monotone
-  upload accounting, and no false-ready event;
+  upload accounting, fenced seed-policy transitions, and no false-ready event;
 - mixed-version startup, migration rollback, and parity of data before and
-  after enabling the new coordination topology.
+  after enabling the new coordination topology;
+- a schema-validated topology artifact for the chosen design, with
+  named-runner resource evidence before any quantitative topology claim; and
+- if bounded follower reads are enabled, invalid, expired, wrong-term, and
+  lagged watermark cases that fall back to authority or refuse, plus a metrics
+  scrape test that performs no coordination-store work.
 
 Every case must converge to one live session and correct payload. Until the
 matrix is green, cluster+torrent stays a config error. A unit test of a lease
@@ -2390,18 +2461,24 @@ before implementation children are created.
 
 **Work:** port the pinned plurx lease and publication contract behind nzbd's
 store interfaces · add the lease kind and durable monotone fence · add
-generation-scoped resume/payload writes plus same-transaction pointer
-publication · add bounded self-fencing on renewal loss · expose heartbeat facts
-and leader proxying · run the real-process failover harness · remove the config
-compatibility error only after the complete gate passes.
+generation-scoped resume/payload writes plus same-transaction fencing of every
+owner-derived authoritative mutation · add the durable removal-intent sequence
+and distinct member/resource/generation retirement rules, or reject dynamic
+removal for torrent-capable clusters · add bounded self-fencing on renewal loss
+· expose passive heartbeat facts and leader proxying · emit the
+schema-validated topology artifact · run the real-process failover harness ·
+remove the config compatibility error only after the complete gate passes.
 
 **Acceptance:** the §12.4 kill matrix converges with one session and correct
-bytes; delayed same-token operations, acknowledgement loss, ABA, majority loss,
-two-candidate takeover, stale generations, mixed versions, and rollback are
-covered; and enabling torrent+cluster no longer weakens any existing
-single-node or Usenet cluster invariant. In particular, `SIGCONT` after a TTL
-cannot let the stale owner mutate the authoritative namespace or publish a
-current generation; any late bytes remain permanently unreachable.
+bytes; delayed same-token operations, acknowledgement loss, ABA, loss of
+linearizable authority, two-candidate takeover, ambiguous removal or explicit
+removal refusal, stale generations, mixed versions, and rollback are covered;
+and enabling torrent+cluster no longer weakens any existing single-node or
+Usenet cluster invariant. In particular, `SIGCONT` after a TTL cannot let the
+stale owner mutate the authoritative namespace or publish a current generation;
+any late bytes remain permanently unreachable. Majority loss and
+quorum-watermark cases apply when the selected ADR uses those mechanisms; loss
+of linearizable authority always fails closed.
 
 ### 15.9 Milestone commit rule
 

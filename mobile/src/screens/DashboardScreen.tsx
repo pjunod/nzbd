@@ -583,7 +583,7 @@ function JobCard({
         <View style={styles.jobMeta}>
           {showStatus ? (
             <Text style={[styles.status, statusKey === 'failed' && styles.statusFailed]}>
-              {jobStatusLabel(job.status)}
+              {jobStatusLabel(job.status, job.ready)}
             </Text>
           ) : null}
           <Text style={styles.metaText}>
