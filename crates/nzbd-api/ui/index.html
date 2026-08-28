@@ -18,14 +18,14 @@
 // before layout choices and is intentionally the fallback for every bad value.
 try {
   var nzbdLayouts = ["classic", "plex", "theater"];
-  var nzbdPalettes = ["classic", "terminal", "noirr", "amber", "giallo", "silver", "void", "vhs", "paper", "tide", "panoptic", "redline", "panovic"];
+  var nzbdPalettes = ["classic", "terminal", "noirr", "amber", "giallo", "silver", "void", "vhs", "paper", "tide", "panoptic", "redline", "panovic", "copper"];
   var nzbdLayout = localStorage.getItem("nzbd-layout") || "classic";
   var nzbdPalette = localStorage.getItem("nzbd-palette") || "classic";
   var nzbdAppearance = localStorage.getItem("nzbd-theme") || "auto";
   if (!nzbdLayouts.includes(nzbdLayout)) nzbdLayout = "classic";
   if (!nzbdPalettes.includes(nzbdPalette)) nzbdPalette = "classic";
   if (!["auto", "light", "dark"].includes(nzbdAppearance)) nzbdAppearance = "auto";
-  var nzbdDarkOnly = nzbdPalette === "void" || nzbdPalette === "vhs" || nzbdPalette === "panoptic" || nzbdPalette === "redline" || nzbdPalette === "panovic";
+  var nzbdDarkOnly = nzbdPalette === "void" || nzbdPalette === "vhs" || nzbdPalette === "panoptic" || nzbdPalette === "redline" || nzbdPalette === "panovic" || nzbdPalette === "copper";
   var nzbdSystemLight = window.matchMedia && window.matchMedia("(prefers-color-scheme: light)").matches;
   var nzbdMode = nzbdDarkOnly ? "dark" : nzbdAppearance === "auto" ? (nzbdSystemLight ? "light" : "dark") : nzbdAppearance;
   document.documentElement.dataset.layout = nzbdLayout;
@@ -151,11 +151,19 @@ try {
   }
   :root[data-palette="panovic"] {
     --bg:#000000;--panel:#181818;--panel2:#242424;--ink:#e8e6e1;--ink2:#c8c6c1;
-    --muted:#9a9aa0;--line:rgba(255,255,255,.06);--accent:#f0723b;--accent2:#8e4a1e;--ok:#5fb582;
+    --muted:#9a9aa0;--line:rgba(255,255,255,.06);--accent:#e8871e;--accent2:#81420b;--ok:#5fb582;
     --warn:#d9a05b;--bad:#ff7a66;--track:#242424;--radius:10px;
     --font-ui:Inter,system-ui,-apple-system,"Segoe UI",sans-serif;
-    --cockpit-glass:var(--panel);--cockpit-strong:var(--bg);--cockpit-glow:rgba(240,114,59,.35);
-    --cockpit-shadow:0 4px 14px rgba(0,0,0,.8);--on-accent:#140a00;
+    --cockpit-glass:var(--panel);--cockpit-strong:var(--bg);--cockpit-glow:rgba(232,135,30,.30);
+    --cockpit-shadow:0 4px 14px rgba(0,0,0,.8);--on-accent:#150b00;
+  }
+  :root[data-palette="copper"] {
+    --bg:#000000;--panel:#181818;--panel2:#242424;--ink:#e8e6e1;--ink2:#c8c6c1;
+    --muted:#9a9aa0;--line:rgba(255,255,255,.06);--accent:#cf7643;--accent2:#70402b;--ok:#5fb582;
+    --warn:#d9a05b;--bad:#ff7a66;--track:#242424;--radius:10px;
+    --font-ui:Inter,system-ui,-apple-system,"Segoe UI",sans-serif;
+    --cockpit-glass:var(--panel);--cockpit-strong:var(--bg);--cockpit-glow:rgba(207,118,67,.28);
+    --cockpit-shadow:0 4px 14px rgba(0,0,0,.8);--on-accent:#160b06;
   }
   * { box-sizing: border-box; }
   /* `hidden` is a promise the page makes to itself, and the UA stylesheet
@@ -643,54 +651,54 @@ try {
   :root[data-palette="void"] .storage-panel,
   :root[data-palette="void"] table,
   :root[data-palette="void"] .cfg-card { box-shadow: none; }
-  :root:is([data-palette="panoptic"],[data-palette="redline"],[data-palette="panovic"]) body {
+  :root:is([data-palette="panoptic"],[data-palette="redline"],[data-palette="panovic"],[data-palette="copper"]) body {
     background-color:var(--bg);
     background-image:
       radial-gradient(ellipse at 50% -18%,color-mix(in srgb,var(--accent) 10%,transparent),transparent 42%),
       repeating-linear-gradient(180deg,transparent 0 3px,color-mix(in srgb,var(--accent) 1.8%,transparent) 3px 4px);
   }
-  :root:is([data-palette="panoptic"],[data-palette="redline"],[data-palette="panovic"]) header h1 {
+  :root:is([data-palette="panoptic"],[data-palette="redline"],[data-palette="panovic"],[data-palette="copper"]) header h1 {
     color:var(--ink);font-family:var(--font-mono);font-size:16px;letter-spacing:.22em;text-transform:uppercase;
     text-shadow:0 0 24px var(--cockpit-glow);
   }
-  :root:is([data-palette="panoptic"],[data-palette="redline"],[data-palette="panovic"]) header h1 .signal {
+  :root:is([data-palette="panoptic"],[data-palette="redline"],[data-palette="panovic"],[data-palette="copper"]) header h1 .signal {
     color:var(--accent);
   }
-  :root:is([data-palette="panoptic"],[data-palette="redline"],[data-palette="panovic"]) header h1::after {
+  :root:is([data-palette="panoptic"],[data-palette="redline"],[data-palette="panovic"],[data-palette="copper"]) header h1::after {
     content:"";display:inline-block;width:6px;height:6px;margin-left:8px;border:1px solid var(--accent);
     border-radius:50%;vertical-align:2px;box-shadow:0 0 9px var(--cockpit-glow),inset 0 0 5px var(--cockpit-glow);
   }
-  :root:is([data-palette="panoptic"],[data-palette="redline"],[data-palette="panovic"]) nav.tabs button,
-  :root:is([data-palette="panoptic"],[data-palette="redline"],[data-palette="panovic"]) .display-menu label,
-  :root:is([data-palette="panoptic"],[data-palette="redline"],[data-palette="panovic"]) tr.section-tr > td.section {
+  :root:is([data-palette="panoptic"],[data-palette="redline"],[data-palette="panovic"],[data-palette="copper"]) nav.tabs button,
+  :root:is([data-palette="panoptic"],[data-palette="redline"],[data-palette="panovic"],[data-palette="copper"]) .display-menu label,
+  :root:is([data-palette="panoptic"],[data-palette="redline"],[data-palette="panovic"],[data-palette="copper"]) tr.section-tr > td.section {
     font-family:var(--font-mono);letter-spacing:.09em;text-transform:uppercase;
   }
-  :root:is([data-palette="panoptic"],[data-palette="redline"],[data-palette="panovic"]) .stat,
-  :root:is([data-palette="panoptic"],[data-palette="redline"],[data-palette="panovic"]) .storage-panel,
-  :root:is([data-palette="panoptic"],[data-palette="redline"],[data-palette="panovic"]) table,
-  :root:is([data-palette="panoptic"],[data-palette="redline"],[data-palette="panovic"]) .cfg-card,
-  :root:is([data-palette="panoptic"],[data-palette="redline"],[data-palette="panovic"]) .display-menu,
-  :root:is([data-palette="panoptic"],[data-palette="redline"],[data-palette="panovic"]) #logbox {
+  :root:is([data-palette="panoptic"],[data-palette="redline"],[data-palette="panovic"],[data-palette="copper"]) .stat,
+  :root:is([data-palette="panoptic"],[data-palette="redline"],[data-palette="panovic"],[data-palette="copper"]) .storage-panel,
+  :root:is([data-palette="panoptic"],[data-palette="redline"],[data-palette="panovic"],[data-palette="copper"]) table,
+  :root:is([data-palette="panoptic"],[data-palette="redline"],[data-palette="panovic"],[data-palette="copper"]) .cfg-card,
+  :root:is([data-palette="panoptic"],[data-palette="redline"],[data-palette="panovic"],[data-palette="copper"]) .display-menu,
+  :root:is([data-palette="panoptic"],[data-palette="redline"],[data-palette="panovic"],[data-palette="copper"]) #logbox {
     background:var(--cockpit-glass);border-color:var(--line);
     -webkit-backdrop-filter:blur(20px) saturate(1.3);backdrop-filter:blur(20px) saturate(1.3);
     box-shadow:var(--cockpit-shadow,0 12px 34px rgba(0,0,0,.58)),inset 0 1px rgba(255,255,255,.035);
   }
-  :root:is([data-palette="panoptic"],[data-palette="redline"],[data-palette="panovic"]) button:not(.active):not(.del) {
+  :root:is([data-palette="panoptic"],[data-palette="redline"],[data-palette="panovic"],[data-palette="copper"]) button:not(.active):not(.del) {
     background:color-mix(in srgb,var(--accent) 12%,transparent);color:var(--accent);
     border-color:color-mix(in srgb,var(--accent) 42%,transparent);
   }
-  :root:is([data-palette="panoptic"],[data-palette="redline"],[data-palette="panovic"]) button:not(.active):not(.del):hover {
+  :root:is([data-palette="panoptic"],[data-palette="redline"],[data-palette="panovic"],[data-palette="copper"]) button:not(.active):not(.del):hover {
     background:var(--accent);color:var(--on-accent);border-color:var(--accent);box-shadow:0 0 16px var(--cockpit-glow);
   }
-  :root:is([data-palette="panoptic"],[data-palette="redline"],[data-palette="panovic"]) input,
-  :root:is([data-palette="panoptic"],[data-palette="redline"],[data-palette="panovic"]) select,
-  :root:is([data-palette="panoptic"],[data-palette="redline"],[data-palette="panovic"]) textarea {
+  :root:is([data-palette="panoptic"],[data-palette="redline"],[data-palette="panovic"],[data-palette="copper"]) input,
+  :root:is([data-palette="panoptic"],[data-palette="redline"],[data-palette="panovic"],[data-palette="copper"]) select,
+  :root:is([data-palette="panoptic"],[data-palette="redline"],[data-palette="panovic"],[data-palette="copper"]) textarea {
     background:color-mix(in srgb,var(--bg) 82%,transparent);border-color:var(--line);caret-color:var(--accent);
   }
-  :root:is([data-palette="panoptic"],[data-palette="redline"],[data-palette="panovic"]) .meter .fill {
+  :root:is([data-palette="panoptic"],[data-palette="redline"],[data-palette="panovic"],[data-palette="copper"]) .meter .fill {
     box-shadow:0 0 10px var(--cockpit-glow);
   }
-  :root:is([data-palette="panoptic"],[data-palette="redline"],[data-palette="panovic"]) ::selection { background:var(--accent);color:var(--on-accent); }
+  :root:is([data-palette="panoptic"],[data-palette="redline"],[data-palette="panovic"],[data-palette="copper"]) ::selection { background:var(--accent);color:var(--on-accent); }
 
   /* Optional layouts. The unqualified rules above ARE Classic, so no Classic
      override exists here and an absent/unknown setting stays exactly familiar. */
@@ -920,7 +928,8 @@ try {
             <option value="tide">Tide</option>
             <option value="panoptic">Panoptic</option>
             <option value="redline">Redline</option>
-            <option value="panovic">Panovic</option>
+            <option value="panovic">Burnt Pumpkin</option>
+            <option value="copper">Copper</option>
           </select>
         </label>
         <label>Appearance
@@ -1075,9 +1084,10 @@ function fmtEta(bytes, bps) {
 
 // ---- display: structure, paint, and brightness are independent -----------
 const DISPLAY_LAYOUTS = ["classic", "plex", "theater"];
-const DISPLAY_PALETTES = ["classic", "terminal", "noirr", "amber", "giallo", "silver", "void", "vhs", "paper", "tide", "panoptic", "redline", "panovic"];
+const DISPLAY_PALETTES = ["classic", "terminal", "noirr", "amber", "giallo", "silver", "void", "vhs", "paper", "tide", "panoptic", "redline", "panovic", "copper"];
 const DISPLAY_APPEARANCES = ["auto", "light", "dark"];
-const DISPLAY_DARK_ONLY = new Set(["void", "vhs", "panoptic", "redline", "panovic"]);
+const DISPLAY_DARK_ONLY = new Set(["void", "vhs", "panoptic", "redline", "panovic", "copper"]);
+const DISPLAY_PALETTE_LABELS = { panovic: "Burnt Pumpkin", copper: "Copper" };
 function readDisplay() {
   let layout = "classic", palette = "classic", appearance = "auto";
   try {
@@ -1109,9 +1119,10 @@ function applyDisplay(settings) {
   $("display-palette").value = settings.palette;
   $("display-appearance").value = settings.appearance;
   const note = $("display-note");
+  const paletteLabel = DISPLAY_PALETTE_LABELS[settings.palette] || settings.palette.toUpperCase();
   note.hidden = !DISPLAY_DARK_ONLY.has(settings.palette);
-  note.textContent = note.hidden ? "" : settings.palette.toUpperCase() + " is a midnight-only scheme and stays dark.";
-  $("display-summary").title = "Layout: " + settings.layout + " · color scheme: " + settings.palette + " · appearance: " + settings.appearance;
+  note.textContent = note.hidden ? "" : paletteLabel + " is a midnight-only scheme and stays dark.";
+  $("display-summary").title = "Layout: " + settings.layout + " · color scheme: " + paletteLabel + " · appearance: " + settings.appearance;
 }
 function saveDisplay(settings) {
   try {

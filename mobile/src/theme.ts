@@ -36,7 +36,8 @@ export type PalettePreference =
   | 'tide'
   | 'panoptic'
   | 'redline'
-  | 'panovic';
+  | 'panovic'
+  | 'copper';
 
 export const LAYOUT_OPTIONS: ReadonlyArray<{ id: LayoutPreference; name: string }> = [
   { id: 'classic', name: 'Classic' },
@@ -57,7 +58,8 @@ export const PALETTE_OPTIONS: ReadonlyArray<{ id: PalettePreference; name: strin
   { id: 'tide', name: 'Tide' },
   { id: 'panoptic', name: 'Panoptic', darkOnly: true },
   { id: 'redline', name: 'Redline', darkOnly: true },
-  { id: 'panovic', name: 'Panovic', darkOnly: true },
+  { id: 'panovic', name: 'Burnt Pumpkin', darkOnly: true },
+  { id: 'copper', name: 'Copper', darkOnly: true },
 ];
 
 export interface Theme {
@@ -229,7 +231,14 @@ const palettes: Record<PalettePreference, PaletteThemes> = {
   panovic: {
     dark: makeTheme(true, {
       background: '#000000', panel: '#181818', panelAlt: '#242424', border: 'rgba(255, 255, 255, 0.06)',
-      text: '#e8e6e1', textMuted: '#9a9aa0', accent: '#f0723b', onAccent: '#140a00',
+      text: '#e8e6e1', textMuted: '#9a9aa0', accent: '#e8871e', onAccent: '#150b00',
+      success: '#5fb582', warning: '#d9a05b', danger: '#ff7a66',
+    }),
+  },
+  copper: {
+    dark: makeTheme(true, {
+      background: '#000000', panel: '#181818', panelAlt: '#242424', border: 'rgba(255, 255, 255, 0.06)',
+      text: '#e8e6e1', textMuted: '#9a9aa0', accent: '#cf7643', onAccent: '#160b06',
       success: '#5fb582', warning: '#d9a05b', danger: '#ff7a66',
     }),
   },
