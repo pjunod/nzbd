@@ -1443,9 +1443,13 @@ function statusName(st, stageOverride) {
 /// which means its output is not always something to put in front of a
 /// person: `post_queued` is a token, not a phrase, and it was reaching
 /// the screen verbatim.
-const STATUS_HUMAN = { post_queued: "waiting to post-process" };
-function statusLabel(st, stageOverride) {
+const STATUS_HUMAN = {
+  completed: "download complete",
+  post_queued: "waiting to post-process",
+};
+function statusLabel(st, stageOverride, ready) {
   const n = statusName(st, stageOverride);
+  if (n === "completed" && ready) return "ready";
   return STATUS_HUMAN[n] || n;
 }
 
@@ -1643,7 +1647,8 @@ function rowModel(j, ctx) {
     nameTip: j.name + " — click for details",
     sub: "#" + j.id + (j.category ? " · " + j.category : "") +
          (j.assigned_node ? " · on " + j.assigned_node : "") + " ",
-    st: (STATUS_HUMAN[shownSt] || shownSt).toUpperCase(),
+    st: (shownSt === "completed" && j.ready
+      ? "ready" : (STATUS_HUMAN[shownSt] || shownSt)).toUpperCase(),
     stCls: "st " + shownCls,
     // Under a heading that names the stage, a pill repeating it is the
     // same word twice on one line. Only the waiting list mixes states
@@ -1991,7 +1996,7 @@ function recoveryMax(j) {
   if (j.pp_done) return "";
   // The open stage remains useful observability during a delayed-PAR
   // Queued/Downloading interlude, but the post manager deliberately rejects
-  // restart requests until the recovery download returns to Completed.
+  // restart requests until the recovery download restores the Post state.
   if (typeof j.status === "string"
       && !["completed", "post_queued"].includes(j.status)) return "";
   const stage = currentPostStage(j);
@@ -2023,7 +2028,7 @@ function detailModel(j, nowMs) {
   return {
     key: "__detail", kind: "detail", id: j.id, name: j.name, scope: "queue",
     pipe: pipelineModels(j, nowMs),
-    st: statusLabel(j.status, postStage).toUpperCase(), stCls: "st " + cls,
+    st: statusLabel(j.status, postStage, j.ready).toUpperCase(), stCls: "st " + cls,
     articles: "articles " + j.done_articles + "/" + j.total_articles +
       (j.failed_articles ? " · " + j.failed_articles + " failed" : "") +
       (j.retried_articles ? " · " + j.retried_articles + " retried" : ""),

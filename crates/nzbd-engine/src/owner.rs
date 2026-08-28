@@ -533,6 +533,51 @@ fn disk_guard_decision(
     )
 }
 
+/// The latest unfinished PP stage, unless a durable final stamp says the whole
+/// pipeline already ended. Older spans cannot reopen a later closed pipeline.
+fn open_post_stage(job: &Job) -> Option<PostStage> {
+    if job
+        .params
+        .iter()
+        .any(|(key, _)| key == nzbd_types::PP_DONE_PARAM)
+    {
+        return None;
+    }
+    job.stages
+        .last()
+        .filter(|span| span.ms.is_none())
+        .map(|span| span.stage)
+}
+
+/// Rebuild the narrow delayed-PAR scheduler lane from facts that survive a
+/// restart. The in-memory authorization map is intentionally exact: an open PP
+/// span permits only unpaused unfinished PAR files, never unrelated payload
+/// files that happen to be unpaused in imported or stale state.
+fn recovered_post_fetch_files(job: &Job) -> Option<HashSet<FileId>> {
+    if !matches!(
+        job.status,
+        JobStatus::Queued | JobStatus::Downloading | JobStatus::Paused
+    ) || open_post_stage(job).is_none()
+    {
+        return None;
+    }
+    let files: HashSet<FileId> = job
+        .files
+        .iter()
+        .filter(|file| file.is_par2 && !file.paused && !file.is_terminal())
+        .map(|file| file.id)
+        .collect();
+    (!files.is_empty()).then_some(files)
+}
+
+fn recovered_post_fetch_map(state: &QueueState) -> HashMap<JobId, HashSet<FileId>> {
+    state
+        .jobs
+        .iter()
+        .filter_map(|job| recovered_post_fetch_files(job).map(|files| (job.id, files)))
+        .collect()
+}
+
 #[allow(clippy::too_many_arguments)]
 impl Owner {
     /// Synchronous construction incl. crash recovery. Authority mode
@@ -631,6 +676,14 @@ impl Owner {
             state.max_active_downloads = crate::queue::clamp_active_downloads(n);
         }
 
+        let post_fetch_files = recovered_post_fetch_map(&state);
+        if !post_fetch_files.is_empty() {
+            tracing::info!(
+                jobs = post_fetch_files.len(),
+                "recovered delayed PAR download authorization"
+            );
+        }
+
         let initial_disk_hold = tuning.min_free_disk_bytes > 0;
         Ok(Owner {
             state,
@@ -644,7 +697,7 @@ impl Owner {
             write_failures: HashMap::new(),
             delegated: HashMap::new(),
             mirror: HashMap::new(),
-            post_fetch_files: HashMap::new(),
+            post_fetch_files,
             job_rates: HashMap::new(),
             job_wire_ema: HashMap::new(),
             server_wire_ema: HashMap::new(),
@@ -1460,10 +1513,13 @@ impl Owner {
         }
         self.delegated.remove(&job_id);
         self.mirror.remove(&job_id);
-        self.post_fetch_files.remove(&job_id);
-
         if fold_journals {
             self.fold_job_journals(job_id);
+        }
+        if let Some(files) = self.state.job(job_id).and_then(recovered_post_fetch_files) {
+            self.post_fetch_files.insert(job_id, files);
+        } else {
+            self.post_fetch_files.remove(&job_id);
         }
         tracing::info!(job = job_id.0, %name, ?status, "job imported");
         self.dirty = true;
@@ -2152,22 +2208,64 @@ impl Owner {
             return;
         }
         let (mut status, health) = final_status(job);
+        // A delayed-PAR fetch temporarily returns a live post-processing job
+        // to the download scheduler. The open stage is persisted while the
+        // in-memory post_fetch_files authorization is not, so the span—not
+        // that map—is the recovery fact that also survives a daemon restart.
+        // Restore the PP state when the supplemental download ends and do not
+        // emit a second JobFinished while verification/repair still owns it.
+        let resume_post_stage = open_post_stage(job);
         // A write that did not land overrides a healthy article set. The two
         // measure different things: health says the bytes arrived off the
         // wire, this says they reached the disk. Reporting SUCCESS on the
         // strength of the first while the second failed is how a consumer
         // ends up importing 500 MiB of a 48 GiB file.
+        let mut recovery_write_failed = false;
         if let Some(reason) = self.write_failures.remove(&job_id) {
-            status = JobStatus::Failed;
+            if let Some(stage) = resume_post_stage {
+                // The active PP task will re-verify the filesystem and either
+                // request another recovery volume or fail once, through its
+                // normal durable history path. Emitting JobFinished(Failed)
+                // here would race that task and could dispose its directory
+                // while it is still using it.
+                status = JobStatus::Post { stage };
+                job.status = status;
+                recovery_write_failed = true;
+                tracing::error!(job = job_id.0, %reason, stage = stage.as_str(),
+                    "post-processing recovery download did not reach disk; resuming verification");
+            } else {
+                status = JobStatus::Failed;
+                job.status = status;
+                tracing::error!(job = job_id.0, %reason,
+                    "job failed: the download completed but the files did not");
+            }
+        } else if let Some(stage) = resume_post_stage {
+            status = JobStatus::Post { stage };
             job.status = status;
-            tracing::error!(job = job_id.0, %reason,
-                "job failed: the download completed but the files did not");
         } else {
             job.status = status;
         }
         let name = job.name.clone();
         let file_ids: Vec<FileId> = job.files.iter().map(|f| f.id).collect();
-        tracing::info!(job = job_id.0, %name, ?status, health = health.0, "job finished");
+        if let Some(stage) = resume_post_stage {
+            if !recovery_write_failed {
+                tracing::info!(
+                    job = job_id.0,
+                    %name,
+                    stage = stage.as_str(),
+                    health = health.0,
+                    "post-processing recovery download finished; resuming post-processing"
+                );
+            }
+        } else {
+            tracing::info!(
+                job = job_id.0,
+                %name,
+                ?status,
+                health = health.0,
+                "download phase finished"
+            );
+        }
         self.attempts.retain(|r, _| r.job != job_id);
         self.post_fetch_files.remove(&job_id);
         for fid in &file_ids {
@@ -2175,9 +2273,12 @@ impl Owner {
             self.file_sizes.remove(fid);
         }
         // Persist and publish BEFORE emitting: an event subscriber that
-        // immediately reads the snapshot must see the terminal state.
+        // immediately reads the snapshot must see the resulting state.
         self.save_snapshot();
         self.publish_now();
+        if resume_post_stage.is_some() {
+            return;
+        }
         self.emit(Event::JobFinished {
             job: job_id,
             name,
@@ -3179,6 +3280,22 @@ mod tests {
         job
     }
 
+    fn restarted_recovery_job(id: u32, state: SegmentState) -> Job {
+        let mut job = pending_job(id);
+        job.status = JobStatus::Queued;
+        job.stages.push(StageSpan {
+            stage: PostStage::ParVerify,
+            started_at_unix: 1_000,
+            ms: None,
+        });
+        job.files[0].filename = "release.vol00+01.par2".into();
+        job.files[0].is_par2 = true;
+        job.files[0].segments[0].state = state;
+        job.files[0].finalized = matches!(state, SegmentState::Done { .. });
+        recompute_job_totals(&mut job);
+        job
+    }
+
     #[test]
     fn writer_errors_fail_pending_segments_and_latch_out_of_space() {
         let (_tmp, mut owner, _epoch) = guard_test_owner(Tuning::default());
@@ -3377,8 +3494,9 @@ mod tests {
     }
 
     /// Delayed PAR fetching temporarily returns the download half of the job
-    /// to Queued/Completed, but verification keeps running in parallel. Only
-    /// the verifier-selected PAR may use that lane; generic FileResume and a
+    /// to Queued/Downloading, but verification keeps running in parallel. The
+    /// selected fetch returns to the open Post stage when it ends. Only the
+    /// verifier-selected PAR may use that lane; generic FileResume and a
     /// PP-only node cannot broaden it to ordinary files.
     #[test]
     fn delayed_par_download_keeps_the_open_post_span() {
@@ -3480,14 +3598,171 @@ mod tests {
         };
         job.files[0].finalized = true;
         recompute_job_totals(job);
+        let mut events = owner.events.subscribe();
         owner.check_job_complete(JobId(402));
         let job = owner.state.job(JobId(402)).unwrap();
-        assert_eq!(job.status, JobStatus::Completed);
+        assert_eq!(
+            job.status,
+            JobStatus::Post {
+                stage: PostStage::ParVerify
+            },
+            "finishing a recovery-volume download resumes the open PP stage"
+        );
         assert!(!owner.post_fetch_files.contains_key(&JobId(402)));
         assert!(
             job.stages[0].ms.is_none(),
             "the post manager, not delayed download completion, closes verification"
         );
+        assert!(
+            matches!(
+                events.try_recv(),
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+            ),
+            "a delayed PAR fetch must not announce a second download completion"
+        );
+    }
+
+    #[test]
+    fn restarted_delayed_par_completion_recovers_from_the_persisted_open_span() {
+        let (_tmp, mut owner, _epoch) = guard_test_owner(Tuning::default());
+        owner.state.jobs.push(restarted_recovery_job(
+            403,
+            SegmentState::Done {
+                offset: 0,
+                len: 100,
+                crc: 0,
+            },
+        ));
+        assert!(
+            !owner.post_fetch_files.contains_key(&JobId(403)),
+            "the authorization map is intentionally absent after restart"
+        );
+
+        let mut events = owner.events.subscribe();
+        owner.check_job_complete(JobId(403));
+        assert_eq!(
+            owner.state.job(JobId(403)).unwrap().status,
+            JobStatus::Post {
+                stage: PostStage::ParVerify
+            }
+        );
+        assert!(matches!(
+            events.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[test]
+    fn restarted_pp_only_node_reauthorizes_only_the_pending_par_file() {
+        let (_tmp, mut owner, _epoch) = guard_test_owner(Tuning::default());
+        owner.download_enabled = false;
+        let mut job = restarted_recovery_job(406, SegmentState::Pending);
+        let recovery_file = job.files[0].id;
+        let mut unrelated = job.files[0].clone();
+        unrelated.id = FileId(4061);
+        unrelated.filename = "release.part001.rar".into();
+        unrelated.is_par2 = false;
+        job.files.push(unrelated);
+        owner.import_job(job, false, false);
+
+        assert_eq!(
+            owner.post_fetch_files[&JobId(406)],
+            HashSet::from([recovery_file]),
+            "restart recovery may authorize the selected PAR and nothing else"
+        );
+        let servers = vec![ServerDef {
+            id: ServerId(1),
+            name: "provider".into(),
+            host: "127.0.0.1".into(),
+            port: 119,
+            tls: nzbd_types::TlsMode::None,
+            username: None,
+            password: None,
+            active: true,
+            tier: 0,
+            group: 0,
+            fill: false,
+            max_connections: 1,
+            pipeline_depth: 1,
+            retention_days: 0,
+            cert_verification: nzbd_types::CertLevel::Strict,
+        }];
+        let ladder = Ladder::new(&servers);
+        let not_blocked = |_: ServerId| false;
+        let mut ctx = SelectionCtx {
+            ladder: &ladder,
+            attempts: &mut owner.attempts,
+            is_blocked: &not_blocked,
+            delegated: &owner.delegated,
+            post_fetch_files: &owner.post_fetch_files,
+            regular_downloads: owner.download_enabled,
+            article_retries: 3,
+            now_unix: 1_800_000_000,
+            propagation_delay_secs: 0,
+            soft_hold: false,
+            rotate: 0,
+        };
+        let selected = next_for_server(&owner.state, &servers[0], &mut ctx)
+            .lease
+            .expect("the PP-only node should resume its recovery download");
+        assert_eq!(selected.file, recovery_file);
+    }
+
+    #[test]
+    fn failed_recovery_articles_return_to_verification_instead_of_disposition() {
+        let (_tmp, mut owner, _epoch) = guard_test_owner(Tuning::default());
+        let mut job = restarted_recovery_job(404, SegmentState::Failed);
+        let mut failed_payload = job.files[0].clone();
+        failed_payload.id = FileId(4041);
+        failed_payload.filename = "release.part001.rar".into();
+        failed_payload.is_par2 = false;
+        failed_payload.segments[0].state = SegmentState::Failed;
+        job.files.push(failed_payload);
+        recompute_job_totals(&mut job);
+        assert_eq!(final_status(&job).0, JobStatus::Failed);
+        owner.state.jobs.push(job);
+
+        let mut events = owner.events.subscribe();
+        owner.check_job_complete(JobId(404));
+        assert_eq!(
+            owner.state.job(JobId(404)).unwrap().status,
+            JobStatus::Post {
+                stage: PostStage::ParVerify
+            }
+        );
+        assert!(matches!(
+            events.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[test]
+    fn recovery_write_failure_stays_owned_by_the_active_post_task() {
+        let (_tmp, mut owner, _epoch) = guard_test_owner(Tuning::default());
+        owner.state.jobs.push(restarted_recovery_job(
+            405,
+            SegmentState::Done {
+                offset: 0,
+                len: 100,
+                crc: 0,
+            },
+        ));
+        owner
+            .write_failures
+            .insert(JobId(405), "write recovery volume: no space left".into());
+
+        let mut events = owner.events.subscribe();
+        owner.check_job_complete(JobId(405));
+        assert_eq!(
+            owner.state.job(JobId(405)).unwrap().status,
+            JobStatus::Post {
+                stage: PostStage::ParVerify
+            }
+        );
+        assert!(matches!(
+            events.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
     }
 
     #[test]
