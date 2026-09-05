@@ -214,7 +214,16 @@ impl TorrentAdmissionService {
         source: TorrentSource,
         opts: AddOpts,
     ) -> Result<AdmissionResult, AdmissionError> {
-        let descriptor = inspect_metainfo(&bytes, self.proxy_enabled, self.dht_enabled)?;
+        // Parser diagnostics come from the embedded engine and are not an API
+        // contract (and may echo hostile bytes). At this boundary they are a
+        // generic client-input failure; named policy errors stay named.
+        let descriptor =
+            inspect_metainfo(&bytes, self.proxy_enabled, self.dht_enabled).map_err(|error| {
+                match error {
+                    nzbd_torrent::TorrentError::Engine(_) => AdmissionError::Encoding,
+                    other => AdmissionError::Torrent(other),
+                }
+            })?;
         let job = match pending {
             Some(job) => job,
             None => {
@@ -311,7 +320,19 @@ impl TorrentAdmissionService {
                 path: path.clone(),
                 source: e,
             })?;
-            let result = self.admit_raw(bytes, AddOpts::default()).await?;
+            let result = match self.admit_raw(bytes, AddOpts::default()).await {
+                Ok(result) => result,
+                Err(_) => {
+                    std::fs::rename(&path, path.with_extension("torrent.rejected")).map_err(
+                        |e| nzbd_state::StateError::Io {
+                            op: "rename rejected torrent watch source",
+                            path: path.clone(),
+                            source: e,
+                        },
+                    )?;
+                    continue;
+                }
+            };
             let suffix = if result.created {
                 "processed"
             } else {
@@ -421,11 +442,23 @@ async fn post_job(
             Json(json!({"id":result.id,"info_hash":result.info_hash,"created":false})),
         )
             .into_response(),
-        Err(error) => (
+        Err(error) if error.is_input_error() => (
             StatusCode::UNPROCESSABLE_ENTITY,
             Json(json!({"error":error.to_string()})),
         )
             .into_response(),
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error":"torrent admission failed"})),
+        )
+            .into_response(),
+    }
+}
+
+impl AdmissionError {
+    fn is_input_error(&self) -> bool {
+        matches!(self, Self::Encoding)
+            || matches!(self, Self::Torrent(error) if !matches!(error, nzbd_torrent::TorrentError::Engine(_)))
     }
 }
 
@@ -462,4 +495,212 @@ fn persist_descriptor(path: &Path, bytes: &[u8]) -> Result<(), nzbd_state::State
             path: parent.to_path_buf(),
             source: e,
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use http_body_util::BodyExt;
+    use nzbd_engine::{Engine, EngineConfig, Tuning};
+    use nzbd_torrent::TorrentSessionConfig;
+    use tower::ServiceExt;
+
+    fn metainfo(name: &[u8]) -> Vec<u8> {
+        fn bytes(out: &mut Vec<u8>, value: &[u8]) {
+            out.extend_from_slice(value.len().to_string().as_bytes());
+            out.push(b':');
+            out.extend_from_slice(value);
+        }
+        let mut torrent = b"d4:infod6:lengthi1e4:name".to_vec();
+        bytes(&mut torrent, name);
+        torrent.extend_from_slice(b"12:piece lengthi16384e6:pieces20:");
+        torrent.extend_from_slice(&[0; 20]);
+        torrent.extend_from_slice(b"ee");
+        torrent
+    }
+
+    async fn service(tmp: &tempfile::TempDir) -> (TorrentAdmissionService, EngineHandle) {
+        let state = tmp.path().join("state");
+        let engine = Engine::spawn(EngineConfig::single_node(
+            vec![],
+            state.clone(),
+            tmp.path().join("dest"),
+            Tuning::default(),
+            None,
+        ))
+        .await
+        .unwrap();
+        let session =
+            TorrentSession::start(tmp.path().join("payload"), TorrentSessionConfig::default())
+                .await
+                .unwrap();
+        (
+            TorrentAdmissionService::new(engine.clone(), session, state, false, false),
+            engine,
+        )
+    }
+
+    #[tokio::test]
+    async fn raw_route_commits_descriptor_before_managed_add_and_deduplicates() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (service, engine) = service(&tmp).await;
+        let body = metainfo(b"payload.bin");
+
+        let response = router(service.clone())
+            .oneshot(
+                axum::http::Request::post("/api/v1/jobs")
+                    .header(CONTENT_TYPE, "application/x-bittorrent")
+                    .body(axum::body::Body::from(body.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let first: serde_json::Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        let persisted = nzbd_state::SnapshotStore::open(&tmp.path().join("state"))
+            .unwrap()
+            .load()
+            .unwrap()
+            .unwrap();
+        let torrent = persisted.jobs[0].torrent.as_ref().unwrap();
+        assert!(tmp
+            .path()
+            .join("state")
+            .join(&torrent.metadata_file)
+            .exists());
+        assert!(persisted.pending_admissions.is_empty());
+
+        let response = router(service)
+            .oneshot(
+                axum::http::Request::post("/api/v1/jobs")
+                    .header(CONTENT_TYPE, "application/x-bittorrent")
+                    .body(axum::body::Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let duplicate: serde_json::Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(duplicate["id"], first["id"]);
+        assert_eq!(duplicate["created"], false);
+        assert_eq!(engine.snapshot().jobs.len(), 1);
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn invalid_input_is_422_without_a_live_or_pending_job() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (service, engine) = service(&tmp).await;
+        let response = router(service)
+            .oneshot(
+                axum::http::Request::post("/api/v1/jobs")
+                    .header(CONTENT_TYPE, "application/x-bittorrent")
+                    .body(axum::body::Body::from("not bencode"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(engine.snapshot().jobs.is_empty());
+        assert!(nzbd_state::SnapshotStore::open(&tmp.path().join("state"))
+            .unwrap()
+            .load()
+            .unwrap()
+            .unwrap_or_default()
+            .pending_admissions
+            .is_empty());
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn typed_http_source_uses_the_same_durable_admission_path() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let body = metainfo(b"fetched.bin");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0; 1024];
+            let _ = stream.read(&mut request).await.unwrap();
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            stream.write_all(&body).await.unwrap();
+        });
+        let (service, engine) = service(&tmp).await;
+        let request = serde_json::json!({
+            "source": {"type": "torrent_url", "uri": format!("http://{address}/source?passkey=secret")},
+            "category": "test"
+        });
+        let response = router(service)
+            .oneshot(
+                axum::http::Request::post("/api/v1/jobs")
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(request.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        server.await.unwrap();
+        let persisted = nzbd_state::SnapshotStore::open(&tmp.path().join("state"))
+            .unwrap()
+            .load()
+            .unwrap()
+            .unwrap();
+        assert_eq!(persisted.jobs.len(), 1);
+        assert_eq!(persisted.jobs[0].category.as_deref(), Some("test"));
+        assert!(persisted.pending_admissions.is_empty());
+        let serialized = serde_json::to_string(&persisted).unwrap();
+        assert!(!serialized.contains("passkey"));
+        assert!(
+            nzbd_state::torrent_sources::PendingSourceStore::open(&tmp.path().join("state"))
+                .unwrap()
+                .inventory()
+                .unwrap()
+                .is_empty()
+        );
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn watch_rejects_a_bad_entry_and_continues_to_the_next() {
+        let tmp = tempfile::tempdir().unwrap();
+        let watch = tmp.path().join("watch");
+        std::fs::create_dir(&watch).unwrap();
+        std::fs::write(watch.join("a.torrent"), b"bad").unwrap();
+        std::fs::write(watch.join("b.torrent"), metainfo(b"watch.bin")).unwrap();
+        let (service, engine) = service(&tmp).await;
+
+        let results = service.scan_watch_once(&watch).await.unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(watch.join("a.torrent.rejected").exists());
+        assert!(watch.join("b.torrent.processed").exists());
+        assert!(service.scan_watch_once(&watch).await.unwrap().is_empty());
+        assert_eq!(engine.snapshot().jobs.len(), 1);
+        engine.shutdown().await;
+    }
+
+    #[test]
+    fn internal_errors_are_opaque_server_failures() {
+        assert!(!AdmissionError::MissingPending.is_input_error());
+        assert!(!AdmissionError::Torrent(nzbd_torrent::TorrentError::Engine(
+            "magnet:?xt=secret".into()
+        ))
+        .is_input_error());
+        assert!(AdmissionError::Encoding.is_input_error());
+    }
 }

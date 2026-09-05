@@ -160,7 +160,7 @@ async fn spawn_engine(dir: &Path, servers: Vec<ServerDef>) -> EngineHandle {
 }
 
 #[tokio::test]
-async fn cluster_authority_adoption_restores_dormant_torrent_rows_without_starting_payload() {
+async fn cluster_authority_adoption_refuses_dormant_torrent_rows_without_rewrite() {
     let tmp = tempfile::tempdir().unwrap();
     let state_dir = tmp.path().join("state");
     let store = nzbd_state::SnapshotStore::open(&state_dir).unwrap();
@@ -173,8 +173,7 @@ async fn cluster_authority_adoption_restores_dormant_torrent_rows_without_starti
         })
         .unwrap();
     // A cluster worker deliberately ignores the authority snapshot at boot;
-    // authority adoption restores durable control state, while engine/session
-    // activation remains the injected runtime's responsibility.
+    // it must apply the same dormant-row guard when it later takes office.
     let mut config = EngineConfig::single_node(
         Vec::new(),
         state_dir,
@@ -187,9 +186,9 @@ async fn cluster_authority_adoption_restores_dormant_torrent_rows_without_starti
     let engine = Engine::spawn(config).await.unwrap();
     assert!(engine.snapshot().jobs.is_empty());
 
-    engine.adopt_authority().await.unwrap();
-    assert_eq!(engine.snapshot().jobs.len(), 1);
-    assert_eq!(engine.snapshot().jobs[0].kind, nzbd_types::JobKind::Torrent);
+    let error = engine.adopt_authority().await.unwrap_err().to_string();
+    assert!(error.contains("no production torrent backend"));
+    assert!(engine.snapshot().jobs.is_empty());
     engine.shutdown().await;
 }
 

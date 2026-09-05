@@ -942,14 +942,30 @@ impl Owner {
                 secret,
                 reply,
             } => {
-                let id = JobId(self.state.next_job_id + 1);
-                let result = self.pending_sources.write(id, &secret).map(|secret_ref| {
-                    let reserved = self.state.reserve_torrent_admission(source, secret_ref);
-                    debug_assert_eq!(reserved, id);
-                    self.save_snapshot();
-                    self.publish_now();
-                    id
-                });
+                // Reserve from the queue owner first: it alone allocates ids. The
+                // reservation is not durable until the protected sidecar exists.
+                let id = self.state.reserve_torrent_admission(source);
+                let result = match self.pending_sources.write(id, &secret) {
+                    Ok(secret_ref) => {
+                        // The reference is derived from the allocated id, never a
+                        // separately predicted identity.
+                        if let Some(pending) = self
+                            .state
+                            .pending_admissions
+                            .iter_mut()
+                            .find(|pending| pending.job_id == id)
+                        {
+                            pending.secret_ref = secret_ref;
+                        }
+                        self.save_snapshot();
+                        self.publish_now();
+                        Ok(id)
+                    }
+                    Err(error) => {
+                        self.state.cancel_torrent_admission(id);
+                        Err(error)
+                    }
+                };
                 let _ = reply.send(result);
             }
             QueueCommand::CommitTorrentAdmission { job, commit, reply } => {

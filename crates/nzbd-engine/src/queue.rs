@@ -86,11 +86,22 @@ pub struct SegRef {
 impl QueueState {
     // -- persistence ---------------------------------------------------------
 
-    /// Production recovery boundary. Torrent rows remain inert in the generic
-    /// owner until the separately injected torrent runtime restores them.
+    /// Production recovery boundary for dormant torrent support. #163 owns
+    /// constructing the torrent runtime; until then the generic owner must not
+    /// adopt rows it cannot advance.
     pub(crate) fn from_runtime_doc(
         doc: QueueSnapshotDoc,
     ) -> Result<QueueState, nzbd_state::StateError> {
+        if doc
+            .jobs
+            .iter()
+            .any(|job| matches!(job.kind, JobKind::Torrent))
+        {
+            return Err(nzbd_state::StateError::Corrupt(
+                "queue.json contains BitTorrent jobs, but this build has no production torrent backend; the queue was left unchanged"
+                    .into(),
+            ));
+        }
         Ok(Self::from_doc(doc))
     }
 
@@ -209,17 +220,13 @@ impl QueueState {
 
     // -- admission -----------------------------------------------------------
 
-    pub fn reserve_torrent_admission(
-        &mut self,
-        source: TorrentSource,
-        secret_ref: std::path::PathBuf,
-    ) -> JobId {
+    pub fn reserve_torrent_admission(&mut self, source: TorrentSource) -> JobId {
         self.next_job_id += 1;
         let job_id = JobId(self.next_job_id);
         self.pending_admissions.push(PendingAdmission {
             job_id,
             source,
-            secret_ref,
+            secret_ref: nzbd_state::torrent_sources::PendingSourceStore::relative_ref(job_id),
         });
         job_id
     }
@@ -1920,7 +1927,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_recovery_keeps_dormant_torrent_control_rows() {
+    fn runtime_recovery_refuses_dormant_torrent_control_rows() {
         let mut queue = QueueState::default();
         admit_fake_torrent(
             &mut queue,
@@ -1929,13 +1936,11 @@ mod tests {
             None,
         );
 
-        let recovered = QueueState::from_runtime_doc(queue.to_doc()).unwrap();
-        assert_eq!(recovered.jobs.len(), 1);
-        assert_eq!(recovered.jobs[0].kind, JobKind::Torrent);
-        assert_eq!(
-            recovered.jobs[0].torrent.as_ref().unwrap().phase,
-            nzbd_types::TorrentPhase::PausedDownload
-        );
+        let error = QueueState::from_runtime_doc(queue.to_doc())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("no production torrent backend"));
+        assert!(error.contains("queue was left unchanged"));
     }
 
     #[test]
@@ -2783,8 +2788,7 @@ mod tests {
     #[test]
     fn torrent_pending_intent_is_structurally_replaced_and_live_hash_deduplicates() {
         let mut queue = QueueState::default();
-        let first = queue
-            .reserve_torrent_admission(TorrentSource::Magnet, "torrents/pending/1.source".into());
+        let first = queue.reserve_torrent_admission(TorrentSource::Magnet);
         assert!(queue.jobs.is_empty());
         let record = TorrentRecord {
             info_hash_v1: "0123456789abcdef0123456789abcdef01234567".into(),
@@ -2820,8 +2824,7 @@ mod tests {
         assert!(queue.pending_admissions.is_empty());
         assert_eq!(queue.jobs[0].id, first);
 
-        let retry =
-            queue.reserve_torrent_admission(TorrentSource::Url, "torrents/pending/2.source".into());
+        let retry = queue.reserve_torrent_admission(TorrentSource::Url);
         assert_eq!(
             queue.commit_torrent_admission(
                 retry,

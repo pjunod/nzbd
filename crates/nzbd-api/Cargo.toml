@@ -5,6 +5,10 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+# Kept off in the shipping daemon until #163 mounts the native torrent route.
+torrent-admission = ["dep:nzbd-torrent"]
+
 [dependencies]
 nzbd-types = { workspace = true }
 nzbd-config = { workspace = true }
@@ -12,7 +16,7 @@ nzbd-engine = { workspace = true }
 nzbd-post = { workspace = true }
 nzbd-nntp = { workspace = true }
 nzbd-state = { workspace = true }
-nzbd-torrent = { workspace = true }
+nzbd-torrent = { workspace = true, optional = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
 base64 = { workspace = true }

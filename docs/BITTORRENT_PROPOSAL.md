@@ -972,6 +972,9 @@ and queue-owned pending intent above both exist. The source can then resume
 after a kill during metadata resolution or HTTP fetch without putting its
 query, tracker passkey, or credentials in the public queue snapshot. The
 production route and watch task remain unmounted until final M2 activation.
+The dormant API module and its engine dependency are likewise feature-gated so
+the default daemon graph does not link the peer engine, DHT, or UPnP before
+#163 activates the production entry points.
 
 ### 7.2 Native read model
 

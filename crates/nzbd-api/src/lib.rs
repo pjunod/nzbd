@@ -12,6 +12,7 @@ use base64::Engine as _;
 
 pub mod eventhub;
 pub mod logbuf;
+#[cfg(feature = "torrent-admission")]
 pub mod torrent_admission;
 pub mod version;
 pub use eventhub::{EventHub, Replay};
