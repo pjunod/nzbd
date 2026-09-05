@@ -611,6 +611,28 @@ pub struct TorrentSession {
 }
 
 impl TorrentSession {
+    /// Resolve magnet metadata in list-only mode. No managed torrent or
+    /// payload storage exists when this returns.
+    pub async fn resolve_magnet_metadata(&self, magnet: String) -> Result<Vec<u8>, TorrentError> {
+        let magnet = validate_magnet_contract(&magnet, self.proxy_enabled)?;
+        if self.dht_enabled {
+            return Err(TorrentError::MagnetWithDht);
+        }
+        let resolved = self
+            .inner
+            .add_torrent(
+                AddTorrent::from_url(magnet),
+                Some(magnet_resolution_options(Vec::new())),
+            )
+            .await
+            .map_err(engine_error)?;
+        let AddTorrentResponse::ListOnly(resolved) = resolved else {
+            return Err(TorrentError::MissingResolvedMagnet);
+        };
+        validate_metainfo_contract(resolved.torrent_bytes.as_ref(), self.proxy_enabled)?;
+        validate_existing_filesystem_paths(resolved.torrent_bytes.as_ref(), &self.output_root)?;
+        Ok(resolved.torrent_bytes.to_vec())
+    }
     pub async fn start(
         output_root: PathBuf,
         config: TorrentSessionConfig,
@@ -813,6 +835,65 @@ impl TorrentSession {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MetainfoDescriptor {
+    pub info_hash_v1: String,
+    pub name: String,
+    pub files: Vec<(PathBuf, u64)>,
+    pub total_bytes: u64,
+}
+
+/// Validate and project durable descriptor facts without creating storage.
+pub fn inspect_metainfo(
+    bytes: &[u8],
+    proxy_enabled: bool,
+    dht_enabled: bool,
+) -> Result<MetainfoDescriptor, TorrentError> {
+    validate_metainfo_admission(bytes, proxy_enabled, dht_enabled)?;
+    let meta =
+        librqbit::torrent_from_bytes::<librqbit::ByteBuf<'_>>(bytes).map_err(engine_error)?;
+    let name = meta
+        .info
+        .name
+        .as_ref()
+        .and_then(|n| std::str::from_utf8(n.as_ref()).ok())
+        .unwrap_or("torrent")
+        .to_string();
+    let mut files = Vec::new();
+    let mut total_bytes = 0u64;
+    for file in meta.info.iter_file_details().map_err(engine_error)? {
+        if file.attrs().padding {
+            continue;
+        }
+        let mut path = PathBuf::new();
+        for component in file.filename.iter_components() {
+            path.push(
+                std::str::from_utf8(component.map_err(engine_error)?.as_ref())
+                    .map_err(engine_error)?,
+            );
+        }
+        total_bytes =
+            total_bytes
+                .checked_add(file.len)
+                .ok_or(TorrentError::InvalidMetainfoGeometry(
+                    "aggregate payload length overflows u64",
+                ))?;
+        files.push((path, file.len));
+    }
+    Ok(MetainfoDescriptor {
+        info_hash_v1: meta.info_hash.as_string(),
+        name,
+        files,
+        total_bytes,
+    })
+}
+
+/// Syntax-only magnet admission check for callers that must reject malformed
+/// requests before reserving durable queue state.
+pub fn validate_magnet_source(magnet: &str, proxy_enabled: bool) -> Result<(), TorrentError> {
+    validate_magnet_contract(magnet, proxy_enabled).map(|_| ())
+}
+
 /// Engine-owned identity. This deliberately contains no nzbd queue identity.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct EngineIdentity {
@@ -846,6 +927,29 @@ impl TorrentRegistry {
             by_hash: HashMap::new(),
             id_to_hash: HashMap::new(),
         }
+    }
+
+    /// Managed admission after the caller's durable queue commit.
+    pub async fn add_committed(
+        &mut self,
+        metainfo: Vec<u8>,
+        config: TorrentAddConfig,
+    ) -> Result<EngineIdentity, TorrentError> {
+        let handle = self.session.add_metainfo(metainfo, config).await?;
+        let identity = EngineIdentity {
+            id: handle.id(),
+            info_hash_v1: handle.info_hash(),
+        };
+        if self.by_hash.contains_key(&identity.info_hash_v1)
+            || self.id_to_hash.contains_key(&identity.id)
+        {
+            self.session.delete(&handle, false).await?;
+            return Err(TorrentError::DuplicateEngineIdentity);
+        }
+        self.id_to_hash
+            .insert(identity.id, identity.info_hash_v1.clone());
+        self.by_hash.insert(identity.info_hash_v1.clone(), handle);
+        Ok(identity)
     }
 
     /// Restore only caller-authorized descriptors, always paused. Duplicate
