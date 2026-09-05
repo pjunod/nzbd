@@ -66,6 +66,19 @@ jobs:
             lcov.info
             target/llvm-cov/html/
           if-no-files-found: error
+          # This step has no `if:`, so it uploads about 1.07 MB on every push
+          # and every pull-request run — a mean of twelve runs a day, and 53 on
+          # the busiest. At the 90-day default that is a steady state of
+          # roughly 1.16 GB from this one step, which is more than the account's
+          # entire shared Actions-storage allowance. It is why uploads across
+          # the account began being refused with `Artifact storage quota has
+          # been hit`.
+          #
+          # A week is the useful life of this artifact. `lcov.info` is
+          # regenerable from any commit by re-running the job, and the browsable
+          # HTML tree — 87% of the bytes — is only ever opened while someone is
+          # looking at that particular run. Seven days holds ~90 MB.
+          retention-days: 7
 
       # Self-hosted badges: single-commit `badges` branch, force-updated on
       # every main push; README references the raw files.
