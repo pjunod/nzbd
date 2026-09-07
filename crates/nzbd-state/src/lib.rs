@@ -901,20 +901,39 @@ mod tests {
     }
 
     #[test]
-    fn schema_3_migrates_with_no_pending_admissions_and_schema_4_always_emits_collection() {
+    fn schema_3_migrates_with_no_pending_admissions() {
         let dir = tempfile::tempdir().unwrap();
         let store = SnapshotStore::open(dir.path()).unwrap();
         std::fs::write(dir.path().join("queue.json"), br#"{"schema_version":3,"jobs":[],"next_job_id":2,"next_file_id":0,"download_paused":false,"speed_limit_bps":null,"max_active_downloads":1}"#).unwrap();
-        let mut loaded = store.load().unwrap().unwrap();
+        let loaded = store.load().unwrap().unwrap();
         assert_eq!(loaded.schema_version, 3);
         assert!(loaded.pending_admissions.is_empty());
-        loaded.schema_version = QUEUE_SCHEMA_VERSION;
-        store.save(&loaded).unwrap();
+    }
+
+    #[test]
+    fn snapshot_roundtrips_a_non_empty_schema_4_pending_admission() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SnapshotStore::open(dir.path()).unwrap();
+        let pending = PendingAdmission {
+            job_id: JobId(7),
+            source: nzbd_types::TorrentSource::Magnet,
+            secret_ref: "torrents/pending/7.source".into(),
+        };
+        store
+            .save(&QueueSnapshotDoc {
+                pending_admissions: vec![pending.clone()],
+                ..QueueSnapshotDoc::default()
+            })
+            .unwrap();
+
         let raw: serde_json::Value =
             serde_json::from_slice(&std::fs::read(dir.path().join("queue.json")).unwrap()).unwrap();
-        assert_eq!(raw["schema_version"], 4);
-        assert_eq!(raw["pending_admissions"], serde_json::json!([]));
-        assert!(raw.as_object().unwrap().contains_key("pending_admissions"));
+        assert_eq!(raw["schema_version"], QUEUE_SCHEMA_VERSION);
+        assert_eq!(raw["pending_admissions"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            store.load().unwrap().unwrap().pending_admissions,
+            vec![pending]
+        );
     }
 
     #[test]

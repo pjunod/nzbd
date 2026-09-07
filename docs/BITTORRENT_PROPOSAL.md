@@ -974,7 +974,9 @@ query, tracker passkey, or credentials in the public queue snapshot. The
 production route and watch task remain unmounted until final M2 activation.
 The dormant API module and its engine dependency are likewise feature-gated so
 the default daemon graph does not link the peer engine, DHT, or UPnP before
-#163 activates the production entry points.
+#163 activates the production entry points. The configured `make test` quality
+command and CI test/lint workflows compile and exercise `nzbd-api` with the
+`torrent-admission` feature explicitly while the production graph stays clean.
 
 ### 7.2 Native read model
 

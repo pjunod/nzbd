@@ -112,6 +112,7 @@ version: ## Print the build identity this checkout would stamp into an image
 .PHONY: test
 test: ## Whole workspace test suite (unit + e2e + cluster + daemon + UI boot)
 	$(CARGO) test --workspace
+	$(CARGO) test --locked -p nzbd-api --features torrent-admission
 
 .PHONY: test-strict
 test-strict: ## Like `test`, but a missing par2/7z is a failure, not a skip (as in CI)
@@ -132,6 +133,7 @@ fmt-check: ## Check formatting without writing (CI gate)
 .PHONY: lint
 lint: ## Clippy across all targets with warnings denied (CI gate)
 	$(CARGO) clippy --workspace --all-targets -- -D warnings
+	$(CARGO) clippy -p nzbd-api --features torrent-admission --all-targets -- -D warnings
 
 .PHONY: msrv
 msrv: ## Type-check on the minimum supported Rust (1.85)

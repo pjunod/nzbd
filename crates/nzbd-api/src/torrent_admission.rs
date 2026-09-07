@@ -26,6 +26,8 @@ pub struct TorrentAdmissionService {
     state_dir: PathBuf,
     proxy_enabled: bool,
     dht_enabled: bool,
+    #[cfg(test)]
+    before_managed_add: Option<Arc<dyn Fn() -> Result<(), AdmissionError> + Send + Sync>>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -67,6 +69,8 @@ impl TorrentAdmissionService {
             state_dir,
             proxy_enabled,
             dht_enabled,
+            #[cfg(test)]
+            before_managed_add: None,
         }
     }
 
@@ -274,6 +278,10 @@ impl TorrentAdmissionService {
                 info_hash: descriptor.info_hash_v1,
             }),
             Ok(id) => {
+                #[cfg(test)]
+                if let Some(hook) = &self.before_managed_add {
+                    hook()?;
+                }
                 let identity = self
                     .registry
                     .lock()
@@ -322,7 +330,7 @@ impl TorrentAdmissionService {
             })?;
             let result = match self.admit_raw(bytes, AddOpts::default()).await {
                 Ok(result) => result,
-                Err(_) => {
+                Err(error) if error.is_input_error() => {
                     std::fs::rename(&path, path.with_extension("torrent.rejected")).map_err(
                         |e| nzbd_state::StateError::Io {
                             op: "rename rejected torrent watch source",
@@ -332,6 +340,7 @@ impl TorrentAdmissionService {
                     )?;
                     continue;
                 }
+                Err(error) => return Err(error),
             };
             let suffix = if result.created {
                 "processed"
@@ -592,6 +601,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn managed_add_failure_observes_descriptor_and_queue_already_durable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut service, engine) = service(&tmp).await;
+        let state = tmp.path().join("state");
+        let observed_state = state.clone();
+        service.before_managed_add = Some(Arc::new(move || {
+            let persisted = nzbd_state::SnapshotStore::open(&observed_state)?
+                .load()?
+                .expect("queue commit must precede managed add");
+            let torrent = persisted.jobs[0]
+                .torrent
+                .as_ref()
+                .expect("torrent row must precede managed add");
+            assert!(observed_state.join(&torrent.metadata_file).exists());
+            Err(AdmissionError::MissingPending)
+        }));
+
+        let error = service
+            .admit_raw(metainfo(b"ordered.bin"), AddOpts::default())
+            .await
+            .unwrap_err();
+        assert!(matches!(error, AdmissionError::MissingPending));
+        assert_eq!(engine.snapshot().jobs.len(), 1);
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn invalid_input_is_422_without_a_live_or_pending_job() {
         let tmp = tempfile::tempdir().unwrap();
         let (service, engine) = service(&tmp).await;
@@ -677,6 +713,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn recover_resumes_a_durable_http_intent_and_reaps_orphans() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let body = metainfo(b"recovered.bin");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0; 1024];
+            let _ = stream.read(&mut request).await.unwrap();
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            stream.write_all(&body).await.unwrap();
+        });
+        let (service, engine) = service(&tmp).await;
+        let state = tmp.path().join("state");
+        let secret = format!("http://{address}/source?passkey=restart-secret");
+        let job = engine
+            .reserve_torrent_admission(TorrentSource::Url, secret.into_bytes())
+            .await
+            .unwrap();
+        let store = PendingSourceStore::open(&state).unwrap();
+        store.write(JobId(999), b"orphan-secret").unwrap();
+
+        let raw: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(state.join("queue.json")).unwrap()).unwrap();
+        assert_eq!(raw["schema_version"], 4);
+        assert_eq!(raw["pending_admissions"][0]["job_id"], job.0);
+        assert_eq!(raw["pending_admissions"][0]["source"], "url");
+        assert_eq!(
+            raw["pending_admissions"][0]["secret_ref"],
+            format!("torrents/pending/{}.source", job.0)
+        );
+        assert!(!raw.to_string().contains("restart-secret"));
+
+        let recovered = service.recover().await.unwrap();
+        server.await.unwrap();
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].id, job);
+        assert!(store.inventory().unwrap().is_empty());
+        let persisted = nzbd_state::SnapshotStore::open(&state)
+            .unwrap()
+            .load()
+            .unwrap()
+            .unwrap();
+        assert!(persisted.pending_admissions.is_empty());
+        assert_eq!(persisted.jobs[0].id, job);
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn watch_rejects_a_bad_entry_and_continues_to_the_next() {
         let tmp = tempfile::tempdir().unwrap();
         let watch = tmp.path().join("watch");
@@ -692,6 +788,22 @@ mod tests {
         assert!(service.scan_watch_once(&watch).await.unwrap().is_empty());
         assert_eq!(engine.snapshot().jobs.len(), 1);
         engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn watch_leaves_valid_input_in_place_after_an_internal_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let watch = tmp.path().join("watch");
+        std::fs::create_dir(&watch).unwrap();
+        let source = watch.join("retry.torrent");
+        std::fs::write(&source, metainfo(b"retry.bin")).unwrap();
+        let (service, engine) = service(&tmp).await;
+        engine.shutdown().await;
+
+        let error = service.scan_watch_once(&watch).await.unwrap_err();
+        assert!(matches!(error, AdmissionError::Engine(_)));
+        assert!(source.exists());
+        assert!(!watch.join("retry.torrent.rejected").exists());
     }
 
     #[test]

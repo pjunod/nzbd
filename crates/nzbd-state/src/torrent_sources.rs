@@ -1,3 +1,8 @@
+//! Protected pending-source storage for dormant torrent admission.
+//!
+//! Unix files are created mode 0600. Owner-only Windows ACL hardening is
+//! tracked by #200 and must land before #163 activates production admission.
+
 use crate::StateError;
 use nzbd_types::JobId;
 use std::fs::{File, OpenOptions};
