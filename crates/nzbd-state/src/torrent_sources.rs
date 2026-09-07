@@ -1,11 +1,12 @@
 //! Protected pending-source storage for dormant torrent admission.
 //!
-//! Unix files are created mode 0600. Owner-only Windows ACL hardening is
-//! tracked by #200 and must land before #163 activates production admission.
+//! Unix files are created mode 0600. On Windows the sidecar is created with
+//! an owner-only ACL via `windows_secret` (#200). Both must be in place
+//! before #163 activates production admission.
 
 use crate::StateError;
 use nzbd_types::JobId;
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -30,14 +31,7 @@ impl PendingSourceStore {
     pub fn write(&self, job: JobId, source: &[u8]) -> Result<PathBuf, StateError> {
         let path = self.root.join(format!("{}.source", job.0));
         let tmp = self.root.join(format!(".{}.source.tmp", job.0));
-        let mut options = OpenOptions::new();
-        options.write(true).create(true).truncate(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let mut file = options.open(&tmp).map_err(|e| io("create", &tmp, e))?;
+        let mut file = open_secret_for_write(&tmp).map_err(|e| io("create", &tmp, e))?;
         file.write_all(source).map_err(|e| io("write", &tmp, e))?;
         file.sync_all().map_err(|e| io("fsync", &tmp, e))?;
         drop(file);
@@ -84,6 +78,31 @@ fn sync_dir(path: &Path) -> Result<(), StateError> {
     File::open(path)
         .and_then(|file| file.sync_all())
         .map_err(|e| io("fsync directory", path, e))
+}
+
+/// Open a sidecar for writing with owner-only protection. Unix creates it
+/// mode `0600`; Windows applies an owner-only ACL on creation (#200); other
+/// platforms fall back to their default file creation. The temp file is
+/// created with the protection and then renamed into place, which preserves
+/// it, so the final `<job>.source` is never world-readable.
+#[cfg(unix)]
+fn open_secret_for_write(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true).mode(0o600);
+    options.open(path)
+}
+
+#[cfg(windows)]
+fn open_secret_for_write(path: &Path) -> std::io::Result<std::fs::File> {
+    crate::windows_secret::open_secret_for_write(path)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn open_secret_for_write(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    options.open(path)
 }
 
 fn io(op: &'static str, path: &Path, source: std::io::Error) -> StateError {
