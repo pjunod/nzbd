@@ -59,7 +59,7 @@ source_redirects = 5
 | `listen_port` | `6881` | One explicit non-zero TCP/IPv4 port; ranges and ephemeral port 0 are unsupported. |
 | `dht` / `pex` | `false` / `true` | Conservative discovery defaults; DHT is incompatible with the SOCKS proxy. |
 | `local_discovery` / `upnp_port_forwarding` | `false` / `false` | Avoids LAN disclosure and router mutation. UPnP `true` is rejected. |
-| `socks_proxy_*` | absent | URL must be a credential-free SOCKS5 origin; username/password are paired and the password is masked by Settings. |
+| `socks_proxy_*` | absent | URL must be a credential-free SOCKS5 origin. Username/password are paired; the username must be non-empty, and both fields may contain only ASCII letters, digits, `-`, `.`, `_`, or `~` (so characters such as `@` and `!` are rejected). The password is masked by Settings. |
 | peer ceilings | `80`, `400`, `1024`, `4096` | Separate live and retained per-torrent/session budgets. |
 | `upload_limit_kib` | `0` | Unlimited; this is the only torrent setting designed for live application. |
 | seed ratio/minutes | `0` | Unlimited globally; optional category values override these and per-add values override categories. |
