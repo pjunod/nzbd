@@ -389,6 +389,53 @@ pub struct EngineHandle {
 }
 
 impl EngineHandle {
+    pub async fn reserve_torrent_admission(
+        &self,
+        source: nzbd_types::TorrentSource,
+        secret: Vec<u8>,
+    ) -> Result<JobId, EngineError> {
+        let (tx, rx) = oneshot::channel();
+        self.send(QueueCommand::ReserveTorrentAdmission {
+            source,
+            secret,
+            reply: tx,
+        })
+        .await?;
+        rx.await
+            .map_err(|_| EngineError::Closed)?
+            .map_err(EngineError::State)
+    }
+
+    pub async fn commit_torrent_admission(
+        &self,
+        job: JobId,
+        name: String,
+        opts: AddOpts,
+        record: nzbd_types::TorrentRecord,
+    ) -> Result<Option<Result<JobId, JobId>>, EngineError> {
+        let (tx, rx) = oneshot::channel();
+        self.send(QueueCommand::CommitTorrentAdmission {
+            job,
+            commit: Box::new(crate::queue::TorrentAdmissionCommit {
+                name,
+                category: opts.category,
+                priority: opts.priority,
+                paused: opts.paused,
+                params: with_client(opts.params, opts.client),
+                record,
+            }),
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| EngineError::Closed)
+    }
+
+    pub async fn cancel_torrent_admission(&self, job: JobId) -> Result<bool, EngineError> {
+        let (tx, rx) = oneshot::channel();
+        self.send(QueueCommand::CancelTorrentAdmission { job, reply: tx })
+            .await?;
+        rx.await.map_err(|_| EngineError::Closed)
+    }
     /// Parse and enqueue an NZB. Parsing happens on the caller's task so a
     /// large or hostile NZB never stalls the queue owner.
     pub async fn add_nzb(

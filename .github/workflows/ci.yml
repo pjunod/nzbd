@@ -88,6 +88,8 @@ jobs:
       # CLI/compat test that boots the real binary.
       - name: cargo test
         run: cargo test --workspace
+      - name: cargo test (torrent admission)
+        run: cargo test --locked -p nzbd-api --features torrent-admission
 
   msrv:
     name: MSRV check (1.85)

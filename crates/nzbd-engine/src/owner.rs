@@ -40,6 +40,20 @@ use tokio_util::task::TaskTracker;
 /// External commands (wrapped by `EngineHandle` methods).
 #[derive(Debug)]
 pub(crate) enum QueueCommand {
+    ReserveTorrentAdmission {
+        source: nzbd_types::TorrentSource,
+        secret: Vec<u8>,
+        reply: oneshot::Sender<Result<JobId, nzbd_state::StateError>>,
+    },
+    CommitTorrentAdmission {
+        job: JobId,
+        commit: Box<crate::queue::TorrentAdmissionCommit>,
+        reply: oneshot::Sender<Option<Result<JobId, JobId>>>,
+    },
+    CancelTorrentAdmission {
+        job: JobId,
+        reply: oneshot::Sender<bool>,
+    },
     AddParsed {
         name: String,
         parsed: Box<ParsedNzb>,
@@ -435,6 +449,7 @@ pub(crate) struct Owner {
     state_dir: PathBuf,
     journal: JobJournals,
     snap_store: SnapshotStore,
+    pending_sources: nzbd_state::torrent_sources::PendingSourceStore,
     /// How long the last snapshot write took — feeds [`save_spacing`], so a
     /// slow state volume stretches the save cadence instead of consuming
     /// the owner loop.
@@ -610,6 +625,7 @@ impl Owner {
         let marker = UncleanMarker::new(state_dir, journal_suffix);
         let was_unclean = marker.check_and_arm()?;
         let snap_store = SnapshotStore::open(state_dir)?;
+        let pending_sources = nzbd_state::torrent_sources::PendingSourceStore::open(state_dir)?;
         let journal = JobJournals::open(state_dir, journal_suffix)?;
 
         let mut state = QueueState::default();
@@ -705,6 +721,7 @@ impl Owner {
             state_dir: state_dir.to_path_buf(),
             journal,
             snap_store,
+            pending_sources,
             marker,
             persist,
             persist_guard,
@@ -920,6 +937,56 @@ impl Owner {
 
     fn on_command(&mut self, cmd: QueueCommand) {
         match cmd {
+            QueueCommand::ReserveTorrentAdmission {
+                source,
+                secret,
+                reply,
+            } => {
+                // Reserve from the queue owner first: it alone allocates ids. The
+                // reservation is not durable until the protected sidecar exists.
+                let id = self.state.reserve_torrent_admission(source);
+                let result = match self.pending_sources.write(id, &secret) {
+                    Ok(secret_ref) => {
+                        // The reference is derived from the allocated id, never a
+                        // separately predicted identity.
+                        if let Some(pending) = self
+                            .state
+                            .pending_admissions
+                            .iter_mut()
+                            .find(|pending| pending.job_id == id)
+                        {
+                            pending.secret_ref = secret_ref;
+                        }
+                        self.save_snapshot();
+                        self.publish_now();
+                        Ok(id)
+                    }
+                    Err(error) => {
+                        self.state.cancel_torrent_admission(id);
+                        Err(error)
+                    }
+                };
+                let _ = reply.send(result);
+            }
+            QueueCommand::CommitTorrentAdmission { job, commit, reply } => {
+                let result = self.state.commit_torrent_admission(job, *commit);
+                if result.is_some() {
+                    self.save_snapshot();
+                    let _ = self.pending_sources.remove(job);
+                    self.publish_now();
+                    self.bump_epoch();
+                }
+                let _ = reply.send(result);
+            }
+            QueueCommand::CancelTorrentAdmission { job, reply } => {
+                let removed = self.state.cancel_torrent_admission(job);
+                if removed {
+                    self.save_snapshot();
+                    let _ = self.pending_sources.remove(job);
+                    self.publish_now();
+                }
+                let _ = reply.send(removed);
+            }
             QueueCommand::AddParsed {
                 name,
                 parsed,
