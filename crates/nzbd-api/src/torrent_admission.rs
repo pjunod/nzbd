@@ -443,26 +443,27 @@ async fn apply_pause_resume(
     if association.applied_pause == Some(pause) {
         return None;
     }
-    let registry = registry.lock().await;
-    let result = if pause {
-        registry.pause(&association.identity).await
-    } else {
-        registry.resume(&association.identity).await
+    let result = {
+        let registry = registry.lock().await;
+        if pause {
+            registry.pause(&association.identity).await
+        } else {
+            registry.resume(&association.identity).await
+        }
     };
     match result {
         Ok(()) => {
-            associations
-                .lock()
-                .await
-                .get_mut(&job)
-                .unwrap()
-                .applied_pause = Some(pause);
-            pause
-                .then(|| BackendFact::Stopped {
+            if let Some(association) = associations.lock().await.get_mut(&job) {
+                association.applied_pause = Some(pause);
+            }
+            if pause {
+                Some(BackendFact::Stopped {
                     job,
                     reason: StopReason::Paused,
                 })
-                .or(Some(BackendFact::Resumed { job }))
+            } else {
+                Some(BackendFact::Resumed { job })
+            }
         }
         // Never send an engine diagnostic across the owner boundary: it may
         // contain a passkey, query, peer address, or untrusted path.

@@ -100,7 +100,7 @@ async fn downloader(
         assert!(handle.is_paused(), "pause must apply before completion");
         assert_eq!(handle.stats().phase, TorrentPhase::Paused);
         let paused_bytes = handle.stats().progress_bytes;
-        tokio::time::sleep(Duration::from_millis(250)).await;
+        tokio::time::sleep(Duration::from_secs(2)).await;
         assert_eq!(
             handle.stats().progress_bytes,
             paused_bytes,
@@ -109,6 +109,10 @@ async fn downloader(
         session.resume(&handle).await.unwrap();
         assert!(!handle.is_paused(), "resume must return a live download");
         assert_eq!(handle.stats().phase, TorrentPhase::Live);
+        assert!(
+            handle.stats().progress_bytes >= paused_bytes,
+            "resume must retain the verified checkpoint before new progress lands"
+        );
         session.set_download_limit_bps(None);
         paused_verified_bytes = Some(paused_bytes);
     }
