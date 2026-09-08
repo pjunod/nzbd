@@ -9,9 +9,7 @@ on:
       - contrib/rqbit/maintained-series.txt
       - contrib/rqbit/*.sha256
       - contrib/rqbit/vendor/**
-      - crates/nzbd-state/Cargo.toml
-      - crates/nzbd-state/src/torrent_sources.rs
-      - crates/nzbd-state/src/windows_secret.rs
+      - crates/nzbd-state/**
       - crates/nzbd-torrent/**
       - crates/nzbd/src/main.rs
       - crates/nzbd/src/tls.rs
@@ -27,9 +25,7 @@ on:
       - contrib/rqbit/maintained-series.txt
       - contrib/rqbit/*.sha256
       - contrib/rqbit/vendor/**
-      - crates/nzbd-state/Cargo.toml
-      - crates/nzbd-state/src/torrent_sources.rs
-      - crates/nzbd-state/src/windows_secret.rs
+      - crates/nzbd-state/**
       - crates/nzbd-torrent/**
       - crates/nzbd/src/main.rs
       - crates/nzbd/src/tls.rs
