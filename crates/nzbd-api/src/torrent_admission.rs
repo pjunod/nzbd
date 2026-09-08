@@ -246,6 +246,7 @@ impl TorrentAdmissionService {
             source,
             metadata_file: relative,
             phase: TorrentPhase::Queued,
+            control_intent: nzbd_types::TorrentControlIntent::Running,
             files: descriptor
                 .files
                 .iter()

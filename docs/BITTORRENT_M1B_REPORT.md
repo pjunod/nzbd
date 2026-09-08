@@ -83,6 +83,15 @@ ready/failure fact. The tests send 50,000 progress updates into a one-command
 channel and observe the remove command next; the owner sees only the latest
 progress value for the job.
 
+For M2 control, `TorrentRecord.control_intent` is the queue owner's durable
+pause/resume request, distinct from the backend-observed `TorrentPhase`.
+The owner snapshots a changed intent before placing its matching pause, resume,
+or priority command on the bounded FIFO. A full FIFO retains that command and
+retries it in order on the next owner tick. Retention is capped at 64 commands:
+once full, a new control request is rejected before its intent is persisted,
+rather than allowing an unattached executor to grow owner memory without
+bound. Records written before this field decode as `running`.
+
 `SafeError` accepts only an already-redacted message from the adapter and
 enforces the proposal's 2 KiB UTF-8-safe persistence bound. Engine-specific
 redaction remains an M2 adapter responsibility.

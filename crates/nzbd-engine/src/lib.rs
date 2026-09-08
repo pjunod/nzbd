@@ -191,6 +191,11 @@ impl Engine {
         let (budget_tx, budget_rx) =
             watch::channel(std::collections::HashMap::<nzbd_types::ServerId, u16>::new());
         let (engine_tx, engine_rx) = mpsc::channel::<EngineMsg>(1024);
+        // The owner gets the command-producing half. Keep the adapter half
+        // with the engine handle until the runtime executor takes it; this
+        // preserves the single owner-to-backend seam without starting a peer
+        // session in the dormant engine configuration.
+        let (backend_owner, backend_adapter) = backend::backend_channel(64, 64);
         let meter = Arc::new(SpeedMeter::new());
         let limiter = Arc::new(RateLimiter::new(cfg.speed_limit_bps));
         let cancel = CancellationToken::new();
@@ -226,6 +231,7 @@ impl Engine {
             limiter.clone(),
             cfg.speed_limit_bps,
             cfg.max_active_downloads,
+            backend_owner,
             engine_tx.clone(),
             tracker.clone(),
             cancel.clone(),
@@ -318,6 +324,7 @@ impl Engine {
             events,
             cancel,
             tracker,
+            backend_adapter: Arc::new(std::sync::Mutex::new(Some(backend_adapter))),
         };
 
         for (job, url) in refetch {
@@ -386,9 +393,16 @@ pub struct EngineHandle {
     events: broadcast::Sender<Event>,
     cancel: CancellationToken,
     tracker: TaskTracker,
+    backend_adapter: Arc<std::sync::Mutex<Option<backend::BackendAdapterPort>>>,
 }
 
 impl EngineHandle {
+    /// Transfer the sole adapter endpoint to the backend runtime. There can
+    /// be only one consumer because backend commands are ordered FIFO.
+    pub fn take_backend_adapter(&self) -> Option<backend::BackendAdapterPort> {
+        self.backend_adapter.lock().ok()?.take()
+    }
+
     pub async fn reserve_torrent_admission(
         &self,
         source: nzbd_types::TorrentSource,

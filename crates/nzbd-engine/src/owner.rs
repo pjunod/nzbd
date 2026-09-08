@@ -8,6 +8,7 @@
 //! about state. Sends toward writer tasks use `try_send` with a
 //! retry-on-tick fallback so owner ⇄ writer backpressure can never deadlock.
 
+use crate::backend::{BackendCommand, BackendOwnerPort};
 use crate::events::Event;
 use crate::failover::{AttemptOutcome, Ladder, SegmentAttempt, Verdict};
 use crate::queue::{
@@ -23,14 +24,20 @@ use arc_swap::ArcSwap;
 use nzbd_nzb::ParsedNzb;
 use nzbd_state::{FsJournal, JobJournals, JournalRecord, SnapshotStore, UncleanMarker};
 use nzbd_types::{
-    FileId, Health, Job, JobId, JobStatus, PostStage, SegmentState, ServerDef, ServerId, StageSpan,
+    FileId, Health, Job, JobId, JobKind, JobStatus, PostStage, SegmentState, ServerDef, ServerId,
+    StageSpan, TorrentControlIntent,
 };
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio::time::{Duration, Instant, MissedTickBehavior};
 use tokio_util::sync::CancellationToken;
+
+/// Retained commands exist only to bridge a temporarily full adapter FIFO.
+/// Refuse a new control request once this bound is reached rather than growing
+/// owner memory without limit while no adapter is attached.
+const MAX_PENDING_BACKEND_COMMANDS: usize = 64;
 use tokio_util::task::TaskTracker;
 
 // ---------------------------------------------------------------------------
@@ -445,6 +452,13 @@ pub(crate) struct Owner {
     /// ladder). Surfaced in the snapshot: this is the gap between wire
     /// throughput and completed bytes, and it must be visible.
     retry_counts: HashMap<u32, u32>,
+    /// The owner is the only queue-state writer and therefore the only
+    /// producer of protocol-neutral backend commands.
+    backend: BackendOwnerPort,
+    /// Commands retained when the bounded backend FIFO is full. They are
+    /// retried in order from the next owner tick, never awaited inline. The
+    /// queue is bounded by [`MAX_PENDING_BACKEND_COMMANDS`].
+    pending_backend_commands: VecDeque<BackendCommand>,
 
     state_dir: PathBuf,
     journal: JobJournals,
@@ -618,6 +632,7 @@ impl Owner {
         limiter: Arc<RateLimiter>,
         config_speed_limit: Option<u64>,
         config_max_active: Option<u32>,
+        backend: BackendOwnerPort,
         engine_tx: mpsc::Sender<EngineMsg>,
         tracker: TaskTracker,
         cancel: CancellationToken,
@@ -718,6 +733,8 @@ impl Owner {
             job_wire_ema: HashMap::new(),
             server_wire_ema: HashMap::new(),
             retry_counts: HashMap::new(),
+            backend,
+            pending_backend_commands: VecDeque::new(),
             state_dir: state_dir.to_path_buf(),
             journal,
             snap_store,
@@ -1201,33 +1218,85 @@ impl Owner {
                 let _ = reply.send(ok);
             }
             QueueCommand::Pause { job, reply } => {
-                let ok = match self.state.job_mut(job) {
-                    Some(j) if matches!(j.status, JobStatus::Queued | JobStatus::Downloading) => {
+                let before = self.state.job(job).cloned();
+                let torrent = match self.state.job_mut(job) {
+                    Some(j)
+                        if j.kind == JobKind::Torrent
+                            && matches!(j.status, JobStatus::Queued | JobStatus::Downloading)
+                            && j.torrent.is_some() =>
+                    {
                         j.status = JobStatus::Paused;
+                        j.torrent.as_mut().unwrap().control_intent = TorrentControlIntent::Paused;
                         true
                     }
                     _ => false,
                 };
-                if ok {
+                let ok = if torrent {
                     self.dirty = true;
-                    self.bump_epoch();
-                    self.publish_now();
-                }
+                    if self.persist_then_command(BackendCommand::Pause { job }) {
+                        self.bump_epoch();
+                        self.publish_now();
+                        true
+                    } else {
+                        if let Some(before) = before {
+                            *self.state.job_mut(job).unwrap() = before;
+                        }
+                        false
+                    }
+                } else {
+                    match self.state.job_mut(job) {
+                        Some(j)
+                            if matches!(j.status, JobStatus::Queued | JobStatus::Downloading) =>
+                        {
+                            j.status = JobStatus::Paused;
+                            self.dirty = true;
+                            self.bump_epoch();
+                            self.publish_now();
+                            true
+                        }
+                        _ => false,
+                    }
+                };
                 let _ = reply.send(ok);
             }
             QueueCommand::Resume { job, reply } => {
-                let ok = match self.state.job_mut(job) {
-                    Some(j) if matches!(j.status, JobStatus::Paused) => {
+                let before = self.state.job(job).cloned();
+                let torrent = match self.state.job_mut(job) {
+                    Some(j)
+                        if j.kind == JobKind::Torrent
+                            && matches!(j.status, JobStatus::Paused)
+                            && j.torrent.is_some() =>
+                    {
                         j.status = JobStatus::Queued;
+                        j.torrent.as_mut().unwrap().control_intent = TorrentControlIntent::Running;
                         true
                     }
                     _ => false,
                 };
-                if ok {
+                let ok = if torrent {
                     self.dirty = true;
-                    self.bump_epoch();
-                    self.publish_now();
-                }
+                    if self.persist_then_command(BackendCommand::Resume { job }) {
+                        self.bump_epoch();
+                        self.publish_now();
+                        true
+                    } else {
+                        if let Some(before) = before {
+                            *self.state.job_mut(job).unwrap() = before;
+                        }
+                        false
+                    }
+                } else {
+                    match self.state.job_mut(job) {
+                        Some(j) if matches!(j.status, JobStatus::Paused) => {
+                            j.status = JobStatus::Queued;
+                            self.dirty = true;
+                            self.bump_epoch();
+                            self.publish_now();
+                            true
+                        }
+                        _ => false,
+                    }
+                };
                 let _ = reply.send(ok);
             }
             QueueCommand::Delete {
@@ -1243,18 +1312,38 @@ impl Owner {
                 priority,
                 reply,
             } => {
-                let ok = match self.state.job_mut(job) {
-                    Some(j) => {
+                let before = self.state.job(job).cloned();
+                let torrent = match self.state.job_mut(job) {
+                    Some(j) if j.kind == JobKind::Torrent && j.priority != priority => {
                         j.priority = priority;
                         true
                     }
-                    None => false,
+                    _ => false,
                 };
-                if ok {
+                let ok = if torrent {
                     self.dirty = true;
-                    self.bump_epoch();
-                    self.publish_now();
-                }
+                    if self.persist_then_command(BackendCommand::SetPriority { job, priority }) {
+                        self.bump_epoch();
+                        self.publish_now();
+                        true
+                    } else {
+                        if let Some(before) = before {
+                            *self.state.job_mut(job).unwrap() = before;
+                        }
+                        false
+                    }
+                } else {
+                    match self.state.job_mut(job) {
+                        Some(j) => {
+                            j.priority = priority;
+                            self.dirty = true;
+                            self.bump_epoch();
+                            self.publish_now();
+                            true
+                        }
+                        None => false,
+                    }
+                };
                 let _ = reply.send(ok);
             }
             QueueCommand::Move { job, op, reply } => {
@@ -2729,6 +2818,8 @@ impl Owner {
 
     fn on_tick(&mut self) {
         let tick_started = Instant::now();
+        self.flush_backend_commands();
+        self.fold_backend_progress();
         self.guard_tick = self.guard_tick.wrapping_add(1);
         self.settle_download_labels();
         // Reading the enforcing disk cache is memory-only, so do it every
@@ -2826,6 +2917,75 @@ impl Owner {
                 snapshot_save_ms = save_ms,
                 "engine tick ran long — the breakdown names the stall; commands and UI updates queue behind this"
             );
+        }
+    }
+
+    /// Try retained commands in FIFO order. A full channel leaves its head in
+    /// place for the next tick; a closed channel has no executor and is not a
+    /// reason to spin or reorder intent.
+    fn flush_backend_commands(&mut self) {
+        while let Some(command) = self.pending_backend_commands.pop_front() {
+            match self.backend.try_command(command) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full(command)) => {
+                    self.pending_backend_commands.push_front(command);
+                    break;
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => break,
+            }
+        }
+    }
+
+    /// Progress is a latest-value map, never a FIFO input. Folding at the
+    /// owner tick keeps peer-stat floods from delaying user controls.
+    fn fold_backend_progress(&mut self) {
+        let latest = self.backend.latest_progress();
+        let mut changed = false;
+        for (job_id, progress) in latest {
+            let Some(job) = self.state.job_mut(job_id) else {
+                continue;
+            };
+            changed |= crate::torrent_runtime::reconcile_progress(job, &progress).durable_changed;
+        }
+        if changed {
+            self.dirty = true;
+        }
+    }
+
+    /// Persist a torrent's requested state before placing its matching backend
+    /// command on the bounded FIFO. A failed persistence attempt is restored
+    /// by the caller, so an unrecorded request cannot become idempotently
+    /// stuck or reach the engine.
+    fn persist_then_command(&mut self, command: BackendCommand) -> bool {
+        // Never let a later request bypass one already retained by a full
+        // adapter FIFO. Refusing at the bound happens before persistence, so
+        // the durable queue remains consistent with the reported result.
+        if !self.pending_backend_commands.is_empty() {
+            if self.pending_backend_commands.len() == MAX_PENDING_BACKEND_COMMANDS {
+                return false;
+            }
+            if self.persist && !self.save_snapshot() {
+                return false;
+            }
+            self.pending_backend_commands.push_back(command);
+            return true;
+        }
+
+        // Worker-mode engines do not own queue persistence. That is an
+        // intentional configuration, not a failed durability barrier.
+        if self.persist && !self.save_snapshot() {
+            return false;
+        }
+        match self.backend.try_command(command) {
+            Ok(()) => true,
+            Err(mpsc::error::TrySendError::Full(command)) => {
+                self.pending_backend_commands.push_back(command);
+                true
+            }
+            // The durable request remains authoritative if a runtime has
+            // stopped; a later restart can converge it rather than silently
+            // rolling back a successfully saved operator action.
+            Err(mpsc::error::TrySendError::Closed(_)) => true,
         }
     }
 
@@ -3268,11 +3428,24 @@ mod tests {
     use super::*;
 
     fn guard_test_owner(tuning: Tuning) -> (tempfile::TempDir, Owner, watch::Receiver<u64>) {
+        let (tmp, owner, epoch, _adapter) = guard_test_owner_with_backend(tuning);
+        (tmp, owner, epoch)
+    }
+
+    fn guard_test_owner_with_backend(
+        tuning: Tuning,
+    ) -> (
+        tempfile::TempDir,
+        Owner,
+        watch::Receiver<u64>,
+        crate::backend::BackendAdapterPort,
+    ) {
         let tmp = tempfile::tempdir().unwrap();
         let (budget_tx, _) = watch::channel(HashMap::new());
         let (events, _) = broadcast::channel(1);
         let (epoch_tx, epoch_rx) = watch::channel(0);
         let (engine_tx, _) = mpsc::channel(1);
+        let (backend, adapter) = crate::backend::backend_channel(1, 1);
         let owner = Owner::recover(
             &tmp.path().join("state"),
             tmp.path().join("dest"),
@@ -3290,12 +3463,317 @@ mod tests {
             Arc::new(RateLimiter::new(None)),
             None,
             None,
+            backend,
             engine_tx,
             TaskTracker::new(),
             CancellationToken::new(),
         )
         .unwrap();
-        (tmp, owner, epoch_rx)
+        (tmp, owner, epoch_rx, adapter)
+    }
+
+    fn control_test_owner() -> (tempfile::TempDir, Owner, crate::backend::BackendAdapterPort) {
+        control_test_owner_with_persistence(true, None)
+    }
+
+    fn control_test_owner_with_persistence(
+        persist: bool,
+        persist_guard: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
+    ) -> (tempfile::TempDir, Owner, crate::backend::BackendAdapterPort) {
+        let tmp = tempfile::tempdir().unwrap();
+        let (budget_tx, _) = watch::channel(HashMap::new());
+        let (events, _) = broadcast::channel(1);
+        let (epoch_tx, _) = watch::channel(0);
+        let (engine_tx, _) = mpsc::channel(1);
+        let (backend, adapter) = crate::backend::backend_channel(1, 1);
+        let owner = Owner::recover(
+            &tmp.path().join("state"),
+            tmp.path().join("dest"),
+            Arc::new(Vec::new()),
+            Tuning::default(),
+            true,
+            persist,
+            "control-test",
+            persist_guard,
+            budget_tx,
+            crate::new_shared_snapshot(),
+            events,
+            epoch_tx,
+            Arc::new(SpeedMeter::new()),
+            Arc::new(RateLimiter::new(None)),
+            None,
+            None,
+            backend,
+            engine_tx,
+            TaskTracker::new(),
+            CancellationToken::new(),
+        )
+        .unwrap();
+        (tmp, owner, adapter)
+    }
+
+    fn control_torrent_job() -> Job {
+        let mut job = bare_job();
+        job.kind = JobKind::Torrent;
+        job.status = JobStatus::Queued;
+        job.torrent = Some(nzbd_types::TorrentRecord {
+            info_hash_v1: "0123456789abcdef0123456789abcdef01234567".into(),
+            source: nzbd_types::TorrentSource::Metainfo,
+            metadata_file: "meta/control.torrent".into(),
+            phase: nzbd_types::TorrentPhase::Queued,
+            control_intent: TorrentControlIntent::Running,
+            files: Vec::new(),
+            total_bytes: 1,
+            selected_bytes: 1,
+            downloaded_bytes: 0,
+            uploaded_bytes: 0,
+            seeding_seconds: 0,
+            ready_at_unix: None,
+            content_path: None,
+            seed_policy: Default::default(),
+            last_activity_unix: None,
+            last_error: None,
+        });
+        job
+    }
+
+    #[tokio::test]
+    async fn torrent_control_is_persisted_before_fifo_delivery_and_is_idempotent() {
+        let (tmp, mut owner, mut adapter) = control_test_owner();
+        owner.state.jobs.push(control_torrent_job());
+
+        let (reply, rx) = oneshot::channel();
+        owner.on_command(QueueCommand::Pause {
+            job: JobId(1),
+            reply,
+        });
+        assert!(rx.await.unwrap());
+        assert_eq!(
+            adapter.next_command().await,
+            Some(BackendCommand::Pause { job: JobId(1) })
+        );
+
+        let persisted = owner.snap_store.load().unwrap().unwrap();
+        let torrent = persisted.jobs[0].torrent.as_ref().unwrap();
+        assert_eq!(persisted.jobs[0].status, JobStatus::Paused);
+        assert_eq!(torrent.control_intent, TorrentControlIntent::Paused);
+
+        let (reply, rx) = oneshot::channel();
+        owner.on_command(QueueCommand::Pause {
+            job: JobId(1),
+            reply,
+        });
+        assert!(!rx.await.unwrap());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), adapter.next_command())
+                .await
+                .is_err()
+        );
+
+        let (reply, rx) = oneshot::channel();
+        owner.on_command(QueueCommand::Resume {
+            job: JobId(1),
+            reply,
+        });
+        assert!(rx.await.unwrap());
+        assert_eq!(
+            adapter.next_command().await,
+            Some(BackendCommand::Resume { job: JobId(1) })
+        );
+        assert!(tmp.path().join("state/queue.json").exists());
+    }
+
+    #[tokio::test]
+    async fn failed_persistence_never_emits_a_torrent_control() {
+        let (_tmp, mut owner, mut adapter) =
+            control_test_owner_with_persistence(true, Some(Arc::new(|| false)));
+        owner.state.jobs.push(control_torrent_job());
+
+        let (reply, rx) = oneshot::channel();
+        owner.on_command(QueueCommand::Pause {
+            job: JobId(1),
+            reply,
+        });
+
+        assert!(!rx.await.unwrap());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), adapter.next_command())
+                .await
+                .is_err(),
+            "a failed durability barrier must prevent FIFO delivery"
+        );
+        let job = owner.state.job(JobId(1)).unwrap();
+        assert_eq!(job.status, JobStatus::Queued);
+        assert_eq!(
+            job.torrent.as_ref().unwrap().control_intent,
+            TorrentControlIntent::Running
+        );
+    }
+
+    #[tokio::test]
+    async fn full_backend_fifo_retries_retained_torrent_commands_in_order() {
+        let (_tmp, mut owner, mut adapter) = control_test_owner();
+        owner.state.jobs.push(control_torrent_job());
+
+        let (reply, rx) = oneshot::channel();
+        owner.on_command(QueueCommand::Pause {
+            job: JobId(1),
+            reply,
+        });
+        assert!(rx.await.unwrap());
+        let (reply, rx) = oneshot::channel();
+        owner.on_command(QueueCommand::SetPriority {
+            job: JobId(1),
+            priority: 77,
+            reply,
+        });
+        assert!(rx.await.unwrap());
+        assert_eq!(owner.pending_backend_commands.len(), 1);
+
+        assert_eq!(
+            adapter.next_command().await,
+            Some(BackendCommand::Pause { job: JobId(1) })
+        );
+        owner.flush_backend_commands();
+        assert_eq!(
+            adapter.next_command().await,
+            Some(BackendCommand::SetPriority {
+                job: JobId(1),
+                priority: 77
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn retained_backend_commands_precede_later_control_requests() {
+        let (_tmp, mut owner, mut adapter) = control_test_owner();
+        owner.state.jobs.push(control_torrent_job());
+
+        for command in [
+            QueueCommand::Pause {
+                job: JobId(1),
+                reply: oneshot::channel().0,
+            },
+            QueueCommand::SetPriority {
+                job: JobId(1),
+                priority: 77,
+                reply: oneshot::channel().0,
+            },
+        ] {
+            owner.on_command(command);
+        }
+        assert_eq!(owner.pending_backend_commands.len(), 1);
+        assert_eq!(
+            adapter.next_command().await,
+            Some(BackendCommand::Pause { job: JobId(1) })
+        );
+
+        let (reply, rx) = oneshot::channel();
+        owner.on_command(QueueCommand::Resume {
+            job: JobId(1),
+            reply,
+        });
+        assert!(rx.await.unwrap());
+        assert_eq!(owner.pending_backend_commands.len(), 2);
+
+        owner.flush_backend_commands();
+        assert_eq!(
+            adapter.next_command().await,
+            Some(BackendCommand::SetPriority {
+                job: JobId(1),
+                priority: 77
+            })
+        );
+        owner.flush_backend_commands();
+        assert_eq!(
+            adapter.next_command().await,
+            Some(BackendCommand::Resume { job: JobId(1) })
+        );
+    }
+
+    #[tokio::test]
+    async fn worker_mode_torrent_controls_do_not_require_queue_persistence() {
+        let (_tmp, mut owner, mut adapter) = control_test_owner_with_persistence(false, None);
+        owner.state.jobs.push(control_torrent_job());
+
+        let (reply, rx) = oneshot::channel();
+        owner.on_command(QueueCommand::Pause {
+            job: JobId(1),
+            reply,
+        });
+
+        assert!(rx.await.unwrap());
+        assert_eq!(
+            adapter.next_command().await,
+            Some(BackendCommand::Pause { job: JobId(1) })
+        );
+    }
+
+    #[tokio::test]
+    async fn retained_backend_commands_are_bounded_before_persisting_new_intent() {
+        let (_tmp, mut owner, _adapter) = control_test_owner();
+        owner.state.jobs.push(control_torrent_job());
+
+        for n in 0..=MAX_PENDING_BACKEND_COMMANDS {
+            let (reply, rx) = oneshot::channel();
+            let command = if n % 2 == 0 {
+                QueueCommand::Pause {
+                    job: JobId(1),
+                    reply,
+                }
+            } else {
+                QueueCommand::Resume {
+                    job: JobId(1),
+                    reply,
+                }
+            };
+            owner.on_command(command);
+            assert!(rx.await.unwrap());
+        }
+        assert_eq!(
+            owner.pending_backend_commands.len(),
+            MAX_PENDING_BACKEND_COMMANDS
+        );
+
+        let (reply, rx) = oneshot::channel();
+        owner.on_command(QueueCommand::Resume {
+            job: JobId(1),
+            reply,
+        });
+        assert!(!rx.await.unwrap());
+        assert_eq!(
+            owner.pending_backend_commands.len(),
+            MAX_PENDING_BACKEND_COMMANDS
+        );
+        assert_eq!(owner.state.job(JobId(1)).unwrap().status, JobStatus::Paused);
+    }
+
+    #[test]
+    fn latest_backend_progress_is_folded_without_a_fifo_backlog() {
+        let (_tmp, mut owner, adapter) = control_test_owner();
+        owner.state.jobs.push(control_torrent_job());
+        for verified in 0..50_000 {
+            adapter.progress(
+                JobId(1),
+                crate::backend::TransferProgress {
+                    verified_bytes: verified,
+                    ..Default::default()
+                },
+            );
+        }
+        owner.fold_backend_progress();
+        assert_eq!(
+            owner
+                .state
+                .job(JobId(1))
+                .unwrap()
+                .torrent
+                .as_ref()
+                .unwrap()
+                .downloaded_bytes,
+            1,
+            "the latest sample is folded once and clamped to selected bytes"
+        );
     }
 
     fn bare_job() -> Job {
