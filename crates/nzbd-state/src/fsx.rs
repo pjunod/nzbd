@@ -157,6 +157,14 @@ pub(super) fn sync_dir(p: &Path) -> Result<(), StateError> {
 /// `FILE_APPEND_DATA` does not grant the `FILE_WRITE_DATA` permission required
 /// by `SetEndOfFile`.
 pub(super) fn truncate(p: &Path) -> Result<(), StateError> {
-    let file = create(p)?;
+    let file = ctx(
+        OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(p),
+        "truncate",
+        p,
+    )?;
     sync_data(&file, p)
 }

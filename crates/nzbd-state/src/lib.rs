@@ -787,14 +787,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("append-only.journal");
         let mut append_only = fsx::open_append(&path).unwrap();
-        fsx::write_all(&mut append_only, b"before\\n", &path).unwrap();
+        fsx::write_all(&mut append_only, b"before\n", &path).unwrap();
         fsx::sync_data(&append_only, &path).unwrap();
 
         fsx::truncate(&path).unwrap();
 
-        fsx::write_all(&mut append_only, b"after\\n", &path).unwrap();
+        fsx::write_all(&mut append_only, b"after\n", &path).unwrap();
         fsx::sync_data(&append_only, &path).unwrap();
-        assert_eq!(fsx::read(&path).unwrap(), b"after\\n");
+        assert_eq!(fsx::read(&path).unwrap(), b"after\n");
     }
 
     #[test]
