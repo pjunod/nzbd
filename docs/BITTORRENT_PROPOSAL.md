@@ -842,8 +842,10 @@ The exact pre-M2 schema-3 reader must reject schema 4 by future-version name
 before serving or writing, so it cannot silently drop an unknown field. The
 original magnet or URL is atomically written and fsynced at
 `queue/torrents/pending/<job-id>.source` with mode 0600 or an equivalent
-platform-secret ACL. It never enters `queue.json`, history, logs, events,
-errors, debug output, or API snapshots.
+platform-secret ACL. On Unix the post-rename directory flush commits the
+rename entry; Windows exposes no supported directory fsync, so there only the
+sidecar file itself is flushed (before the rename). It never enters
+`queue.json`, history, logs, events, errors, debug output, or API snapshots.
 
 Admission recovers as an ordered state machine: protected source artifact →
 durable pending intent → bounded fetch/list-only metadata resolution → durable
