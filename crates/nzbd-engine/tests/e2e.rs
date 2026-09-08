@@ -36,6 +36,7 @@ fn dormant_torrent_job() -> nzbd_types::Job {
             source: nzbd_types::TorrentSource::Magnet,
             metadata_file: "torrent/0123.torrent".into(),
             phase: nzbd_types::TorrentPhase::Downloading,
+            control_intent: nzbd_types::TorrentControlIntent::Running,
             files: Vec::new(),
             total_bytes: 42,
             selected_bytes: 42,

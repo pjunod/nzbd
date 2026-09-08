@@ -72,6 +72,19 @@ pub enum TorrentPhase {
     Failed,
 }
 
+/// The last pause/resume request durably accepted by the queue owner.
+///
+/// This is deliberately separate from [`TorrentPhase`]: phases describe what
+/// the backend has observed, while this is the queue's authoritative request
+/// that survives a restart before the backend has caught up.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TorrentControlIntent {
+    #[default]
+    Running,
+    Paused,
+}
+
 impl TorrentPhase {
     /// Whether this phase may compete for a shared active-download slot.
     pub fn wants_download_slot(self) -> bool {
@@ -110,6 +123,10 @@ pub struct TorrentRecord {
     /// Relative to the configured torrent state root.
     pub metadata_file: PathBuf,
     pub phase: TorrentPhase,
+    /// Defaulted so records written before owner-side control routing retain
+    /// their historical (running) meaning.
+    #[serde(default)]
+    pub control_intent: TorrentControlIntent,
     pub files: Vec<TorrentFileRecord>,
     pub total_bytes: u64,
     pub selected_bytes: u64,
@@ -126,6 +143,36 @@ pub struct TorrentRecord {
     pub last_activity_unix: Option<i64>,
     /// Redacted, display-safe, and bounded by the backend before persistence.
     pub last_error: Option<String>,
+}
+
+#[cfg(test)]
+mod torrent_control_tests {
+    use super::*;
+
+    #[test]
+    fn absent_control_intent_reads_as_running() {
+        let record: TorrentRecord = serde_json::from_str(
+            r#"{
+                "info_hash_v1":"0123456789abcdef0123456789abcdef01234567",
+                "source":"metainfo",
+                "metadata_file":"meta/example.torrent",
+                "phase":"paused_download",
+                "files":[],
+                "total_bytes":1,
+                "selected_bytes":1,
+                "downloaded_bytes":0,
+                "uploaded_bytes":0,
+                "seeding_seconds":0,
+                "ready_at_unix":null,
+                "content_path":null,
+                "seed_policy":{"ratio_limit":null,"time_limit_secs":null},
+                "last_activity_unix":null,
+                "last_error":null
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(record.control_intent, TorrentControlIntent::Running);
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

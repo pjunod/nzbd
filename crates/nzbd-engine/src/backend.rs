@@ -243,6 +243,7 @@ mod tests {
             source: TorrentSource::Magnet,
             metadata_file: "meta/example.torrent".into(),
             phase,
+            control_intent: nzbd_types::TorrentControlIntent::Running,
             files: Vec::new(),
             total_bytes: 100,
             selected_bytes: 100,

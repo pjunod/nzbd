@@ -529,6 +529,7 @@ mod tests {
                 source: TorrentSource::Metainfo,
                 metadata_file: PathBuf::from("meta/selected.torrent"),
                 phase: TorrentPhase::Downloading,
+                control_intent: nzbd_types::TorrentControlIntent::Running,
                 files: vec![
                     TorrentFileRecord {
                         path: "one".into(),
