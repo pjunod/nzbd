@@ -9,6 +9,7 @@ on:
       - contrib/rqbit/maintained-series.txt
       - contrib/rqbit/*.sha256
       - contrib/rqbit/vendor/**
+      - crates/nzbd-state/**
       - crates/nzbd-torrent/**
       - crates/nzbd/src/main.rs
       - crates/nzbd/src/tls.rs
@@ -24,6 +25,7 @@ on:
       - contrib/rqbit/maintained-series.txt
       - contrib/rqbit/*.sha256
       - contrib/rqbit/vendor/**
+      - crates/nzbd-state/**
       - crates/nzbd-torrent/**
       - crates/nzbd/src/main.rs
       - crates/nzbd/src/tls.rs
@@ -103,6 +105,11 @@ jobs:
           key: bittorrent-m0-${{ matrix.target }}
       - name: Run the isolated adapter suite
         run: cargo test --locked -p nzbd-torrent --target ${{ matrix.target }}
+      - name: Verify pending-source Windows ACL
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        run: >-
+          cargo test --locked -p nzbd-state --target ${{ matrix.target }}
+          windows_secret::tests::
       - name: Bound sampled 100-torrent resident-memory growth
         run: >-
           cargo run --locked -p nzbd-torrent --release
