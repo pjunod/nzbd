@@ -33,6 +33,11 @@ use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio::time::{Duration, Instant, MissedTickBehavior};
 use tokio_util::sync::CancellationToken;
+
+/// Retained commands exist only to bridge a temporarily full adapter FIFO.
+/// Refuse a new control request once this bound is reached rather than growing
+/// owner memory without limit while no adapter is attached.
+const MAX_PENDING_BACKEND_COMMANDS: usize = 64;
 use tokio_util::task::TaskTracker;
 
 // ---------------------------------------------------------------------------
@@ -451,7 +456,8 @@ pub(crate) struct Owner {
     /// producer of protocol-neutral backend commands.
     backend: BackendOwnerPort,
     /// Commands retained when the bounded backend FIFO is full. They are
-    /// retried in order from the next owner tick, never awaited inline.
+    /// retried in order from the next owner tick, never awaited inline. The
+    /// queue is bounded by [`MAX_PENDING_BACKEND_COMMANDS`].
     pending_backend_commands: VecDeque<BackendCommand>,
 
     state_dir: PathBuf,
@@ -2951,7 +2957,23 @@ impl Owner {
     /// by the caller, so an unrecorded request cannot become idempotently
     /// stuck or reach the engine.
     fn persist_then_command(&mut self, command: BackendCommand) -> bool {
-        if !self.save_snapshot() {
+        // Never let a later request bypass one already retained by a full
+        // adapter FIFO. Refusing at the bound happens before persistence, so
+        // the durable queue remains consistent with the reported result.
+        if !self.pending_backend_commands.is_empty() {
+            if self.pending_backend_commands.len() == MAX_PENDING_BACKEND_COMMANDS {
+                return false;
+            }
+            if self.persist && !self.save_snapshot() {
+                return false;
+            }
+            self.pending_backend_commands.push_back(command);
+            return true;
+        }
+
+        // Worker-mode engines do not own queue persistence. That is an
+        // intentional configuration, not a failed durability barrier.
+        if self.persist && !self.save_snapshot() {
             return false;
         }
         match self.backend.try_command(command) {
@@ -3451,6 +3473,13 @@ mod tests {
     }
 
     fn control_test_owner() -> (tempfile::TempDir, Owner, crate::backend::BackendAdapterPort) {
+        control_test_owner_with_persistence(true, None)
+    }
+
+    fn control_test_owner_with_persistence(
+        persist: bool,
+        persist_guard: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
+    ) -> (tempfile::TempDir, Owner, crate::backend::BackendAdapterPort) {
         let tmp = tempfile::tempdir().unwrap();
         let (budget_tx, _) = watch::channel(HashMap::new());
         let (events, _) = broadcast::channel(1);
@@ -3463,9 +3492,9 @@ mod tests {
             Arc::new(Vec::new()),
             Tuning::default(),
             true,
-            true,
+            persist,
             "control-test",
-            None,
+            persist_guard,
             budget_tx,
             crate::new_shared_snapshot(),
             events,
@@ -3555,6 +3584,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn failed_persistence_never_emits_a_torrent_control() {
+        let (_tmp, mut owner, mut adapter) =
+            control_test_owner_with_persistence(true, Some(Arc::new(|| false)));
+        owner.state.jobs.push(control_torrent_job());
+
+        let (reply, rx) = oneshot::channel();
+        owner.on_command(QueueCommand::Pause {
+            job: JobId(1),
+            reply,
+        });
+
+        assert!(!rx.await.unwrap());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), adapter.next_command())
+                .await
+                .is_err(),
+            "a failed durability barrier must prevent FIFO delivery"
+        );
+        let job = owner.state.job(JobId(1)).unwrap();
+        assert_eq!(job.status, JobStatus::Queued);
+        assert_eq!(
+            job.torrent.as_ref().unwrap().control_intent,
+            TorrentControlIntent::Running
+        );
+    }
+
+    #[tokio::test]
     async fn full_backend_fifo_retries_retained_torrent_commands_in_order() {
         let (_tmp, mut owner, mut adapter) = control_test_owner();
         owner.state.jobs.push(control_torrent_job());
@@ -3586,6 +3642,110 @@ mod tests {
                 priority: 77
             })
         );
+    }
+
+    #[tokio::test]
+    async fn retained_backend_commands_precede_later_control_requests() {
+        let (_tmp, mut owner, mut adapter) = control_test_owner();
+        owner.state.jobs.push(control_torrent_job());
+
+        for command in [
+            QueueCommand::Pause {
+                job: JobId(1),
+                reply: oneshot::channel().0,
+            },
+            QueueCommand::SetPriority {
+                job: JobId(1),
+                priority: 77,
+                reply: oneshot::channel().0,
+            },
+        ] {
+            owner.on_command(command);
+        }
+        assert_eq!(owner.pending_backend_commands.len(), 1);
+        assert_eq!(
+            adapter.next_command().await,
+            Some(BackendCommand::Pause { job: JobId(1) })
+        );
+
+        let (reply, rx) = oneshot::channel();
+        owner.on_command(QueueCommand::Resume {
+            job: JobId(1),
+            reply,
+        });
+        assert!(rx.await.unwrap());
+        assert_eq!(owner.pending_backend_commands.len(), 2);
+
+        owner.flush_backend_commands();
+        assert_eq!(
+            adapter.next_command().await,
+            Some(BackendCommand::SetPriority {
+                job: JobId(1),
+                priority: 77
+            })
+        );
+        owner.flush_backend_commands();
+        assert_eq!(
+            adapter.next_command().await,
+            Some(BackendCommand::Resume { job: JobId(1) })
+        );
+    }
+
+    #[tokio::test]
+    async fn worker_mode_torrent_controls_do_not_require_queue_persistence() {
+        let (_tmp, mut owner, mut adapter) = control_test_owner_with_persistence(false, None);
+        owner.state.jobs.push(control_torrent_job());
+
+        let (reply, rx) = oneshot::channel();
+        owner.on_command(QueueCommand::Pause {
+            job: JobId(1),
+            reply,
+        });
+
+        assert!(rx.await.unwrap());
+        assert_eq!(
+            adapter.next_command().await,
+            Some(BackendCommand::Pause { job: JobId(1) })
+        );
+    }
+
+    #[tokio::test]
+    async fn retained_backend_commands_are_bounded_before_persisting_new_intent() {
+        let (_tmp, mut owner, _adapter) = control_test_owner();
+        owner.state.jobs.push(control_torrent_job());
+
+        for n in 0..=MAX_PENDING_BACKEND_COMMANDS {
+            let (reply, rx) = oneshot::channel();
+            let command = if n % 2 == 0 {
+                QueueCommand::Pause {
+                    job: JobId(1),
+                    reply,
+                }
+            } else {
+                QueueCommand::Resume {
+                    job: JobId(1),
+                    reply,
+                }
+            };
+            owner.on_command(command);
+            assert!(rx.await.unwrap());
+        }
+        assert_eq!(
+            owner.pending_backend_commands.len(),
+            MAX_PENDING_BACKEND_COMMANDS
+        );
+
+        let (reply, rx) = oneshot::channel();
+        owner.on_command(QueueCommand::Resume {
+            job: JobId(1),
+            reply,
+        });
+        assert!(!rx.await.unwrap());
+        assert_eq!(
+            owner.pending_backend_commands.len(),
+            MAX_PENDING_BACKEND_COMMANDS
+        );
+        assert_eq!(owner.state.job(JobId(1)).unwrap().status, JobStatus::Paused);
     }
 
     #[test]
