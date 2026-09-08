@@ -22,6 +22,7 @@
 mod fsx;
 pub mod history;
 pub mod torrent_sources;
+#[cfg(windows)]
 mod windows_secret;
 
 use nzbd_types::{FileId, Job, JobId, TorrentSource};

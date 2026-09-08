@@ -2,278 +2,231 @@
 //!
 //! `PendingSourceStore` sidecars may carry tracker credentials or URL
 //! passkeys, so on Unix they are created `0600`. Windows has no mode bits:
-//! a file created with the inherited directory DACL is world-readable on a
-//! multi-user machine. This module gives the sidecar the Windows equivalent
-//! of `0600` — a DACL that permits only the current user (the owner) full
-//! control, and grants no one else any right.
+//! this module creates the sidecar with a protected DACL containing one allow
+//! ACE for the process user and no inherited entries.
 //!
-//! The ACL is applied directly through the Win32 security APIs. No shell
-//! command (`icacls`, `takeown`, …) is invoked: a `cmd.exe` round trip would
-//! depend on the process locale for path and SID handling, and would hand a
-//! credentials-bearing path to an external process for nothing.
-//!
-//! The file is *created* with the security descriptor (`CreateFileW` +
-//! `SECURITY_ATTRIBUTES`), so it never exists in a world-readable state and
-//! we never need a follow-up `SetFileSecurity` call that would require the
-//! `WRITE_DAC` right we may not hold. `std::fs::rename` (a same-directory
-//! `MoveFileEx`) preserves the descriptor, so the final `<job>.source` keeps
-//! the owner-only DACL after `PendingSourceStore::write` moves the temp file.
+//! The ACL is applied through Win32 APIs, without a locale-dependent shell
+//! command. It is supplied to `CreateFileW`, so a new file is private from its
+//! first observable instant. It is also applied to the returned handle before
+//! any secret is written: `CREATE_ALWAYS` preserves the ACL when a crash left
+//! the predictable temporary file behind, and that stale file must be
+//! hardened too.
 
 #![cfg(windows)]
 
+use std::ffi::c_void;
+use std::fs::File;
 use std::io::{self, ErrorKind, Result as IoResult};
-use std::os::raw::c_void;
+use std::mem::size_of;
+use std::os::windows::ffi::OsStrExt;
+use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::path::Path;
+use windows_sys::Win32::Foundation::{GENERIC_WRITE, INVALID_HANDLE_VALUE};
+use windows_sys::Win32::Security::Authorization::{SetSecurityInfo, SE_FILE_OBJECT};
+use windows_sys::Win32::Security::{
+    AddAccessAllowedAce, GetLengthSid, GetTokenInformation, InitializeAcl,
+    InitializeSecurityDescriptor, SetSecurityDescriptorControl, SetSecurityDescriptorDacl,
+    TokenUser, ACCESS_ALLOWED_ACE, ACL, ACL_REVISION, DACL_SECURITY_INFORMATION,
+    PROTECTED_DACL_SECURITY_INFORMATION, PSID, SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR,
+    SE_DACL_PROTECTED, TOKEN_QUERY, TOKEN_USER,
+};
+use windows_sys::Win32::Storage::FileSystem::{
+    CreateFileW, CREATE_ALWAYS, FILE_ALL_ACCESS, FILE_ATTRIBUTE_NORMAL, WRITE_DAC,
+};
+use windows_sys::Win32::System::SystemServices::SECURITY_DESCRIPTOR_REVISION;
+use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
-/// `SECURITY_ATTRIBUTES` passed to `CreateFileW`. `#[repr(C)]` keeps the
-/// documented layout: `nLength`, `lpSecurityDescriptor`, `bInheritHandle`.
-#[repr(C)]
-struct SecurityAttributes {
-    n_length: u32,
-    lp_security_descriptor: *mut c_void,
-    b_inherit_handle: i32,
+/// An aligned Win32 output buffer. `Vec<u8>` only promises byte alignment,
+/// while token information, ACLs, and security descriptors contain pointers
+/// or DWORDs and must be read through their native aligned types.
+fn aligned_buffer(byte_len: usize) -> Vec<usize> {
+    let words = byte_len.saturating_add(size_of::<usize>() - 1) / size_of::<usize>();
+    vec![0; words]
 }
 
-/// `TOKEN_USER`: `DWORD Length; PSID Sid;`. `#[repr(C)]` matches the
-/// documented layout on both 32- and 64-bit Windows, so the SID pointer is
-/// read by name rather than by a hard-coded byte offset.
-#[repr(C)]
-struct TokenUser {
-    length: u32,
-    sid: *const u8,
+fn buffer_bytes(buffer: &[usize]) -> usize {
+    buffer.len() * size_of::<usize>()
 }
 
-/// Self-relative `SECURITY_DESCRIPTOR` header (the in-file layout), read
-/// back for the regression test. The four trailing fields are 32-bit
-/// *offsets* from the start of the descriptor, not pointers. The in-file
-/// order is `Owner, Group, Sacl, Dacl`, matching `SECURITY_DESCRIPTOR_RELATIVE`.
-#[cfg(test)]
-#[repr(C)]
-struct RelSecurityDescriptor {
-    revision: u8,
-    sbz1: u8,
-    control: u16,
-    owner: u32,
-    group: u32,
-    sacl: u32,
-    dacl: u32,
+/// Keeps the token-information allocation alive for the SID pointer stored
+/// inside it.
+struct OwnedSid {
+    _buffer: Vec<usize>,
+    ptr: PSID,
+    len: u32,
 }
 
-/// Self-relative `ACL` header. `first_ace` is a 32-bit offset *from the start
-/// of the ACL*, not a pointer and not an offset from the descriptor.
-#[cfg(test)]
-#[repr(C)]
-struct RelAcl {
-    revision: u8,
-    sbz1: u8,
-    ace_count: u16,
-    acl_size: u32,
-    first_ace: u32,
+fn current_user_sid() -> IoResult<OwnedSid> {
+    let mut raw_token = std::ptr::null_mut();
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut raw_token) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let token = unsafe { OwnedHandle::from_raw_handle(raw_token) };
+
+    let mut needed = 0u32;
+    unsafe {
+        GetTokenInformation(
+            token.as_raw_handle(),
+            TokenUser,
+            std::ptr::null_mut(),
+            0,
+            &mut needed,
+        )
+    };
+    if needed == 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    let mut buffer = aligned_buffer(needed as usize);
+    if unsafe {
+        GetTokenInformation(
+            token.as_raw_handle(),
+            TokenUser,
+            buffer.as_mut_ptr().cast(),
+            buffer_bytes(&buffer) as u32,
+            &mut needed,
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+
+    let ptr = unsafe { (*buffer.as_ptr().cast::<TOKEN_USER>()).User.Sid };
+    if ptr.is_null() {
+        return Err(io::Error::new(
+            ErrorKind::InvalidData,
+            "process token has no user SID",
+        ));
+    }
+    let len = unsafe { GetLengthSid(ptr) };
+    let start = buffer.as_ptr() as usize;
+    let end = start + buffer_bytes(&buffer);
+    let sid_start = ptr as usize;
+    let Some(sid_end) = sid_start.checked_add(len as usize) else {
+        return Err(io::Error::new(
+            ErrorKind::InvalidData,
+            "process token user SID length overflowed",
+        ));
+    };
+    if len == 0 || sid_start < start || sid_end > end {
+        return Err(io::Error::new(
+            ErrorKind::InvalidData,
+            "process token returned an invalid user SID",
+        ));
+    }
+
+    Ok(OwnedSid {
+        _buffer: buffer,
+        ptr,
+        len,
+    })
 }
 
-/// Self-relative `ACCESS_ALLOWED_ACE` header plus `Mask` and the 32-bit
-/// `SidStart` offset, which is measured *from the start of the descriptor*.
-#[cfg(test)]
-#[repr(C)]
-struct RelAce {
-    ace_type: u8,
-    ace_flags: u8,
-    ace_size: u16,
-    mask: u32,
-    sid_start: u32,
-}
+/// Create `path` for write-only access with a DACL that permits only the
+/// process user. This is the Windows equivalent of the Unix `0600` creation
+/// used by `PendingSourceStore`.
+pub fn open_secret_for_write(path: &Path) -> IoResult<File> {
+    let user = current_user_sid()?;
+    let acl_len = size_of::<ACL>()
+        .checked_add(size_of::<ACCESS_ALLOWED_ACE>() - size_of::<u32>())
+        .and_then(|len| len.checked_add(user.len as usize))
+        .and_then(|len| u32::try_from(len).ok())
+        .ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "user SID is too large"))?;
+    let mut acl_storage = aligned_buffer(acl_len as usize);
+    let acl = acl_storage.as_mut_ptr().cast::<ACL>();
 
-// Sizes of the self-relative headers above. They are the offsets we rely on
-// when laying the buffer out and parsing it back, so keep them honest.
-const SD_HEADER_SIZE: usize = 20; // 1+1+2 + 4*4 (Owner, Group, Sacl, Dacl)
-const ACL_HEADER_SIZE: usize = 12; // 1+1+2 + 4 + 4
-const ACE_HEADER_SIZE: usize = 12; // 1+1+2 + 4 + 4
+    if unsafe { InitializeAcl(acl, acl_len, ACL_REVISION) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if unsafe { AddAccessAllowedAce(acl, ACL_REVISION, FILE_ALL_ACCESS, user.ptr) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
 
-// Access masks.
-const FILE_ALL_ACCESS: u32 = 0x001F01FF;
+    let mut descriptor = SECURITY_DESCRIPTOR::default();
+    if unsafe {
+        InitializeSecurityDescriptor(
+            (&mut descriptor as *mut SECURITY_DESCRIPTOR).cast(),
+            SECURITY_DESCRIPTOR_REVISION,
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    if unsafe {
+        SetSecurityDescriptorDacl(
+            (&mut descriptor as *mut SECURITY_DESCRIPTOR).cast(),
+            1,
+            acl,
+            0,
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    if unsafe {
+        SetSecurityDescriptorControl(
+            (&mut descriptor as *mut SECURITY_DESCRIPTOR).cast(),
+            SE_DACL_PROTECTED,
+            SE_DACL_PROTECTED,
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
 
-// CreateFileW constants.
-const GENERIC_WRITE: u32 = 0x40000000;
-const CREATE_ALWAYS: u32 = 4;
-const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
-
-// advapi32 constants.
-const TOKEN_QUERY: u32 = 0x0008;
-const TOKEN_USER: u32 = 1;
-
-#[link(name = "kernel32")]
-extern "system" {
-    fn CreateFileW(
-        lp_file_name: *const u16,
-        dw_desired_access: u32,
-        dw_share_mode: u32,
-        lp_security_attributes: *const SecurityAttributes,
-        dw_creation_disposition: u32,
-        dw_flags_and_attributes: u32,
-        h_template_file: *mut c_void,
-    ) -> *mut c_void;
-    fn GetCurrentProcess() -> *mut c_void;
-    fn CloseHandle(h: *mut c_void) -> i32;
-}
-
-#[link(name = "advapi32")]
-extern "system" {
-    fn OpenProcessToken(
-        h_process: *mut c_void,
-        dw_desired_access: u32,
-        token: *mut *mut c_void,
-    ) -> i32;
-    fn GetTokenInformation(
-        token_handle: *mut c_void,
-        token_information_class: u32,
-        token_information: *mut c_void,
-        token_information_length: u32,
-        return_length: *mut u32,
-    ) -> i32;
-    fn GetLengthSid(sid: *const c_void) -> u32;
-    fn InitializeSecurityDescriptor(p_sd: *mut c_void, dw_revision: u32) -> i32;
-    fn InitializeAcl(p_acl: *mut c_void, n_acl_length: u32, n_ace_count: u32) -> i32;
-    fn AddAccessAllowedAce(
-        p_acl: *mut c_void,
-        dw_acl_revision: u32,
-        dw_access_mask: u32,
-        psid: *const c_void,
-    ) -> i32;
-    fn SetSecurityDescriptorDacl(
-        p_sd: *mut c_void,
-        b_inherited: i32,
-        b_dacl_present: i32,
-        p_dacl: *mut c_void,
-    ) -> i32;
-}
-
-fn io_err() -> io::Error {
-    io::Error::last_os_error()
-}
-
-/// Create `path` for write-only access so that its DACL permits only the
-/// current user. This is the Windows stand-in for the Unix `0600` that
-/// `PendingSourceStore` applies on creation.
-pub fn open_secret_for_write(path: &Path) -> IoResult<std::fs::File> {
-    use std::os::windows::io::FromRawHandle;
-
-    let sd = owner_only_security_descriptor()?;
     let wide = to_wide(path)?;
-    let sa = SecurityAttributes {
-        n_length: std::mem::size_of::<SecurityAttributes>() as u32,
-        lp_security_descriptor: sd.as_ptr() as *mut c_void,
-        b_inherit_handle: 0,
+    let attributes = SECURITY_ATTRIBUTES {
+        nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: (&mut descriptor as *mut SECURITY_DESCRIPTOR).cast::<c_void>(),
+        bInheritHandle: 0,
     };
     let handle = unsafe {
         CreateFileW(
             wide.as_ptr(),
-            GENERIC_WRITE,
+            GENERIC_WRITE | WRITE_DAC,
             0,
-            &sa,
+            &attributes,
             CREATE_ALWAYS,
             FILE_ATTRIBUTE_NORMAL,
             std::ptr::null_mut(),
         )
     };
-    if handle as isize == -1 {
-        // `last_os_error()` captures the error from the failed call.
-        return Err(io_err());
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(io::Error::last_os_error());
     }
-    // `CreateFileW` returns a `HANDLE` (a pointer); `File` wants the
-    // integer `RawHandle`. `File` takes ownership, so we never
-    // `CloseHandle` it ourselves.
-    let raw = handle as std::os::windows::io::RawHandle;
-    Ok(unsafe { std::fs::File::from_raw_handle(raw) })
-}
+    let file = unsafe { File::from_raw_handle(handle) };
 
-/// Build a self-contained, self-relative security descriptor whose DACL has
-/// exactly one `ACCESS_ALLOWED` ACE for the current user with full control.
-fn owner_only_security_descriptor() -> IoResult<Vec<u8>> {
-    // Own the SID bytes for the whole call so the ACE-builder reads valid
-    // memory; never hand `AddAccessAllowedAce` a pointer into a buffer we
-    // are about to drop.
-    let sid = current_user_sid()?;
-    let sid_len = sid.len();
-
-    let acl_total = ACL_HEADER_SIZE + ACE_HEADER_SIZE + sid_len;
-    let total = SD_HEADER_SIZE + acl_total;
-    let mut buf = vec![0u8; total];
-    let sd = buf.as_mut_ptr() as *mut c_void;
-    // The DACL region is the slice of the buffer that follows the SD header.
-    // Derive its pointer from a safe slice instead of raw arithmetic so the
-    // code is correct regardless of toolchain pointer-arithmetic rules.
-    let acl = buf[SD_HEADER_SIZE..].as_mut_ptr() as *mut c_void;
-
-    unsafe {
-        if InitializeSecurityDescriptor(sd, 1) == 0 {
-            return Err(io_err());
-        }
-        if InitializeAcl(acl, acl_total as u32, 1) == 0 {
-            return Err(io_err());
-        }
-        if AddAccessAllowedAce(acl, 2, FILE_ALL_ACCESS, sid.as_ptr() as *const c_void) == 0 {
-            return Err(io_err());
-        }
-        // DACL present, not inherited.
-        if SetSecurityDescriptorDacl(sd, 0, 1, acl) == 0 {
-            return Err(io_err());
-        }
+    // Security attributes affect only a newly created file. CREATE_ALWAYS can
+    // reopen a temporary file left by a crash, so protect the handle again
+    // before returning it to the caller for the first secret-bearing write.
+    let status = unsafe {
+        SetSecurityInfo(
+            file.as_raw_handle(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            acl,
+            std::ptr::null(),
+        )
+    };
+    if status != 0 {
+        return Err(io::Error::from_raw_os_error(status as i32));
     }
-    Ok(buf)
-}
 
-/// The current user's SID, copied into an owned buffer so the caller owns the
-/// bytes. We never return a pointer into a buffer this function owns, which
-/// would dangle the moment it drops.
-fn current_user_sid() -> IoResult<Vec<u8>> {
-    unsafe {
-        let process = GetCurrentProcess();
-        let mut token: *mut c_void = std::ptr::null_mut();
-        if OpenProcessToken(process, TOKEN_QUERY, &mut token) == 0 {
-            return Err(io_err());
-        }
-        let result = (|| {
-            let mut len = 0u32;
-            // Probe the required length with a null buffer.
-            let _ = GetTokenInformation(token, TOKEN_USER, std::ptr::null_mut(), 0, &mut len);
-            if len == 0 {
-                return Err(io::Error::new(ErrorKind::Other, "token user size is zero"));
-            }
-            let mut buf = vec![0u8; len as usize];
-            if GetTokenInformation(
-                token,
-                TOKEN_USER,
-                buf.as_mut_ptr() as *mut c_void,
-                len,
-                &mut len,
-            ) == 0
-            {
-                return Err(io_err());
-            }
-            // `buf` is 1-aligned but `TokenUser` holds a pointer (8-aligned);
-            // read it unaligned instead of forming a reference through a
-            // misaligned pointer.
-            let user = std::ptr::read_unaligned(buf.as_ptr() as *const TokenUser);
-            let sid = user.sid;
-            if sid.is_null() {
-                return Err(io::Error::new(ErrorKind::Other, "token user has no SID"));
-            }
-            let sid_len = GetLengthSid(sid as *const c_void);
-            // Copy the SID out of `buf` so it outlives the buffer.
-            Ok(std::slice::from_raw_parts(sid, sid_len as usize).to_vec())
-        })();
-        CloseHandle(token);
-        result
-    }
+    Ok(file)
 }
 
 fn to_wide(path: &Path) -> IoResult<Vec<u16>> {
-    use std::os::windows::ffi::OsStrExt;
-    Ok(path
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect())
+    let mut wide = path.as_os_str().encode_wide().collect::<Vec<_>>();
+    if wide.contains(&0) {
+        return Err(io::Error::new(
+            ErrorKind::InvalidInput,
+            "Windows path contains an interior NUL",
+        ));
+    }
+    wide.push(0);
+    Ok(wide)
 }
 
 #[cfg(test)]
@@ -281,54 +234,136 @@ mod tests {
     use super::*;
     use crate::torrent_sources::PendingSourceStore;
     use nzbd_types::JobId;
+    use windows_sys::Win32::Foundation::FALSE;
+    use windows_sys::Win32::Security::{
+        AclSizeInformation, EqualSid, GetAce, GetAclInformation, GetFileSecurityW,
+        GetSecurityDescriptorControl, GetSecurityDescriptorDacl, GetSecurityDescriptorOwner,
+        ACL_SIZE_INFORMATION, OWNER_SECURITY_INFORMATION,
+    };
+    use windows_sys::Win32::System::SystemServices::ACCESS_ALLOWED_ACE_TYPE;
 
-    // Test-only: the masks we assert are present in the owner ACE, the
-    // security-information class for reading the DACL back, and the two
-    // advapi32 entry points used only here.
-    const FILE_GENERIC_READ: u32 = 0x00120089;
-    const FILE_GENERIC_WRITE: u32 = 0x00120116;
-    const DACL_SECURITY_INFORMATION: u32 = 0x4;
-
-    #[link(name = "advapi32")]
-    extern "system" {
-        fn GetFileSecurityW(
-            lp_file_name: *const u16,
-            security_information: u32,
-            p_security_descriptor: *mut c_void,
-            n_length: u32,
-            lp_n_length: *mut u32,
-        ) -> i32;
-        fn EqualSid(sid1: *const c_void, sid2: *const c_void) -> i32;
-    }
-
-    /// Read back the file's self-relative security descriptor (DACL portion).
-    fn read_security_descriptor(path: &Path) -> IoResult<Vec<u8>> {
+    fn read_security_descriptor(path: &Path) -> IoResult<Vec<usize>> {
         let wide = to_wide(path)?;
+        let information = OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION;
+        let mut needed = 0u32;
         unsafe {
-            let mut needed = 0u32;
-            // First call: probe the required size. `GetFileSecurityW`
-            // returns `FALSE` with `ERROR_INSUFFICIENT_BUFFER` on a small
-            // buffer.
-            let _ = GetFileSecurityW(
+            GetFileSecurityW(
                 wide.as_ptr(),
-                DACL_SECURITY_INFORMATION,
+                information,
                 std::ptr::null_mut(),
                 0,
                 &mut needed,
-            );
-            let mut buf = vec![0u8; needed as usize];
-            if GetFileSecurityW(
-                wide.as_ptr(),
-                DACL_SECURITY_INFORMATION,
-                buf.as_mut_ptr() as *mut c_void,
-                buf.len() as u32,
-                &mut needed,
-            ) == 0
-            {
-                return Err(io_err());
-            }
-            Ok(buf)
+            )
+        };
+        if needed == 0 {
+            return Err(io::Error::last_os_error());
         }
+
+        let mut buffer = aligned_buffer(needed as usize);
+        if unsafe {
+            GetFileSecurityW(
+                wide.as_ptr(),
+                information,
+                buffer.as_mut_ptr().cast(),
+                buffer_bytes(&buffer) as u32,
+                &mut needed,
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(buffer)
+    }
+
+    fn assert_owner_only_acl(path: &Path) {
+        let descriptor = read_security_descriptor(path).unwrap();
+        let descriptor_ptr = descriptor.as_ptr() as *mut c_void;
+
+        let mut control = 0u16;
+        let mut revision = 0u32;
+        assert_ne!(
+            unsafe { GetSecurityDescriptorControl(descriptor_ptr, &mut control, &mut revision) },
+            0,
+            "security descriptor control should be readable"
+        );
+        assert_ne!(
+            control & SE_DACL_PROTECTED,
+            0,
+            "DACL must be protected from inherited entries"
+        );
+
+        let mut dacl_present = FALSE;
+        let mut dacl_defaulted = FALSE;
+        let mut dacl = std::ptr::null_mut();
+        assert_ne!(
+            unsafe {
+                GetSecurityDescriptorDacl(
+                    descriptor_ptr,
+                    &mut dacl_present,
+                    &mut dacl,
+                    &mut dacl_defaulted,
+                )
+            },
+            0,
+            "security descriptor DACL should be readable"
+        );
+        assert_ne!(dacl_present, 0, "DACL must be present");
+        assert_eq!(dacl_defaulted, 0, "DACL must be explicit");
+        assert!(!dacl.is_null(), "a null DACL would grant everyone access");
+
+        let mut acl_info = ACL_SIZE_INFORMATION::default();
+        assert_ne!(
+            unsafe {
+                GetAclInformation(
+                    dacl,
+                    (&mut acl_info as *mut ACL_SIZE_INFORMATION).cast(),
+                    size_of::<ACL_SIZE_INFORMATION>() as u32,
+                    AclSizeInformation,
+                )
+            },
+            0,
+            "DACL metadata should be readable"
+        );
+        assert_eq!(acl_info.AceCount, 1, "owner-only means exactly one ACE");
+
+        let mut raw_ace = std::ptr::null_mut();
+        assert_ne!(
+            unsafe { GetAce(dacl, 0, &mut raw_ace) },
+            0,
+            "the sole DACL ACE should be readable"
+        );
+        let ace = raw_ace.cast::<ACCESS_ALLOWED_ACE>();
+        assert_eq!(
+            unsafe { (*ace).Header.AceType },
+            ACCESS_ALLOWED_ACE_TYPE as u8,
+            "the sole ACE must allow access"
+        );
+        assert_eq!(
+            unsafe { (*ace).Mask },
+            FILE_ALL_ACCESS,
+            "the owner must have full control"
+        );
+
+        let ace_sid = unsafe { std::ptr::addr_of_mut!((*ace).SidStart).cast::<c_void>() };
+        let mut owner = std::ptr::null_mut();
+        let mut owner_defaulted = FALSE;
+        assert_ne!(
+            unsafe { GetSecurityDescriptorOwner(descriptor_ptr, &mut owner, &mut owner_defaulted) },
+            0,
+            "file owner should be readable"
+        );
+        assert!(!owner.is_null(), "file must have an owner");
+        let current_user = current_user_sid().unwrap();
+        assert_ne!(
+            unsafe { EqualSid(owner, current_user.ptr) },
+            0,
+            "the file owner must be the process user"
+        );
+        assert_ne!(
+            unsafe { EqualSid(ace_sid, owner) },
+            0,
+            "the sole ACE must belong to the file owner"
+        );
     }
 
     #[test]
@@ -336,45 +371,21 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = PendingSourceStore::open(dir.path()).unwrap();
         store.write(JobId(7), b"secret-source").unwrap();
-        let path = dir.path().join("torrents/pending/7.source");
 
-        let sd = read_security_descriptor(&path).unwrap();
-        let rel_sd = unsafe { &*(sd.as_ptr() as *const RelSecurityDescriptor) };
-        assert_eq!(
-            rel_sd.dacl, SD_HEADER_SIZE as u32,
-            "DACL must be present at the expected offset"
-        );
+        assert_owner_only_acl(&dir.path().join("torrents/pending/7.source"));
+    }
 
-        // The DACL region begins at the descriptor's `dacl` offset.
-        let acl_region = &sd[rel_sd.dacl as usize..];
-        let acl = unsafe { &*(acl_region.as_ptr() as *const RelAcl) };
-        assert_eq!(acl.ace_count, 1, "owner-only means exactly one ACE");
+    #[test]
+    fn windows_sidecar_hardens_a_stale_temporary_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = PendingSourceStore::open(dir.path()).unwrap();
+        let stale = dir.path().join("torrents/pending/.9.source.tmp");
+        std::fs::write(&stale, b"older-longer-secret").unwrap();
 
-        // `first_ace` is an offset from the start of the ACL.
-        let ace_region = &acl_region[acl.first_ace as usize..];
-        let ace = unsafe { &*(ace_region.as_ptr() as *const RelAce) };
-        assert_eq!(ace.ace_type, 0, "the single ACE must be ACCESS_ALLOWED");
-        assert!(
-            ace.mask & FILE_GENERIC_READ != 0,
-            "owner must be able to read"
-        );
-        assert!(
-            ace.mask & FILE_GENERIC_WRITE != 0,
-            "owner must be able to write"
-        );
+        store.write(JobId(9), b"new-secret").unwrap();
 
-        // `sid_start` is an offset from the start of the descriptor.
-        let sid_bytes = &sd[ace.sid_start as usize..];
-        let mine = current_user_sid().unwrap();
-        let same = unsafe {
-            EqualSid(
-                sid_bytes.as_ptr() as *const c_void,
-                mine.as_ptr() as *const c_void,
-            )
-        };
-        assert_eq!(
-            same, 1,
-            "the only ACE must be for the current user (owner-only)"
-        );
+        let final_path = dir.path().join("torrents/pending/9.source");
+        assert_eq!(std::fs::read(&final_path).unwrap(), b"new-secret");
+        assert_owner_only_acl(&final_path);
     }
 }

@@ -6,9 +6,11 @@
 
 use crate::StateError;
 use nzbd_types::JobId;
-use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+
+#[cfg(not(windows))]
+use std::fs::File;
 
 /// Protected sidecars for source strings that must never enter queue.json.
 #[derive(Clone, Debug)]
@@ -74,10 +76,20 @@ impl PendingSourceStore {
     }
 }
 
+#[cfg(not(windows))]
 fn sync_dir(path: &Path) -> Result<(), StateError> {
     File::open(path)
         .and_then(|file| file.sync_all())
         .map_err(|e| io("fsync directory", path, e))
+}
+
+// Windows does not expose a supported equivalent of fsync on a directory:
+// opening one as `File` needs backup semantics and `FlushFileBuffers` rejects
+// directory handles. The sidecar itself is still flushed before its atomic
+// rename.
+#[cfg(windows)]
+fn sync_dir(_path: &Path) -> Result<(), StateError> {
+    Ok(())
 }
 
 /// Open a sidecar for writing with owner-only protection. Unix creates it
