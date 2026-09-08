@@ -26,12 +26,12 @@ use windows_sys::Win32::Security::Authorization::{SetSecurityInfo, SE_FILE_OBJEC
 use windows_sys::Win32::Security::{
     AddAccessAllowedAce, GetLengthSid, GetTokenInformation, InitializeAcl,
     InitializeSecurityDescriptor, SetSecurityDescriptorControl, SetSecurityDescriptorDacl,
-    TokenUser, ACCESS_ALLOWED_ACE, ACL, ACL_REVISION, DACL_SECURITY_INFORMATION,
-    PROTECTED_DACL_SECURITY_INFORMATION, PSID, SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR,
-    SE_DACL_PROTECTED, TOKEN_QUERY, TOKEN_USER,
+    SetSecurityDescriptorOwner, TokenUser, ACCESS_ALLOWED_ACE, ACL, ACL_REVISION,
+    DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
+    PSID, SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR, SE_DACL_PROTECTED, TOKEN_QUERY, TOKEN_USER,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, CREATE_ALWAYS, FILE_ALL_ACCESS, FILE_ATTRIBUTE_NORMAL, WRITE_DAC,
+    CreateFileW, CREATE_ALWAYS, FILE_ALL_ACCESS, FILE_ATTRIBUTE_NORMAL, WRITE_DAC, WRITE_OWNER,
 };
 use windows_sys::Win32::System::SystemServices::SECURITY_DESCRIPTOR_REVISION;
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
@@ -163,6 +163,20 @@ pub fn open_secret_for_write(path: &Path) -> IoResult<File> {
     {
         return Err(io::Error::last_os_error());
     }
+    // An elevated token can default a new object's owner to the Administrators
+    // group even though TokenUser names the account running nzbd. Set the owner
+    // explicitly so the file owner and the sole allow ACE always identify the
+    // same user.
+    if unsafe {
+        SetSecurityDescriptorOwner(
+            (&mut descriptor as *mut SECURITY_DESCRIPTOR).cast(),
+            user.ptr,
+            0,
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
     if unsafe {
         SetSecurityDescriptorControl(
             (&mut descriptor as *mut SECURITY_DESCRIPTOR).cast(),
@@ -183,7 +197,7 @@ pub fn open_secret_for_write(path: &Path) -> IoResult<File> {
     let handle = unsafe {
         CreateFileW(
             wide.as_ptr(),
-            GENERIC_WRITE | WRITE_DAC,
+            GENERIC_WRITE | WRITE_DAC | WRITE_OWNER,
             0,
             &attributes,
             CREATE_ALWAYS,
@@ -197,14 +211,17 @@ pub fn open_secret_for_write(path: &Path) -> IoResult<File> {
     let file = unsafe { File::from_raw_handle(handle) };
 
     // Security attributes affect only a newly created file. CREATE_ALWAYS can
-    // reopen a temporary file left by a crash, so protect the handle again
-    // before returning it to the caller for the first secret-bearing write.
+    // reopen a temporary file left by a crash, so restore both its owner and
+    // DACL before returning it to the caller for the first secret-bearing
+    // write.
     let status = unsafe {
         SetSecurityInfo(
             file.as_raw_handle(),
             SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
-            std::ptr::null_mut(),
+            OWNER_SECURITY_INFORMATION
+                | DACL_SECURITY_INFORMATION
+                | PROTECTED_DACL_SECURITY_INFORMATION,
+            user.ptr,
             std::ptr::null_mut(),
             acl,
             std::ptr::null(),

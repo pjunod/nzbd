@@ -111,7 +111,9 @@ jobs:
         run: cargo test --locked -p nzbd-torrent --target ${{ matrix.target }}
       - name: Verify pending-source Windows ACL
         if: matrix.target == 'x86_64-pc-windows-msvc'
-        run: cargo test --locked -p nzbd-state --target ${{ matrix.target }}
+        run: >-
+          cargo test --locked -p nzbd-state --target ${{ matrix.target }}
+          windows_secret::tests::
       - name: Bound sampled 100-torrent resident-memory growth
         run: >-
           cargo run --locked -p nzbd-torrent --release
