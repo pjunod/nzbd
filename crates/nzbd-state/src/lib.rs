@@ -950,6 +950,7 @@ mod tests {
             source: nzbd_types::TorrentSource::Metainfo,
             metadata_file: "meta/0123.torrent".into(),
             phase: nzbd_types::TorrentPhase::PausedDownload,
+            control_intent: nzbd_types::TorrentControlIntent::Paused,
             files: vec![nzbd_types::TorrentFileRecord {
                 path: "payload.bin".into(),
                 length: 42,
