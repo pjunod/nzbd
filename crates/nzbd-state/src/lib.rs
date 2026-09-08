@@ -160,8 +160,7 @@ impl FsJournal {
 
     /// Truncate after the records have been folded into a snapshot.
     pub fn compact(&mut self) -> Result<(), StateError> {
-        fsx::set_len(&self.file, 0, &self.path)?;
-        fsx::sync_data(&self.file, &self.path)?;
+        fsx::truncate(&self.path)?;
         self.dirty = false;
         Ok(())
     }
@@ -780,6 +779,22 @@ mod tests {
         j.append(&rec(9)).unwrap();
         j.sync().unwrap();
         assert_eq!(j.replay().unwrap(), vec![rec(9)]);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn journal_truncation_reopens_an_append_only_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("append-only.journal");
+        let mut append_only = fsx::open_append(&path).unwrap();
+        fsx::write_all(&mut append_only, b"before\\n", &path).unwrap();
+        fsx::sync_data(&append_only, &path).unwrap();
+
+        fsx::truncate(&path).unwrap();
+
+        fsx::write_all(&mut append_only, b"after\\n", &path).unwrap();
+        fsx::sync_data(&append_only, &path).unwrap();
+        assert_eq!(fsx::read(&path).unwrap(), b"after\\n");
     }
 
     #[test]
