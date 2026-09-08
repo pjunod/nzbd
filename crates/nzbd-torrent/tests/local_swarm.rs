@@ -1,4 +1,6 @@
-use nzbd_torrent::{TorrentAddConfig, TorrentPhase, TorrentSession, TorrentSessionConfig};
+use nzbd_torrent::{
+    TorrentAddConfig, TorrentPhase, TorrentRegistry, TorrentSession, TorrentSessionConfig,
+};
 use sha1::{Digest, Sha1};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener};
 use std::num::NonZeroU32;
@@ -69,6 +71,7 @@ async fn downloader(
         .await
         .unwrap();
     let prove_live_rate_change = matches!(&source, Source::Metainfo(_));
+    let mut paused_verified_bytes = None;
     if prove_live_rate_change {
         session.set_download_limit_bps(NonZeroU32::new(16 * 1024));
     }
@@ -82,7 +85,13 @@ async fn downloader(
         Source::Magnet(magnet) => session.add_magnet(magnet, config).await.unwrap(),
     };
     if prove_live_rate_change {
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while handle.stats().progress_bytes == 0 {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("limited local transfer did not make verified progress");
         assert!(
             !handle.stats().finished,
             "16 KiB/s limit should hold a 256 KiB local transfer"
@@ -90,22 +99,62 @@ async fn downloader(
         session.pause(&handle).await.unwrap();
         assert!(handle.is_paused(), "pause must apply before completion");
         assert_eq!(handle.stats().phase, TorrentPhase::Paused);
+        let paused_bytes = handle.stats().progress_bytes;
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert_eq!(
+            handle.stats().progress_bytes,
+            paused_bytes,
+            "a paused torrent must not continue verified download progress"
+        );
         session.resume(&handle).await.unwrap();
         assert!(!handle.is_paused(), "resume must return a live download");
         assert_eq!(handle.stats().phase, TorrentPhase::Live);
         session.set_download_limit_bps(None);
+        paused_verified_bytes = Some(paused_bytes);
     }
     tokio::time::timeout(Duration::from_secs(20), handle.wait_until_completed())
         .await
         .expect("local TCP swarm timed out")
         .unwrap();
     assert!(handle.stats().finished);
+    if let Some(paused_bytes) = paused_verified_bytes {
+        assert!(
+            handle.stats().progress_bytes > paused_bytes,
+            "resume must retain and continue the verified checkpoint"
+        );
+    }
     session.pause(&handle).await.unwrap();
     assert!(handle.is_paused());
     assert_eq!(handle.stats().phase, TorrentPhase::Paused);
     session.resume(&handle).await.unwrap();
     assert_eq!(handle.stats().phase, TorrentPhase::Live);
     (session, handle)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn registry_pause_and_resume_are_idempotent() {
+    let payload = generated_payload();
+    let (torrent, _) = metainfo(&payload);
+    let root = tempfile::tempdir().unwrap();
+    let session = TorrentSession::start(root.path().to_path_buf(), TorrentSessionConfig::default())
+        .await
+        .unwrap();
+    let mut registry = TorrentRegistry::new(session.clone());
+    let identity = registry
+        .add_committed(torrent, TorrentAddConfig::default())
+        .await
+        .unwrap();
+    registry.wait_until_initialized(&identity).await.unwrap();
+
+    registry.pause(&identity).await.unwrap();
+    registry.pause(&identity).await.unwrap();
+    assert_eq!(registry.is_paused(&identity), Some(true));
+
+    registry.resume(&identity).await.unwrap();
+    registry.resume(&identity).await.unwrap();
+    assert_eq!(registry.is_paused(&identity), Some(false));
+
+    registry.stop().await;
 }
 
 enum Source {

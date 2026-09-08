@@ -25,7 +25,7 @@ pub struct TorrentAdmissionService {
     engine: EngineHandle,
     session: TorrentSession,
     registry: Arc<tokio::sync::Mutex<TorrentRegistry>>,
-    associations: Arc<tokio::sync::Mutex<HashMap<JobId, nzbd_torrent::EngineIdentity>>>,
+    associations: Arc<tokio::sync::Mutex<HashMap<JobId, Association>>>,
     state_dir: PathBuf,
     proxy_enabled: bool,
     dht_enabled: bool,
@@ -54,6 +54,15 @@ pub struct AdmissionResult {
     pub id: JobId,
     pub created: bool,
     pub info_hash: String,
+}
+
+#[derive(Clone)]
+struct Association {
+    identity: nzbd_torrent::EngineIdentity,
+    /// `None` means that the engine's initial paused state has not yet been
+    /// reconciled with a queue-owner control. Managed admission deliberately
+    /// starts paused, while the durable queue starts runnable.
+    applied_pause: Option<bool>,
 }
 
 impl TorrentAdmissionService {
@@ -178,7 +187,13 @@ impl TorrentAdmissionService {
                 }])
                 .await?;
             if let Some(identity) = identities.into_iter().next() {
-                self.associations.lock().await.insert(job.id, identity);
+                self.associations.lock().await.insert(
+                    job.id,
+                    Association {
+                        identity,
+                        applied_pause: None,
+                    },
+                );
             }
         }
 
@@ -315,7 +330,13 @@ impl TorrentAdmissionService {
                         },
                     )
                     .await?;
-                self.associations.lock().await.insert(id, identity.clone());
+                self.associations.lock().await.insert(
+                    id,
+                    Association {
+                        identity: identity.clone(),
+                        applied_pause: None,
+                    },
+                );
                 Ok(AdmissionResult {
                     id,
                     created: true,
@@ -384,7 +405,7 @@ impl TorrentAdmissionService {
 async fn run_backend_executor(
     mut adapter: BackendAdapterPort,
     registry: Arc<tokio::sync::Mutex<TorrentRegistry>>,
-    associations: Arc<tokio::sync::Mutex<HashMap<JobId, nzbd_torrent::EngineIdentity>>>,
+    associations: Arc<tokio::sync::Mutex<HashMap<JobId, Association>>>,
 ) {
     while let Some(command) = adapter.next_command().await {
         let fact = match command {
@@ -414,27 +435,35 @@ async fn apply_pause_resume(
     job: JobId,
     pause: bool,
     registry: &Arc<tokio::sync::Mutex<TorrentRegistry>>,
-    associations: &Arc<tokio::sync::Mutex<HashMap<JobId, nzbd_torrent::EngineIdentity>>>,
+    associations: &Arc<tokio::sync::Mutex<HashMap<JobId, Association>>>,
 ) -> Option<BackendFact> {
-    let Some(identity) = associations.lock().await.get(&job).cloned() else {
+    let Some(association) = associations.lock().await.get(&job).cloned() else {
         return Some(control_failure(job));
     };
-    let registry = registry.lock().await;
-    let already_requested = registry.is_paused(&identity) == Some(pause);
-    if already_requested {
+    if association.applied_pause == Some(pause) {
         return None;
     }
+    let registry = registry.lock().await;
     let result = if pause {
-        registry.pause(&identity).await
+        registry.pause(&association.identity).await
     } else {
-        registry.resume(&identity).await
+        registry.resume(&association.identity).await
     };
     match result {
-        Ok(()) if pause => Some(BackendFact::Stopped {
-            job,
-            reason: StopReason::Paused,
-        }),
-        Ok(()) => Some(BackendFact::Resumed { job }),
+        Ok(()) => {
+            associations
+                .lock()
+                .await
+                .get_mut(&job)
+                .unwrap()
+                .applied_pause = Some(pause);
+            pause
+                .then(|| BackendFact::Stopped {
+                    job,
+                    reason: StopReason::Paused,
+                })
+                .or(Some(BackendFact::Resumed { job }))
+        }
         // Never send an engine diagnostic across the owner boundary: it may
         // contain a passkey, query, peer address, or untrusted path.
         Err(_) => Some(control_failure(job)),
@@ -660,13 +689,22 @@ mod tests {
                 .unwrap();
         let mut registry = TorrentRegistry::new(session.clone());
         let identity = registry
-            .add_committed(metainfo(b"executor.bin"), TorrentAddConfig::default())
+            .add_committed(
+                metainfo(b"executor.bin"),
+                TorrentAddConfig {
+                    paused: true,
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         let registry = Arc::new(tokio::sync::Mutex::new(registry));
         let associations = Arc::new(tokio::sync::Mutex::new(HashMap::from([(
             JobId(7),
-            identity.clone(),
+            Association {
+                identity: identity.clone(),
+                applied_pause: None,
+            },
         )])));
         let (mut owner, adapter) = backend_channel(8, 8);
         let executor = tokio::spawn(run_backend_executor(

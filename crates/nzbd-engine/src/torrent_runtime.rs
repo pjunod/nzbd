@@ -389,6 +389,7 @@ pub fn reconcile_fact(
         }
         BackendFact::Resumed { .. } => {
             let torrent = job.torrent.as_mut().unwrap();
+            torrent.last_error = None;
             if job.status != JobStatus::Paused {
                 torrent.phase = if torrent.ready_at_unix.is_some() {
                     TorrentPhase::Seeding
@@ -990,6 +991,17 @@ mod tests {
             seeding.torrent.as_ref().unwrap().phase,
             TorrentPhase::Seeding
         );
+
+        let mut storage_full = job(10, hash, JobStatus::Paused);
+        storage_full.torrent.as_mut().unwrap().last_error = Some(STORAGE_FULL_ERROR.to_owned());
+        reconcile_fact(
+            &mut storage_full,
+            BackendFact::Resumed { job: JobId(10) },
+            None,
+            100,
+            root.path(),
+        );
+        assert_eq!(storage_full.torrent.as_ref().unwrap().last_error, None);
     }
 
     #[test]
