@@ -89,8 +89,10 @@ async fn downloader(
         );
         session.pause(&handle).await.unwrap();
         assert!(handle.is_paused(), "pause must apply before completion");
+        assert_eq!(handle.stats().phase, TorrentPhase::Paused);
         session.resume(&handle).await.unwrap();
         assert!(!handle.is_paused(), "resume must return a live download");
+        assert_eq!(handle.stats().phase, TorrentPhase::Live);
         session.set_download_limit_bps(None);
     }
     tokio::time::timeout(Duration::from_secs(20), handle.wait_until_completed())
@@ -100,7 +102,9 @@ async fn downloader(
     assert!(handle.stats().finished);
     session.pause(&handle).await.unwrap();
     assert!(handle.is_paused());
+    assert_eq!(handle.stats().phase, TorrentPhase::Paused);
     session.resume(&handle).await.unwrap();
+    assert_eq!(handle.stats().phase, TorrentPhase::Live);
     (session, handle)
 }
 
