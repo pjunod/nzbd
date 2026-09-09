@@ -387,6 +387,22 @@ pub fn reconcile_fact(
                 storage_hold,
             }
         }
+        BackendFact::Resumed { .. } => {
+            let torrent = job.torrent.as_mut().unwrap();
+            torrent.last_error = None;
+            if job.status != JobStatus::Paused {
+                torrent.phase = if torrent.ready_at_unix.is_some() {
+                    TorrentPhase::Seeding
+                } else {
+                    TorrentPhase::Downloading
+                };
+                job.status = JobStatus::Downloading;
+            }
+            ReconcileOutcome {
+                durable_changed: fact_state_changed(&before, job),
+                storage_hold: false,
+            }
+        }
         BackendFact::Failed { error, .. } => {
             let torrent = job.torrent.as_mut().unwrap();
             torrent.phase = TorrentPhase::Failed;
@@ -419,6 +435,7 @@ fn fact_job(fact: &BackendFact) -> JobId {
         BackendFact::MetadataReady { job, .. }
         | BackendFact::Ready { job, .. }
         | BackendFact::Stopped { job, .. }
+        | BackendFact::Resumed { job }
         | BackendFact::Failed { job, .. } => *job,
     }
 }
@@ -930,6 +947,61 @@ mod tests {
             TorrentPhase::PausedSeed
         );
         assert!(paused.ready());
+    }
+
+    #[test]
+    fn resume_fact_restores_the_phase_that_pause_preserved() {
+        let hash = "0123456789abcdef0123456789abcdef01234567";
+        let root = tempfile::tempdir().unwrap();
+
+        let mut downloading = job(10, hash, JobStatus::Queued);
+        downloading.torrent.as_mut().unwrap().phase = TorrentPhase::PausedDownload;
+        assert!(
+            reconcile_fact(
+                &mut downloading,
+                BackendFact::Resumed { job: JobId(10) },
+                None,
+                100,
+                root.path(),
+            )
+            .durable_changed
+        );
+        assert_eq!(downloading.status, JobStatus::Downloading);
+        assert_eq!(
+            downloading.torrent.as_ref().unwrap().phase,
+            TorrentPhase::Downloading
+        );
+
+        let mut seeding = job(10, hash, JobStatus::Queued);
+        let torrent = seeding.torrent.as_mut().unwrap();
+        torrent.phase = TorrentPhase::PausedSeed;
+        torrent.ready_at_unix = Some(99);
+        assert!(
+            reconcile_fact(
+                &mut seeding,
+                BackendFact::Resumed { job: JobId(10) },
+                None,
+                100,
+                root.path(),
+            )
+            .durable_changed
+        );
+        assert_eq!(seeding.status, JobStatus::Downloading);
+        assert_eq!(
+            seeding.torrent.as_ref().unwrap().phase,
+            TorrentPhase::Seeding
+        );
+
+        let mut storage_full = job(10, hash, JobStatus::Paused);
+        storage_full.torrent.as_mut().unwrap().last_error = Some(STORAGE_FULL_ERROR.to_owned());
+        reconcile_fact(
+            &mut storage_full,
+            BackendFact::Resumed { job: JobId(10) },
+            None,
+            100,
+            root.path(),
+        );
+        assert_eq!(storage_full.torrent.as_ref().unwrap().last_error, None);
     }
 
     #[test]

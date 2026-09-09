@@ -107,6 +107,12 @@ pub enum BackendFact {
         job: JobId,
         reason: StopReason,
     },
+    /// The adapter has applied a resume request. This is structural rather
+    /// than progress so the durable phase can leave either paused state even
+    /// before the next peer-stat sample arrives.
+    Resumed {
+        job: JobId,
+    },
     Failed {
         job: JobId,
         error: SafeError,

@@ -3,6 +3,9 @@ use axum::extract::State;
 use axum::http::{header::CONTENT_TYPE, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::{Json, Router};
+use nzbd_engine::backend::{
+    BackendAdapterPort, BackendCommand, BackendFact, SafeError, StopReason,
+};
 use nzbd_engine::{AddOpts, EngineHandle};
 use nzbd_state::torrent_sources::PendingSourceStore;
 use nzbd_torrent::{
@@ -22,7 +25,7 @@ pub struct TorrentAdmissionService {
     engine: EngineHandle,
     session: TorrentSession,
     registry: Arc<tokio::sync::Mutex<TorrentRegistry>>,
-    associations: Arc<tokio::sync::Mutex<HashMap<JobId, nzbd_torrent::EngineIdentity>>>,
+    associations: Arc<tokio::sync::Mutex<HashMap<JobId, Association>>>,
     state_dir: PathBuf,
     proxy_enabled: bool,
     dht_enabled: bool,
@@ -42,6 +45,8 @@ pub enum AdmissionError {
     Encoding,
     #[error("pending torrent admission disappeared")]
     MissingPending,
+    #[error("torrent backend adapter has already been taken")]
+    MissingBackendAdapter,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -49,6 +54,15 @@ pub struct AdmissionResult {
     pub id: JobId,
     pub created: bool,
     pub info_hash: String,
+}
+
+#[derive(Clone)]
+struct Association {
+    identity: nzbd_torrent::EngineIdentity,
+    /// `None` means that the engine's initial paused state has not yet been
+    /// reconciled with a queue-owner control. Managed admission deliberately
+    /// starts paused, while the durable queue starts runnable.
+    applied_pause: Option<bool>,
 }
 
 impl TorrentAdmissionService {
@@ -173,7 +187,13 @@ impl TorrentAdmissionService {
                 }])
                 .await?;
             if let Some(identity) = identities.into_iter().next() {
-                self.associations.lock().await.insert(job.id, identity);
+                self.associations.lock().await.insert(
+                    job.id,
+                    Association {
+                        identity,
+                        applied_pause: None,
+                    },
+                );
             }
         }
 
@@ -209,6 +229,21 @@ impl TorrentAdmissionService {
             );
         }
         Ok(restored)
+    }
+
+    /// Start the single consumer of queue-owner backend controls. The daemon
+    /// still decides when this feature-gated service is mounted; once it is,
+    /// controls remain ordered on the existing backend FIFO.
+    pub fn spawn_backend_executor(&self) -> Result<tokio::task::JoinHandle<()>, AdmissionError> {
+        let adapter = self
+            .engine
+            .take_backend_adapter()
+            .ok_or(AdmissionError::MissingBackendAdapter)?;
+        let registry = self.registry.clone();
+        let associations = self.associations.clone();
+        Ok(tokio::spawn(async move {
+            run_backend_executor(adapter, registry, associations).await;
+        }))
     }
 
     async fn finish(
@@ -295,7 +330,13 @@ impl TorrentAdmissionService {
                         },
                     )
                     .await?;
-                self.associations.lock().await.insert(id, identity.clone());
+                self.associations.lock().await.insert(
+                    id,
+                    Association {
+                        identity: identity.clone(),
+                        applied_pause: None,
+                    },
+                );
                 Ok(AdmissionResult {
                     id,
                     created: true,
@@ -358,6 +399,95 @@ impl TorrentAdmissionService {
             results.push(result);
         }
         Ok(results)
+    }
+}
+
+async fn run_backend_executor(
+    mut adapter: BackendAdapterPort,
+    registry: Arc<tokio::sync::Mutex<TorrentRegistry>>,
+    associations: Arc<tokio::sync::Mutex<HashMap<JobId, Association>>>,
+) {
+    while let Some(command) = adapter.next_command().await {
+        let fact = match command {
+            BackendCommand::Pause { job } => {
+                apply_pause_resume(job, true, &registry, &associations).await
+            }
+            BackendCommand::Resume { job } => {
+                apply_pause_resume(job, false, &registry, &associations).await
+            }
+            // M2e-3 owns removal and the remaining commands have their own
+            // executor slices. The service is feature-gated and unmounted
+            // until those ordered children complete.
+            BackendCommand::Start { .. }
+            | BackendCommand::Remove { .. }
+            | BackendCommand::SetPriority { .. }
+            | BackendCommand::SetDownloadLimit { .. } => None,
+        };
+        if let Some(fact) = fact {
+            if adapter.structural(fact).await.is_err() {
+                break;
+            }
+        }
+    }
+}
+
+async fn apply_pause_resume(
+    job: JobId,
+    pause: bool,
+    registry: &Arc<tokio::sync::Mutex<TorrentRegistry>>,
+    associations: &Arc<tokio::sync::Mutex<HashMap<JobId, Association>>>,
+) -> Option<BackendFact> {
+    let Some(association) = associations.lock().await.get(&job).cloned() else {
+        return Some(control_failure(job));
+    };
+    if association.applied_pause == Some(pause) {
+        return None;
+    }
+    let result = {
+        let registry = registry.lock().await;
+        if pause {
+            registry.pause(&association.identity).await
+        } else {
+            registry.resume(&association.identity).await
+        }
+    };
+    match result {
+        Ok(()) => {
+            if let Some(association) = associations.lock().await.get_mut(&job) {
+                association.applied_pause = Some(pause);
+            }
+            if pause {
+                Some(BackendFact::Stopped {
+                    job,
+                    reason: StopReason::Paused,
+                })
+            } else {
+                Some(BackendFact::Resumed { job })
+            }
+        }
+        // Never send an engine diagnostic across the owner boundary: it may
+        // contain a passkey, query, peer address, or untrusted path. A handle
+        // that disappeared is terminal, but rqbit can reject a control while
+        // it is still initializing; that is a live, retryable condition.
+        Err(error) => Some(control_error_fact(job, error)),
+    }
+}
+
+fn control_failure(job: JobId) -> BackendFact {
+    BackendFact::Failed {
+        job,
+        error: SafeError::from_redacted("torrent control target is unavailable"),
+    }
+}
+
+fn control_error_fact(job: JobId, error: nzbd_torrent::TorrentError) -> BackendFact {
+    if matches!(error, nzbd_torrent::TorrentError::MissingHandle) {
+        control_failure(job)
+    } else {
+        BackendFact::Stopped {
+            job,
+            reason: StopReason::Transient,
+        }
     }
 }
 
@@ -511,6 +641,7 @@ fn persist_descriptor(path: &Path, bytes: &[u8]) -> Result<(), nzbd_state::State
 mod tests {
     use super::*;
     use http_body_util::BodyExt;
+    use nzbd_engine::backend::backend_channel;
     use nzbd_engine::{Engine, EngineConfig, Tuning};
     use nzbd_torrent::TorrentSessionConfig;
     use tower::ServiceExt;
@@ -548,6 +679,129 @@ mod tests {
             TorrentAdmissionService::new(engine.clone(), session, state, false, false),
             engine,
         )
+    }
+
+    async fn next_fact(owner: &mut nzbd_engine::backend::BackendOwnerPort) -> BackendFact {
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if let Ok(fact) = owner.try_structural() {
+                    return fact;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("backend executor did not emit a structural fact")
+    }
+
+    #[test]
+    fn transient_control_errors_do_not_terminally_fail_the_job() {
+        let job = JobId(7);
+        assert_eq!(
+            control_error_fact(
+                job,
+                nzbd_torrent::TorrentError::Engine("initializing".into())
+            ),
+            BackendFact::Stopped {
+                job,
+                reason: StopReason::Transient,
+            }
+        );
+        assert_eq!(
+            control_error_fact(job, nzbd_torrent::TorrentError::MissingHandle),
+            BackendFact::Failed {
+                job,
+                error: SafeError::from_redacted("torrent control target is unavailable"),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn backend_executor_pauses_and_resumes_once_per_state_change() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session =
+            TorrentSession::start(tmp.path().join("payload"), TorrentSessionConfig::default())
+                .await
+                .unwrap();
+        let mut registry = TorrentRegistry::new(session.clone());
+        let identity = registry
+            .add_committed(
+                metainfo(b"executor.bin"),
+                TorrentAddConfig {
+                    paused: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let registry = Arc::new(tokio::sync::Mutex::new(registry));
+        let associations = Arc::new(tokio::sync::Mutex::new(HashMap::from([(
+            JobId(7),
+            Association {
+                identity: identity.clone(),
+                applied_pause: None,
+            },
+        )])));
+        let (mut owner, adapter) = backend_channel(8, 8);
+        let executor = tokio::spawn(run_backend_executor(
+            adapter,
+            registry.clone(),
+            associations,
+        ));
+
+        owner
+            .try_command(BackendCommand::Pause { job: JobId(7) })
+            .unwrap();
+        assert_eq!(
+            next_fact(&mut owner).await,
+            BackendFact::Stopped {
+                job: JobId(7),
+                reason: StopReason::Paused,
+            }
+        );
+        assert_eq!(registry.lock().await.is_paused(&identity), Some(true));
+
+        owner
+            .try_command(BackendCommand::Pause { job: JobId(7) })
+            .unwrap();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), next_fact(&mut owner))
+                .await
+                .is_err()
+        );
+
+        owner
+            .try_command(BackendCommand::Resume { job: JobId(7) })
+            .unwrap();
+        assert_eq!(
+            next_fact(&mut owner).await,
+            BackendFact::Resumed { job: JobId(7) }
+        );
+        assert_eq!(registry.lock().await.is_paused(&identity), Some(false));
+
+        owner
+            .try_command(BackendCommand::Resume { job: JobId(7) })
+            .unwrap();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), next_fact(&mut owner))
+                .await
+                .is_err()
+        );
+
+        owner
+            .try_command(BackendCommand::Pause { job: JobId(8) })
+            .unwrap();
+        assert_eq!(
+            next_fact(&mut owner).await,
+            BackendFact::Failed {
+                job: JobId(8),
+                error: SafeError::from_redacted("torrent control target is unavailable"),
+            }
+        );
+
+        drop(owner);
+        executor.await.unwrap();
+        session.stop().await;
     }
 
     #[tokio::test]

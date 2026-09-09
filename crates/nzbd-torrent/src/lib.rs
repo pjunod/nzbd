@@ -1028,6 +1028,9 @@ impl TorrentRegistry {
             .get(&identity.info_hash_v1)
             .filter(|handle| handle.id() == identity.id)
             .ok_or(TorrentError::MissingHandle)?;
+        if !handle.is_paused() {
+            return Ok(());
+        }
         self.session.resume(handle).await
     }
 
@@ -1037,6 +1040,9 @@ impl TorrentRegistry {
             .get(&identity.info_hash_v1)
             .filter(|handle| handle.id() == identity.id)
             .ok_or(TorrentError::MissingHandle)?;
+        if handle.is_paused() {
+            return Ok(());
+        }
         self.session.pause(handle).await
     }
 
