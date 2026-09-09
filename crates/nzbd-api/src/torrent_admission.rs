@@ -466,8 +466,10 @@ async fn apply_pause_resume(
             }
         }
         // Never send an engine diagnostic across the owner boundary: it may
-        // contain a passkey, query, peer address, or untrusted path.
-        Err(_) => Some(control_failure(job)),
+        // contain a passkey, query, peer address, or untrusted path. A handle
+        // that disappeared is terminal, but rqbit can reject a control while
+        // it is still initializing; that is a live, retryable condition.
+        Err(error) => Some(control_error_fact(job, error)),
     }
 }
 
@@ -475,6 +477,17 @@ fn control_failure(job: JobId) -> BackendFact {
     BackendFact::Failed {
         job,
         error: SafeError::from_redacted("torrent control target is unavailable"),
+    }
+}
+
+fn control_error_fact(job: JobId, error: nzbd_torrent::TorrentError) -> BackendFact {
+    if matches!(error, nzbd_torrent::TorrentError::MissingHandle) {
+        control_failure(job)
+    } else {
+        BackendFact::Stopped {
+            job,
+            reason: StopReason::Transient,
+        }
     }
 }
 
@@ -679,6 +692,28 @@ mod tests {
         })
         .await
         .expect("backend executor did not emit a structural fact")
+    }
+
+    #[test]
+    fn transient_control_errors_do_not_terminally_fail_the_job() {
+        let job = JobId(7);
+        assert_eq!(
+            control_error_fact(
+                job,
+                nzbd_torrent::TorrentError::Engine("initializing".into())
+            ),
+            BackendFact::Stopped {
+                job,
+                reason: StopReason::Transient,
+            }
+        );
+        assert_eq!(
+            control_error_fact(job, nzbd_torrent::TorrentError::MissingHandle),
+            BackendFact::Failed {
+                job,
+                error: SafeError::from_redacted("torrent control target is unavailable"),
+            }
+        );
     }
 
     #[tokio::test]
