@@ -152,6 +152,19 @@ pub(super) fn sync_dir(p: &Path) -> Result<(), StateError> {
     Ok(())
 }
 
-pub(super) fn set_len(f: &File, len: u64, p: &Path) -> Result<(), StateError> {
-    ctx(f.set_len(len), "truncate", p)
+/// Truncate a file through a fresh write-capable handle, then make the
+/// truncation durable. This must not use an append-only handle: on Windows
+/// `FILE_APPEND_DATA` does not grant the `FILE_WRITE_DATA` permission required
+/// by `SetEndOfFile`.
+pub(super) fn truncate(p: &Path) -> Result<(), StateError> {
+    let file = ctx(
+        OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(p),
+        "truncate",
+        p,
+    )?;
+    sync_data(&file, p)
 }
