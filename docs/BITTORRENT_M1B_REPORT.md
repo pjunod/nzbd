@@ -75,7 +75,7 @@ The new backend channel has three independent paths:
 | Path | Direction | Delivery rule |
 |---|---|---|
 | Commands | owner → adapter | Bounded FIFO for start, pause, resume, remove, priority, and limit changes |
-| Structural facts | adapter → owner | Bounded reliable FIFO for metadata, ready, stopped, and failed facts |
+| Structural facts | adapter → owner | Bounded reliable FIFO for metadata, ready, stopped, resumed, and failed facts |
 | Progress | adapter → owner | Watched latest-value map, one replaceable value per job |
 
 A progress flood therefore cannot sit ahead of a delete command or displace a
@@ -95,6 +95,13 @@ bound. Records written before this field decode as `running`.
 `SafeError` accepts only an already-redacted message from the adapter and
 enforces the proposal's 2 KiB UTF-8-safe persistence bound. Engine-specific
 redaction remains an M2 adapter responsibility.
+
+The M2e pause/resume executor emits `Stopped { Paused }` after it has applied
+a pause, and `Resumed` after it has applied a resume. These facts are emitted
+only on a state change: repeat controls leave the registry state and the
+structural FIFO unchanged. A `Resumed` fact restores `downloading` or
+`seeding` from the durable readiness checkpoint, so a paused seed cannot be
+mistaken for a new download.
 
 ### 1.4 One active set spans both protocols
 
