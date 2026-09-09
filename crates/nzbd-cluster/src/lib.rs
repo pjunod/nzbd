@@ -61,6 +61,7 @@ pub struct ClusterConfig {
     /// Every configured write root on this node, used by the engine's
     /// enforcing low-disk guard.
     pub disk_guard_roots: Vec<nzbd_engine::volumes::DiskGuardRoot>,
+    pub torrent_payload_roots: Vec<PathBuf>,
 }
 
 /// Post-processing wiring for a cluster node (C2): the PP pipeline config
@@ -128,6 +129,7 @@ impl ClusterRuntime {
             download_enabled: cfg.download,
             state_dir: layout.state_dir(),
             dest_dir: dest_dir.clone(),
+            torrent_payload_roots: cfg.torrent_payload_roots.clone(),
             disk_guard_roots: cfg.disk_guard_roots.clone(),
             tuning,
             speed_limit_bps,

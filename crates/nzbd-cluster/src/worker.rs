@@ -623,6 +623,7 @@ mod tests {
             takeover_after: std::time::Duration::from_secs(2),
             worker_ttl: std::time::Duration::from_secs(3),
             disk_guard_roots: Vec::new(),
+            torrent_payload_roots: Vec::new(),
         };
         let client = ClusterClient::new("secret".into());
         let active: ActiveLeases = Default::default();

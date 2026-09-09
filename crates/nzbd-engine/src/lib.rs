@@ -130,6 +130,8 @@ pub struct EngineConfig {
     pub state_dir: PathBuf,
     /// Completed jobs are written to `<dest_dir>/<job name>/`.
     pub dest_dir: PathBuf,
+    /// Ordered configured torrent payload roots used only for removal safety.
+    pub torrent_payload_roots: Vec<PathBuf>,
     /// Every configured filesystem root the daemon may write. The enforcing
     /// guard probes all of them and gates intake on the lowest reading.
     pub disk_guard_roots: Vec<DiskGuardRoot>,
@@ -169,6 +171,7 @@ impl EngineConfig {
                 path: dest_dir.clone(),
             }],
             dest_dir,
+            torrent_payload_roots: Vec::new(),
             tuning,
             max_active_downloads: None,
             speed_limit_bps,
@@ -217,6 +220,7 @@ impl Engine {
         let owner = Owner::recover(
             &cfg.state_dir,
             cfg.dest_dir.clone(),
+            cfg.torrent_payload_roots.clone(),
             servers.clone(),
             cfg.tuning.clone(),
             cfg.download_enabled,

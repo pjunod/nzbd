@@ -837,6 +837,7 @@ mod tests {
             takeover_after: std::time::Duration::from_secs(2),
             worker_ttl: std::time::Duration::from_secs(3),
             disk_guard_roots: Vec::new(),
+            torrent_payload_roots: Vec::new(),
         };
         let shared = LeaderShared::new(engine.clone(), layout, cfg, vec![provider, scarce], view);
         for (lease, node) in [("pp-a", "worker-a"), ("pp-b", "worker-b")] {
@@ -927,6 +928,7 @@ mod tests {
             takeover_after: std::time::Duration::from_secs(2),
             worker_ttl: std::time::Duration::from_secs(3),
             disk_guard_roots: Vec::new(),
+            torrent_payload_roots: Vec::new(),
         };
         let shared = LeaderShared::new(engine.clone(), layout, cfg, Vec::new(), view);
         shared.leases.lock().unwrap().insert(

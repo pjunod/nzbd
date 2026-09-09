@@ -85,6 +85,13 @@ pub enum TorrentControlIntent {
     Paused,
 }
 
+/// The queue's authoritative request to remove a torrent after the backend
+/// has stopped its engine handle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TorrentRemovalIntent {
+    pub delete_data: bool,
+}
+
 impl TorrentPhase {
     /// Whether this phase may compete for a shared active-download slot.
     pub fn wants_download_slot(self) -> bool {
@@ -127,6 +134,9 @@ pub struct TorrentRecord {
     /// their historical (running) meaning.
     #[serde(default)]
     pub control_intent: TorrentControlIntent,
+    /// Defaulted so rows written before durable removal routing remain valid.
+    #[serde(default)]
+    pub removal_intent: Option<TorrentRemovalIntent>,
     pub files: Vec<TorrentFileRecord>,
     pub total_bytes: u64,
     pub selected_bytes: u64,
@@ -172,6 +182,7 @@ mod torrent_control_tests {
         )
         .unwrap();
         assert_eq!(record.control_intent, TorrentControlIntent::Running);
+        assert_eq!(record.removal_intent, None);
     }
 }
 

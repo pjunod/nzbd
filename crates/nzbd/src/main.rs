@@ -239,6 +239,18 @@ fn disk_guard_roots(cfg: &nzbd_config::Config) -> Vec<nzbd_engine::volumes::Disk
         .collect()
 }
 
+fn torrent_payload_roots(cfg: &nzbd_config::Config) -> Vec<PathBuf> {
+    let mut roots = vec![cfg.torrent_dir()];
+    roots.extend(
+        cfg.categories
+            .iter()
+            .filter_map(|category| category.torrent_dir.as_ref())
+            .map(|path| nzbd_config::expand_home(path)),
+    );
+    roots.dedup();
+    roots
+}
+
 /// Map daemon queue settings onto the engine's runtime units and bounds.
 fn engine_tuning(cfg: &nzbd_config::Config) -> Tuning {
     Tuning {
@@ -283,6 +295,7 @@ fn cluster_runtime_config(
         takeover_after: Duration::from_secs(c.takeover_after_secs.max(2)),
         worker_ttl: Duration::from_secs(c.worker_ttl_secs.max(3)),
         disk_guard_roots: disk_guard_roots(cfg),
+        torrent_payload_roots: torrent_payload_roots(cfg),
     };
     Ok((runtime, shared_dir))
 }
@@ -695,6 +708,7 @@ fn run(
         cfg.speed_limit_bps(),
     );
     engine_cfg.disk_guard_roots = disk_guard_roots(&cfg);
+    engine_cfg.torrent_payload_roots = torrent_payload_roots(&cfg);
     engine_cfg.max_active_downloads = cfg.max_active_downloads();
 
     runtime.block_on(async move {
