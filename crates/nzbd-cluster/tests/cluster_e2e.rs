@@ -123,6 +123,7 @@ async fn start_node_with_auth(
             label: "downloads".into(),
             path: shared.join("complete"),
         }],
+        torrent_payload_roots: Vec::new(),
     };
     let tuning = Tuning {
         retry_interval: Duration::from_millis(400),

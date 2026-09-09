@@ -966,6 +966,7 @@ mod tests {
             metadata_file: "meta/0123.torrent".into(),
             phase: nzbd_types::TorrentPhase::PausedDownload,
             control_intent: nzbd_types::TorrentControlIntent::Paused,
+            removal_intent: None,
             files: vec![nzbd_types::TorrentFileRecord {
                 path: "payload.bin".into(),
                 length: 42,

@@ -6,7 +6,7 @@
 //! with peer-rate updates. Structural facts are reliable and bounded;
 //! progress is a latest-value snapshot per job.
 
-use nzbd_types::{JobId, TorrentPhase, TorrentRecord};
+use nzbd_types::{JobId, TorrentFileRecord, TorrentPhase, TorrentRecord};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use tokio::sync::{mpsc, watch};
@@ -18,12 +18,29 @@ pub const STALLED_SLOT_YIELD_SECS: i64 = 60;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BackendCommand {
-    Start { job: JobId },
-    Pause { job: JobId },
-    Resume { job: JobId },
-    Remove { job: JobId, delete_data: bool },
-    SetPriority { job: JobId, priority: i32 },
-    SetDownloadLimit { bytes_per_sec: Option<u64> },
+    Start {
+        job: JobId,
+    },
+    Pause {
+        job: JobId,
+    },
+    Resume {
+        job: JobId,
+    },
+    Remove {
+        job: JobId,
+        delete_data: bool,
+        content_path: Option<PathBuf>,
+        files: Vec<TorrentFileRecord>,
+        allowed_roots: Vec<PathBuf>,
+    },
+    SetPriority {
+        job: JobId,
+        priority: i32,
+    },
+    SetDownloadLimit {
+        bytes_per_sec: Option<u64>,
+    },
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -60,6 +77,15 @@ pub enum StopReason {
     MissingContent,
     /// Discovery or peer availability temporarily cannot make progress.
     Transient,
+}
+
+/// Categorical removal result that is safe to persist or display.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemovalOutcome {
+    DataDeleted,
+    DataKept,
+    RefusedUnsafeRoot,
+    RefusedInventoryMismatch,
 }
 
 /// A display-safe backend failure. The adapter must redact passkeys, query
@@ -112,6 +138,10 @@ pub enum BackendFact {
     /// before the next peer-stat sample arrives.
     Resumed {
         job: JobId,
+    },
+    Removed {
+        job: JobId,
+        outcome: RemovalOutcome,
     },
     Failed {
         job: JobId,
@@ -250,6 +280,7 @@ mod tests {
             metadata_file: "meta/example.torrent".into(),
             phase,
             control_intent: nzbd_types::TorrentControlIntent::Running,
+            removal_intent: None,
             files: Vec::new(),
             total_bytes: 100,
             selected_bytes: 100,
@@ -282,6 +313,9 @@ mod tests {
             .try_command(BackendCommand::Remove {
                 job: JobId(7),
                 delete_data: false,
+                content_path: None,
+                files: Vec::new(),
+                allowed_roots: Vec::new(),
             })
             .unwrap();
         assert_eq!(
@@ -289,6 +323,9 @@ mod tests {
             Some(BackendCommand::Remove {
                 job: JobId(7),
                 delete_data: false,
+                content_path: None,
+                files: Vec::new(),
+                allowed_roots: Vec::new(),
             })
         );
         owner

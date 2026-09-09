@@ -4,8 +4,9 @@ use axum::http::{header::CONTENT_TYPE, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::{Json, Router};
 use nzbd_engine::backend::{
-    BackendAdapterPort, BackendCommand, BackendFact, SafeError, StopReason,
+    BackendAdapterPort, BackendCommand, BackendFact, RemovalOutcome, SafeError, StopReason,
 };
+use nzbd_engine::torrent_runtime::{validate_removal_payload, RemovalRefusal};
 use nzbd_engine::{AddOpts, EngineHandle};
 use nzbd_state::torrent_sources::PendingSourceStore;
 use nzbd_torrent::{
@@ -282,6 +283,7 @@ impl TorrentAdmissionService {
             metadata_file: relative,
             phase: TorrentPhase::Queued,
             control_intent: nzbd_types::TorrentControlIntent::Running,
+            removal_intent: None,
             files: descriptor
                 .files
                 .iter()
@@ -415,11 +417,28 @@ async fn run_backend_executor(
             BackendCommand::Resume { job } => {
                 apply_pause_resume(job, false, &registry, &associations).await
             }
+            BackendCommand::Remove {
+                job,
+                delete_data,
+                content_path,
+                files,
+                allowed_roots,
+            } => {
+                apply_remove(
+                    job,
+                    delete_data,
+                    content_path,
+                    files,
+                    allowed_roots,
+                    &registry,
+                    &associations,
+                )
+                .await
+            }
             // M2e-3 owns removal and the remaining commands have their own
             // executor slices. The service is feature-gated and unmounted
             // until those ordered children complete.
             BackendCommand::Start { .. }
-            | BackendCommand::Remove { .. }
             | BackendCommand::SetPriority { .. }
             | BackendCommand::SetDownloadLimit { .. } => None,
         };
@@ -428,6 +447,53 @@ async fn run_backend_executor(
                 break;
             }
         }
+    }
+}
+
+async fn apply_remove(
+    job: JobId,
+    delete_data: bool,
+    content_path: Option<PathBuf>,
+    files: Vec<TorrentFileRecord>,
+    allowed_roots: Vec<PathBuf>,
+    registry: &Arc<tokio::sync::Mutex<TorrentRegistry>>,
+    associations: &Arc<tokio::sync::Mutex<HashMap<JobId, Association>>>,
+) -> Option<BackendFact> {
+    let Some(association) = associations.lock().await.get(&job).cloned() else {
+        return Some(control_failure(job));
+    };
+    let outcome = if delete_data {
+        let Some(content_path) = content_path else {
+            return Some(BackendFact::Removed {
+                job,
+                outcome: RemovalOutcome::RefusedUnsafeRoot,
+            });
+        };
+        match validate_removal_payload(&content_path, &files, &allowed_roots) {
+            Ok(()) => RemovalOutcome::DataDeleted,
+            Err(RemovalRefusal::UnsafeRoot) => RemovalOutcome::RefusedUnsafeRoot,
+            Err(RemovalRefusal::InventoryMismatch) => RemovalOutcome::RefusedInventoryMismatch,
+        }
+    } else {
+        RemovalOutcome::DataKept
+    };
+    if matches!(
+        outcome,
+        RemovalOutcome::RefusedUnsafeRoot | RemovalOutcome::RefusedInventoryMismatch
+    ) {
+        return Some(BackendFact::Removed { job, outcome });
+    }
+    let result = registry
+        .lock()
+        .await
+        .delete(&association.identity, delete_data)
+        .await;
+    match result {
+        Ok(()) | Err(nzbd_torrent::TorrentError::MissingHandle) => {
+            associations.lock().await.remove(&job);
+            Some(BackendFact::Removed { job, outcome })
+        }
+        Err(error) => Some(control_error_fact(job, error)),
     }
 }
 

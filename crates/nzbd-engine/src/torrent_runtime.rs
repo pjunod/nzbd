@@ -4,9 +4,9 @@
 //! maintained adapter receives only [`RestoreRequest`] values and returns
 //! engine identities, keeping raw rqbit handles and queue identities apart.
 
-use crate::backend::{BackendFact, SafeError, StopReason, TransferProgress};
+use crate::backend::{BackendFact, RemovalOutcome, SafeError, StopReason, TransferProgress};
 use crate::queue::rename_job;
-use nzbd_types::{Job, JobId, JobKind, JobStatus, TorrentPhase};
+use nzbd_types::{Job, JobId, JobKind, JobStatus, TorrentFileRecord, TorrentPhase};
 use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 
@@ -41,6 +41,34 @@ pub enum RestoreDiagnostic {
     DuplicatePreferredIdentity,
     DeletedRecord,
     UnsafePayloadRoot,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemovalRefusal {
+    UnsafeRoot,
+    InventoryMismatch,
+}
+
+/// Revalidate persisted payload facts immediately before data deletion.
+pub fn validate_removal_payload(
+    content_path: &Path,
+    files: &[TorrentFileRecord],
+    allowed_roots: &[PathBuf],
+) -> Result<(), RemovalRefusal> {
+    if !allowed_roots
+        .iter()
+        .any(|root| payload_is_within_root(content_path, root))
+    {
+        return Err(RemovalRefusal::UnsafeRoot);
+    }
+    for file in files {
+        if !safe_relative_path(&file.path)
+            || !payload_is_within_root(&content_path.join(&file.path), content_path)
+        {
+            return Err(RemovalRefusal::InventoryMismatch);
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -403,6 +431,19 @@ pub fn reconcile_fact(
                 storage_hold: false,
             }
         }
+        BackendFact::Removed { outcome, .. } => {
+            let torrent = job.torrent.as_mut().unwrap();
+            if matches!(
+                outcome,
+                RemovalOutcome::RefusedUnsafeRoot | RemovalOutcome::RefusedInventoryMismatch
+            ) {
+                torrent.last_error = Some("torrent removal refused unsafe payload".to_owned());
+            }
+            ReconcileOutcome {
+                durable_changed: fact_state_changed(&before, job),
+                storage_hold: false,
+            }
+        }
         BackendFact::Failed { error, .. } => {
             let torrent = job.torrent.as_mut().unwrap();
             torrent.phase = TorrentPhase::Failed;
@@ -436,6 +477,7 @@ fn fact_job(fact: &BackendFact) -> JobId {
         | BackendFact::Ready { job, .. }
         | BackendFact::Stopped { job, .. }
         | BackendFact::Resumed { job }
+        | BackendFact::Removed { job, .. }
         | BackendFact::Failed { job, .. } => *job,
     }
 }
@@ -463,7 +505,7 @@ fn safe_relative_path(path: &Path) -> bool {
 /// Resolve the existing portion of a payload path so a symlink cannot make a
 /// lexically contained path escape. The leaf may not exist yet during restore,
 /// so canonicalization deliberately stops at its nearest existing ancestor.
-fn payload_is_within_root(path: &Path, root: &Path) -> bool {
+pub fn payload_is_within_root(path: &Path, root: &Path) -> bool {
     let Some(path) = normalize_absolute(path) else {
         return false;
     };
@@ -547,6 +589,7 @@ mod tests {
                 metadata_file: PathBuf::from("meta/selected.torrent"),
                 phase: TorrentPhase::Downloading,
                 control_intent: nzbd_types::TorrentControlIntent::Running,
+                removal_intent: None,
                 files: vec![
                     TorrentFileRecord {
                         path: "one".into(),
@@ -1029,6 +1072,43 @@ mod tests {
         assert_eq!(
             serde_json::to_value(record).unwrap(),
             serde_json::to_value(before).unwrap()
+        );
+    }
+
+    #[test]
+    fn removal_validation_refuses_symlink_escape_and_inventory_escape() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        let payload = root.join("payload");
+        std::fs::create_dir_all(&payload).unwrap();
+        std::fs::write(payload.join("owned.bin"), b"owned").unwrap();
+        assert_eq!(
+            validate_removal_payload(
+                &payload,
+                &[TorrentFileRecord {
+                    path: "owned.bin".into(),
+                    length: 5,
+                    selected: true
+                }],
+                std::slice::from_ref(&root),
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            validate_removal_payload(
+                &payload,
+                &[TorrentFileRecord {
+                    path: "../sibling.bin".into(),
+                    length: 1,
+                    selected: true
+                }],
+                std::slice::from_ref(&root),
+            ),
+            Err(RemovalRefusal::InventoryMismatch)
+        );
+        assert_eq!(
+            validate_removal_payload(&payload, &[], &[temp.path().join("other")]),
+            Err(RemovalRefusal::UnsafeRoot)
         );
     }
 

@@ -8,7 +8,7 @@
 //! about state. Sends toward writer tasks use `try_send` with a
 //! retry-on-tick fallback so owner ⇄ writer backpressure can never deadlock.
 
-use crate::backend::{BackendCommand, BackendOwnerPort};
+use crate::backend::{BackendCommand, BackendFact, BackendOwnerPort, RemovalOutcome};
 use crate::events::Event;
 use crate::failover::{AttemptOutcome, Ladder, SegmentAttempt, Verdict};
 use crate::queue::{
@@ -25,7 +25,7 @@ use nzbd_nzb::ParsedNzb;
 use nzbd_state::{FsJournal, JobJournals, JournalRecord, SnapshotStore, UncleanMarker};
 use nzbd_types::{
     FileId, Health, Job, JobId, JobKind, JobStatus, PostStage, SegmentState, ServerDef, ServerId,
-    StageSpan, TorrentControlIntent,
+    StageSpan, TorrentControlIntent, TorrentRemovalIntent,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -512,6 +512,7 @@ pub(crate) struct Owner {
     /// explicit `post_fetch_files` lane remains available there.
     download_enabled: bool,
     dest_dir: PathBuf,
+    torrent_payload_roots: Vec<PathBuf>,
 
     engine_tx: mpsc::Sender<EngineMsg>,
     tracker: TaskTracker,
@@ -618,6 +619,7 @@ impl Owner {
     pub(crate) fn recover(
         state_dir: &Path,
         dest_dir: PathBuf,
+        torrent_payload_roots: Vec<PathBuf>,
         servers: Arc<Vec<ServerDef>>,
         tuning: Tuning,
         download_enabled: bool,
@@ -754,6 +756,7 @@ impl Owner {
             tuning,
             download_enabled,
             dest_dir,
+            torrent_payload_roots,
             engine_tx,
             tracker,
             cancel,
@@ -1304,7 +1307,35 @@ impl Owner {
                 delete_files,
                 reply,
             } => {
-                let ok = self.delete_job(job, delete_files);
+                let before = self.state.job(job).cloned();
+                let torrent_command = self.state.job_mut(job).and_then(|record| {
+                    let torrent = record.torrent.as_mut()?;
+                    torrent.removal_intent = Some(TorrentRemovalIntent {
+                        delete_data: delete_files,
+                    });
+                    Some(BackendCommand::Remove {
+                        job,
+                        delete_data: delete_files,
+                        content_path: torrent.content_path.clone(),
+                        files: torrent.files.clone(),
+                        allowed_roots: self.torrent_payload_roots.clone(),
+                    })
+                });
+                let ok = if let Some(command) = torrent_command {
+                    self.dirty = true;
+                    if self.persist_then_command(command) {
+                        self.bump_epoch();
+                        self.publish_now();
+                        true
+                    } else {
+                        if let Some(before) = before {
+                            *self.state.job_mut(job).unwrap() = before;
+                        }
+                        false
+                    }
+                } else {
+                    self.delete_job(job, delete_files)
+                };
                 let _ = reply.send(ok);
             }
             QueueCommand::SetPriority {
@@ -2819,6 +2850,7 @@ impl Owner {
     fn on_tick(&mut self) {
         let tick_started = Instant::now();
         self.flush_backend_commands();
+        self.fold_backend_structural();
         self.fold_backend_progress();
         self.guard_tick = self.guard_tick.wrapping_add(1);
         self.settle_download_labels();
@@ -2949,6 +2981,40 @@ impl Owner {
         }
         if changed {
             self.dirty = true;
+        }
+    }
+
+    fn fold_backend_structural(&mut self) {
+        while let Ok(fact) = self.backend.try_structural() {
+            let job_id = match &fact {
+                BackendFact::Removed { job, outcome } => {
+                    if matches!(
+                        outcome,
+                        RemovalOutcome::DataDeleted | RemovalOutcome::DataKept
+                    ) {
+                        self.delete_job(*job, false);
+                        continue;
+                    }
+                    *job
+                }
+                BackendFact::MetadataReady { job, .. }
+                | BackendFact::Ready { job, .. }
+                | BackendFact::Stopped { job, .. }
+                | BackendFact::Resumed { job }
+                | BackendFact::Failed { job, .. } => *job,
+            };
+            if let Some(job) = self.state.job_mut(job_id) {
+                let outcome = crate::torrent_runtime::reconcile_fact(
+                    job,
+                    fact,
+                    None,
+                    unix_now(),
+                    self.torrent_payload_roots
+                        .first()
+                        .map_or(Path::new("/"), PathBuf::as_path),
+                );
+                self.dirty |= outcome.durable_changed;
+            }
         }
     }
 
@@ -3449,6 +3515,7 @@ mod tests {
         let owner = Owner::recover(
             &tmp.path().join("state"),
             tmp.path().join("dest"),
+            Vec::new(),
             Arc::new(Vec::new()),
             tuning,
             true,
@@ -3489,6 +3556,7 @@ mod tests {
         let owner = Owner::recover(
             &tmp.path().join("state"),
             tmp.path().join("dest"),
+            Vec::new(),
             Arc::new(Vec::new()),
             Tuning::default(),
             true,
@@ -3522,6 +3590,7 @@ mod tests {
             metadata_file: "meta/control.torrent".into(),
             phase: nzbd_types::TorrentPhase::Queued,
             control_intent: TorrentControlIntent::Running,
+            removal_intent: None,
             files: Vec::new(),
             total_bytes: 1,
             selected_bytes: 1,

@@ -1046,6 +1046,23 @@ impl TorrentRegistry {
         self.session.pause(handle).await
     }
 
+    pub async fn delete(
+        &mut self,
+        identity: &EngineIdentity,
+        delete_files: bool,
+    ) -> Result<(), TorrentError> {
+        let handle = self
+            .by_hash
+            .get(&identity.info_hash_v1)
+            .filter(|handle| handle.id() == identity.id)
+            .cloned()
+            .ok_or(TorrentError::MissingHandle)?;
+        self.session.delete(&handle, delete_files).await?;
+        self.by_hash.remove(&identity.info_hash_v1);
+        self.id_to_hash.remove(&identity.id);
+        Ok(())
+    }
+
     pub fn is_paused(&self, identity: &EngineIdentity) -> Option<bool> {
         self.by_hash
             .get(&identity.info_hash_v1)
