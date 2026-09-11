@@ -915,7 +915,14 @@ replace the info-hash invariant.
    configured torrent root.
 4. Start the library session paused.
 5. Explicitly restore each durable torrent job, using fast resume only when
-   the library validates it against the stored metainfo and paths.
+   the library validates it against the stored metainfo and paths. Restore
+   consults the durable control intent before the transient queue status: a
+   persisted pause remains paused and a persisted resume is eligible to run
+   without discarding verified progress. Any durable removal intent excludes
+   the job from restore before engine recovery, regardless of whether its
+   requested disposition keeps or deletes payload data. Ready and seeding jobs
+   remain live restores even without an active-download slot; only an explicit
+   removal or terminal failure retires them.
 6. Recheck any job whose ready stamp, file state, and resume state disagree.
 7. Publish the first combined snapshot.
 8. Resume only jobs allowed by queue policy.

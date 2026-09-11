@@ -6,7 +6,9 @@
 
 use crate::backend::{BackendFact, RemovalOutcome, SafeError, StopReason, TransferProgress};
 use crate::queue::rename_job;
-use nzbd_types::{Job, JobId, JobKind, JobStatus, TorrentFileRecord, TorrentPhase};
+use nzbd_types::{
+    Job, JobId, JobKind, JobStatus, TorrentControlIntent, TorrentFileRecord, TorrentPhase,
+};
 use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 
@@ -40,6 +42,7 @@ pub enum RestoreDiagnostic {
     DuplicateInfoHash,
     DuplicatePreferredIdentity,
     DeletedRecord,
+    RemovalIntent,
     UnsafePayloadRoot,
 }
 
@@ -93,6 +96,10 @@ pub fn plan_restore(
             push_diagnostic(&mut plan, RestoreDiagnostic::MissingTorrentRecord);
             continue;
         };
+        if record.removal_intent.is_some() {
+            push_diagnostic(&mut plan, RestoreDiagnostic::RemovalIntent);
+            continue;
+        }
         if job.status == JobStatus::Deleted {
             push_diagnostic(&mut plan, RestoreDiagnostic::DeletedRecord);
             continue;
@@ -127,12 +134,12 @@ pub fn plan_restore(
             state.finished != record.ready_at_unix.is_some()
                 || state.verified_bytes != record.downloaded_bytes
         });
-        let resume_after_restore = scheduler_allowed.contains(&job.id)
-            && matches!(job.status, JobStatus::Queued | JobStatus::Downloading)
-            && !matches!(
+        let resume_after_restore = record.control_intent == TorrentControlIntent::Running
+            && !matches!(record.phase, TorrentPhase::Failed)
+            && (matches!(
                 record.phase,
-                TorrentPhase::PausedDownload | TorrentPhase::PausedSeed | TorrentPhase::Failed
-            );
+                TorrentPhase::Seeding | TorrentPhase::PausedSeed
+            ) || scheduler_allowed.contains(&job.id));
         plan.requests.push(RestoreRequest {
             job: job.id,
             info_hash_v1: record.info_hash_v1.clone(),
@@ -652,6 +659,129 @@ mod tests {
         assert_eq!(request.preferred_engine_id, Some(7));
         assert_eq!(request.selected_files, vec![0]);
         assert!(plan.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn restore_obeys_durable_pause_and_resume_intent_over_stale_status() {
+        let hash = "0123456789abcdef0123456789abcdef01234567";
+        let mut paused = job(10, hash, JobStatus::Downloading);
+        paused.torrent.as_mut().unwrap().control_intent = TorrentControlIntent::Paused;
+        let paused_plan = plan_restore(
+            &[paused],
+            &HashMap::new(),
+            Path::new("/torrents"),
+            &HashSet::from([JobId(10)]),
+        );
+        assert!(paused_plan.requests[0].start_paused);
+        assert!(!paused_plan.requests[0].resume_after_restore);
+
+        let mut resumed = job(10, hash, JobStatus::Paused);
+        let torrent = resumed.torrent.as_mut().unwrap();
+        torrent.phase = TorrentPhase::PausedDownload;
+        torrent.control_intent = TorrentControlIntent::Running;
+        torrent.downloaded_bytes = 64;
+        let resumed_plan = plan_restore(
+            &[resumed],
+            &HashMap::from([(
+                hash.to_owned(),
+                ObservedResumeState {
+                    engine_id: 7,
+                    verified_bytes: 64,
+                    finished: false,
+                },
+            )]),
+            Path::new("/torrents"),
+            &HashSet::from([JobId(10)]),
+        );
+        assert!(resumed_plan.requests[0].resume_after_restore);
+        assert!(!resumed_plan.requests[0].force_recheck);
+        assert_eq!(resumed_plan.requests[0].trusted_downloaded_bytes, 64);
+    }
+
+    #[test]
+    fn restore_skips_every_durable_removal_intent_before_engine_recovery() {
+        let hash = "0123456789abcdef0123456789abcdef01234567";
+        for delete_data in [false, true] {
+            for (index, (status, phase)) in [
+                (JobStatus::Queued, TorrentPhase::Queued),
+                (JobStatus::Downloading, TorrentPhase::Downloading),
+                (JobStatus::Paused, TorrentPhase::PausedDownload),
+                (JobStatus::Downloading, TorrentPhase::Seeding),
+                (JobStatus::Paused, TorrentPhase::PausedSeed),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let job_id = JobId((index + 10) as u32);
+                let mut pending_removal = job(job_id.0, hash, status);
+                let torrent = pending_removal.torrent.as_mut().unwrap();
+                torrent.phase = phase;
+                torrent.removal_intent = Some(nzbd_types::TorrentRemovalIntent { delete_data });
+                let plan = plan_restore(
+                    &[pending_removal],
+                    &HashMap::new(),
+                    Path::new("/torrents"),
+                    &HashSet::from([job_id]),
+                );
+                assert!(plan.requests.is_empty());
+                assert_eq!(plan.diagnostics, vec![RestoreDiagnostic::RemovalIntent]);
+            }
+        }
+    }
+
+    #[test]
+    fn seeding_family_restores_without_a_download_slot_according_to_durable_intent() {
+        let hash = "0123456789abcdef0123456789abcdef01234567";
+        let mut running_seed = job(10, hash, JobStatus::Downloading);
+        let torrent = running_seed.torrent.as_mut().unwrap();
+        torrent.phase = TorrentPhase::Seeding;
+        torrent.ready_at_unix = Some(1);
+        let running_plan = plan_restore(
+            &[running_seed],
+            &HashMap::new(),
+            Path::new("/torrents"),
+            &HashSet::new(),
+        );
+        assert_eq!(running_plan.requests.len(), 1);
+        assert!(running_plan.requests[0].resume_after_restore);
+
+        let mut paused_seed = job(10, hash, JobStatus::Paused);
+        let torrent = paused_seed.torrent.as_mut().unwrap();
+        torrent.phase = TorrentPhase::PausedSeed;
+        torrent.ready_at_unix = Some(1);
+        torrent.control_intent = TorrentControlIntent::Paused;
+        let paused_plan = plan_restore(
+            &[paused_seed],
+            &HashMap::new(),
+            Path::new("/torrents"),
+            &HashSet::new(),
+        );
+        assert_eq!(paused_plan.requests.len(), 1);
+        assert!(!paused_plan.requests[0].resume_after_restore);
+
+        let mut resumed_seed = job(10, hash, JobStatus::Queued);
+        let torrent = resumed_seed.torrent.as_mut().unwrap();
+        torrent.phase = TorrentPhase::PausedSeed;
+        torrent.ready_at_unix = Some(1);
+        torrent.control_intent = TorrentControlIntent::Running;
+        torrent.downloaded_bytes = 1;
+        let resumed_plan = plan_restore(
+            &[resumed_seed],
+            &HashMap::from([(
+                hash.to_owned(),
+                ObservedResumeState {
+                    engine_id: 7,
+                    verified_bytes: 1,
+                    finished: true,
+                },
+            )]),
+            Path::new("/torrents"),
+            &HashSet::new(),
+        );
+        let request = &resumed_plan.requests[0];
+        assert!(request.start_paused);
+        assert!(request.resume_after_restore);
+        assert!(!request.force_recheck);
     }
 
     #[test]
