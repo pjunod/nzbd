@@ -136,7 +136,10 @@ pub fn plan_restore(
         });
         let resume_after_restore = record.control_intent == TorrentControlIntent::Running
             && !matches!(record.phase, TorrentPhase::Failed)
-            && (record.phase == TorrentPhase::Seeding || scheduler_allowed.contains(&job.id));
+            && (matches!(
+                record.phase,
+                TorrentPhase::Seeding | TorrentPhase::PausedSeed
+            ) || scheduler_allowed.contains(&job.id));
         plan.requests.push(RestoreRequest {
             job: job.id,
             info_hash_v1: record.info_hash_v1.clone(),
@@ -727,7 +730,7 @@ mod tests {
     }
 
     #[test]
-    fn running_seed_restores_without_a_download_slot_and_paused_seed_remains_paused() {
+    fn seeding_family_restores_without_a_download_slot_according_to_durable_intent() {
         let hash = "0123456789abcdef0123456789abcdef01234567";
         let mut running_seed = job(10, hash, JobStatus::Downloading);
         let torrent = running_seed.torrent.as_mut().unwrap();
@@ -755,6 +758,30 @@ mod tests {
         );
         assert_eq!(paused_plan.requests.len(), 1);
         assert!(!paused_plan.requests[0].resume_after_restore);
+
+        let mut resumed_seed = job(10, hash, JobStatus::Queued);
+        let torrent = resumed_seed.torrent.as_mut().unwrap();
+        torrent.phase = TorrentPhase::PausedSeed;
+        torrent.ready_at_unix = Some(1);
+        torrent.control_intent = TorrentControlIntent::Running;
+        torrent.downloaded_bytes = 1;
+        let resumed_plan = plan_restore(
+            &[resumed_seed],
+            &HashMap::from([(
+                hash.to_owned(),
+                ObservedResumeState {
+                    engine_id: 7,
+                    verified_bytes: 1,
+                    finished: true,
+                },
+            )]),
+            Path::new("/torrents"),
+            &HashSet::new(),
+        );
+        let request = &resumed_plan.requests[0];
+        assert!(request.start_paused);
+        assert!(request.resume_after_restore);
+        assert!(!request.force_recheck);
     }
 
     #[test]
