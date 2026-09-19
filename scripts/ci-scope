@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+base=${1:?usage: scripts/ci-scope BASE_SHA}
+git cat-file -e "${base}^{commit}"
+mapfile -t changed < <(git diff --name-only "$base"...HEAD)
+
+rust=false
+mobile=false
+docs_only=true
+
+for path in "${changed[@]}"; do
+  case "$path" in
+    *.md|docs/*) ;;
+    *) docs_only=false ;;
+  esac
+  case "$path" in
+    Cargo.toml|Cargo.lock|rust-toolchain.toml|crates/*|contrib/*|Makefile|scripts/*|.github/workflows/*)
+      rust=true
+      ;;
+  esac
+  case "$path" in
+    mobile/*|Cargo.toml|Cargo.lock|crates/nzbd-api/*|crates/nzbd-types/*)
+      mobile=true
+      ;;
+  esac
+done
+
+printf 'rust=%s\nmobile=%s\ndocs_only=%s\n' "$rust" "$mobile" "$docs_only"

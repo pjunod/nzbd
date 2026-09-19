@@ -1,7 +1,7 @@
 # Cluster completion — progress and remaining work
 
-**Updated:** 2026-09-19 · **State:** analysis and documentation complete; implementation not started ·
-**Branch:** `codex/clustering-completion-plan`
+**Updated:** 2026-09-19 · **State:** implementation in progress ·
+**Branch:** `codex/clustering-completion`
 
 Companion to [CLUSTERING.md](CLUSTERING.md) (the existing implementation) and
 [CLUSTERING_COMPLETION_PLAN.md](CLUSTERING_COMPLETION_PLAN.md) (the finite
@@ -20,7 +20,7 @@ a claimed verification of a newer Forgejo tip or the deployed fleet.
 |---|---|---|
 | Current source comparison | Complete | Coordination, publication, transport recovery, PP ownership, provider budgets, and CI inspected at the revisions above |
 | Documentation and finite implementation plan | Complete | Existing claims reconciled; recommended dependency/migration decision and P0–P5 acceptance recorded in the linked plan |
-| P0 — delivery lane | Not started | Adapt nzbd to the current draft-to-ready fast-lane workflow |
+| P0 — delivery lane | Implemented; not yet reviewed or tested | Draft PRs allocate no validation jobs; readiness starts the affected lane; full suites remain explicit |
 | P1 — transactional control authority | Not started | Reuse the maintained plurx coordination dependency and narrow contracts |
 | P2 — worker lifetime and publication | Not started | Exact leases, bounded calls, isolated outputs, durable completion |
 | P3 — weighted placement and account budgets | Not started | Capacity-based placement and acknowledged budget transfer |
@@ -28,7 +28,7 @@ a claimed verification of a newer Forgejo tip or the deployed fleet.
 | P5 — operator surface and final acceptance | Not started | Advisory requirements, live diagnostics, finite failure scenarios |
 | One adversarial review | Not requested | Request only when the implementation PR is ready to merge |
 | Fast lane | Not run | Run after review findings are addressed |
-| PR / merge / deployment | None | Documentation is committed on the named branch; no PR opened because the existing workflows would start full suites |
+| PR / merge / deployment | None | P0 makes an eventual draft safe; the batched PR remains unopened while runtime work is active |
 
 ## Working rules
 

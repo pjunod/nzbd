@@ -5,6 +5,7 @@ on:
     branches: [main]
     tags: ["v*"]
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review, converted_to_draft]
   schedule:
     # Refresh the RustSec result even when the lockfile has not changed.
     - cron: "17 6 * * *"
@@ -19,6 +20,7 @@ env:
 jobs:
   reviewed-exceptions:
     name: reviewed dependency exceptions
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     runs-on: ${{ fromJSON((vars.CI_RUNNER_MODE == 'github' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && '["ubuntu-24.04"]' || '["self-hosted","Linux","X64","lab","general"]') }}
     timeout-minutes: 10
     steps:
@@ -36,6 +38,7 @@ jobs:
 
   policy:
     name: licenses, bans, and sources
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     runs-on: ${{ fromJSON((vars.CI_RUNNER_MODE == 'github' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && '["ubuntu-24.04"]' || '["self-hosted","Linux","X64","lab","general"]') }}
     steps:
       - uses: actions/checkout@v5
@@ -49,6 +52,7 @@ jobs:
 
   advisories:
     name: RustSec advisories
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     runs-on: ${{ fromJSON((vars.CI_RUNNER_MODE == 'github' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && '["ubuntu-24.04"]' || '["self-hosted","Linux","X64","lab","general"]') }}
     steps:
       - uses: actions/checkout@v5

@@ -192,6 +192,21 @@ bittorrent-policy: ## Verify adapter, daemon, review-doc, and dependency policie
 check: fmt-check lint test msrv ## Core Rust gates (run before pushing)
 	@echo "OK - all local gates passed"
 
+.PHONY: fast-check-rust
+fast-check-rust: ## Reviewed merge candidate: compile/lint Rust and run bounded cluster regressions
+	$(CARGO) fmt --all --check
+	$(CARGO) check --workspace --all-targets --locked
+	$(CARGO) clippy --workspace --all-targets --locked -- -D warnings
+	$(CARGO) test --locked -p nzbd-cluster --lib
+	$(CARGO) test --locked -p nzbd-cluster --test cluster_e2e
+
+.PHONY: fast-check
+fast-check: ## Final affected fast lane; run once after the combined adversarial review
+	scripts/check-fast-lane-contract
+	$(MAKE) ui-test
+	$(MAKE) fast-check-rust
+	@echo "OK - merge-candidate fast lane passed"
+
 .PHONY: gate
 gate: ## Deterministic release gate: core checks + BitTorrent policy + fuzz contracts
 	$(MAKE) check
