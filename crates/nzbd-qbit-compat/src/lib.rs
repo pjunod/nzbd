@@ -39,6 +39,7 @@ pub struct QbitState {
     pub queueing: bool,
     pub global_seed_ratio: f64,
     pub global_seed_minutes: u64,
+    pub clients: Option<Arc<nzbd_api::ClientRegistry>>,
     categories: Arc<Mutex<CategoryStore>>,
     sessions: Arc<Mutex<HashMap<String, i64>>>,
     failed_logins: Arc<Mutex<HashMap<IpAddr, VecDeque<i64>>>>,
@@ -76,6 +77,7 @@ impl QbitState {
         queueing: bool,
         global_seed_ratio: f64,
         global_seed_minutes: u64,
+        clients: Option<Arc<nzbd_api::ClientRegistry>>,
     ) -> Self {
         let path = state_dir.join("torrent-categories.json");
         let mut overlay: BTreeMap<String, OverlayCategory> = std::fs::read(&path)
@@ -102,6 +104,7 @@ impl QbitState {
             queueing,
             global_seed_ratio,
             global_seed_minutes,
+            clients,
             categories: Arc::new(Mutex::new(CategoryStore {
                 path,
                 configured: configured_categories,
@@ -139,6 +142,14 @@ pub fn router(state: QbitState) -> Router {
 
 async fn authenticate(State(state): State<QbitState>, request: Request, next: Next) -> Response {
     if request.uri().path() == "/api/v2/auth/login" || authorized(&state, request.headers()) {
+        if request.uri().path() != "/api/v2/auth/login" {
+            note_client(
+                &state,
+                request.headers(),
+                request.method().as_str(),
+                request.uri().path(),
+            );
+        }
         return next.run(request).await;
     }
     (StatusCode::FORBIDDEN, "Forbidden").into_response()
@@ -243,6 +254,7 @@ async fn login(
         }
     }
     sessions.insert(sid.clone(), now + SESSION_TTL_SECS);
+    note_client(&state, &headers, "POST", "/api/v2/auth/login");
     (
         [(
             header::SET_COOKIE,
@@ -435,6 +447,10 @@ async fn torrent_add(State(state): State<QbitState>, headers: HeaderMap, body: B
             .parse::<u64>()
             .ok()
             .map(|minutes| minutes.saturating_mul(60)),
+        client: headers
+            .get(header::USER_AGENT)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string),
         ..Default::default()
     };
     let result = if let Some(bytes) = parts.get("torrents") {
@@ -716,6 +732,16 @@ fn valid_category(value: &str) -> Option<String> {
         && value != ".."
         && !value.chars().any(char::is_control))
     .then(|| value.to_string())
+}
+
+fn note_client(state: &QbitState, headers: &HeaderMap, method: &str, path: &str) {
+    let Some(clients) = &state.clients else {
+        return;
+    };
+    let agent = headers
+        .get(header::USER_AGENT)
+        .and_then(|value| value.to_str().ok());
+    clients.note(agent, &format!("{method} {path}"), unix_now());
 }
 
 fn persist_categories(store: &CategoryStore) -> std::io::Result<()> {

@@ -977,6 +977,7 @@ fn run(
                 true,
                 cfg.torrent.default_seed_ratio,
                 cfg.torrent.default_seed_minutes,
+                Some(clients_registry.clone()),
             )));
         }
 

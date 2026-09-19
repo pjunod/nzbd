@@ -995,13 +995,19 @@ impl TorrentAdmissionService {
         &self,
         headers: HeaderMap,
         body: axum::body::Bytes,
-        raw_options: AddOpts,
+        mut raw_options: AddOpts,
     ) -> Response {
         let content_type = headers
             .get(CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.split(';').next())
             .unwrap_or("");
+        let client = headers
+            .get("x-nzbd-client")
+            .or_else(|| headers.get(axum::http::header::USER_AGENT))
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
+        raw_options.client = client.clone();
         let result = match content_type {
             "application/x-bittorrent" => self.admit_raw(body.to_vec(), raw_options).await,
             "application/json" => match serde_json::from_slice::<TypedRequest>(&body) {
@@ -1027,6 +1033,7 @@ impl TorrentAdmissionService {
                             seed_ratio_limit: request.seed_ratio_limit,
                             seed_time_limit_secs: request.seed_time_limit_secs,
                             params: request.params.into_iter().collect(),
+                            client,
                             ..Default::default()
                         },
                     )
