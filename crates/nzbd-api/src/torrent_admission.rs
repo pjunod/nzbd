@@ -825,9 +825,8 @@ async fn publish_backend_state(
             let error = stats
                 .error
                 .filter(|_| !association.error_emitted)
-                .map(|error| {
+                .inspect(|_| {
                     association.error_emitted = true;
-                    error
                 });
             (progress, ready, error)
         };
