@@ -4194,9 +4194,8 @@ mod tests {
         );
 
         let (reply, rx) = oneshot::channel();
-        owner.on_command(QueueCommand::SetPriority {
+        owner.on_command(QueueCommand::Resume {
             job: JobId(1),
-            priority: (MAX_PENDING_BACKEND_COMMANDS + 2) as i32,
             reply,
         });
         assert!(rx.await.unwrap());
@@ -4355,8 +4354,9 @@ mod tests {
         );
 
         let (reply, rx) = oneshot::channel();
-        owner.on_command(QueueCommand::Resume {
+        owner.on_command(QueueCommand::SetPriority {
             job: JobId(1),
+            priority: (MAX_PENDING_BACKEND_COMMANDS + 2) as i32,
             reply,
         });
         assert!(!rx.await.unwrap());

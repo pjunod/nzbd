@@ -163,8 +163,10 @@ not compiled without the `parsing` feature.
 turns those statements into a repository-wide blocking graph check. It fails
 if:
 
-- the `quick-xml 0.37.5` package set differs from the reviewed
-  `nzbd-torrent → librqbit → librqbit-upnp` chain;
+- the `quick-xml 0.37.5` package set differs from the reviewed active daemon
+  chain (`nzbd`, its API/compat/cluster routing crates, `nzbd-torrent`,
+  `librqbit`, and `librqbit-upnp`); the broader workspace reach reflects
+  activation, while the affected UPnP runtime path remains unconstructable;
 - `time 0.3.41` gains another package path or its exact `alloc`/`std` feature
   set changes;
 - the exact MPL-2.0 `option-ext 0.2.0` path changes; or
