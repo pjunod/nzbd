@@ -20,6 +20,7 @@ nzbd-post = { workspace = true }
 nzbd-feed = { workspace = true }
 nzbd-state = { workspace = true }
 nzbd-torrent = { workspace = true }
+nzbd-qbit-compat = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 tokio-rustls = { workspace = true }

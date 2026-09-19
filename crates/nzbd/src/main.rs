@@ -927,7 +927,12 @@ fn run(
         // so graceful shutdown can drain and a restart isn't held open by an
         // open `/api/v1/events` connection.
         let (sse_shutdown_tx, sse_shutdown_rx) = tokio::sync::watch::channel(false);
-        let app = nzbd_api::require_auth(
+        let auth = nzbd_api::AuthConfig {
+            username: cfg.api.username.clone(),
+            password: cfg.api.password.clone(),
+            token: cfg.api.token.clone(),
+        };
+        let mut app = nzbd_api::require_auth(
             nzbd_api::router_with(nzbd_api::ApiState {
                 engine: engine.clone(),
                 torrent: torrent_service.clone(),
@@ -941,12 +946,39 @@ fn run(
                 events: None, // router_with starts the hub
             })
             .merge(nzbd_compat::router(compat_state)),
-            nzbd_api::AuthConfig {
-                username: cfg.api.username.clone(),
-                password: cfg.api.password.clone(),
-                token: cfg.api.token.clone(),
-            },
+            auth.clone(),
         );
+        if let Some(torrent) = torrent_service.clone() {
+            let qbit_save_path = torrent.output_root().to_path_buf();
+            let configured_categories = cfg
+                .categories
+                .iter()
+                .map(|category| {
+                    let path = category
+                        .torrent_dir
+                        .as_ref()
+                        .map(|path| nzbd_config::expand_home(path))
+                        .unwrap_or_else(|| cfg.torrent_dir().join(&category.name));
+                    (category.name.clone(), path)
+                })
+                .collect();
+            app = app.merge(nzbd_qbit_compat::router(nzbd_qbit_compat::QbitState::new(
+                engine.clone(),
+                torrent,
+                nzbd_qbit_compat::QbitAuth {
+                    username: auth.username,
+                    password: auth.password,
+                    token: auth.token,
+                },
+                cfg.state_dir(),
+                qbit_save_path,
+                configured_categories,
+                cfg.torrent.dht,
+                true,
+                cfg.torrent.default_seed_ratio,
+                cfg.torrent.default_seed_minutes,
+            )));
+        }
 
         // A second view of the shutdown signal for the drain deadline below.
         let mut force_rx = sse_shutdown_tx.subscribe();
@@ -990,7 +1022,11 @@ fn run(
             None => {
                 tracing::info!(%bind, "nzbd listening");
                 let serve = std::future::IntoFuture::into_future(
-                    axum::serve(listener, app).with_graceful_shutdown(shutdown),
+                    axum::serve(
+                        listener,
+                        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+                    )
+                    .with_graceful_shutdown(shutdown),
                 );
                 tokio::pin!(serve, force);
                 tokio::select! {
@@ -1066,9 +1102,11 @@ async fn serve_tls(
         tokio::select! {
             _ = &mut shutdown => break,
             accepted = listener.accept() => {
-                let Ok((stream, _peer)) = accepted else { continue };
+                let Ok((stream, peer)) = accepted else { continue };
                 let acceptor = acceptor.clone();
-                let app = app.clone();
+                let app = app
+                    .clone()
+                    .layer(axum::Extension(axum::extract::ConnectInfo(peer)));
                 tokio::spawn(async move {
                     let Ok(stream) = acceptor.accept(stream).await else {
                         return; // handshake failure (scanner, plain HTTP, …)

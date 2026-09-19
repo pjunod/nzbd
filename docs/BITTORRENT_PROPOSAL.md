@@ -1,17 +1,16 @@
 # BitTorrent support — one queue, two transfer protocols
 
-**Status:** ADR-19 amended; maintained rqbit M0 accepted; M1b merged; M2a #152
-and M2b #153 merged via PRs #161/#181; M2c #154 implemented as an unmounted
-admission/watch boundary with queue schema 4; remaining M2 slices are #156–#160;
-final activation #163 retains sole activation ownership; production wiring remains disabled ·
+**Status:** ADR-19 implemented for single-node v1; M2 lifecycle/policy/activation,
+M3 native surfaces, and M4 qBittorrent compatibility are implemented on the
+consolidated branch; adversarial review and fast qualification remain ·
 **Decision:** pin the reproducibly derived nine-patch rqbit v8.1.1 engine;
 complete single-node M2–M5 before separately approving M6 ·
-**Written:** 2026-08-05 · **Revised:** 2026-08-22 ·
+**Written:** 2026-08-05 · **Revised:** 2026-09-19 ·
 **Verified against:** rqbit v8.1.1 (`00b97485160ff5b5aa2b379ea0815d568ec665f0`) ·
 **Cluster reuse baseline:** plurx `7c781e5f5e28ac8114bacb1919a463a6a18e2680` ·
 **Post-baseline cluster audit:** plurx `64e96aa71f58ebb3ec2c7b71d5c36a537b50aba6` ·
-**Scope:** architecture, contracts, milestones, and review questions; no
-production BitTorrent path is authorized before the gates below pass
+**Scope:** architecture, contracts, milestones, and review questions; M6
+cluster ownership remains separately gated
 
 Companion to [ARCHITECTURE.md](ARCHITECTURE.md) (how nzbd is built),
 [INTEGRATION.md](INTEGRATION.md) (the current consumer seams), and
@@ -2757,7 +2756,7 @@ data-loss change, not a feature toggle.
 
 ---
 
-## 19. Review disposition — maintained rqbit selected; production still disabled
+## 19. Review disposition — maintained rqbit selected; single-node activated
 
 The first 2026-08-05 review approved the architecture and rejected the
 original engine capability claim. Fable's follow-up review found the proxy
@@ -2783,16 +2782,11 @@ both review passes as follows:
 | UPnP | Unavailable in the first release; a future opt-in requires a patched dependency and fresh security review. |
 | Cluster | Keep torrent+cluster as a startup error. M6 still requires separate approval after single-node evidence. |
 
-The review authorized groundwork and the M0 spike, not a production torrent
-listener. ADR-19 now records the maintained engine/API resolution, and the
-local and native proofs pass all eleven gates; independent review is complete.
-The engine-neutral M1b seam is already implemented. Disk-guard F1–F3 and
-durable history deletion are complete. M2a #152 and M2b #153 merged via PRs
-#161/#181; remaining M2 slices are tracked by #154–#160 under the corrected
-dependency graph. Only #163 may activate the composed backend. No production
-daemon wiring is implied by that status.
-The mobile P0 prerequisites are complete;
-M3 remains downstream of M2.
+ADR-19 records the maintained engine/API resolution, and the local and native
+proofs pass all eleven M0 gates. The consolidated implementation composes the
+single-node session, durable queue ownership, native web/mobile surfaces, and
+the narrow qBittorrent Web API projection. Cluster ownership remains rejected
+at startup until M6 receives its own ADR and evidence.
 
 The 2026-08-22 cross-project adversarial review also rejected transplanting
 plurx's cluster implementation or treating nzbd's residual shared-filesystem

@@ -32,7 +32,7 @@ pub struct TorrentAdmissionService {
     dht_enabled: bool,
     default_seed_policy: SeedPolicy,
     category_seed_policies: HashMap<String, SeedPolicy>,
-    category_payload_roots: HashMap<String, PathBuf>,
+    category_payload_roots: Arc<std::sync::RwLock<HashMap<String, PathBuf>>>,
     upload_limit_bps: Option<u64>,
     source_fetch_limits: TorrentSourceFetchLimits,
     #[cfg(test)]
@@ -47,6 +47,8 @@ pub enum AdmissionError {
     Engine(#[from] nzbd_engine::EngineError),
     #[error("{0}")]
     State(#[from] nzbd_state::StateError),
+    #[error("torrent descriptor I/O failed")]
+    Io(#[from] std::io::Error),
     #[error("invalid torrent source encoding")]
     Encoding,
     #[error("pending torrent admission disappeared")]
@@ -101,7 +103,7 @@ impl TorrentAdmissionService {
             dht_enabled,
             default_seed_policy: SeedPolicy::default(),
             category_seed_policies: HashMap::new(),
-            category_payload_roots: HashMap::new(),
+            category_payload_roots: Arc::new(std::sync::RwLock::new(HashMap::new())),
             upload_limit_bps: None,
             source_fetch_limits: TorrentSourceFetchLimits::default(),
             #[cfg(test)]
@@ -115,8 +117,19 @@ impl TorrentAdmissionService {
     }
 
     pub fn with_category_payload_roots(mut self, roots: HashMap<String, PathBuf>) -> Self {
-        self.category_payload_roots = roots;
+        self.category_payload_roots = Arc::new(std::sync::RwLock::new(roots));
         self
+    }
+
+    pub fn register_category_payload_root(&self, category: String, root: PathBuf) {
+        self.category_payload_roots
+            .write()
+            .unwrap()
+            .insert(category, root);
+    }
+
+    pub fn output_root(&self) -> &Path {
+        self.session.output_root()
     }
 
     pub fn with_transfer_policy(
@@ -199,7 +212,13 @@ impl TorrentAdmissionService {
         }
 
         let mut payload_roots = vec![self.session.output_root().to_path_buf()];
-        payload_roots.extend(self.category_payload_roots.values().cloned());
+        payload_roots.extend(
+            self.category_payload_roots
+                .read()
+                .unwrap()
+                .values()
+                .cloned(),
+        );
         let restore_plan = nzbd_engine::torrent_runtime::plan_restore_with_roots(
             &snapshot.jobs,
             &HashMap::new(),
@@ -230,6 +249,8 @@ impl TorrentAdmissionService {
             if payload_root != self.session.output_root()
                 && !self
                     .category_payload_roots
+                    .read()
+                    .unwrap()
                     .values()
                     .any(|root| root == payload_root)
             {
@@ -339,6 +360,29 @@ impl TorrentAdmissionService {
         self.session.stop().await;
     }
 
+    /// Return the retained descriptor for an authorized live torrent. The
+    /// persisted path is always relative and is revalidated at read time so a
+    /// corrupted snapshot cannot turn this endpoint into an arbitrary file
+    /// read.
+    pub async fn export_metainfo(&self, job: JobId) -> Result<Option<Vec<u8>>, AdmissionError> {
+        let Some(job) = self.engine.export_job(job).await? else {
+            return Ok(None);
+        };
+        let Some(torrent) = job.torrent else {
+            return Ok(None);
+        };
+        if torrent.metadata_file.is_absolute()
+            || torrent
+                .metadata_file
+                .components()
+                .any(|component| !matches!(component, std::path::Component::Normal(_)))
+        {
+            return Err(AdmissionError::Encoding);
+        }
+        let bytes = std::fs::read(self.state_dir.join(torrent.metadata_file))?;
+        Ok(Some(bytes))
+    }
+
     async fn finish(
         &self,
         pending: Option<JobId>,
@@ -387,8 +431,13 @@ impl TorrentAdmissionService {
         let payload_root = opts
             .category
             .as_ref()
-            .and_then(|category| self.category_payload_roots.get(category))
-            .cloned()
+            .and_then(|category| {
+                self.category_payload_roots
+                    .read()
+                    .unwrap()
+                    .get(category)
+                    .cloned()
+            })
             .unwrap_or_else(|| self.session.output_root().to_path_buf());
         let record = TorrentRecord {
             info_hash_v1: descriptor.info_hash_v1.clone(),
@@ -938,13 +987,23 @@ async fn post_job(
 
 impl TorrentAdmissionService {
     pub async fn handle_http_post(&self, headers: HeaderMap, body: axum::body::Bytes) -> Response {
+        self.handle_http_post_with_options(headers, body, AddOpts::default())
+            .await
+    }
+
+    pub async fn handle_http_post_with_options(
+        &self,
+        headers: HeaderMap,
+        body: axum::body::Bytes,
+        raw_options: AddOpts,
+    ) -> Response {
         let content_type = headers
             .get(CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.split(';').next())
             .unwrap_or("");
         let result = match content_type {
-            "application/x-bittorrent" => self.admit_raw(body.to_vec(), AddOpts::default()).await,
+            "application/x-bittorrent" => self.admit_raw(body.to_vec(), raw_options).await,
             "application/json" => match serde_json::from_slice::<TypedRequest>(&body) {
                 Ok(request) => {
                     let source = match request.source.kind.as_str() {

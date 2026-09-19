@@ -1911,6 +1911,7 @@ dependencies = [
  "nzbd-feed",
  "nzbd-nserv",
  "nzbd-post",
+ "nzbd-qbit-compat",
  "nzbd-state",
  "nzbd-torrent",
  "nzbd-types",
@@ -2108,6 +2109,25 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+]
+
+[[package]]
+name = "nzbd-qbit-compat"
+version = "0.2.0"
+dependencies = [
+ "axum",
+ "base64",
+ "hex",
+ "nzbd-api",
+ "nzbd-engine",
+ "nzbd-types",
+ "rand 0.8.7",
+ "serde",
+ "serde_json",
+ "subtle",
+ "tokio",
+ "tracing",
+ "url",
 ]
 
 [[package]]

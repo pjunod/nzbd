@@ -633,6 +633,28 @@ impl EngineHandle {
         .await
     }
 
+    pub async fn set_category(
+        &self,
+        job: JobId,
+        category: Option<String>,
+    ) -> Result<bool, EngineError> {
+        self.roundtrip_bool(|reply| QueueCommand::SetCategory {
+            job,
+            category,
+            reply,
+        })
+        .await
+    }
+
+    pub async fn set_torrent_seed_policy(
+        &self,
+        job: JobId,
+        policy: nzbd_types::SeedPolicy,
+    ) -> Result<bool, EngineError> {
+        self.roundtrip_bool(|reply| QueueCommand::SetTorrentSeedPolicy { job, policy, reply })
+            .await
+    }
+
     /// Reorder a job in the queue (position is the scheduling tiebreaker
     /// within a priority band).
     pub async fn move_job(&self, job: JobId, op: MoveOp) -> Result<bool, EngineError> {

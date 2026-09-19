@@ -28,6 +28,7 @@ export interface StageSpan {
 
 export interface JobSummary {
   id: number;
+  kind?: 'nzb' | 'torrent';
   name: string;
   status: JobStatus;
   category: string | null;
@@ -49,6 +50,11 @@ export interface JobSummary {
   pp_done: boolean;
   ready: boolean;
   ready_at_unix: number | null;
+  uploaded_bytes?: number;
+  upload_rate_bps?: number;
+  ratio?: number;
+  seeding_seconds?: number;
+  useful_peers?: number;
   dupe_key: string;
   dupe_score: number;
   params: [string, string][];
@@ -122,6 +128,18 @@ export interface AddNzbOptions {
 
 export interface AddNzbResult {
   id: number;
+}
+
+export interface AddTorrentOptions {
+  category?: string;
+  priority: number;
+  paused: boolean;
+}
+
+export interface AddTorrentResult {
+  id: number;
+  info_hash: string;
+  created?: boolean;
 }
 
 export interface HistoryFile {

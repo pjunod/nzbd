@@ -37,8 +37,8 @@ for file in "$review_doc" "$proposal" "$m0_report" "$gate9_review" "$readme"; do
   fi
 done
 
-require_literal "$review_doc" '**Status:** pre-release review surface; production BitTorrent remains disabled'
-require_literal "$review_doc" '> **No production wiring:** do not add a production switch or weaken the'
+require_literal "$review_doc" '**Status:** single-node implementation complete; consolidated review and fast'
+require_literal "$review_doc" '| Production reachability | `[torrent].enabled = true` starts one maintained session'
 
 for heading in \
   '## 2. Public traffic' \
@@ -79,12 +79,12 @@ require_literal "$gate9_review" 'https://github.com/pjunod/nzbd/issues/83#issuec
 require_count "$gate9_review" '^\| *[0-9]+ \| \*\*Accepted' 11
 
 # The selected maintained series implements items 6-11. M0 completion still
-# requires exact derivation, native evidence, independent review, and a dormant
-# production boundary.
+# requires exact derivation, native evidence, independent review, and an
+# explicitly documented production boundary.
 require_literal "$gate9_review" 'Gate 9 passes because the maintained engine enforces every applicable boundary'
 require_literal "$proposal" 'The checked-in vendor is generated output and must never be hand-edited.'
 require_literal "$m0_report" 'gate 9 review brief §4.1'
 require_literal "$proposal" 'Its §4.1 records the accepted disposition'
-require_literal "$review_doc" "the eleven-gate M0 evidence, and today's disabled production boundary"
+require_literal "$review_doc" 'eleven-gate M0 evidence, and the active single-node boundary'
 
-echo 'BitTorrent release-review policy: maintained M0 state, operator review domains, and disabled production wiring are explicit'
+echo 'BitTorrent release-review policy: maintained M0 state, operator review domains, and active single-node wiring are explicit'

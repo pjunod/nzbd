@@ -147,6 +147,16 @@ pub(crate) enum QueueCommand {
         priority: i32,
         reply: oneshot::Sender<bool>,
     },
+    SetCategory {
+        job: JobId,
+        category: Option<String>,
+        reply: oneshot::Sender<bool>,
+    },
+    SetTorrentSeedPolicy {
+        job: JobId,
+        policy: nzbd_types::SeedPolicy,
+        reply: oneshot::Sender<bool>,
+    },
     /// Reorder within the queue vec — the scheduling tiebreaker inside a
     /// priority band, and the order the UI displays.
     Move {
@@ -1431,6 +1441,37 @@ impl Owner {
                         None => false,
                     }
                 };
+                let _ = reply.send(ok);
+            }
+            QueueCommand::SetCategory {
+                job,
+                category,
+                reply,
+            } => {
+                let ok = self.state.job_mut(job).is_some_and(|record| {
+                    record.category = category;
+                    true
+                });
+                if ok {
+                    self.save_snapshot();
+                    self.publish_now();
+                    self.bump_epoch();
+                }
+                let _ = reply.send(ok);
+            }
+            QueueCommand::SetTorrentSeedPolicy { job, policy, reply } => {
+                let ok = self.state.job_mut(job).is_some_and(|record| {
+                    let Some(torrent) = record.torrent.as_mut() else {
+                        return false;
+                    };
+                    torrent.seed_policy = policy;
+                    true
+                });
+                if ok {
+                    self.save_snapshot();
+                    self.publish_now();
+                    self.bump_epoch();
+                }
                 let _ = reply.send(ok);
             }
             QueueCommand::Move { job, op, reply } => {

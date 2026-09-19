@@ -25,7 +25,7 @@ dest_dir = "~/downloads/complete"   # finished downloads (per-category overrides
 The watch dir is polled by the daemon; a dropped `.nzb` is queued and the
 file removed. In cluster mode only the current leader watches it.
 
-## `[torrent]` — reserved BitTorrent settings (unavailable)
+## `[torrent]` — single-node BitTorrent
 
 ```toml
 [paths]
@@ -55,23 +55,35 @@ source_redirects = 5
 
 | Key | Default | Security and operational implication |
 |---|---|---|
-| `enabled` | `false` | No session, listener, or discovery traffic starts. `true` is rejected until final M2 activation. |
-| `listen_port` | `6881` | One explicit non-zero TCP/IPv4 port; ranges and ephemeral port 0 are unsupported. |
+| `enabled` | `false` | `true` starts one torrent session after restart. Disabled mode opens no peer listener and refuses startup if live torrent records still need an owner. |
+| `listen_port` | `6881` | One explicit TCP/IPv4 port from 1–65534; ranges and ephemeral port 0 are unsupported. |
 | `dht` / `pex` | `false` / `true` | Conservative discovery defaults; DHT is incompatible with the SOCKS proxy. |
-| `local_discovery` / `upnp_port_forwarding` | `false` / `false` | Avoids LAN disclosure and router mutation. UPnP `true` is rejected. |
+| `local_discovery` / `upnp_port_forwarding` | `false` / `false` | Avoids LAN disclosure and router mutation. Either unsupported value is rejected. |
 | `socks_proxy_*` | absent | URL must be a credential-free SOCKS5 origin. Username/password are paired; the username must be non-empty, and both fields may contain only ASCII letters, digits, `-`, `.`, `_`, or `~` (so characters such as `@` and `!` are rejected). The password is masked by Settings. |
 | peer ceilings | `80`, `400`, `1024`, `4096` | Separate live and retained per-torrent/session budgets. |
 | `upload_limit_kib` | `0` | Unlimited; this is the only torrent setting designed for live application. |
 | seed ratio/minutes | `0` | Unlimited globally; optional category values override these and per-add values override categories. |
 | `metainfo_max_mib` / `source_redirects` | `10` / `5` | Bounds hostile metadata and source fetches; metainfo accepts 1–100 MiB. |
 
-This surface is reserved and unavailable until final M2 activation. Omitting
-`[torrent]` is identical to its defaults and default saves omit the section so
-older binaries remain able to read ordinary configurations. `torrent_dir`
+Omitting `[torrent]` is identical to its disabled defaults. `torrent_dir`
 never falls back to Usenet `dest_dir`; when omitted it derives as
 `<main_dir>/torrents`. Optional category `torrent_dir`, `seed_ratio`, and
 `seed_minutes` follow per-add → category → global precedence. Torrent roots do
-not enter disk probes while disabled. Unknown keys fail closed.
+not enter disk probes while disabled. Cluster mode and BitTorrent cannot be
+enabled together. Unknown keys fail closed.
+
+Before enabling, publish the configured TCP peer port only where intended,
+confirm the payload and state volumes have durable free space, and decide
+whether unlimited seeding is acceptable. DHT is public discovery, and a SOCKS
+proxy is not a VPN kill switch; proxy deployments must keep DHT off and enforce
+required routing in the host or container firewall. The Settings page presents
+these warnings but does not replace the operator's explicit `enabled` choice.
+
+Sonarr and Radarr can use nzbd as a qBittorrent client at the normal nzbd API
+URL. Use the existing nzbd username/password, or put `[api].token` in the
+client's API-key field. The compatibility surface reports Web API `2.8.1` and
+implements only the download-client routes; search, RSS, plugins, tracker
+editing, torrent creation, alternate Web UI, and remote shutdown are absent.
 
 ## `[[server]]` — one block per news server
 
@@ -105,6 +117,9 @@ regular servers of their tier miss an article.
 [[category]]
 name = "tv"
 dest_dir = "/data/complete/tv"   # optional override of paths.dest_dir
+torrent_dir = "/data/torrents/tv" # optional immutable seed root
+seed_ratio = 1.5                 # optional torrent override; 0 = unlimited
+seed_minutes = 4320              # optional torrent override; 0 = unlimited
 unpack = true                    # optional per-category unpack override
 extensions = []                  # extension scripts to run for this category
 ```

@@ -789,6 +789,51 @@ async fn get_job_files(State(st): State<ApiState>, Path(id): Path<u32>) -> Respo
     }
 }
 
+async fn get_job_torrent(State(st): State<ApiState>, Path(id): Path<u32>) -> Response {
+    match st.engine.export_job(JobId(id)).await {
+        Ok(Some(job)) => match job.torrent {
+            Some(torrent) => Json(json!({
+                "job": id,
+                "info_hash_v1": torrent.info_hash_v1,
+                "phase": torrent.phase,
+                "content_path": torrent.content_path,
+                "selected_bytes": torrent.selected_bytes,
+                "downloaded_bytes": torrent.downloaded_bytes,
+                "uploaded_bytes": torrent.uploaded_bytes,
+                "ratio": if torrent.selected_bytes == 0 { 0.0 } else { torrent.uploaded_bytes as f64 / torrent.selected_bytes as f64 },
+                "seeding_seconds": torrent.seeding_seconds,
+                "seed_ratio_limit": torrent.seed_policy.ratio_limit,
+                "seed_time_limit_secs": torrent.seed_policy.time_limit_secs,
+                "ready_at_unix": torrent.ready_at_unix,
+                "last_activity_unix": torrent.last_activity_unix,
+                "last_error": torrent.last_error,
+            }))
+            .into_response(),
+            None => not_found(),
+        },
+        Ok(None) => not_found(),
+        Err(_) => error(StatusCode::SERVICE_UNAVAILABLE, "queue owner unavailable"),
+    }
+}
+
+async fn get_job_torrent_file(State(st): State<ApiState>, Path(id): Path<u32>) -> Response {
+    let Some(service) = &st.torrent else {
+        return error(StatusCode::SERVICE_UNAVAILABLE, "BitTorrent is disabled");
+    };
+    match service.export_metainfo(JobId(id)).await {
+        Ok(Some(bytes)) => (
+            [
+                (axum::http::header::CONTENT_TYPE, "application/x-bittorrent"),
+                (axum::http::header::CACHE_CONTROL, "no-store"),
+            ],
+            bytes,
+        )
+            .into_response(),
+        Ok(None) => not_found(),
+        Err(_) => error(StatusCode::INTERNAL_SERVER_ERROR, "torrent export failed"),
+    }
+}
+
 /// `GET /api/v1/jobs/{id}/nzb` — the job's NZB, regenerated from queue
 /// state (subjects, groups, message-ids, sizes — everything the daemon
 /// needed to download is everything an NZB contains). Downloadable from
@@ -906,7 +951,18 @@ async fn add_job(
                 "BitTorrent is disabled in this daemon configuration",
             );
         };
-        return torrent.handle_http_post(headers, body).await;
+        return torrent
+            .handle_http_post_with_options(
+                headers,
+                body,
+                nzbd_engine::AddOpts {
+                    category: q.category,
+                    priority: q.priority.unwrap_or(0),
+                    paused: q.paused.unwrap_or(false),
+                    ..Default::default()
+                },
+            )
+            .await;
     }
     let name = q.name.unwrap_or_default();
     let params = match q.params.as_deref().map(parse_add_params).transpose() {
@@ -1664,6 +1720,40 @@ async fn metrics(State(st): State<ApiState>) -> Response {
     for (k, v) in by_status {
         let _ = writeln!(m, "nzbd_jobs{{status=\"{k}\"}} {v}");
     }
+    let torrent_jobs = snap
+        .jobs
+        .iter()
+        .filter(|job| job.kind == nzbd_types::JobKind::Torrent)
+        .collect::<Vec<_>>();
+    let _ = writeln!(m, "# TYPE nzbd_torrent_jobs gauge");
+    let _ = writeln!(m, "nzbd_torrent_jobs {}", torrent_jobs.len());
+    let _ = writeln!(m, "# TYPE nzbd_torrent_upload_rate_bytes_per_second gauge");
+    let _ = writeln!(
+        m,
+        "nzbd_torrent_upload_rate_bytes_per_second {}",
+        torrent_jobs
+            .iter()
+            .map(|job| job.upload_rate_bps)
+            .sum::<u64>()
+    );
+    let _ = writeln!(m, "# TYPE nzbd_torrent_uploaded_bytes counter");
+    let _ = writeln!(
+        m,
+        "nzbd_torrent_uploaded_bytes {}",
+        torrent_jobs
+            .iter()
+            .map(|job| job.uploaded_bytes)
+            .sum::<u64>()
+    );
+    let _ = writeln!(m, "# TYPE nzbd_torrent_useful_peers gauge");
+    let _ = writeln!(
+        m,
+        "nzbd_torrent_useful_peers {}",
+        torrent_jobs
+            .iter()
+            .map(|job| u64::from(job.useful_peers))
+            .sum::<u64>()
+    );
     let _ = writeln!(m, "# TYPE nzbd_up_since_seconds gauge");
     let _ = writeln!(m, "nzbd_up_since_seconds {}", snap.up_since_unix);
     // Integration observability: is the event stream actually producing,
@@ -2480,6 +2570,8 @@ pub fn router_with(state: ApiState) -> Router {
         .route("/api/v1/jobs/{id}", get(get_job))
         .route("/api/v1/jobs/{id}/priority", put(set_job_priority))
         .route("/api/v1/jobs/{id}/files", get(get_job_files))
+        .route("/api/v1/jobs/{id}/torrent", get(get_job_torrent))
+        .route("/api/v1/jobs/{id}/torrent-file", get(get_job_torrent_file))
         .route("/api/v1/jobs/{id}/nzb", get(get_job_nzb))
         .route("/api/v1/jobs/{id}/actions/{action}", post(job_action))
         .route("/api/v1/queue/actions/{action}", post(queue_action))

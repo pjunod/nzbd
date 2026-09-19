@@ -18,9 +18,9 @@ not authorize production use by itself.
 | M2h enforcing disk guard | implemented, unqualified | Incomplete torrents pause on guard/ENOSPC while completed seeds remain live |
 | M2i terminal history | implemented, unqualified | Confirmed payload outcome is durable before retry-safe mixed-protocol history retirement |
 | M2j daemon activation | implemented, unqualified | One configured session owns admission, recovery, watch ingestion, shutdown, and disabled-mode refusal |
-| M3 native web/mobile surface | building | Web queue exposes protocol, upload, ratio, peer and destructive-removal state; dedicated detail/export and mobile remain |
-| M4 Sonarr/Radarr compatibility | queued | Pinned clients complete add, poll, import, seed-limit, and removal workflows |
-| M5 release evidence | queued | Fast-lane qualification and required operational evidence are green |
+| M3 native web/mobile surface | implemented, unqualified | Typed add, detail/export/files/metrics, web controls, mobile file/magnet add, and torrent status are wired |
+| M4 Sonarr/Radarr compatibility | implemented, unqualified | Web API 2.8.1 routes, Bearer/Basic/SID auth, per-IP login limiting, durable categories, projections, and mutations are wired |
+| M5 release evidence | building | Documentation and policy checks reflect activation; adversarial review and one fast-lane qualification remain |
 
 ## Working rules — one consolidated review and qualification pass
 
@@ -58,3 +58,5 @@ not authorize production use by itself.
 | 2026-09-19 | Began ordered torrent terminal history transition | Backend outcome now checkpoints before durable history and queue retirement |
 | 2026-09-19 | Activated the single-node daemon runtime and native admission | Workspace and all-target compile checks pass; tests intentionally deferred |
 | 2026-09-19 | Added category-root recovery containment and removed the obsolete Cargo feature flag | Persisted payloads restore only under the configured default or category roots |
+| 2026-09-19 | Added native web/mobile torrent workflows and observability | Dedicated detail/export/files, metrics, mobile file/magnet admission, and explicit payload deletion are present |
+| 2026-09-19 | Added the narrow qBittorrent Web API 2.8.1 projection | Required *arr routes use queue-owner mutations; category overlays persist without rewriting config |

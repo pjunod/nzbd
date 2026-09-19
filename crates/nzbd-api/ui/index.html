@@ -3875,6 +3875,8 @@ const SETTINGS_SECTIONS = [
     ["paths.dest_dir", "completed downloads", "text"],
     ["paths.inter_dir", "intermediate dir (optional)", "text?"],
     ["paths.nzb_watch_dir", "watch dir for dropped .nzb (optional)", "text?"],
+    ["paths.torrent_dir", "torrent payload dir (optional)", "text?"],
+    ["paths.torrent_watch_dir", "watch dir for dropped .torrent (optional)", "text?"],
   ]},
   { key: "servers", title: "News servers", desc: "Tier 0 is tried first; higher tiers are backups. Fill servers only see missing articles. Connection counts apply immediately when lowered; raising one above what the daemon started with needs a restart.", array: true },
   { key: "queue", title: "Speed & queue", desc: "Speed limit and simultaneous downloads apply immediately on save; the rest needs a restart.", fields: [
@@ -3891,6 +3893,22 @@ const SETTINGS_SECTIONS = [
     ["queue.direct_write", "direct write", "check"],
     ["queue.crc_check", "CRC check", "check"],
     ["queue.continue_partial", "resume partials on restart", "check"],
+  ]},
+  { key: "torrent", title: "BitTorrent", desc: "Single-node v1 BitTorrent. Enabling starts a public peer listener after restart. The active-download limit is shared with Usenet; seeding is unlimited unless you set a ratio or time. Cluster mode, UPnP, local discovery, IPv6, uTP and v2 torrents are not supported.", fields: [
+    ["torrent.enabled", "enable BitTorrent after restart", "check"],
+    ["torrent.listen_port", "peer TCP listen port", "num"],
+    ["torrent.dht", "DHT discovery", "check"],
+    ["torrent.pex", "peer exchange (PEX)", "check"],
+    ["torrent.upload_limit_kib", "upload limit (KiB/s, 0 = unlimited)", "num"],
+    ["torrent.default_seed_ratio", "default seed ratio (0 = unlimited)", "num"],
+    ["torrent.default_seed_minutes", "default seed time (minutes, 0 = unlimited)", "num"],
+    ["torrent.metainfo_max_mib", "maximum metainfo size (MiB)", "num"],
+    ["torrent.source_redirects", "maximum source URL redirects", "num"],
+    ["torrent.max_peers_per_torrent", "live peers per torrent", "num"],
+    ["torrent.max_peers_total", "live peers for the daemon", "num"],
+    ["torrent.socks_proxy_url", "SOCKS proxy URL (optional; requires DHT off)", "text?"],
+    ["torrent.socks_proxy_username", "SOCKS username (optional)", "text?"],
+    ["torrent.socks_proxy_password", "SOCKS password (empty = keep current)", "secret"],
   ]},
   { key: "api", title: "Web UI & API", desc: "Changing bind, auth or TLS restarts the listener — you may need to sign in again or change the URL.", fields: [
     ["api.bind", "listen address", "text"],
@@ -4028,6 +4046,9 @@ function categoryCard(cIdx) {
     <div class="cfg-grid">
       ${fieldControl(p("name"), "name", "text")}
       ${fieldControl(p("dest_dir"), "destination (optional)", "text?")}
+      ${fieldControl(p("torrent_dir"), "torrent payload dir (optional)", "text?")}
+      ${fieldControl(p("seed_ratio"), "torrent seed ratio (empty = global)", "num?")}
+      ${fieldControl(p("seed_minutes"), "torrent seed minutes (empty = global)", "num?")}
       ${fieldControl(p("unpack"), "unpack override", "select3")}
     </div>
   </div>`;
