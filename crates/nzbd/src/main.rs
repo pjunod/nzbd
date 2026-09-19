@@ -712,33 +712,40 @@ fn run(
     engine_cfg.max_active_downloads = cfg.max_active_downloads();
 
     runtime.block_on(async move {
+        // History is a queue-terminal dependency for torrents even when
+        // Usenet post-processing is disabled: payload disposition must be
+        // durable before a confirmed removal can leave the active queue.
+        let history_db = if cfg.post.enabled || cfg.torrent.enabled {
+            let state_dir = cfg.state_dir();
+            Some(open_history(
+                &state_dir,
+                &state_dir.join("history"),
+                None,
+                history_retention(&cfg),
+            )?)
+        } else {
+            None
+        };
+        engine_cfg.history = history_db.clone();
         let engine = Engine::spawn(engine_cfg).await.map_err(with_fs_hint)?;
 
         // Post-processing manager (par verify/repair → unpack → cleanup →
         // scripts), watching the engine's finish events.
         let pp_cancel = tokio_util::sync::CancellationToken::new();
         let pp_tracker = tokio_util::task::TaskTracker::new();
-        let mut history = None;
+        let history = history_db.clone();
         // Shared with the API so `/metrics` can report stage durations
         // measured where they actually happen.
         let mut pp_stats = None;
         let mut pp_manager = None;
         if cfg.post.enabled {
-            let state_dir = cfg.state_dir();
-            let db = open_history(
-                &state_dir,
-                &state_dir.join("history"),
-                None,
-                history_retention(&cfg),
-            )?;
-            history = Some(db.clone());
             let slots = nzbd_post::manager::strategy_slots(&cfg.post.strategy);
             let stats = Arc::new(nzbd_types::metrics::PpStageStats::new());
             pp_stats = Some(stats.clone());
             pp_manager = Some(nzbd_post::manager::spawn_post_manager(
                 engine.clone(),
                 post_config(&cfg, slots, Some(stats)),
-                db,
+                history_db.expect("post-processing history opened above"),
                 cfg.dest_dir(),
                 None, // single node: always the authority
                 pp_cancel.clone(),

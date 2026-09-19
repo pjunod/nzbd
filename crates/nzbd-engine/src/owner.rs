@@ -12,8 +12,8 @@ use crate::backend::{BackendCommand, BackendFact, BackendOwnerPort, RemovalOutco
 use crate::events::Event;
 use crate::failover::{AttemptOutcome, Ladder, SegmentAttempt, Verdict};
 use crate::queue::{
-    final_status, job_dir_name, next_for_server, pick_par_files, recompute_job_totals, QueueState,
-    SegRef, SelectionCtx,
+    active_set, final_status, job_dir_name, next_for_server, pick_par_files, recompute_job_totals,
+    QueueState, SegRef, SelectionCtx,
 };
 use crate::rate::{RateLimiter, SpeedMeter};
 use crate::snapshot::{JobSummary, QueueSnapshot, SharedSnapshot, StorageVolumeSnapshot};
@@ -25,7 +25,7 @@ use nzbd_nzb::ParsedNzb;
 use nzbd_state::{FsJournal, JobJournals, JournalRecord, SnapshotStore, UncleanMarker};
 use nzbd_types::{
     FileId, Health, Job, JobId, JobKind, JobStatus, PostStage, SegmentState, ServerDef, ServerId,
-    StageSpan, TorrentControlIntent, TorrentRemovalIntent,
+    StageSpan, TorrentControlIntent, TorrentPayloadDisposition, TorrentPhase, TorrentRemovalIntent,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -39,6 +39,30 @@ use tokio_util::sync::CancellationToken;
 /// owner memory without limit while no adapter is attached.
 const MAX_PENDING_BACKEND_COMMANDS: usize = 64;
 use tokio_util::task::TaskTracker;
+
+#[derive(Debug, Clone, Copy)]
+struct SeedCheckpoint {
+    uploaded_bytes: u64,
+    seeding_seconds: u64,
+}
+
+fn durable_seed_checkpoints(state: &QueueState) -> HashMap<JobId, SeedCheckpoint> {
+    state
+        .jobs
+        .iter()
+        .filter_map(|job| {
+            job.torrent.as_ref().map(|torrent| {
+                (
+                    job.id,
+                    SeedCheckpoint {
+                        uploaded_bytes: torrent.uploaded_bytes,
+                        seeding_seconds: torrent.seeding_seconds,
+                    },
+                )
+            })
+        })
+        .collect()
+}
 
 // ---------------------------------------------------------------------------
 // Messages
@@ -141,6 +165,10 @@ pub(crate) enum QueueCommand {
         reply: oneshot::Sender<()>,
     },
     SetSpeedLimit {
+        bytes_per_sec: Option<u64>,
+        reply: oneshot::Sender<()>,
+    },
+    SetTorrentUploadLimit {
         bytes_per_sec: Option<u64>,
         reply: oneshot::Sender<()>,
     },
@@ -459,6 +487,25 @@ pub(crate) struct Owner {
     /// retried in order from the next owner tick, never awaited inline. The
     /// queue is bounded by [`MAX_PENDING_BACKEND_COMMANDS`].
     pending_backend_commands: VecDeque<BackendCommand>,
+    /// Latest counters known to be present in the durable queue snapshot.
+    /// Seed accounting bypasses the adaptive five-minute save ceiling once
+    /// either the 30-second or 8 MiB crash-loss bound is reached.
+    seed_checkpoints: HashMap<JobId, SeedCheckpoint>,
+    /// Wall-clock edge for active seeds in this process. It intentionally
+    /// starts empty after restart so offline time is never counted as upload
+    /// service and an unclean stop can only extend, never shorten, a limit.
+    seed_clock_unix: HashMap<JobId, i64>,
+    /// Torrent handles that have received a start/resume request. Admission
+    /// creates handles paused, so the shared scheduler is the only component
+    /// allowed to make a newly queued transfer live.
+    backend_started: HashSet<JobId>,
+    /// Latest volatile torrent samples. Durable counters are folded into the
+    /// queue record; rates and peers live here so snapshot traffic does not
+    /// rewrite the queue once per second.
+    torrent_progress: HashMap<JobId, crate::backend::TransferProgress>,
+    applied_usenet_limit: Option<Option<u64>>,
+    applied_torrent_limit: Option<Option<u64>>,
+    history: Option<Arc<nzbd_state::history::HistoryDb>>,
 
     state_dir: PathBuf,
     journal: JobJournals,
@@ -620,6 +667,7 @@ impl Owner {
         state_dir: &Path,
         dest_dir: PathBuf,
         torrent_payload_roots: Vec<PathBuf>,
+        history: Option<Arc<nzbd_state::history::HistoryDb>>,
         servers: Arc<Vec<ServerDef>>,
         tuning: Tuning,
         download_enabled: bool,
@@ -710,6 +758,7 @@ impl Owner {
         }
 
         let post_fetch_files = recovered_post_fetch_map(&state);
+        let seed_checkpoints = durable_seed_checkpoints(&state);
         if !post_fetch_files.is_empty() {
             tracing::info!(
                 jobs = post_fetch_files.len(),
@@ -737,6 +786,13 @@ impl Owner {
             retry_counts: HashMap::new(),
             backend,
             pending_backend_commands: VecDeque::new(),
+            seed_checkpoints,
+            seed_clock_unix: HashMap::new(),
+            backend_started: HashSet::new(),
+            torrent_progress: HashMap::new(),
+            applied_usenet_limit: None,
+            applied_torrent_limit: None,
+            history,
             state_dir: state_dir.to_path_buf(),
             journal,
             snap_store,
@@ -1278,7 +1334,7 @@ impl Owner {
                 };
                 let ok = if torrent {
                     self.dirty = true;
-                    if self.persist_then_command(BackendCommand::Resume { job }) {
+                    if !self.persist || self.save_snapshot() {
                         self.bump_epoch();
                         self.publish_now();
                         true
@@ -1423,10 +1479,19 @@ impl Owner {
                 reply,
             } => {
                 self.state.speed_limit_bps = bytes_per_sec;
-                self.limiter.set(bytes_per_sec);
+                self.applied_usenet_limit = None;
+                self.applied_torrent_limit = None;
+                self.rebalance_download_budget(self.shared.load().download_rate_bps);
                 self.dirty = true;
                 self.emit(Event::SpeedLimitChanged { bytes_per_sec });
                 self.publish_now();
+                let _ = reply.send(());
+            }
+            QueueCommand::SetTorrentUploadLimit {
+                bytes_per_sec,
+                reply,
+            } => {
+                self.enqueue_backend_command(BackendCommand::SetUploadLimit { bytes_per_sec });
                 let _ = reply.send(());
             }
             QueueCommand::SetMaxActiveDownloads { n, reply } => {
@@ -2746,6 +2811,7 @@ impl Owner {
         }
         if !self.disk_low {
             self.disk_low = true;
+            self.pause_incomplete_torrents_for_storage();
             self.publish_now();
         }
     }
@@ -2795,6 +2861,7 @@ impl Owner {
         }
         if self.disk_low != was {
             if self.disk_low {
+                self.pause_incomplete_torrents_for_storage();
                 tracing::warn!(
                     free = free.unwrap_or_default(),
                     floor = self.tuning.min_free_disk_bytes,
@@ -2804,6 +2871,7 @@ impl Owner {
                     "configured write volume low on space — downloads held"
                 );
             } else {
+                self.release_torrents_after_storage_recovery();
                 tracing::info!(
                     free = free.unwrap_or_default(),
                     limiting_path = ?reading.limiting_path,
@@ -2811,6 +2879,50 @@ impl Owner {
                 );
             }
             self.publish_guard_change(was, self.disk_low);
+        }
+    }
+
+    fn pause_incomplete_torrents_for_storage(&mut self) {
+        let jobs = self
+            .state
+            .jobs
+            .iter()
+            .filter(|job| {
+                job.kind == JobKind::Torrent
+                    && job.torrent.as_ref().is_some_and(|torrent| {
+                        torrent.ready_at_unix.is_none()
+                            && torrent.removal_intent.is_none()
+                            && torrent.control_intent == TorrentControlIntent::Running
+                    })
+            })
+            .map(|job| job.id)
+            .collect::<Vec<_>>();
+        for job in jobs {
+            if self.enqueue_backend_command(BackendCommand::PauseForStorage { job }) {
+                self.backend_started.remove(&job);
+            }
+        }
+    }
+
+    fn release_torrents_after_storage_recovery(&mut self) {
+        let mut changed = false;
+        for job in &mut self.state.jobs {
+            let Some(torrent) = job.torrent.as_mut() else {
+                continue;
+            };
+            if torrent.control_intent == TorrentControlIntent::Running
+                && torrent.phase == TorrentPhase::PausedDownload
+                && torrent.last_error.as_deref() == Some("storage full")
+            {
+                torrent.phase = TorrentPhase::Queued;
+                torrent.last_error = None;
+                job.status = JobStatus::Queued;
+                changed = true;
+            }
+        }
+        if changed {
+            self.dirty = true;
+            self.bump_epoch();
         }
     }
 
@@ -2851,9 +2963,12 @@ impl Owner {
         let tick_started = Instant::now();
         self.flush_backend_commands();
         self.fold_backend_structural();
+        self.finalize_confirmed_torrent_removals();
         self.fold_backend_progress();
+        let seed_checkpoint_due = self.update_seed_policies(unix_now());
         self.guard_tick = self.guard_tick.wrapping_add(1);
         self.settle_download_labels();
+        self.schedule_torrent_starts();
         // Reading the enforcing disk cache is memory-only, so do it every
         // owner tick. Quota totals still touch peer files and retain their
         // 10-second cadence. NOT `is_multiple_of`: stabilized in 1.87;
@@ -2891,6 +3006,7 @@ impl Owner {
             .values()
             .map(|e| e.max(0.0) as u64)
             .sum();
+        self.rebalance_download_budget(rate);
 
         let now = Instant::now();
         let before = self.blocked.len();
@@ -2924,7 +3040,9 @@ impl Owner {
         let finalize_ms = t.elapsed().as_millis() as u64;
 
         let mut save_ms = 0u64;
-        if self.dirty && self.last_save.elapsed() > save_spacing(self.last_save_ms) {
+        if self.dirty
+            && (seed_checkpoint_due || self.last_save.elapsed() > save_spacing(self.last_save_ms))
+        {
             let save_started = Instant::now();
             self.save_snapshot();
             save_ms = save_started.elapsed().as_millis() as u64;
@@ -2974,25 +3092,252 @@ impl Owner {
         let latest = self.backend.latest_progress();
         let mut changed = false;
         for (job_id, progress) in latest {
-            let Some(job) = self.state.job_mut(job_id) else {
-                continue;
+            let verified_delta = {
+                let Some(job) = self.state.job_mut(job_id) else {
+                    continue;
+                };
+                let before = job
+                    .torrent
+                    .as_ref()
+                    .map_or(0, |torrent| torrent.downloaded_bytes);
+                changed |=
+                    crate::torrent_runtime::reconcile_progress(job, &progress).durable_changed;
+                job.torrent
+                    .as_ref()
+                    .map_or(0, |torrent| torrent.downloaded_bytes.saturating_sub(before))
             };
-            changed |= crate::torrent_runtime::reconcile_progress(job, &progress).durable_changed;
+            if verified_delta > 0 {
+                self.volumes.add(
+                    crate::volumes::TORRENT_SOURCE_ID,
+                    verified_delta,
+                    unix_now(),
+                    self.tuning.quota_start_day,
+                );
+            }
+            self.torrent_progress.insert(job_id, progress);
         }
+        let live: HashSet<JobId> = self.state.jobs.iter().map(|job| job.id).collect();
+        self.torrent_progress.retain(|job, _| live.contains(job));
         if changed {
             self.dirty = true;
         }
     }
 
+    fn schedule_torrent_starts(&mut self) {
+        let mut desired = active_set(
+            &self.state,
+            &self.delegated,
+            self.quota_reached || self.disk_low,
+            unix_now(),
+        )
+        .into_iter()
+        .collect::<HashSet<_>>();
+        // Verified payloads seed outside the download-slot cap. They remain
+        // live until their seed policy, an operator pause, or removal stops
+        // them.
+        desired.extend(self.state.jobs.iter().filter_map(|job| {
+            let torrent = job.torrent.as_ref()?;
+            (torrent.ready_at_unix.is_some()
+                && torrent.control_intent == TorrentControlIntent::Running
+                && torrent.removal_intent.is_none())
+            .then_some(job.id)
+        }));
+
+        for job_id in desired.iter().copied() {
+            let runnable = self.state.job(job_id).is_some_and(|job| {
+                job.kind == JobKind::Torrent
+                    && job.status != JobStatus::Paused
+                    && job.torrent.as_ref().is_some_and(|torrent| {
+                        torrent.control_intent == TorrentControlIntent::Running
+                            && torrent.removal_intent.is_none()
+                    })
+            });
+            if !runnable || self.backend_started.contains(&job_id) {
+                continue;
+            }
+            let queued = self.enqueue_backend_command(BackendCommand::Start { job: job_id });
+            if queued {
+                self.backend_started.insert(job_id);
+            }
+        }
+
+        // A stalled or lower-priority incomplete torrent must actually yield
+        // its backend bandwidth, not merely disappear from the accounting
+        // set while continuing to transfer underneath it.
+        let yielding = self
+            .backend_started
+            .iter()
+            .copied()
+            .filter(|job_id| !desired.contains(job_id))
+            .filter(|job_id| {
+                self.state.job(*job_id).is_some_and(|job| {
+                    job.torrent
+                        .as_ref()
+                        .is_some_and(|torrent| torrent.ready_at_unix.is_none())
+                })
+            })
+            .collect::<Vec<_>>();
+        for job in yielding {
+            let queued = self.enqueue_backend_command(BackendCommand::PauseForScheduler { job });
+            if queued {
+                self.backend_started.remove(&job);
+            }
+        }
+    }
+
+    fn rebalance_download_budget(&mut self, usenet_rate_bps: u64) {
+        let active = active_set(
+            &self.state,
+            &self.delegated,
+            self.quota_reached || self.disk_low,
+            unix_now(),
+        );
+        let usenet_active = active.iter().any(|job| {
+            self.state
+                .job(*job)
+                .is_some_and(|job| job.kind != JobKind::Torrent)
+        });
+        let torrent_jobs = active
+            .iter()
+            .filter(|job| {
+                self.state
+                    .job(**job)
+                    .is_some_and(|job| job.kind == JobKind::Torrent)
+            })
+            .copied()
+            .collect::<HashSet<_>>();
+        let torrent_active = !torrent_jobs.is_empty();
+        let torrent_rate_bps = self
+            .torrent_progress
+            .iter()
+            .filter(|(job, _)| torrent_jobs.contains(job))
+            .map(|(_, progress)| progress.download_bps)
+            .sum();
+        let (usenet_limit, torrent_limit) = crate::backend::allocate_download_budget(
+            self.state.speed_limit_bps,
+            usenet_active,
+            torrent_active,
+            usenet_rate_bps,
+            torrent_rate_bps,
+        );
+        if self.applied_usenet_limit != Some(usenet_limit) {
+            self.limiter.set(usenet_limit);
+            self.applied_usenet_limit = Some(usenet_limit);
+        }
+        if self.applied_torrent_limit == Some(torrent_limit) {
+            return;
+        }
+        let command = BackendCommand::SetDownloadLimit {
+            bytes_per_sec: torrent_limit,
+        };
+        let queued = self.enqueue_backend_command(command);
+        if queued {
+            self.applied_torrent_limit = Some(torrent_limit);
+        }
+    }
+
+    /// Accrue only time spent in the live seeding phase and enforce the first
+    /// configured ratio/time boundary through the same durable control seam
+    /// as an operator pause. Returning `true` requests an immediate snapshot
+    /// rather than the normal adaptive debounce.
+    fn update_seed_policies(&mut self, now_unix: i64) -> bool {
+        let mut changed = false;
+        let mut reached = Vec::new();
+        let mut live = HashSet::new();
+
+        for job in &mut self.state.jobs {
+            let Some(torrent) = job.torrent.as_mut() else {
+                continue;
+            };
+            if torrent.phase != TorrentPhase::Seeding
+                || torrent.control_intent != TorrentControlIntent::Running
+            {
+                continue;
+            }
+            live.insert(job.id);
+            let last = self.seed_clock_unix.entry(job.id).or_insert(now_unix);
+            let elapsed = now_unix.saturating_sub(*last) as u64;
+            *last = now_unix;
+            if elapsed > 0 {
+                torrent.seeding_seconds = torrent.seeding_seconds.saturating_add(elapsed);
+                changed = true;
+            }
+            if crate::torrent_runtime::seed_policy_reached(torrent) {
+                reached.push(job.id);
+            }
+        }
+        self.seed_clock_unix.retain(|job, _| live.contains(job));
+        self.dirty |= changed;
+
+        for job_id in reached {
+            let Some(before) = self.state.job(job_id).cloned() else {
+                continue;
+            };
+            let Some(job) = self.state.job_mut(job_id) else {
+                continue;
+            };
+            job.status = JobStatus::Paused;
+            job.torrent.as_mut().unwrap().control_intent = TorrentControlIntent::Paused;
+            self.dirty = true;
+            if self.persist_then_command(BackendCommand::PauseForSeedPolicy { job: job_id }) {
+                self.bump_epoch();
+                self.publish_now();
+            } else if let Some(job) = self.state.job_mut(job_id) {
+                *job = before;
+            }
+        }
+
+        self.state.jobs.iter().any(|job| {
+            let Some(torrent) = &job.torrent else {
+                return false;
+            };
+            let checkpoint =
+                self.seed_checkpoints
+                    .get(&job.id)
+                    .copied()
+                    .unwrap_or(SeedCheckpoint {
+                        uploaded_bytes: 0,
+                        seeding_seconds: 0,
+                    });
+            crate::torrent_runtime::seed_checkpoint_due(
+                torrent,
+                checkpoint.uploaded_bytes,
+                checkpoint.seeding_seconds,
+            )
+        })
+    }
+
     fn fold_backend_structural(&mut self) {
         while let Ok(fact) = self.backend.try_structural() {
+            match &fact {
+                BackendFact::Resumed { job } => {
+                    self.backend_started.insert(*job);
+                }
+                BackendFact::Stopped { job, .. }
+                | BackendFact::Removed { job, .. }
+                | BackendFact::Failed { job, .. } => {
+                    self.backend_started.remove(job);
+                }
+                BackendFact::MetadataReady { .. } | BackendFact::Ready { .. } => {}
+            }
             let job_id = match &fact {
                 BackendFact::Removed { job, outcome } => {
-                    if matches!(
-                        outcome,
-                        RemovalOutcome::DataDeleted | RemovalOutcome::DataKept
-                    ) {
-                        self.delete_job(*job, false);
+                    let disposition = match outcome {
+                        RemovalOutcome::DataDeleted => Some(TorrentPayloadDisposition::Deleted),
+                        RemovalOutcome::DataKept => Some(TorrentPayloadDisposition::Retained),
+                        RemovalOutcome::RefusedUnsafeRoot
+                        | RemovalOutcome::RefusedInventoryMismatch => None,
+                    };
+                    if let Some(disposition) = disposition {
+                        if let Some(torrent) = self
+                            .state
+                            .job_mut(*job)
+                            .and_then(|record| record.torrent.as_mut())
+                        {
+                            torrent.removal_outcome = Some(disposition);
+                            torrent.removal_confirmed_at_unix = Some(unix_now());
+                            self.dirty = true;
+                        }
                         continue;
                     }
                     *job
@@ -3003,6 +3348,7 @@ impl Owner {
                 | BackendFact::Resumed { job }
                 | BackendFact::Failed { job, .. } => *job,
             };
+            let terminal_failure = matches!(&fact, BackendFact::Failed { .. });
             if let Some(job) = self.state.job_mut(job_id) {
                 let outcome = crate::torrent_runtime::reconcile_fact(
                     job,
@@ -3014,6 +3360,119 @@ impl Owner {
                         .map_or(Path::new("/"), PathBuf::as_path),
                 );
                 self.dirty |= outcome.durable_changed;
+                if terminal_failure {
+                    if let Some(torrent) = job.torrent.as_mut() {
+                        torrent.removal_outcome = Some(TorrentPayloadDisposition::Retained);
+                        torrent.removal_confirmed_at_unix = Some(unix_now());
+                        self.dirty = true;
+                    }
+                }
+                if outcome.storage_hold {
+                    let whence = self
+                        .torrent_payload_roots
+                        .first()
+                        .map(|root| format!("torrent payload write under {}", root.display()))
+                        .unwrap_or_else(|| "torrent payload write".to_owned());
+                    self.observe_out_of_space(&whence);
+                }
+            }
+        }
+    }
+
+    /// Complete the ordered torrent terminal transition:
+    ///
+    /// backend outcome -> durable queue checkpoint -> durable history ->
+    /// queue retirement. A crash at any edge restarts from the persisted
+    /// outcome and never repeats payload deletion merely because history was
+    /// temporarily unavailable.
+    fn finalize_confirmed_torrent_removals(&mut self) {
+        let pending = self
+            .state
+            .jobs
+            .iter()
+            .filter(|job| {
+                job.torrent
+                    .as_ref()
+                    .is_some_and(|torrent| torrent.removal_outcome.is_some())
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if pending.is_empty() {
+            return;
+        }
+
+        if self.persist && !self.save_snapshot() {
+            return;
+        }
+
+        for job in pending {
+            let Some(torrent) = job.torrent.as_ref() else {
+                continue;
+            };
+            let Some(completed_at_unix) = torrent.removal_confirmed_at_unix else {
+                tracing::error!(
+                    job = job.id.0,
+                    "confirmed torrent removal has no stable history timestamp"
+                );
+                continue;
+            };
+            let final_dir = matches!(
+                torrent.removal_outcome,
+                Some(TorrentPayloadDisposition::Retained)
+            )
+            .then(|| {
+                torrent
+                    .content_path
+                    .as_ref()
+                    .map(|path| path.to_string_lossy().into_owned())
+            })
+            .flatten();
+            let entry = nzbd_state::HistoryEntry {
+                job: job.id,
+                name: job.name.clone(),
+                category: job.category.clone(),
+                final_dir,
+                status: if job.status == JobStatus::Failed {
+                    "FAILURE/TORRENT".to_owned()
+                } else {
+                    "DELETED".to_owned()
+                },
+                size: torrent.selected_bytes,
+                health: 1000,
+                params: job.params.clone(),
+                dupe_key: job.dupe.key.clone(),
+                dupe_score: job.dupe.score,
+                completed_at_unix,
+                hidden: false,
+                first_seen_at_unix: None,
+                last_seen_at_unix: None,
+                seen_count: 0,
+                removed_at_unix: None,
+                picked_up_by: None,
+                record: Some(nzbd_state::JobRecord::from_job(&job)),
+                stages: job.stages.clone(),
+                seq: 0,
+            };
+
+            let recorded = match &self.history {
+                Some(history) => match history.record_seq_durable(&entry) {
+                    Ok(_) => true,
+                    Err(error) => {
+                        tracing::warn!(
+                            job = job.id.0,
+                            error = %error,
+                            "torrent removal confirmed but terminal history is not durable; retaining queue record for retry"
+                        );
+                        false
+                    }
+                },
+                // Embedded engine users may omit history. The daemon always
+                // supplies it; preserving the old behavior here keeps the
+                // engine's standalone test and library surface usable.
+                None => true,
+            };
+            if recorded {
+                self.delete_job(job.id, false);
             }
         }
     }
@@ -3042,9 +3501,27 @@ impl Owner {
         if self.persist && !self.save_snapshot() {
             return false;
         }
+        self.enqueue_backend_command(command)
+    }
+
+    /// Preserve the one backend FIFO's ordering even when a previous send had
+    /// to be retained locally. Scheduler, policy, and operator commands all
+    /// pass through this seam; none may jump ahead by writing directly to the
+    /// channel while the retained queue is non-empty.
+    fn enqueue_backend_command(&mut self, command: BackendCommand) -> bool {
+        if !self.pending_backend_commands.is_empty() {
+            if self.pending_backend_commands.len() == MAX_PENDING_BACKEND_COMMANDS {
+                return false;
+            }
+            self.pending_backend_commands.push_back(command);
+            return true;
+        }
         match self.backend.try_command(command) {
             Ok(()) => true,
             Err(mpsc::error::TrySendError::Full(command)) => {
+                if self.pending_backend_commands.len() == MAX_PENDING_BACKEND_COMMANDS {
+                    return false;
+                }
                 self.pending_backend_commands.push_back(command);
                 true
             }
@@ -3262,6 +3739,9 @@ impl Owner {
             server_volumes: {
                 let now_day = unix_now().div_euclid(86_400);
                 let name_of = |id: u32| {
+                    if id == crate::volumes::TORRENT_SOURCE_ID.0 {
+                        return "BitTorrent".to_owned();
+                    }
                     self.servers
                         .iter()
                         .find(|s| s.id.0 == id)
@@ -3377,6 +3857,7 @@ impl Owner {
             }
         }
         self.dirty = false;
+        self.seed_checkpoints = durable_seed_checkpoints(&self.state);
         self.last_save = Instant::now();
         true
     }
@@ -3516,6 +3997,7 @@ mod tests {
             &tmp.path().join("state"),
             tmp.path().join("dest"),
             Vec::new(),
+            None,
             Arc::new(Vec::new()),
             tuning,
             true,
@@ -3557,6 +4039,7 @@ mod tests {
             &tmp.path().join("state"),
             tmp.path().join("dest"),
             Vec::new(),
+            None,
             Arc::new(Vec::new()),
             Tuning::default(),
             true,
@@ -3591,6 +4074,8 @@ mod tests {
             phase: nzbd_types::TorrentPhase::Queued,
             control_intent: TorrentControlIntent::Running,
             removal_intent: None,
+            removal_outcome: None,
+            removal_confirmed_at_unix: None,
             files: Vec::new(),
             total_bytes: 1,
             selected_bytes: 1,
@@ -3645,9 +4130,10 @@ mod tests {
             reply,
         });
         assert!(rx.await.unwrap());
+        owner.schedule_torrent_starts();
         assert_eq!(
             adapter.next_command().await,
-            Some(BackendCommand::Resume { job: JobId(1) })
+            Some(BackendCommand::Start { job: JobId(1) })
         );
         assert!(tmp.path().join("state/queue.json").exists());
     }
@@ -3743,6 +4229,7 @@ mod tests {
             reply,
         });
         assert!(rx.await.unwrap());
+        owner.schedule_torrent_starts();
         assert_eq!(owner.pending_backend_commands.len(), 2);
 
         owner.flush_backend_commands();
@@ -3756,7 +4243,7 @@ mod tests {
         owner.flush_backend_commands();
         assert_eq!(
             adapter.next_command().await,
-            Some(BackendCommand::Resume { job: JobId(1) })
+            Some(BackendCommand::Start { job: JobId(1) })
         );
     }
 

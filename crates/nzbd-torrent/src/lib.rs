@@ -671,6 +671,13 @@ impl TorrentSession {
         self.inner.tcp_listen_port()
     }
 
+    /// Canonical payload root owned by this session. Higher layers may use it
+    /// to derive and revalidate the queue's durable content path, but raw
+    /// engine handles and library persistence remain private to the adapter.
+    pub fn output_root(&self) -> &Path {
+        &self.output_root
+    }
+
     pub fn set_download_limit_bps(&self, bytes_per_second: Option<NonZeroU32>) {
         self.inner.ratelimits.set_download_bps(bytes_per_second);
     }
@@ -927,6 +934,14 @@ impl TorrentRegistry {
             by_hash: HashMap::new(),
             id_to_hash: HashMap::new(),
         }
+    }
+
+    pub fn set_download_limit_bps(&self, bytes_per_second: Option<NonZeroU32>) {
+        self.session.set_download_limit_bps(bytes_per_second);
+    }
+
+    pub fn set_upload_limit_bps(&self, bytes_per_second: Option<NonZeroU32>) {
+        self.session.set_upload_limit_bps(bytes_per_second);
     }
 
     /// Managed admission after the caller's durable queue commit.

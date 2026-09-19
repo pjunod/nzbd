@@ -825,6 +825,22 @@ impl Config {
                 "[torrent] default_seed_ratio must be a finite non-negative number".into(),
             ));
         }
+        let rqbit_max_kib = u64::from(u32::MAX) / 1024;
+        if torrent.upload_limit_kib > rqbit_max_kib {
+            return Err(ConfigError::Invalid(format!(
+                "[torrent] upload_limit_kib must not exceed {rqbit_max_kib}"
+            )));
+        }
+        if torrent.enabled
+            && self
+                .queue
+                .speed_limit_kib
+                .is_some_and(|limit| limit > rqbit_max_kib)
+        {
+            return Err(ConfigError::Invalid(format!(
+                "[queue] speed_limit_kib must not exceed {rqbit_max_kib} while the torrent backend is configured"
+            )));
+        }
         if !(1..=100).contains(&torrent.metainfo_max_mib) {
             return Err(ConfigError::Invalid(
                 "[torrent] metainfo_max_mib must be between 1 and 100".into(),

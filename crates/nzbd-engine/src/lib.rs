@@ -132,6 +132,9 @@ pub struct EngineConfig {
     pub dest_dir: PathBuf,
     /// Ordered configured torrent payload roots used only for removal safety.
     pub torrent_payload_roots: Vec<PathBuf>,
+    /// Durable terminal history. Torrent removal is not retired from the
+    /// queue until this store confirms its append+fsync protocol.
+    pub history: Option<Arc<nzbd_state::history::HistoryDb>>,
     /// Every configured filesystem root the daemon may write. The enforcing
     /// guard probes all of them and gates intake on the lowest reading.
     pub disk_guard_roots: Vec<DiskGuardRoot>,
@@ -172,6 +175,7 @@ impl EngineConfig {
             }],
             dest_dir,
             torrent_payload_roots: Vec::new(),
+            history: None,
             tuning,
             max_active_downloads: None,
             speed_limit_bps,
@@ -221,6 +225,7 @@ impl Engine {
             &cfg.state_dir,
             cfg.dest_dir.clone(),
             cfg.torrent_payload_roots.clone(),
+            cfg.history.clone(),
             servers.clone(),
             cfg.tuning.clone(),
             cfg.download_enabled,
@@ -356,6 +361,12 @@ impl Engine {
 pub struct AddOpts {
     pub category: Option<String>,
     pub priority: i32,
+    /// Torrent-only cumulative upload ratio limit. `None` or zero means
+    /// unlimited; non-torrent admission ignores it.
+    pub seed_ratio_limit: Option<f64>,
+    /// Torrent-only cumulative seeding-time limit in seconds. `None` or zero
+    /// means unlimited; non-torrent admission ignores it.
+    pub seed_time_limit_secs: Option<u64>,
     /// Duplicate-detection metadata (key/score/mode) carried on the job.
     pub dupe: Option<nzbd_types::DupeInfo>,
     /// Add in Paused state (NZBGet `AddPaused`).
@@ -648,6 +659,17 @@ impl EngineHandle {
 
     pub async fn set_speed_limit(&self, bytes_per_sec: Option<u64>) -> Result<(), EngineError> {
         self.roundtrip_unit(|reply| QueueCommand::SetSpeedLimit {
+            bytes_per_sec,
+            reply,
+        })
+        .await
+    }
+
+    pub async fn set_torrent_upload_limit(
+        &self,
+        bytes_per_sec: Option<u64>,
+    ) -> Result<(), EngineError> {
+        self.roundtrip_unit(|reply| QueueCommand::SetTorrentUploadLimit {
             bytes_per_sec,
             reply,
         })

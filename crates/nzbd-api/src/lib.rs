@@ -876,6 +876,7 @@ async fn add_job(
         // Who asked. Only used when the job's own documents name it
         // nothing — see `queue::requestor_name`.
         client: consumer_name(&headers).or_else(|| client_name(&headers)),
+        ..Default::default()
     };
     if let Some(url) = &q.url {
         return match st.engine.add_url(&name, url, opts).await {
@@ -1773,6 +1774,14 @@ async fn get_history(
                     let mut v = serde_json::to_value(&e).unwrap_or_else(|_| json!({}));
                     if let Some(o) = v.as_object_mut() {
                         o.insert("can_requeue".into(), json!(can));
+                        o.insert(
+                            "kind".into(),
+                            json!(e
+                                .record
+                                .as_ref()
+                                .map(|record| record.kind)
+                                .unwrap_or(nzbd_types::JobKind::Nzb)),
+                        );
                     }
                     v
                 })
@@ -2190,6 +2199,11 @@ async fn put_config(
             .set_max_active_downloads(new_cfg.queue.max_active_downloads)
             .await;
     }
+    if live.contains(&"torrent upload limit") {
+        let bps = (new_cfg.torrent.upload_limit_kib > 0)
+            .then_some(new_cfg.torrent.upload_limit_kib * 1024);
+        let _ = st.engine.set_torrent_upload_limit(bps).await;
+    }
     // Connection counts: applied live, but only down to the number of
     // sockets that exist. Asking for more than a server spawned at boot
     // writes to the file and takes effect on the next start — and says
@@ -2310,6 +2324,7 @@ async fn history_requeue(st: &ApiState, db: Arc<HistoryDb>, job: JobId) -> Respo
             .filter(|(k, _)| !k.starts_with('*'))
             .cloned()
             .collect(),
+        ..Default::default()
     };
     let added = match (&nzb, &url) {
         (Some(bytes), _) => st.engine.add_nzb_opts(&entry.name, bytes, opts).await,

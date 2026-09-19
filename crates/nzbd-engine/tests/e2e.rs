@@ -38,6 +38,8 @@ fn dormant_torrent_job() -> nzbd_types::Job {
             phase: nzbd_types::TorrentPhase::Downloading,
             control_intent: nzbd_types::TorrentControlIntent::Running,
             removal_intent: None,
+            removal_outcome: None,
+            removal_confirmed_at_unix: None,
             files: Vec::new(),
             total_bytes: 42,
             selected_bytes: 42,

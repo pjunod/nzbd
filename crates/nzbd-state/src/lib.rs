@@ -562,6 +562,10 @@ pub struct HistoryFile {
 /// and because a job that failed before it had files has nothing to say.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 pub struct JobRecord {
+    /// Additive protocol discriminator. Old history entries deserialize as
+    /// NZB so existing consumers retain their historical interpretation.
+    #[serde(default = "default_history_job_kind")]
+    pub kind: nzbd_types::JobKind,
     pub files: Vec<HistoryFile>,
     pub total_articles: u32,
     pub success_articles: u32,
@@ -590,6 +594,24 @@ pub struct JobRecord {
     /// destination.
     #[serde(default)]
     pub dir_name: Option<String>,
+    /// Stable torrent facts retained after the live backend handle is gone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub torrent: Option<TorrentHistoryRecord>,
+}
+
+fn default_history_job_kind() -> nzbd_types::JobKind {
+    nzbd_types::JobKind::Nzb
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TorrentHistoryRecord {
+    pub info_hash_v1: String,
+    pub downloaded_bytes: u64,
+    pub uploaded_bytes: u64,
+    pub seeding_seconds: u64,
+    pub ready_at_unix: Option<i64>,
+    pub terminal_reason: String,
+    pub payload: nzbd_types::TorrentPayloadDisposition,
 }
 
 impl JobRecord {
@@ -602,6 +624,7 @@ impl JobRecord {
                 .map(|(_, v)| v.clone())
         };
         JobRecord {
+            kind: job.kind,
             files: job
                 .files
                 .iter()
@@ -635,6 +658,21 @@ impl JobRecord {
             queued_at_unix: (job.queued_at_unix > 0).then_some(job.queued_at_unix),
             original_name: (!job.original_name.is_empty()).then(|| job.original_name.clone()),
             dir_name: (!job.dir_name.is_empty()).then(|| job.dir_name.clone()),
+            torrent: job.torrent.as_ref().and_then(|torrent| {
+                torrent.removal_outcome.map(|payload| TorrentHistoryRecord {
+                    info_hash_v1: torrent.info_hash_v1.clone(),
+                    downloaded_bytes: torrent.downloaded_bytes,
+                    uploaded_bytes: torrent.uploaded_bytes,
+                    seeding_seconds: torrent.seeding_seconds,
+                    ready_at_unix: torrent.ready_at_unix,
+                    terminal_reason: if job.status == nzbd_types::JobStatus::Failed {
+                        "failed".to_owned()
+                    } else {
+                        "removed".to_owned()
+                    },
+                    payload,
+                })
+            }),
         }
     }
 }
@@ -967,6 +1005,8 @@ mod tests {
             phase: nzbd_types::TorrentPhase::PausedDownload,
             control_intent: nzbd_types::TorrentControlIntent::Paused,
             removal_intent: None,
+            removal_outcome: None,
+            removal_confirmed_at_unix: None,
             files: vec![nzbd_types::TorrentFileRecord {
                 path: "payload.bin".into(),
                 length: 42,

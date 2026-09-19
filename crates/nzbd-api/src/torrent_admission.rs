@@ -30,6 +30,9 @@ pub struct TorrentAdmissionService {
     state_dir: PathBuf,
     proxy_enabled: bool,
     dht_enabled: bool,
+    default_seed_policy: SeedPolicy,
+    category_seed_policies: HashMap<String, SeedPolicy>,
+    upload_limit_bps: Option<u64>,
     #[cfg(test)]
     before_managed_add: Option<Arc<dyn Fn() -> Result<(), AdmissionError> + Send + Sync>>,
 }
@@ -64,6 +67,14 @@ struct Association {
     /// reconciled with a queue-owner control. Managed admission deliberately
     /// starts paused, while the durable queue starts runnable.
     applied_pause: Option<bool>,
+    content_path: PathBuf,
+    files: Vec<PathBuf>,
+    uploaded_base: u64,
+    engine_uploaded_origin: Option<u64>,
+    last_engine_progress: u64,
+    last_engine_uploaded: u64,
+    ready_emitted: bool,
+    error_emitted: bool,
 }
 
 impl TorrentAdmissionService {
@@ -84,9 +95,24 @@ impl TorrentAdmissionService {
             state_dir,
             proxy_enabled,
             dht_enabled,
+            default_seed_policy: SeedPolicy::default(),
+            category_seed_policies: HashMap::new(),
+            upload_limit_bps: None,
             #[cfg(test)]
             before_managed_add: None,
         }
+    }
+
+    pub fn with_transfer_policy(
+        mut self,
+        default_seed_policy: SeedPolicy,
+        category_seed_policies: HashMap<String, SeedPolicy>,
+        upload_limit_bps: Option<u64>,
+    ) -> Self {
+        self.default_seed_policy = default_seed_policy;
+        self.category_seed_policies = category_seed_policies;
+        self.upload_limit_bps = upload_limit_bps;
+        self
     }
 
     pub async fn admit_raw(
@@ -156,35 +182,51 @@ impl TorrentAdmissionService {
             source_store.remove(orphan)?;
         }
 
+        let restore_plan = nzbd_engine::torrent_runtime::plan_restore(
+            &snapshot.jobs,
+            &HashMap::new(),
+            self.session.output_root(),
+            &std::collections::HashSet::new(),
+        );
+        if !restore_plan.diagnostics.is_empty() {
+            tracing::warn!(
+                rejected = restore_plan.diagnostics.len(),
+                "torrent recovery left unsafe or terminal records fenced"
+            );
+        }
+
         let mut restored = Vec::new();
-        for job in &snapshot.jobs {
+        for request in restore_plan.requests {
+            let job = snapshot.jobs.iter().find(|job| job.id == request.job);
+            let Some(job) = job else {
+                continue;
+            };
             let Some(torrent) = &job.torrent else {
                 continue;
             };
+            let descriptor_path = self.state_dir.join(&request.metadata_file);
             let bytes =
-                std::fs::read(self.state_dir.join(&torrent.metadata_file)).map_err(|error| {
-                    nzbd_state::StateError::Io {
-                        op: "read torrent descriptor",
-                        path: self.state_dir.join(&torrent.metadata_file),
-                        source: error,
-                    }
+                std::fs::read(&descriptor_path).map_err(|error| nzbd_state::StateError::Io {
+                    op: "read torrent descriptor",
+                    path: descriptor_path,
+                    source: error,
                 })?;
+            let descriptor = inspect_metainfo(&bytes, self.proxy_enabled, self.dht_enabled)?;
+            let content_path = self.session.output_root().join(&descriptor.name);
+            let files = descriptor
+                .files
+                .iter()
+                .map(|(path, _)| path.clone())
+                .collect();
             let identities = self
                 .registry
                 .lock()
                 .await
                 .restore_selected([nzbd_torrent::RestoreDescriptor {
                     metainfo: bytes,
-                    expected_info_hash_v1: torrent.info_hash_v1.clone(),
-                    preferred_id: None,
-                    selected_files: Some(
-                        torrent
-                            .files
-                            .iter()
-                            .enumerate()
-                            .filter_map(|(index, file)| file.selected.then_some(index))
-                            .collect(),
-                    ),
+                    expected_info_hash_v1: request.info_hash_v1,
+                    preferred_id: request.preferred_engine_id,
+                    selected_files: Some(request.selected_files),
                 }])
                 .await?;
             if let Some(identity) = identities.into_iter().next() {
@@ -193,6 +235,14 @@ impl TorrentAdmissionService {
                     Association {
                         identity,
                         applied_pause: None,
+                        content_path,
+                        files,
+                        uploaded_base: torrent.uploaded_bytes,
+                        engine_uploaded_origin: None,
+                        last_engine_progress: torrent.downloaded_bytes,
+                        last_engine_uploaded: 0,
+                        ready_emitted: torrent.ready_at_unix.is_some(),
+                        error_emitted: false,
                     },
                 );
             }
@@ -242,8 +292,9 @@ impl TorrentAdmissionService {
             .ok_or(AdmissionError::MissingBackendAdapter)?;
         let registry = self.registry.clone();
         let associations = self.associations.clone();
+        let upload_limit_bps = self.upload_limit_bps;
         Ok(tokio::spawn(async move {
-            run_backend_executor(adapter, registry, associations).await;
+            run_backend_executor(adapter, registry, associations, upload_limit_bps).await;
         }))
     }
 
@@ -277,6 +328,18 @@ impl TorrentAdmissionService {
             descriptor.info_hash_v1
         ));
         persist_descriptor(&self.state_dir.join(&relative), &bytes)?;
+        let category_policy = opts
+            .category
+            .as_ref()
+            .and_then(|category| self.category_seed_policies.get(category));
+        let seed_policy = nzbd_engine::torrent_runtime::normalized_seed_policy(
+            opts.seed_ratio_limit
+                .or_else(|| category_policy.and_then(|policy| policy.ratio_limit))
+                .or(self.default_seed_policy.ratio_limit),
+            opts.seed_time_limit_secs
+                .or_else(|| category_policy.and_then(|policy| policy.time_limit_secs))
+                .or(self.default_seed_policy.time_limit_secs),
+        );
         let record = TorrentRecord {
             info_hash_v1: descriptor.info_hash_v1.clone(),
             source,
@@ -284,6 +347,8 @@ impl TorrentAdmissionService {
             phase: TorrentPhase::Queued,
             control_intent: nzbd_types::TorrentControlIntent::Running,
             removal_intent: None,
+            removal_outcome: None,
+            removal_confirmed_at_unix: None,
             files: descriptor
                 .files
                 .iter()
@@ -300,13 +365,19 @@ impl TorrentAdmissionService {
             seeding_seconds: 0,
             ready_at_unix: None,
             content_path: None,
-            seed_policy: SeedPolicy::default(),
+            seed_policy,
             last_activity_unix: None,
             last_error: None,
         };
+        let content_path = self.session.output_root().join(&descriptor.name);
+        let content_files = descriptor
+            .files
+            .iter()
+            .map(|(path, _)| path.clone())
+            .collect::<Vec<_>>();
         let committed = self
             .engine
-            .commit_torrent_admission(job, descriptor.name, opts, record)
+            .commit_torrent_admission(job, descriptor.name.clone(), opts, record)
             .await?
             .ok_or(AdmissionError::MissingPending)?;
         match committed {
@@ -337,6 +408,14 @@ impl TorrentAdmissionService {
                     Association {
                         identity: identity.clone(),
                         applied_pause: None,
+                        content_path,
+                        files: content_files,
+                        uploaded_base: 0,
+                        engine_uploaded_origin: None,
+                        last_engine_progress: 0,
+                        last_engine_uploaded: 0,
+                        ready_emitted: false,
+                        error_emitted: false,
                     },
                 );
                 Ok(AdmissionResult {
@@ -408,14 +487,65 @@ async fn run_backend_executor(
     mut adapter: BackendAdapterPort,
     registry: Arc<tokio::sync::Mutex<TorrentRegistry>>,
     associations: Arc<tokio::sync::Mutex<HashMap<JobId, Association>>>,
+    upload_limit_bps: Option<u64>,
 ) {
-    while let Some(command) = adapter.next_command().await {
+    enum Wake {
+        Command(Option<BackendCommand>),
+        Poll,
+    }
+
+    let mut poll = tokio::time::interval(std::time::Duration::from_secs(1));
+    poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    registry
+        .lock()
+        .await
+        .set_upload_limit_bps(rate_limit(upload_limit_bps));
+    loop {
+        let wake = tokio::select! {
+            command = adapter.next_command() => Wake::Command(command),
+            _ = poll.tick() => Wake::Poll,
+        };
+        let command = match wake {
+            Wake::Command(Some(command)) => command,
+            Wake::Command(None) => break,
+            Wake::Poll => {
+                publish_backend_state(&adapter, &registry, &associations).await;
+                continue;
+            }
+        };
         let fact = match command {
+            BackendCommand::Start { job } => {
+                apply_pause_resume(job, false, StopReason::Paused, &registry, &associations).await
+            }
             BackendCommand::Pause { job } => {
-                apply_pause_resume(job, true, &registry, &associations).await
+                apply_pause_resume(job, true, StopReason::Paused, &registry, &associations).await
+            }
+            BackendCommand::PauseForSeedPolicy { job } => {
+                apply_pause_resume(
+                    job,
+                    true,
+                    StopReason::SeedPolicyReached,
+                    &registry,
+                    &associations,
+                )
+                .await
+            }
+            BackendCommand::PauseForStorage { job } => {
+                apply_pause_resume(job, true, StopReason::StorageFull, &registry, &associations)
+                    .await
+            }
+            BackendCommand::PauseForScheduler { job } => {
+                apply_pause_resume(
+                    job,
+                    true,
+                    StopReason::SchedulerYield,
+                    &registry,
+                    &associations,
+                )
+                .await
             }
             BackendCommand::Resume { job } => {
-                apply_pause_resume(job, false, &registry, &associations).await
+                apply_pause_resume(job, false, StopReason::Paused, &registry, &associations).await
             }
             BackendCommand::Remove {
                 job,
@@ -438,9 +568,21 @@ async fn run_backend_executor(
             // M2e-3 owns removal and the remaining commands have their own
             // executor slices. The service is feature-gated and unmounted
             // until those ordered children complete.
-            BackendCommand::Start { .. }
-            | BackendCommand::SetPriority { .. }
-            | BackendCommand::SetDownloadLimit { .. } => None,
+            BackendCommand::SetDownloadLimit { bytes_per_sec } => {
+                registry
+                    .lock()
+                    .await
+                    .set_download_limit_bps(rate_limit(bytes_per_sec));
+                None
+            }
+            BackendCommand::SetUploadLimit { bytes_per_sec } => {
+                registry
+                    .lock()
+                    .await
+                    .set_upload_limit_bps(rate_limit(bytes_per_sec));
+                None
+            }
+            BackendCommand::SetPriority { .. } => None,
         };
         if let Some(fact) = fact {
             if adapter.structural(fact).await.is_err() {
@@ -448,6 +590,148 @@ async fn run_backend_executor(
             }
         }
     }
+}
+
+fn rate_limit(bytes_per_sec: Option<u64>) -> Option<std::num::NonZeroU32> {
+    bytes_per_sec
+        .and_then(|rate| u32::try_from(rate).ok())
+        .and_then(std::num::NonZeroU32::new)
+}
+
+async fn publish_backend_state(
+    adapter: &BackendAdapterPort,
+    registry: &Arc<tokio::sync::Mutex<TorrentRegistry>>,
+    associations: &Arc<tokio::sync::Mutex<HashMap<JobId, Association>>>,
+) {
+    let association_snapshot = associations.lock().await.clone();
+    let samples = {
+        let registry = registry.lock().await;
+        association_snapshot
+            .iter()
+            .filter_map(|(job, association)| {
+                registry
+                    .stats(&association.identity)
+                    .map(|stats| (*job, stats))
+            })
+            .collect::<Vec<_>>()
+    };
+
+    for (job, stats) in samples {
+        let (progress, ready, error) = {
+            let mut associations = associations.lock().await;
+            let Some(association) = associations.get_mut(&job) else {
+                continue;
+            };
+            let origin = *association
+                .engine_uploaded_origin
+                .get_or_insert(stats.uploaded_bytes);
+            let uploaded_bytes = association
+                .uploaded_base
+                .saturating_add(stats.uploaded_bytes.saturating_sub(origin));
+            let progressed = stats.progress_bytes > association.last_engine_progress
+                || stats.uploaded_bytes > association.last_engine_uploaded;
+            association.last_engine_progress =
+                association.last_engine_progress.max(stats.progress_bytes);
+            association.last_engine_uploaded =
+                association.last_engine_uploaded.max(stats.uploaded_bytes);
+            if stats.error.is_none() {
+                association.error_emitted = false;
+            }
+            let last_activity_unix = (progressed || stats.peers.live > 0).then(unix_now);
+            let useful_peers = u32::try_from(stats.peers.live).unwrap_or(u32::MAX);
+            let progress = nzbd_engine::backend::TransferProgress {
+                downloaded_bytes: stats.progress_bytes,
+                verified_bytes: stats.progress_bytes,
+                uploaded_bytes,
+                download_bps: stats.download_bps,
+                upload_bps: stats.upload_bps,
+                useful_peers,
+                last_activity_unix,
+            };
+            let ready = (stats.finished && !association.ready_emitted)
+                .then(|| (association.content_path.clone(), association.files.clone()));
+            let error = stats
+                .error
+                .filter(|_| !association.error_emitted)
+                .map(|error| {
+                    association.error_emitted = true;
+                    error
+                });
+            (progress, ready, error)
+        };
+        adapter.progress(job, progress);
+
+        if let Some((content_path, files)) = ready {
+            let durable =
+                tokio::task::spawn_blocking(move || durable_content_path(&content_path, &files))
+                    .await
+                    .ok()
+                    .and_then(Result::ok);
+            let (fact, durable_ready) = match durable {
+                Some(content_path) => (BackendFact::Ready { job, content_path }, true),
+                None => (
+                    BackendFact::Stopped {
+                        job,
+                        reason: StopReason::MissingContent,
+                    },
+                    false,
+                ),
+            };
+            if adapter.structural(fact).await.is_err() {
+                return;
+            }
+            if durable_ready {
+                if let Some(association) = associations.lock().await.get_mut(&job) {
+                    association.ready_emitted = true;
+                }
+            }
+        }
+
+        if let Some(error) = error {
+            let reason = if nzbd_engine::is_out_of_space(&error) {
+                StopReason::StorageFull
+            } else {
+                StopReason::Transient
+            };
+            if adapter
+                .structural(BackendFact::Stopped { job, reason })
+                .await
+                .is_err()
+            {
+                return;
+            }
+        }
+    }
+}
+
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
+}
+
+fn durable_content_path(content_path: &Path, files: &[PathBuf]) -> std::io::Result<PathBuf> {
+    let canonical = std::fs::canonicalize(content_path)?;
+    if canonical.is_file() {
+        std::fs::File::open(&canonical)?.sync_all()?;
+    } else {
+        for relative in files {
+            let file = std::fs::canonicalize(canonical.join(relative))?;
+            if !file.starts_with(&canonical) || !file.is_file() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "torrent payload escaped its canonical content root",
+                ));
+            }
+            std::fs::File::open(file)?.sync_all()?;
+        }
+    }
+    #[cfg(unix)]
+    if let Some(parent) = canonical.parent() {
+        std::fs::File::open(parent)?.sync_all()?;
+    }
+    Ok(canonical)
 }
 
 async fn apply_remove(
@@ -460,7 +744,13 @@ async fn apply_remove(
     associations: &Arc<tokio::sync::Mutex<HashMap<JobId, Association>>>,
 ) -> Option<BackendFact> {
     let Some(association) = associations.lock().await.get(&job).cloned() else {
-        return Some(control_failure(job));
+        // A missing handle during removal is ambiguous: the prior attempt may
+        // have stopped it before crashing. Keep the durable removal intent
+        // fenced and retryable; never turn ambiguity into terminal history.
+        return Some(BackendFact::Stopped {
+            job,
+            reason: StopReason::Transient,
+        });
     };
     let outcome = if delete_data {
         let Some(content_path) = content_path else {
@@ -500,6 +790,7 @@ async fn apply_remove(
 async fn apply_pause_resume(
     job: JobId,
     pause: bool,
+    pause_reason: StopReason,
     registry: &Arc<tokio::sync::Mutex<TorrentRegistry>>,
     associations: &Arc<tokio::sync::Mutex<HashMap<JobId, Association>>>,
 ) -> Option<BackendFact> {
@@ -525,7 +816,7 @@ async fn apply_pause_resume(
             if pause {
                 Some(BackendFact::Stopped {
                     job,
-                    reason: StopReason::Paused,
+                    reason: pause_reason,
                 })
             } else {
                 Some(BackendFact::Resumed { job })
@@ -566,6 +857,10 @@ struct TypedRequest {
     priority: i32,
     #[serde(default)]
     paused: bool,
+    #[serde(default)]
+    seed_ratio_limit: Option<f64>,
+    #[serde(default)]
+    seed_time_limit_secs: Option<u64>,
     #[serde(default)]
     params: std::collections::BTreeMap<String, String>,
 }
@@ -615,6 +910,8 @@ async fn post_job(
                             category: request.category,
                             priority: request.priority,
                             paused: request.paused,
+                            seed_ratio_limit: request.seed_ratio_limit,
+                            seed_time_limit_secs: request.seed_time_limit_secs,
                             params: request.params.into_iter().collect(),
                             ..Default::default()
                         },

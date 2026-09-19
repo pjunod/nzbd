@@ -12,6 +12,10 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+/// Synthetic source row for verified incoming BitTorrent payload. It shares
+/// the quota book without pretending a peer swarm is an NNTP provider.
+pub const TORRENT_SOURCE_ID: ServerId = ServerId(u32::MAX);
+
 /// Days → (year, month, day) — Howard Hinnant's civil-from-days.
 fn civil_from_days(z: i64) -> (i64, u32, u32) {
     let z = z + 719_468;

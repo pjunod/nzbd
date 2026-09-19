@@ -8,12 +8,57 @@ use crate::backend::{BackendFact, RemovalOutcome, SafeError, StopReason, Transfe
 use crate::queue::rename_job;
 use nzbd_types::{
     Job, JobId, JobKind, JobStatus, TorrentControlIntent, TorrentFileRecord, TorrentPhase,
+    TorrentRecord,
 };
 use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 
 pub const MAX_RESTORE_DIAGNOSTICS: usize = 64;
+pub const SEED_CHECKPOINT_SECS: u64 = 30;
+pub const SEED_CHECKPOINT_BYTES: u64 = 8 * 1024 * 1024;
 const STORAGE_FULL_ERROR: &str = "storage full";
+
+/// A zero ratio or time value is the public "unlimited" spelling. Normalize
+/// it once at admission so every later boundary can reason in `Option`s.
+pub fn normalized_seed_policy(
+    ratio: Option<f64>,
+    time_secs: Option<u64>,
+) -> nzbd_types::SeedPolicy {
+    nzbd_types::SeedPolicy {
+        ratio_limit: ratio.filter(|ratio| ratio.is_finite() && *ratio > 0.0),
+        time_limit_secs: time_secs.filter(|seconds| *seconds > 0),
+    }
+}
+
+/// Evaluate the durable cumulative counters, never a volatile instantaneous
+/// rate. Exact equality reaches the limit, and an empty selection cannot
+/// manufacture an infinite ratio.
+pub fn seed_policy_reached(torrent: &TorrentRecord) -> bool {
+    let ratio_reached = torrent.seed_policy.ratio_limit.is_some_and(|limit| {
+        torrent.selected_bytes > 0
+            && (torrent.uploaded_bytes as f64) >= (torrent.selected_bytes as f64 * limit)
+    });
+    let time_reached = torrent
+        .seed_policy
+        .time_limit_secs
+        .is_some_and(|limit| torrent.seeding_seconds >= limit);
+    ratio_reached || time_reached
+}
+
+/// Return whether the unsaved accounting window reached its durable bound.
+/// A crash can therefore only extend seeding by the latest 30 seconds or
+/// 8 MiB window; it can never make a limit fire early.
+pub fn seed_checkpoint_due(
+    torrent: &TorrentRecord,
+    saved_uploaded_bytes: u64,
+    saved_seeding_seconds: u64,
+) -> bool {
+    torrent.uploaded_bytes.saturating_sub(saved_uploaded_bytes) >= SEED_CHECKPOINT_BYTES
+        || torrent
+            .seeding_seconds
+            .saturating_sub(saved_seeding_seconds)
+            >= SEED_CHECKPOINT_SECS
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct EngineIdentity {
@@ -393,6 +438,11 @@ pub fn reconcile_fact(
                         (reason == StopReason::StorageFull).then(|| STORAGE_FULL_ERROR.to_owned());
                     job.status = JobStatus::Paused;
                 }
+                StopReason::SchedulerYield => {
+                    torrent.phase = TorrentPhase::Queued;
+                    torrent.last_error = None;
+                    job.status = JobStatus::Queued;
+                }
                 StopReason::MissingContent => {
                     torrent.phase = TorrentPhase::MissingFiles;
                     job.status = JobStatus::Paused;
@@ -597,6 +647,8 @@ mod tests {
                 phase: TorrentPhase::Downloading,
                 control_intent: nzbd_types::TorrentControlIntent::Running,
                 removal_intent: None,
+                removal_outcome: None,
+                removal_confirmed_at_unix: None,
                 files: vec![
                     TorrentFileRecord {
                         path: "one".into(),
@@ -622,6 +674,49 @@ mod tests {
             }),
             stages: Vec::new(),
         }
+    }
+
+    #[test]
+    fn seed_policy_normalizes_unlimited_and_stops_on_exact_boundaries() {
+        assert_eq!(
+            normalized_seed_policy(Some(0.0), Some(0)),
+            SeedPolicy::default()
+        );
+
+        let mut record = job(
+            10,
+            "0123456789abcdef0123456789abcdef01234567",
+            JobStatus::Downloading,
+        );
+        let torrent = record.torrent.as_mut().unwrap();
+        torrent.selected_bytes = 100;
+        torrent.seed_policy = normalized_seed_policy(Some(1.5), Some(90));
+        torrent.uploaded_bytes = 149;
+        torrent.seeding_seconds = 89;
+        assert!(!seed_policy_reached(torrent));
+        torrent.uploaded_bytes = 150;
+        assert!(seed_policy_reached(torrent));
+        torrent.uploaded_bytes = 0;
+        torrent.seeding_seconds = 90;
+        assert!(seed_policy_reached(torrent));
+    }
+
+    #[test]
+    fn seed_checkpoint_bound_is_thirty_seconds_or_eight_mib() {
+        let mut record = job(
+            10,
+            "0123456789abcdef0123456789abcdef01234567",
+            JobStatus::Downloading,
+        );
+        let torrent = record.torrent.as_mut().unwrap();
+        torrent.uploaded_bytes = SEED_CHECKPOINT_BYTES - 1;
+        torrent.seeding_seconds = SEED_CHECKPOINT_SECS - 1;
+        assert!(!seed_checkpoint_due(torrent, 0, 0));
+        torrent.uploaded_bytes += 1;
+        assert!(seed_checkpoint_due(torrent, 0, 0));
+        torrent.uploaded_bytes = 0;
+        torrent.seeding_seconds += 1;
+        assert!(seed_checkpoint_due(torrent, 0, 0));
     }
 
     #[test]
