@@ -510,13 +510,36 @@ pub fn install_process_crypto_provider() -> Result<CryptoProviderInstall, Torren
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct TorrentSessionConfig {
     pub dht: bool,
+    pub pex: bool,
     pub listen_port_range: Option<Range<u16>>,
     pub proxy: Option<TorrentProxyConfig>,
     /// Engine resume state is an accelerator; construction never restores it.
     pub persistence_dir: Option<PathBuf>,
+    pub max_peers_per_torrent: Option<usize>,
+    pub max_peers_total: Option<usize>,
+    pub max_known_peers_per_torrent: Option<usize>,
+    pub max_known_peers_total: Option<usize>,
+    pub metainfo_max_bytes: Option<u32>,
+}
+
+impl Default for TorrentSessionConfig {
+    fn default() -> Self {
+        Self {
+            dht: false,
+            pex: true,
+            listen_port_range: None,
+            proxy: None,
+            persistence_dir: None,
+            max_peers_per_torrent: None,
+            max_peers_total: None,
+            max_known_peers_per_torrent: None,
+            max_known_peers_total: None,
+            metainfo_max_bytes: None,
+        }
+    }
 }
 
 #[derive(Clone, Default)]
@@ -600,6 +623,7 @@ pub struct TorrentAddConfig {
     pub initial_peers: Vec<SocketAddr>,
     pub only_files: Option<Vec<usize>>,
     pub preferred_id: Option<usize>,
+    pub output_root: Option<PathBuf>,
 }
 
 #[derive(Clone)]
@@ -652,9 +676,15 @@ impl TorrentSession {
         let output_root = std::fs::canonicalize(output_root).map_err(engine_error)?;
         let options = session_options(
             config.dht,
+            config.pex,
             config.listen_port_range,
             socks_proxy_url,
             config.persistence_dir,
+            config.max_peers_per_torrent,
+            config.max_peers_total,
+            config.max_known_peers_per_torrent,
+            config.max_known_peers_total,
+            config.metainfo_max_bytes,
         );
         let inner = Session::new_with_opts(output_root.clone(), options)
             .await
@@ -701,7 +731,18 @@ impl TorrentSession {
         install_process_crypto_provider()?;
         std::fs::create_dir_all(&output_root).map_err(engine_error)?;
         let output_root = std::fs::canonicalize(output_root).map_err(engine_error)?;
-        let options = session_options(false, Some(listen_port_range), None, None);
+        let options = session_options(
+            false,
+            true,
+            Some(listen_port_range),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
         let inner = Session::new_with_opts(output_root.clone(), options)
             .await
             .map_err(engine_error)?;
@@ -720,7 +761,8 @@ impl TorrentSession {
     ) -> Result<TorrentHandle, TorrentError> {
         normalize_initial_peers(&mut config.initial_peers)?;
         validate_metainfo_admission(&bytes, self.proxy_enabled, self.dht_enabled)?;
-        validate_existing_filesystem_paths(&bytes, &self.output_root)?;
+        let output_root = config.output_root.as_deref().unwrap_or(&self.output_root);
+        validate_existing_filesystem_paths(&bytes, output_root)?;
         self.add_validated_metainfo(bytes.into(), config).await
     }
 
@@ -917,6 +959,7 @@ pub struct RestoreDescriptor {
     pub expected_info_hash_v1: String,
     pub preferred_id: Option<usize>,
     pub selected_files: Option<Vec<usize>>,
+    pub output_root: Option<PathBuf>,
 }
 
 /// Owns all raw handles for one maintained session, indexed only by engine
@@ -991,6 +1034,7 @@ impl TorrentRegistry {
                         overwrite: true,
                         only_files: descriptor.selected_files,
                         preferred_id: descriptor.preferred_id,
+                        output_root: descriptor.output_root,
                         ..Default::default()
                     },
                 )
@@ -1118,6 +1162,9 @@ fn managed_add_options(config: TorrentAddConfig) -> AddTorrentOptions {
         exact_add_options(config.paused, config.overwrite, false, config.initial_peers);
     options.only_files = config.only_files;
     options.preferred_id = config.preferred_id;
+    options.output_folder = config
+        .output_root
+        .map(|path| path.to_string_lossy().into_owned());
     options
 }
 
@@ -1154,12 +1201,19 @@ fn exact_add_options(
 
 fn session_options(
     dht: bool,
+    pex: bool,
     listen_port_range: Option<Range<u16>>,
     socks_proxy_url: Option<String>,
     persistence_dir: Option<PathBuf>,
+    max_peers_per_torrent: Option<usize>,
+    max_peers_total: Option<usize>,
+    max_known_peers_per_torrent: Option<usize>,
+    max_known_peers_total: Option<usize>,
+    metainfo_max_bytes: Option<u32>,
 ) -> SessionOptions {
     SessionOptions {
         disable_dht: !dht,
+        disable_pex: !pex,
         // librqbit's default persistent DHT state lives in rqbit's
         // process-global cache directory. nzbd must not share a listen port or
         // routing table with another session on the same host.
@@ -1183,9 +1237,9 @@ fn session_options(
         // restores its authoritative jobs.
         disable_auto_restore: true,
         peer_id: None,
-        peer_opts: Some(explicit_peer_connection_options()),
-        known_peer_limit: Some(MAX_KNOWN_PEERS_PER_TORRENT),
-        known_peer_limit_total: Some(MAX_KNOWN_PEERS_TOTAL),
+        peer_opts: Some(explicit_peer_connection_options(metainfo_max_bytes)),
+        known_peer_limit: Some(max_known_peers_per_torrent.unwrap_or(MAX_KNOWN_PEERS_PER_TORRENT)),
+        known_peer_limit_total: Some(max_known_peers_total.unwrap_or(MAX_KNOWN_PEERS_TOTAL)),
         defer_writes_up_to: None,
         default_storage_factory: None,
         cancellation_token: None,
@@ -1195,21 +1249,21 @@ fn session_options(
         concurrent_init_limit: Some(MAX_CONCURRENT_TORRENT_INITIALIZATIONS),
         root_span: None,
         ratelimits: Default::default(),
-        peer_limit: Some(MAX_LIVE_PEERS_PER_TORRENT),
-        peer_limit_total: Some(MAX_LIVE_PEERS_TOTAL),
+        peer_limit: Some(max_peers_per_torrent.unwrap_or(MAX_LIVE_PEERS_PER_TORRENT)),
+        peer_limit_total: Some(max_peers_total.unwrap_or(MAX_LIVE_PEERS_TOTAL)),
         blocklist_url: None,
         trackers: HashSet::new(),
     }
 }
 
-fn explicit_peer_connection_options() -> PeerConnectionOptions {
+fn explicit_peer_connection_options(metainfo_max_bytes: Option<u32>) -> PeerConnectionOptions {
     // Pin stable 8.1.1's effective fallbacks so a future engine default cannot
     // silently lengthen connection or I/O lifetime at nzbd's network boundary.
     PeerConnectionOptions {
         connect_timeout: Some(PEER_CONNECT_TIMEOUT),
         read_write_timeout: Some(PEER_READ_WRITE_TIMEOUT),
         keep_alive_interval: Some(PEER_KEEP_ALIVE_INTERVAL),
-        max_metadata_size: Some(DEFAULT_MAX_METAINFO_BYTES as u32),
+        max_metadata_size: Some(metainfo_max_bytes.unwrap_or(DEFAULT_MAX_METAINFO_BYTES as u32)),
     }
 }
 
@@ -2314,7 +2368,7 @@ mod tests {
     fn session_options_are_an_explicit_dormant_boundary() {
         // This pins the helper used by TorrentSession::start. If start stops
         // delegating here, move the assertion to the replacement call path.
-        let options = session_options(false, None, None, None);
+        let options = session_options(false, true, None, None, None, None, None, None, None, None);
         assert!(options.disable_dht);
         assert!(options.disable_dht_persistence);
         assert!(options.dht_config.is_none());

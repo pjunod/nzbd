@@ -1,4 +1,4 @@
-//! Dormant native BitTorrent admission. Production mounting belongs to #163.
+//! Native BitTorrent admission and runtime reconciliation.
 use axum::extract::State;
 use axum::http::{header::CONTENT_TYPE, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -32,7 +32,9 @@ pub struct TorrentAdmissionService {
     dht_enabled: bool,
     default_seed_policy: SeedPolicy,
     category_seed_policies: HashMap<String, SeedPolicy>,
+    category_payload_roots: HashMap<String, PathBuf>,
     upload_limit_bps: Option<u64>,
+    source_fetch_limits: TorrentSourceFetchLimits,
     #[cfg(test)]
     before_managed_add: Option<Arc<dyn Fn() -> Result<(), AdmissionError> + Send + Sync>>,
 }
@@ -51,6 +53,8 @@ pub enum AdmissionError {
     MissingPending,
     #[error("torrent backend adapter has already been taken")]
     MissingBackendAdapter,
+    #[error("torrent metainfo exceeds the configured limit")]
+    MetainfoTooLarge,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -97,10 +101,22 @@ impl TorrentAdmissionService {
             dht_enabled,
             default_seed_policy: SeedPolicy::default(),
             category_seed_policies: HashMap::new(),
+            category_payload_roots: HashMap::new(),
             upload_limit_bps: None,
+            source_fetch_limits: TorrentSourceFetchLimits::default(),
             #[cfg(test)]
             before_managed_add: None,
         }
+    }
+
+    pub fn with_source_fetch_limits(mut self, limits: TorrentSourceFetchLimits) -> Self {
+        self.source_fetch_limits = limits;
+        self
+    }
+
+    pub fn with_category_payload_roots(mut self, roots: HashMap<String, PathBuf>) -> Self {
+        self.category_payload_roots = roots;
+        self
     }
 
     pub fn with_transfer_policy(
@@ -151,7 +167,7 @@ impl TorrentAdmissionService {
             TorrentSource::Url => {
                 nzbd_torrent::fetch_torrent_source(
                     &secret,
-                    TorrentSourceFetchLimits::default(),
+                    self.source_fetch_limits,
                     self.proxy_enabled,
                 )
                 .await?
@@ -182,10 +198,12 @@ impl TorrentAdmissionService {
             source_store.remove(orphan)?;
         }
 
-        let restore_plan = nzbd_engine::torrent_runtime::plan_restore(
+        let mut payload_roots = vec![self.session.output_root().to_path_buf()];
+        payload_roots.extend(self.category_payload_roots.values().cloned());
+        let restore_plan = nzbd_engine::torrent_runtime::plan_restore_with_roots(
             &snapshot.jobs,
             &HashMap::new(),
-            self.session.output_root(),
+            &payload_roots,
             &std::collections::HashSet::new(),
         );
         if !restore_plan.diagnostics.is_empty() {
@@ -204,6 +222,23 @@ impl TorrentAdmissionService {
             let Some(torrent) = &job.torrent else {
                 continue;
             };
+            let payload_root = if torrent.payload_root.as_os_str().is_empty() {
+                self.session.output_root()
+            } else {
+                &torrent.payload_root
+            };
+            if payload_root != self.session.output_root()
+                && !self
+                    .category_payload_roots
+                    .values()
+                    .any(|root| root == payload_root)
+            {
+                tracing::warn!(
+                    job = job.id.0,
+                    "torrent recovery refused an unauthorized payload root"
+                );
+                continue;
+            }
             let descriptor_path = self.state_dir.join(&request.metadata_file);
             let bytes =
                 std::fs::read(&descriptor_path).map_err(|error| nzbd_state::StateError::Io {
@@ -212,7 +247,7 @@ impl TorrentAdmissionService {
                     source: error,
                 })?;
             let descriptor = inspect_metainfo(&bytes, self.proxy_enabled, self.dht_enabled)?;
-            let content_path = self.session.output_root().join(&descriptor.name);
+            let content_path = payload_root.join(&descriptor.name);
             let files = descriptor
                 .files
                 .iter()
@@ -227,6 +262,8 @@ impl TorrentAdmissionService {
                     expected_info_hash_v1: request.info_hash_v1,
                     preferred_id: request.preferred_engine_id,
                     selected_files: Some(request.selected_files),
+                    output_root: (!torrent.payload_root.as_os_str().is_empty())
+                        .then(|| torrent.payload_root.clone()),
                 }])
                 .await?;
             if let Some(identity) = identities.into_iter().next() {
@@ -262,7 +299,7 @@ impl TorrentAdmissionService {
                 TorrentSource::Url => {
                     nzbd_torrent::fetch_torrent_source(
                         &String::from_utf8(source_bytes).map_err(|_| AdmissionError::Encoding)?,
-                        TorrentSourceFetchLimits::default(),
+                        self.source_fetch_limits,
                         self.proxy_enabled,
                     )
                     .await?
@@ -298,6 +335,10 @@ impl TorrentAdmissionService {
         }))
     }
 
+    pub async fn shutdown(&self) {
+        self.session.stop().await;
+    }
+
     async fn finish(
         &self,
         pending: Option<JobId>,
@@ -305,6 +346,9 @@ impl TorrentAdmissionService {
         source: TorrentSource,
         opts: AddOpts,
     ) -> Result<AdmissionResult, AdmissionError> {
+        if bytes.len() > self.source_fetch_limits.max_metainfo_bytes {
+            return Err(AdmissionError::MetainfoTooLarge);
+        }
         // Parser diagnostics come from the embedded engine and are not an API
         // contract (and may echo hostile bytes). At this boundary they are a
         // generic client-input failure; named policy errors stay named.
@@ -340,10 +384,17 @@ impl TorrentAdmissionService {
                 .or_else(|| category_policy.and_then(|policy| policy.time_limit_secs))
                 .or(self.default_seed_policy.time_limit_secs),
         );
+        let payload_root = opts
+            .category
+            .as_ref()
+            .and_then(|category| self.category_payload_roots.get(category))
+            .cloned()
+            .unwrap_or_else(|| self.session.output_root().to_path_buf());
         let record = TorrentRecord {
             info_hash_v1: descriptor.info_hash_v1.clone(),
             source,
             metadata_file: relative,
+            payload_root: payload_root.clone(),
             phase: TorrentPhase::Queued,
             control_intent: nzbd_types::TorrentControlIntent::Running,
             removal_intent: None,
@@ -369,7 +420,7 @@ impl TorrentAdmissionService {
             last_activity_unix: None,
             last_error: None,
         };
-        let content_path = self.session.output_root().join(&descriptor.name);
+        let content_path = payload_root.join(&descriptor.name);
         let content_files = descriptor
             .files
             .iter()
@@ -399,6 +450,7 @@ impl TorrentAdmissionService {
                         bytes,
                         TorrentAddConfig {
                             paused: true,
+                            output_root: Some(payload_root),
                             ..Default::default()
                         },
                     )
@@ -565,9 +617,8 @@ async fn run_backend_executor(
                 )
                 .await
             }
-            // M2e-3 owns removal and the remaining commands have their own
-            // executor slices. The service is feature-gated and unmounted
-            // until those ordered children complete.
+            // Transfer limits are session-global; pause, resume, and removal
+            // retain per-job ownership through the association table.
             BackendCommand::SetDownloadLimit { bytes_per_sec } => {
                 registry
                     .lock()
@@ -882,28 +933,32 @@ async fn post_job(
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
-    let content_type = headers
-        .get(CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.split(';').next())
-        .unwrap_or("");
-    let result = match content_type {
-        "application/x-bittorrent" => service.admit_raw(body.to_vec(), AddOpts::default()).await,
-        "application/json" => match serde_json::from_slice::<TypedRequest>(&body) {
-            Ok(request) => {
-                let source = match request.source.kind.as_str() {
-                    "magnet" => TorrentSource::Magnet,
-                    "torrent_url" => TorrentSource::Url,
-                    _ => {
-                        return (
-                            StatusCode::UNPROCESSABLE_ENTITY,
-                            Json(json!({"error":"unsupported torrent source type"})),
-                        )
-                            .into_response()
-                    }
-                };
-                service
-                    .admit_source(
+    service.handle_http_post(headers, body).await
+}
+
+impl TorrentAdmissionService {
+    pub async fn handle_http_post(&self, headers: HeaderMap, body: axum::body::Bytes) -> Response {
+        let content_type = headers
+            .get(CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.split(';').next())
+            .unwrap_or("");
+        let result = match content_type {
+            "application/x-bittorrent" => self.admit_raw(body.to_vec(), AddOpts::default()).await,
+            "application/json" => match serde_json::from_slice::<TypedRequest>(&body) {
+                Ok(request) => {
+                    let source = match request.source.kind.as_str() {
+                        "magnet" => TorrentSource::Magnet,
+                        "torrent_url" => TorrentSource::Url,
+                        _ => {
+                            return (
+                                StatusCode::UNPROCESSABLE_ENTITY,
+                                Json(json!({"error":"unsupported torrent source type"})),
+                            )
+                                .into_response()
+                        }
+                    };
+                    self.admit_source(
                         source,
                         request.source.uri,
                         AddOpts {
@@ -917,50 +972,51 @@ async fn post_job(
                         },
                     )
                     .await
-            }
-            Err(_) => {
+                }
+                Err(_) => {
+                    return (
+                        StatusCode::UNPROCESSABLE_ENTITY,
+                        Json(json!({"error":"invalid typed torrent request"})),
+                    )
+                        .into_response()
+                }
+            },
+            _ => {
                 return (
                     StatusCode::UNPROCESSABLE_ENTITY,
-                    Json(json!({"error":"invalid typed torrent request"})),
+                    Json(json!({"error":"unsupported torrent content type"})),
                 )
                     .into_response()
             }
-        },
-        _ => {
-            return (
-                StatusCode::UNPROCESSABLE_ENTITY,
-                Json(json!({"error":"unsupported torrent content type"})),
+        };
+        match result {
+            Ok(result) if result.created => (
+                StatusCode::CREATED,
+                Json(json!({"id":result.id,"info_hash":result.info_hash})),
             )
-                .into_response()
+                .into_response(),
+            Ok(result) => (
+                StatusCode::OK,
+                Json(json!({"id":result.id,"info_hash":result.info_hash,"created":false})),
+            )
+                .into_response(),
+            Err(error) if error.is_input_error() => (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(json!({"error":error.to_string()})),
+            )
+                .into_response(),
+            Err(_) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error":"torrent admission failed"})),
+            )
+                .into_response(),
         }
-    };
-    match result {
-        Ok(result) if result.created => (
-            StatusCode::CREATED,
-            Json(json!({"id":result.id,"info_hash":result.info_hash})),
-        )
-            .into_response(),
-        Ok(result) => (
-            StatusCode::OK,
-            Json(json!({"id":result.id,"info_hash":result.info_hash,"created":false})),
-        )
-            .into_response(),
-        Err(error) if error.is_input_error() => (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            Json(json!({"error":error.to_string()})),
-        )
-            .into_response(),
-        Err(_) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error":"torrent admission failed"})),
-        )
-            .into_response(),
     }
 }
 
 impl AdmissionError {
     fn is_input_error(&self) -> bool {
-        matches!(self, Self::Encoding)
+        matches!(self, Self::Encoding | Self::MetainfoTooLarge)
             || matches!(self, Self::Torrent(error) if !matches!(error, nzbd_torrent::TorrentError::Engine(_)))
     }
 }
@@ -1103,6 +1159,14 @@ mod tests {
             Association {
                 identity: identity.clone(),
                 applied_pause: None,
+                content_path: tmp.path().join("payload/executor.bin"),
+                files: vec![PathBuf::from("executor.bin")],
+                uploaded_base: 0,
+                engine_uploaded_origin: None,
+                last_engine_progress: 0,
+                last_engine_uploaded: 0,
+                ready_emitted: false,
+                error_emitted: false,
             },
         )])));
         let (mut owner, adapter) = backend_channel(8, 8);
@@ -1110,6 +1174,7 @@ mod tests {
             adapter,
             registry.clone(),
             associations,
+            None,
         ));
 
         owner

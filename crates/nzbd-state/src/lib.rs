@@ -1002,6 +1002,7 @@ mod tests {
             info_hash_v1: "0123456789abcdef0123456789abcdef01234567".into(),
             source: nzbd_types::TorrentSource::Metainfo,
             metadata_file: "meta/0123.torrent".into(),
+            payload_root: PathBuf::new(),
             phase: nzbd_types::TorrentPhase::PausedDownload,
             control_intent: nzbd_types::TorrentControlIntent::Paused,
             removal_intent: None,

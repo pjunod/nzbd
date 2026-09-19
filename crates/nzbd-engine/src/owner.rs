@@ -3606,6 +3606,29 @@ impl Owner {
                     pp_done: j.params.iter().any(|(k, _)| k == nzbd_types::PP_DONE_PARAM),
                     ready: j.ready(),
                     ready_at_unix: j.ready_at_unix(),
+                    uploaded_bytes: j
+                        .torrent
+                        .as_ref()
+                        .map_or(0, |torrent| torrent.uploaded_bytes),
+                    upload_rate_bps: self
+                        .torrent_progress
+                        .get(&j.id)
+                        .map_or(0, |progress| progress.upload_bps),
+                    ratio: j.torrent.as_ref().map_or(0.0, |torrent| {
+                        if torrent.selected_bytes == 0 {
+                            0.0
+                        } else {
+                            torrent.uploaded_bytes as f64 / torrent.selected_bytes as f64
+                        }
+                    }),
+                    seeding_seconds: j
+                        .torrent
+                        .as_ref()
+                        .map_or(0, |torrent| torrent.seeding_seconds),
+                    useful_peers: self
+                        .torrent_progress
+                        .get(&j.id)
+                        .map_or(0, |progress| progress.useful_peers),
                     dupe_key: j.dupe.key.clone(),
                     dupe_score: j.dupe.score,
                     params: j
@@ -4071,6 +4094,7 @@ mod tests {
             info_hash_v1: "0123456789abcdef0123456789abcdef01234567".into(),
             source: nzbd_types::TorrentSource::Metainfo,
             metadata_file: "meta/control.torrent".into(),
+            payload_root: PathBuf::new(),
             phase: nzbd_types::TorrentPhase::Queued,
             control_intent: TorrentControlIntent::Running,
             removal_intent: None,

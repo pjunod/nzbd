@@ -1592,6 +1592,7 @@ function rowModel(j, ctx) {
   const busy = pend ? pend.busy(j.id) : false;   // an action is in flight
   const section = ctx.section || sectionOf(j);
   const active = section !== "waiting";
+  const torrent = j.kind === "torrent";
 
   // A URL job has no articles until its NZB arrives — "0 B of 0 B" reads as
   // broken; say what it is actually doing instead.
@@ -1600,6 +1601,11 @@ function rowModel(j, ctx) {
   if (dl && j.rate_bps > 0) {
     rest.push(" · " + fmtRate(j.rate_bps));
     rest.push(" · ~" + fmtEta(Math.max(0, j.remaining_bytes), j.rate_bps));
+  }
+  if (torrent) {
+    if (j.upload_rate_bps > 0) rest.push(" · ▲ " + fmtRate(j.upload_rate_bps));
+    rest.push(" · ratio " + Number(j.ratio || 0).toFixed(2));
+    if (j.useful_peers > 0) rest.push(" · " + j.useful_peers + " peers");
   }
   // A post-processing row's own heading already names the stage, so the
   // line under the bar answers the question the heading raises instead:
@@ -1645,7 +1651,8 @@ function rowModel(j, ctx) {
             "job-" + section + (busy ? " pending" : ""),
     name: j.name,
     nameTip: j.name + " — click for details",
-    sub: "#" + j.id + (j.category ? " · " + j.category : "") +
+    sub: "#" + j.id + (torrent ? " · BITTORRENT" : " · USENET") +
+         (j.category ? " · " + j.category : "") +
          (j.assigned_node ? " · on " + j.assigned_node : "") + " ",
     st: (shownSt === "completed" && j.ready
       ? "ready" : (STATUS_HUMAN[shownSt] || shownSt)).toUpperCase(),
@@ -1673,10 +1680,10 @@ function rowModel(j, ctx) {
       ? "Articles that failed and were re-downloaded — this is bandwidth the header rate spends that never lands in the file. A high count means a flaky server or an aging post."
       : "",
     size: fetching ? "—" : fmtBytes(total),
-    health: fetching ? "—" : (j.health / 10).toFixed(1) + "%",
-    healthColor: fetching ? "" : healthColor(j.health, j.critical_health),
-    healthTip: fetching ? "" : healthTip(j.health, j.critical_health),
-    hNote: fetching ? "" : hNote,
+    health: fetching ? "—" : (torrent ? Number(j.ratio || 0).toFixed(2) + "×" : (j.health / 10).toFixed(1) + "%"),
+    healthColor: fetching || torrent ? "" : healthColor(j.health, j.critical_health),
+    healthTip: fetching ? "" : (torrent ? "uploaded / selected payload bytes" : healthTip(j.health, j.critical_health)),
+    hNote: fetching ? "" : (torrent ? fmtDur((j.seeding_seconds || 0) * 1000) + " seeding" : hNote),
     hNoteCls: fetching ? "hnote" : hNoteCls,
     hNoteTip: hNoteTip,
     upDisabled: ctx.idx === 0,
@@ -1688,6 +1695,8 @@ function rowModel(j, ctx) {
     pauseHidden: fetching,
     pauseLabel: (over || st) === "paused" ? "resume" : "pause",
     pauseAction: (over || st) === "paused" ? "resume" : "pause",
+    deleteDataHidden: !torrent,
+    deleteDataLabel: armIsSet("q" + j.id) ? "sure?" : "delete data",
     // `detail` is the joined line the row shows; kept as one string for
     // readability and for the DOM test's assertions.
     detail: (fetching ? "fetching the NZB from the indexer…"
@@ -1743,6 +1752,8 @@ function buildJobRow(d) {
   c.pause = mk("", "pause", "pause", "");
   c.del = mk("del", "delete", "delete",
     "Remove this job from the queue. One click — no dialog; you get 8 seconds to undo it.");
+  c.delData = mk("del", "delete-data", "delete data",
+    "Forget this torrent and delete only its validated payload inventory. Click twice to confirm.");
   tr.__c = c;
   return tr;
 }
@@ -1789,6 +1800,8 @@ function applyRow(tr, m, d) {
   w("pauseHidden", m.pauseHidden, v => d.prop(c.pause, "hidden", v));
   w("pauseLabel", m.pauseLabel, v => d.text(c.pause, v));
   w("pauseAction", m.pauseAction, v => d.data(c.pause, "action", v));
+  w("deleteDataHidden", m.deleteDataHidden, v => d.prop(c.delData, "hidden", v));
+  w("deleteDataLabel", m.deleteDataLabel, v => d.text(c.delData, v));
 }
 KINDS.job = { build: buildJobRow, apply: applyRow };
 
@@ -3435,8 +3448,8 @@ function armIsSet(key) { return armed.key === key; }
 function armButton(key) {
   if (armed.timer) clearTimeout(armed.timer);
   armed.key = key;
-  armed.timer = setTimeout(() => { armed.key = null; armed.timer = null; renderHistory(); }, ARM_MS);
-  renderHistory();
+  armed.timer = setTimeout(() => { armed.key = null; armed.timer = null; renderHistory(); renderQueue(); }, ARM_MS);
+  renderHistory(); renderQueue();
 }
 function disarmButton() {
   if (armed.timer) clearTimeout(armed.timer);
@@ -3453,7 +3466,7 @@ document.addEventListener("click", (ev) => {
   const scope = row ? row.dataset.scope : "queue";
   // Any other click disarms a pending two-step button: aiming somewhere
   // else is as clear a "no" as waiting it out.
-  if (action !== "h-delete-files" && armed.key) { disarmButton(); renderHistory(); }
+  if (action !== "h-delete-files" && action !== "delete-data" && armed.key) { disarmButton(); renderHistory(); renderQueue(); }
   if (PAGE_MOVES[action]) { PAGE_MOVES[action](); return; }
   // One panel serves both tabs, so its close button is the same button in
   // both — the row it sits in says which list is holding it open.
@@ -3486,6 +3499,18 @@ document.addEventListener("click", (ev) => {
   }
   if (action === "delete") {
     deleteJob(id, name);
+    return;
+  }
+  if (action === "delete-data") {
+    const key = "q" + id;
+    if (!armIsSet(key)) { armButton(key); return; }
+    disarmButton();
+    jobAction(id, "delete-files", {
+      key: pending.key(id, "delete"), kind: "delete", jobId: id,
+      label: "Deleting torrent payload for “" + name + "”",
+    }).then(r => {
+      if (r) toast({ text: "Deleted “" + name + "” and its validated torrent payload" });
+    });
     return;
   }
   if (action === "pause" || action === "resume") {

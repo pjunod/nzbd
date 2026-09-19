@@ -19,6 +19,7 @@ nzbd-cluster = { workspace = true }
 nzbd-post = { workspace = true }
 nzbd-feed = { workspace = true }
 nzbd-state = { workspace = true }
+nzbd-torrent = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 tokio-rustls = { workspace = true }

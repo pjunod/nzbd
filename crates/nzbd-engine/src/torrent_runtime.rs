@@ -1,4 +1,4 @@
-//! Dormant BitTorrent runtime ownership and restore reconciliation.
+//! BitTorrent runtime ownership and restore reconciliation.
 //!
 //! This module intentionally knows `JobId` but has no engine dependency. The
 //! maintained adapter receives only [`RestoreRequest`] values and returns
@@ -133,6 +133,23 @@ pub fn plan_restore(
     torrent_root: &Path,
     scheduler_allowed: &HashSet<JobId>,
 ) -> RestorePlan {
+    plan_restore_with_roots(
+        jobs,
+        observed,
+        std::slice::from_ref(&torrent_root.to_path_buf()),
+        scheduler_allowed,
+    )
+}
+
+/// Build a restore plan while accepting every configured torrent payload
+/// root. Category roots are first-class storage boundaries and must survive a
+/// restart without weakening containment to arbitrary persisted paths.
+pub fn plan_restore_with_roots(
+    jobs: &[Job],
+    observed: &HashMap<String, ObservedResumeState>,
+    torrent_roots: &[PathBuf],
+    scheduler_allowed: &HashSet<JobId>,
+) -> RestorePlan {
     let mut plan = RestorePlan::default();
     let mut hashes = HashSet::new();
     let mut preferred_ids = HashSet::new();
@@ -157,11 +174,11 @@ pub fn plan_restore(
             push_diagnostic(&mut plan, RestoreDiagnostic::UnsafeMetadataPath);
             continue;
         }
-        if record
-            .content_path
-            .as_ref()
-            .is_some_and(|path| !payload_is_within_root(path, torrent_root))
-        {
+        if record.content_path.as_ref().is_some_and(|path| {
+            !torrent_roots
+                .iter()
+                .any(|root| payload_is_within_root(path, root))
+        }) {
             push_diagnostic(&mut plan, RestoreDiagnostic::UnsafePayloadRoot);
             continue;
         }
@@ -644,6 +661,7 @@ mod tests {
                 info_hash_v1: hash.into(),
                 source: TorrentSource::Metainfo,
                 metadata_file: PathBuf::from("meta/selected.torrent"),
+                payload_root: PathBuf::new(),
                 phase: TorrentPhase::Downloading,
                 control_intent: nzbd_types::TorrentControlIntent::Running,
                 removal_intent: None,

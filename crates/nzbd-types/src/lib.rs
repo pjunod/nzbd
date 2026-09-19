@@ -140,6 +140,9 @@ pub struct TorrentRecord {
     pub source: TorrentSource,
     /// Relative to the configured torrent state root.
     pub metadata_file: PathBuf,
+    /// Canonical configured root selected for this job at admission.
+    #[serde(default)]
+    pub payload_root: PathBuf,
     pub phase: TorrentPhase,
     /// Defaulted so records written before owner-side control routing retain
     /// their historical (running) meaning.

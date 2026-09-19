@@ -353,6 +353,7 @@ mod tests {
             info_hash_v1: "0123456789abcdef0123456789abcdef01234567".into(),
             source: TorrentSource::Magnet,
             metadata_file: "meta/example.torrent".into(),
+            payload_root: PathBuf::new(),
             phase,
             control_intent: nzbd_types::TorrentControlIntent::Running,
             removal_intent: None,

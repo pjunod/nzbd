@@ -8,7 +8,7 @@ architecture and acceptance contract. This page records execution progress for
 the consolidated implementation branch. It is not an operator guide and does
 not authorize production use by itself.
 
-## Current position — lifecycle complete, policy and activation remain
+## Current position — single-node runtime active, native surfaces in progress
 
 | Workstream | State | Next observable result |
 |---|---|---|
@@ -16,9 +16,9 @@ not authorize production use by itself.
 | M2f seed policy | implemented, unqualified | Durable ratio/time accounting pauses at exact boundaries and retains payload |
 | M2g bandwidth and quota accounting | implemented, unqualified | Shared ceiling reallocates idle capacity; verified torrent bytes enter quota accounting |
 | M2h enforcing disk guard | implemented, unqualified | Incomplete torrents pause on guard/ENOSPC while completed seeds remain live |
-| M2i terminal history | building | Confirmed payload outcome is durable before retry-safe mixed-protocol history retirement |
-| M2j daemon activation | blocked on policy decision | Compose startup, admission, recovery, rollback, and disabled-mode behavior |
-| M3 native web/mobile surface | queued | Torrent details and controls are visible without leaking secrets |
+| M2i terminal history | implemented, unqualified | Confirmed payload outcome is durable before retry-safe mixed-protocol history retirement |
+| M2j daemon activation | implemented, unqualified | One configured session owns admission, recovery, watch ingestion, shutdown, and disabled-mode refusal |
+| M3 native web/mobile surface | building | Web queue exposes protocol, upload, ratio, peer and destructive-removal state; dedicated detail/export and mobile remain |
 | M4 Sonarr/Radarr compatibility | queued | Pinned clients complete add, poll, import, seed-limit, and removal workflows |
 | M5 release evidence | queued | Fast-lane qualification and required operational evidence are green |
 
@@ -35,18 +35,18 @@ not authorize production use by itself.
   repository exists there. GitHub remains the source for this isolated clone;
   no Forgejo repository will be created without explicit authorization.
 
-## Decisions awaiting reconciliation
+## Decisions applied during implementation
 
-1. **Activation policy.** ADR-19 requires fail-closed activation until M2j
-   evidence passes. The current instruction requests advisory-only enablement
-   with no code gate. Non-activation work proceeds while this conflict is open.
-2. **Settings owner.** The instruction names the plurx developer settings tab,
-   while the feature and configuration live in nzbd. No cross-repository UI
-   change will be assumed.
-3. **Qualification scope.** M2j currently requires `make test`, revised
-   `make bittorrent-policy`, and `make gate`; the current instruction requests
-   only the fast lane before merge. The final qualification command will be
-   chosen after this policy is reconciled.
+1. **Activation policy.** The explicit instruction to avoid feature gates wins
+   over ADR-19's temporary dormant guard. `[torrent].enabled = true` now starts
+   the supported single-node runtime; actual incompatibilities such as cluster
+   mode remain startup validation errors rather than advisory conditions.
+2. **Settings owner.** Runtime configuration remains in nzbd. A separate
+   isolated plurx change will expose deployment readiness as advisory status;
+   it will not control or override nzbd activation.
+3. **Qualification scope.** The consolidated head will receive one adversarial
+   review and one fast-lane test pass before merge. Full-suite failures remain
+   outside this resource-constrained pass as explicitly requested.
 
 ## Activity log
 
@@ -56,3 +56,5 @@ not authorize production use by itself.
 | 2026-09-19 | Based the consolidated branch on reviewed restore head | PR #218 head `e0898c2`; eight remote checks green |
 | 2026-09-19 | Implemented seed policy, shared bandwidth/quota accounting, storage holds, and scheduler-owned torrent starts | Source inspection only; qualification intentionally deferred |
 | 2026-09-19 | Began ordered torrent terminal history transition | Backend outcome now checkpoints before durable history and queue retirement |
+| 2026-09-19 | Activated the single-node daemon runtime and native admission | Workspace and all-target compile checks pass; tests intentionally deferred |
+| 2026-09-19 | Added category-root recovery containment and removed the obsolete Cargo feature flag | Persisted payloads restore only under the configured default or category roots |

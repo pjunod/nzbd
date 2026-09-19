@@ -12,7 +12,6 @@ use base64::Engine as _;
 
 pub mod eventhub;
 pub mod logbuf;
-#[cfg(feature = "torrent-admission")]
 pub mod torrent_admission;
 pub mod version;
 pub use eventhub::{EventHub, Replay};
@@ -30,6 +29,8 @@ use tokio_stream::StreamExt as _;
 #[derive(Clone)]
 pub struct ApiState {
     pub engine: EngineHandle,
+    /// Present only when the daemon started the single-node torrent session.
+    pub torrent: Option<torrent_admission::TorrentAdmissionService>,
     pub history: Option<Arc<HistoryDb>>,
     pub log: Option<Arc<LogBuffer>>,
     /// First-run setup mode: present when the daemon booted with a
@@ -706,6 +707,19 @@ async fn list_jobs(State(st): State<ApiState>) -> Response {
 async fn get_job(State(st): State<ApiState>, Path(id): Path<u32>) -> Response {
     let snap = st.engine.snapshot();
     match snap.jobs.iter().find(|j| j.id == JobId(id)) {
+        Some(job) if job.kind == nzbd_types::JobKind::Torrent => {
+            match st.engine.export_job(JobId(id)).await {
+                Ok(Some(record)) => {
+                    let mut value = serde_json::to_value(job).unwrap_or_else(|_| json!({}));
+                    if let Some(object) = value.as_object_mut() {
+                        object.insert("torrent".into(), json!(record.torrent));
+                    }
+                    Json(value).into_response()
+                }
+                Ok(None) => not_found(),
+                Err(err) => error(StatusCode::SERVICE_UNAVAILABLE, &err.to_string()),
+            }
+        }
         Some(job) => Json(job.clone()).into_response(),
         None => not_found(),
     }
@@ -717,6 +731,25 @@ async fn get_job_files(State(st): State<ApiState>, Path(id): Path<u32>) -> Respo
     use nzbd_types::SegmentState;
     match st.engine.export_job(JobId(id)).await {
         Ok(Some(job)) => {
+            if let Some(torrent) = &job.torrent {
+                let files = torrent
+                    .files
+                    .iter()
+                    .enumerate()
+                    .map(|(index, file)| {
+                        json!({
+                            "id": index,
+                            "filename": file.path,
+                            "size_bytes": file.length,
+                            "downloaded_bytes": if torrent.ready_at_unix.is_some() && file.selected { file.length } else { 0 },
+                            "selected": file.selected,
+                            "verified": torrent.ready_at_unix.is_some() && file.selected,
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                return Json(json!({ "job": job.id.0, "name": job.name, "files": files }))
+                    .into_response();
+            }
             let files: Vec<serde_json::Value> = job
                 .files
                 .iter()
@@ -858,6 +891,23 @@ async fn add_job(
     headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
+    let content_type = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .unwrap_or("");
+    if matches!(
+        content_type,
+        "application/x-bittorrent" | "application/json"
+    ) {
+        let Some(torrent) = &st.torrent else {
+            return error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "BitTorrent is disabled in this daemon configuration",
+            );
+        };
+        return torrent.handle_http_post(headers, body).await;
+    }
     let name = q.name.unwrap_or_default();
     let params = match q.params.as_deref().map(parse_add_params).transpose() {
         Ok(p) => p.unwrap_or_default(),
@@ -1863,6 +1913,7 @@ fn error(code: StatusCode, msg: &str) -> Response {
 pub fn router(engine: EngineHandle) -> Router {
     router_with(ApiState {
         engine,
+        torrent: None,
         history: None,
         log: None,
         setup: None,
@@ -2516,7 +2567,7 @@ mod tests {
 </file></nzb>"#;
 
     #[tokio::test]
-    async fn production_router_keeps_torrent_admission_unmounted_without_side_effects() {
+    async fn disabled_router_rejects_torrent_admission_without_side_effects() {
         let tmp = tempfile::tempdir().unwrap();
         let engine = test_engine(&tmp).await;
         let response = router(engine.clone())
@@ -2530,7 +2581,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert!(engine.snapshot().jobs.is_empty());
         let store =
             nzbd_state::torrent_sources::PendingSourceStore::open(&tmp.path().join("state"))
@@ -2564,6 +2615,11 @@ mod tests {
             pp_done: false,
             ready: false,
             ready_at_unix: None,
+            uploaded_bytes: 0,
+            upload_rate_bps: 0,
+            ratio: 0.0,
+            seeding_seconds: 0,
+            useful_peers: 0,
             dupe_key: String::new(),
             dupe_score: 0,
             params: vec![],
@@ -2812,6 +2868,7 @@ mod tests {
             Arc::new(HistoryDb::open(&tmp.path().join("history.sqlite"), Some(&shared)).unwrap());
         let app = router_with(ApiState {
             engine: engine.clone(),
+            torrent: None,
             history: Some(db.clone()),
             log: None,
             setup: None,
@@ -3388,6 +3445,7 @@ mod tests {
         }
         let app = router_with(ApiState {
             engine: engine.clone(),
+            torrent: None,
             history: Some(db.clone()),
             log: None,
             setup: None,
@@ -3482,6 +3540,7 @@ mod tests {
         let log = LogBuffer::new(500);
         let app = router_with(ApiState {
             engine: engine.clone(),
+            torrent: None,
             history: None,
             log: Some(log.clone()),
             setup: None,
@@ -3688,6 +3747,7 @@ mod tests {
         });
         let app = router_with(ApiState {
             engine: engine.clone(),
+            torrent: None,
             history: None,
             log: None,
             setup: Some(Arc::new(SetupHandle::for_running(

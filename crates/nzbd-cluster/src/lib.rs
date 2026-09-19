@@ -333,6 +333,7 @@ impl ClusterRuntime {
         let proxied = nzbd_api::require_auth(
             nzbd_api::router_with(nzbd_api::ApiState {
                 engine: self.engine.clone(),
+                torrent: None,
                 history,
                 log,
                 setup: None, // cluster mode always has a config file

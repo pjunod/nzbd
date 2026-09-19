@@ -121,6 +121,7 @@ pub(crate) struct ManagedTorrentOptions {
     pub peer_limit: Option<usize>,
     pub known_peer_limit: Option<usize>,
     pub known_peer_semaphore_total: Option<Arc<tokio::sync::Semaphore>>,
+    pub disable_pex: bool,
     #[cfg(feature = "disable-upload")]
     pub _disable_upload: bool,
 }
