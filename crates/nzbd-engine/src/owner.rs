@@ -74,6 +74,7 @@ pub(crate) enum QueueCommand {
     ReserveTorrentAdmission {
         source: nzbd_types::TorrentSource,
         secret: Vec<u8>,
+        opts: AddOpts,
         reply: oneshot::Sender<Result<JobId, nzbd_state::StateError>>,
     },
     CommitTorrentAdmission {
@@ -1026,11 +1027,12 @@ impl Owner {
             QueueCommand::ReserveTorrentAdmission {
                 source,
                 secret,
+                opts,
                 reply,
             } => {
                 // Reserve from the queue owner first: it alone allocates ids. The
                 // reservation is not durable until the protected sidecar exists.
-                let id = self.state.reserve_torrent_admission(source);
+                let id = self.state.reserve_torrent_admission(source, opts);
                 let result = match self.pending_sources.write(id, &secret) {
                     Ok(secret_ref) => {
                         // The reference is derived from the allocated id, never a
@@ -3003,9 +3005,12 @@ impl Owner {
     fn on_tick(&mut self) {
         let tick_started = Instant::now();
         self.flush_backend_commands();
+        // The adapter publishes its latest-value progress sample before a
+        // structural Ready fact. Fold that sample first so Ready can prove
+        // completion in the same owner tick.
+        self.fold_backend_progress();
         self.fold_backend_structural();
         self.finalize_confirmed_torrent_removals();
-        self.fold_backend_progress();
         let seed_checkpoint_due = self.update_seed_policies(unix_now());
         self.guard_tick = self.guard_tick.wrapping_add(1);
         self.settle_download_labels();
@@ -3390,15 +3395,14 @@ impl Owner {
                 | BackendFact::Failed { job, .. } => *job,
             };
             let terminal_failure = matches!(&fact, BackendFact::Failed { .. });
+            let latest = self.torrent_progress.get(&job_id).cloned();
             if let Some(job) = self.state.job_mut(job_id) {
-                let outcome = crate::torrent_runtime::reconcile_fact(
+                let outcome = crate::torrent_runtime::reconcile_fact_with_roots(
                     job,
                     fact,
-                    None,
+                    latest.as_ref(),
                     unix_now(),
-                    self.torrent_payload_roots
-                        .first()
-                        .map_or(Path::new("/"), PathBuf::as_path),
+                    &self.torrent_payload_roots,
                 );
                 self.dirty |= outcome.durable_changed;
                 if terminal_failure {

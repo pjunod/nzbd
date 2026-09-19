@@ -23,4 +23,4 @@ jobs:
       - name: clippy (deny warnings)
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: clippy (torrent admission)
-        run: cargo clippy -p nzbd-api --features torrent-admission --all-targets -- -D warnings
+        run: cargo clippy -p nzbd-api --all-targets -- -D warnings

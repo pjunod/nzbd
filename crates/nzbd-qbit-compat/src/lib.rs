@@ -57,7 +57,7 @@ struct OverlayCategory {
     save_path: PathBuf,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 struct CategoryStore {
     path: PathBuf,
     configured: BTreeMap<String, PathBuf>,
@@ -80,21 +80,10 @@ impl QbitState {
         clients: Option<Arc<nzbd_api::ClientRegistry>>,
     ) -> Self {
         let path = state_dir.join("torrent-categories.json");
-        let mut overlay: BTreeMap<String, OverlayCategory> = std::fs::read(&path)
-            .ok()
-            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-            .unwrap_or_default();
-        overlay.retain(|name, category| {
-            let Ok(root) = std::fs::canonicalize(&category.save_path) else {
-                return false;
-            };
-            if !root.starts_with(&save_path) {
-                return false;
-            }
-            category.save_path = root.clone();
-            torrent.register_category_payload_root(name.clone(), root);
-            true
-        });
+        let overlay = load_category_overlay(&path, &save_path);
+        for (name, category) in &overlay {
+            torrent.register_category_payload_root(name.clone(), category.save_path.clone());
+        }
         Self {
             engine,
             torrent,
@@ -116,7 +105,49 @@ impl QbitState {
     }
 }
 
+/// Load only canonical qBittorrent-created category roots contained by the
+/// configured global torrent root. The daemon calls this before recovery so
+/// overlay-category jobs have the same authorized root inventory on restart
+/// as they do after the compatibility router is mounted.
+pub fn load_overlay_category_roots(
+    state_dir: &std::path::Path,
+    save_path: &std::path::Path,
+) -> BTreeMap<String, PathBuf> {
+    load_category_overlay(&state_dir.join("torrent-categories.json"), save_path)
+        .into_iter()
+        .map(|(name, category)| (name, category.save_path))
+        .collect()
+}
+
+fn load_category_overlay(
+    path: &std::path::Path,
+    save_path: &std::path::Path,
+) -> BTreeMap<String, OverlayCategory> {
+    let Ok(save_path) = std::fs::canonicalize(save_path) else {
+        return BTreeMap::new();
+    };
+    let mut overlay: BTreeMap<String, OverlayCategory> = std::fs::read(path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default();
+    overlay.retain(|_, category| {
+        let Ok(root) = std::fs::canonicalize(&category.save_path) else {
+            return false;
+        };
+        if !root.starts_with(&save_path) {
+            return false;
+        }
+        category.save_path = root;
+        true
+    });
+    overlay
+}
+
 pub fn router(state: QbitState) -> Router {
+    let upload_body_limit = state
+        .torrent
+        .max_request_body_bytes()
+        .saturating_add(64 * 1024);
     Router::new()
         .route("/api/v2/auth/login", post(login))
         .route("/api/v2/app/webapiVersion", get(webapi_version))
@@ -125,7 +156,10 @@ pub fn router(state: QbitState) -> Router {
         .route("/api/v2/torrents/info", get(torrent_info))
         .route("/api/v2/torrents/properties", get(torrent_properties))
         .route("/api/v2/torrents/files", get(torrent_files))
-        .route("/api/v2/torrents/add", post(torrent_add))
+        .route(
+            "/api/v2/torrents/add",
+            post(torrent_add).layer(axum::extract::DefaultBodyLimit::max(upload_body_limit)),
+        )
         .route("/api/v2/torrents/delete", post(torrent_delete))
         .route("/api/v2/torrents/setCategory", post(set_category))
         .route("/api/v2/torrents/categories", get(categories))
@@ -402,7 +436,7 @@ async fn torrent_files(State(state): State<QbitState>, Query(query): Query<HashQ
                     "index": index,
                     "name": file.path,
                     "size": file.length,
-                    "progress": if ready && file.selected { 1.0 } else { 0.0 },
+                    "progress": if file.length == 0 { 0.0 } else { file.downloaded_bytes as f64 / file.length as f64 },
                     "priority": if file.selected { 1 } else { 0 },
                     "is_seed": ready,
                 })
@@ -442,11 +476,8 @@ async fn torrent_add(State(state): State<QbitState>, headers: HeaderMap, body: B
     let opts = AddOpts {
         category: nonempty(text("category")),
         paused: matches!(text("paused"), "true" | "1"),
-        seed_ratio_limit: text("ratioLimit").parse().ok(),
-        seed_time_limit_secs: text("seedingTimeLimit")
-            .parse::<u64>()
-            .ok()
-            .map(|minutes| minutes.saturating_mul(60)),
+        seed_ratio_limit: add_ratio_limit(text("ratioLimit")),
+        seed_time_limit_secs: add_time_limit(text("seedingTimeLimit")),
         client: headers
             .get(header::USER_AGENT)
             .and_then(|value| value.to_str().ok())
@@ -534,12 +565,21 @@ async fn create_category(State(state): State<QbitState>, body: Bytes) -> Respons
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };
-    state
-        .torrent
-        .register_category_payload_root(name.clone(), save_path.clone());
-    store.overlay.insert(name, OverlayCategory { save_path });
-    match persist_categories(&store) {
-        Ok(()) => "Ok.".into_response(),
+    let mut candidate = store.clone();
+    candidate.overlay.insert(
+        name.clone(),
+        OverlayCategory {
+            save_path: save_path.clone(),
+        },
+    );
+    match persist_categories(&candidate) {
+        Ok(()) => {
+            store.overlay = candidate.overlay;
+            state
+                .torrent
+                .register_category_payload_root(name, save_path);
+            "Ok.".into_response()
+        }
         Err(error) => {
             tracing::warn!(error = %error, "could not persist qBittorrent category overlay");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
@@ -549,15 +589,8 @@ async fn create_category(State(state): State<QbitState>, body: Bytes) -> Respons
 
 async fn set_share_limits(State(state): State<QbitState>, body: Bytes) -> Response {
     let form = form_fields(&body);
-    let ratio = form
-        .get("ratioLimit")
-        .and_then(|value| value.parse::<f64>().ok())
-        .filter(|value| *value > 0.0);
-    let time = form
-        .get("seedingTimeLimit")
-        .and_then(|value| value.parse::<u64>().ok())
-        .filter(|value| *value > 0)
-        .map(|minutes| minutes.saturating_mul(60));
+    let ratio = share_ratio_limit(form.get("ratioLimit"), state.global_seed_ratio);
+    let time = share_time_limit(form.get("seedingTimeLimit"), state.global_seed_minutes);
     mutate_hashes(&state, form.get("hashes"), move |engine, id| async move {
         engine
             .set_torrent_seed_policy(
@@ -723,6 +756,45 @@ fn nonempty(value: &str) -> Option<String> {
     (!value.trim().is_empty()).then(|| value.trim().to_string())
 }
 
+/// qBittorrent uses -2 for "inherit the global limit" and -1 for
+/// "unlimited". At admission, absence represents inheritance and an explicit
+/// zero is nzbd's unlimited sentinel.
+fn add_ratio_limit(value: &str) -> Option<f64> {
+    match value.trim().parse::<f64>().ok()? {
+        value if value == -2.0 => None,
+        value if value == -1.0 => Some(0.0),
+        value if value >= 0.0 && value.is_finite() => Some(value),
+        _ => None,
+    }
+}
+
+fn add_time_limit(value: &str) -> Option<u64> {
+    match value.trim().parse::<i64>().ok()? {
+        -2 => None,
+        -1 => Some(0),
+        minutes if minutes >= 0 => Some((minutes as u64).saturating_mul(60)),
+        _ => None,
+    }
+}
+
+/// Unlike admission, setShareLimits must resolve -2 immediately because it
+/// replaces the job's already-materialized policy.
+fn share_ratio_limit(value: Option<&String>, global: f64) -> Option<f64> {
+    match value.and_then(|value| value.trim().parse::<f64>().ok()) {
+        Some(value) if value == -2.0 => (global > 0.0 && global.is_finite()).then_some(global),
+        Some(value) if value > 0.0 && value.is_finite() => Some(value),
+        _ => None,
+    }
+}
+
+fn share_time_limit(value: Option<&String>, global_minutes: u64) -> Option<u64> {
+    match value.and_then(|value| value.trim().parse::<i64>().ok()) {
+        Some(-2) => (global_minutes > 0).then(|| global_minutes.saturating_mul(60)),
+        Some(minutes) if minutes > 0 => Some((minutes as u64).saturating_mul(60)),
+        _ => None,
+    }
+}
+
 fn valid_category(value: &str) -> Option<String> {
     let value = value.trim();
     (!value.is_empty()
@@ -750,8 +822,15 @@ fn persist_categories(store: &CategoryStore) -> std::io::Result<()> {
     }
     let temp = store.path.with_extension("json.tmp");
     let bytes = serde_json::to_vec_pretty(&store.overlay).map_err(std::io::Error::other)?;
-    std::fs::write(&temp, bytes)?;
-    std::fs::rename(temp, &store.path)
+    let mut file = std::fs::File::create(&temp)?;
+    use std::io::Write;
+    file.write_all(&bytes)?;
+    file.sync_all()?;
+    std::fs::rename(&temp, &store.path)?;
+    if let Some(parent) = store.path.parent() {
+        std::fs::File::open(parent)?.sync_all()?;
+    }
+    Ok(())
 }
 
 fn unix_now() -> i64 {
@@ -797,5 +876,22 @@ mod tests {
         assert_eq!(valid_category("tv/movies"), None);
         assert_eq!(valid_category("tv\n"), Some("tv".into()));
         assert_eq!(valid_category("tv\u{0000}"), None);
+    }
+
+    #[test]
+    fn qbit_share_limit_sentinels_preserve_inherit_and_unlimited() {
+        assert_eq!(add_ratio_limit("-2"), None);
+        assert_eq!(add_ratio_limit("-1"), Some(0.0));
+        assert_eq!(add_ratio_limit("1.5"), Some(1.5));
+        assert_eq!(add_time_limit("-2"), None);
+        assert_eq!(add_time_limit("-1"), Some(0));
+        assert_eq!(add_time_limit("5"), Some(300));
+
+        let inherit = "-2".to_string();
+        let unlimited = "-1".to_string();
+        assert_eq!(share_ratio_limit(Some(&inherit), 1.25), Some(1.25));
+        assert_eq!(share_ratio_limit(Some(&unlimited), 1.25), None);
+        assert_eq!(share_time_limit(Some(&inherit), 45), Some(2_700));
+        assert_eq!(share_time_limit(Some(&unlimited), 45), None);
     }
 }

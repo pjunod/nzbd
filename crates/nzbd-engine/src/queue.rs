@@ -8,6 +8,7 @@
 
 use crate::backend::torrent_wants_download_slot;
 use crate::failover::{Candidates, Ladder, SegmentAttempt};
+use crate::AddOpts;
 use nzbd_nzb::ParsedNzb;
 use nzbd_state::{PendingAdmission, QueueSnapshotDoc, QUEUE_SCHEMA_VERSION};
 use nzbd_types::{
@@ -220,13 +221,20 @@ impl QueueState {
 
     // -- admission -----------------------------------------------------------
 
-    pub fn reserve_torrent_admission(&mut self, source: TorrentSource) -> JobId {
+    pub fn reserve_torrent_admission(&mut self, source: TorrentSource, opts: AddOpts) -> JobId {
         self.next_job_id += 1;
         let job_id = JobId(self.next_job_id);
         self.pending_admissions.push(PendingAdmission {
             job_id,
             source,
             secret_ref: nzbd_state::torrent_sources::PendingSourceStore::relative_ref(job_id),
+            category: opts.category,
+            priority: opts.priority,
+            paused: opts.paused,
+            seed_ratio_limit: opts.seed_ratio_limit,
+            seed_time_limit_secs: opts.seed_time_limit_secs,
+            params: opts.params,
+            client: opts.client,
         });
         job_id
     }
@@ -2793,7 +2801,7 @@ mod tests {
     #[test]
     fn torrent_pending_intent_is_structurally_replaced_and_live_hash_deduplicates() {
         let mut queue = QueueState::default();
-        let first = queue.reserve_torrent_admission(TorrentSource::Magnet);
+        let first = queue.reserve_torrent_admission(TorrentSource::Magnet, AddOpts::default());
         assert!(queue.jobs.is_empty());
         let record = TorrentRecord {
             info_hash_v1: "0123456789abcdef0123456789abcdef01234567".into(),
@@ -2834,7 +2842,7 @@ mod tests {
         assert!(queue.pending_admissions.is_empty());
         assert_eq!(queue.jobs[0].id, first);
 
-        let retry = queue.reserve_torrent_admission(TorrentSource::Url);
+        let retry = queue.reserve_torrent_admission(TorrentSource::Url, AddOpts::default());
         assert_eq!(
             queue.commit_torrent_admission(
                 retry,

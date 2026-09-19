@@ -128,6 +128,10 @@ impl TorrentAdmissionService {
             .insert(category, root);
     }
 
+    pub fn max_request_body_bytes(&self) -> usize {
+        self.source_fetch_limits.max_metainfo_bytes
+    }
+
     pub fn output_root(&self) -> &Path {
         self.session.output_root()
     }
@@ -147,7 +151,7 @@ impl TorrentAdmissionService {
     pub async fn admit_raw(
         &self,
         bytes: Vec<u8>,
-        opts: AddOpts,
+        mut opts: AddOpts,
     ) -> Result<AdmissionResult, AdmissionError> {
         self.finish(None, bytes, TorrentSource::Metainfo, opts)
             .await
@@ -173,7 +177,7 @@ impl TorrentAdmissionService {
         }
         let job = self
             .engine
-            .reserve_torrent_admission(source, secret.as_bytes().to_vec())
+            .reserve_torrent_admission(source, secret.as_bytes().to_vec(), opts.clone())
             .await?;
         let bytes = match source {
             TorrentSource::Magnet => self.session.resolve_magnet_metadata(secret).await?,
@@ -307,35 +311,50 @@ impl TorrentAdmissionService {
         }
 
         for pending in snapshot.pending_admissions {
-            let source_bytes = source_store.read(pending.job_id)?;
-            let bytes = match pending.source {
-                TorrentSource::Magnet => {
-                    self.session
-                        .resolve_magnet_metadata(
-                            String::from_utf8(source_bytes)
+            let opts = AddOpts {
+                category: pending.category.clone(),
+                priority: pending.priority,
+                paused: pending.paused,
+                seed_ratio_limit: pending.seed_ratio_limit,
+                seed_time_limit_secs: pending.seed_time_limit_secs,
+                params: pending.params.clone(),
+                client: pending.client.clone(),
+                ..Default::default()
+            };
+            let attempt: Result<AdmissionResult, AdmissionError> = async {
+                let source_bytes = source_store.read(pending.job_id)?;
+                let bytes = match pending.source {
+                    TorrentSource::Magnet => {
+                        self.session
+                            .resolve_magnet_metadata(
+                                String::from_utf8(source_bytes)
+                                    .map_err(|_| AdmissionError::Encoding)?,
+                            )
+                            .await?
+                    }
+                    TorrentSource::Url => {
+                        nzbd_torrent::fetch_torrent_source(
+                            &String::from_utf8(source_bytes)
                                 .map_err(|_| AdmissionError::Encoding)?,
+                            self.source_fetch_limits,
+                            self.proxy_enabled,
                         )
                         .await?
-                }
-                TorrentSource::Url => {
-                    nzbd_torrent::fetch_torrent_source(
-                        &String::from_utf8(source_bytes).map_err(|_| AdmissionError::Encoding)?,
-                        self.source_fetch_limits,
-                        self.proxy_enabled,
-                    )
-                    .await?
-                }
-                TorrentSource::Metainfo => source_bytes,
-            };
-            restored.push(
-                self.finish(
-                    Some(pending.job_id),
-                    bytes,
-                    pending.source,
-                    AddOpts::default(),
-                )
-                .await?,
-            );
+                    }
+                    TorrentSource::Metainfo => source_bytes,
+                };
+                self.finish(Some(pending.job_id), bytes, pending.source, opts)
+                    .await
+            }
+            .await;
+            match attempt {
+                Ok(result) => restored.push(result),
+                Err(_) => tracing::warn!(
+                    job = pending.job_id.0,
+                    source = ?pending.source,
+                    "pending torrent admission could not be recovered; it remains durable for a later retry"
+                ),
+            }
         }
         Ok(restored)
     }
@@ -351,8 +370,9 @@ impl TorrentAdmissionService {
         let registry = self.registry.clone();
         let associations = self.associations.clone();
         let upload_limit_bps = self.upload_limit_bps;
+        let engine = self.engine.clone();
         Ok(tokio::spawn(async move {
-            run_backend_executor(adapter, registry, associations, upload_limit_bps).await;
+            run_backend_executor(adapter, registry, associations, upload_limit_bps, engine).await;
         }))
     }
 
@@ -407,7 +427,7 @@ impl TorrentAdmissionService {
             Some(job) => job,
             None => {
                 self.engine
-                    .reserve_torrent_admission(TorrentSource::Metainfo, bytes.clone())
+                    .reserve_torrent_admission(TorrentSource::Metainfo, bytes.clone(), opts.clone())
                     .await?
             }
         };
@@ -416,10 +436,32 @@ impl TorrentAdmissionService {
             descriptor.info_hash_v1
         ));
         persist_descriptor(&self.state_dir.join(&relative), &bytes)?;
-        let category_policy = opts
-            .category
-            .as_ref()
-            .and_then(|category| self.category_seed_policies.get(category));
+        // Match qBittorrent/*arr category names case-insensitively while
+        // retaining the configured spelling in durable queue state.
+        if let Some(requested) = opts.category.as_deref() {
+            let canonical = self
+                .category_seed_policies
+                .keys()
+                .find(|name| name.eq_ignore_ascii_case(requested))
+                .cloned()
+                .or_else(|| {
+                    self.category_payload_roots
+                        .read()
+                        .unwrap()
+                        .keys()
+                        .find(|name| name.eq_ignore_ascii_case(requested))
+                        .cloned()
+                });
+            if let Some(canonical) = canonical {
+                opts.category = Some(canonical);
+            }
+        }
+        let category_policy = opts.category.as_ref().and_then(|category| {
+            self.category_seed_policies
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case(category))
+                .map(|(_, policy)| policy)
+        });
         let seed_policy = nzbd_engine::torrent_runtime::normalized_seed_policy(
             opts.seed_ratio_limit
                 .or_else(|| category_policy.and_then(|policy| policy.ratio_limit))
@@ -435,8 +477,9 @@ impl TorrentAdmissionService {
                 self.category_payload_roots
                     .read()
                     .unwrap()
-                    .get(category)
-                    .cloned()
+                    .iter()
+                    .find(|(name, _)| name.eq_ignore_ascii_case(category))
+                    .map(|(_, root)| root.clone())
             })
             .unwrap_or_else(|| self.session.output_root().to_path_buf());
         let record = TorrentRecord {
@@ -456,6 +499,7 @@ impl TorrentAdmissionService {
                     path: path.clone(),
                     length: *length,
                     selected: true,
+                    downloaded_bytes: 0,
                 })
                 .collect(),
             total_bytes: descriptor.total_bytes,
@@ -589,6 +633,7 @@ async fn run_backend_executor(
     registry: Arc<tokio::sync::Mutex<TorrentRegistry>>,
     associations: Arc<tokio::sync::Mutex<HashMap<JobId, Association>>>,
     upload_limit_bps: Option<u64>,
+    engine: EngineHandle,
 ) {
     enum Wake {
         Command(Option<BackendCommand>),
@@ -610,7 +655,7 @@ async fn run_backend_executor(
             Wake::Command(Some(command)) => command,
             Wake::Command(None) => break,
             Wake::Poll => {
-                publish_backend_state(&adapter, &registry, &associations).await;
+                publish_backend_state(&adapter, &registry, &associations, &engine).await;
                 continue;
             }
         };
@@ -702,7 +747,23 @@ async fn publish_backend_state(
     adapter: &BackendAdapterPort,
     registry: &Arc<tokio::sync::Mutex<TorrentRegistry>>,
     associations: &Arc<tokio::sync::Mutex<HashMap<JobId, Association>>>,
+    engine: &EngineHandle,
 ) {
+    let accepted_ready = engine
+        .snapshot()
+        .jobs
+        .iter()
+        .filter(|job| job.ready_at_unix.is_some())
+        .map(|job| job.id)
+        .collect::<std::collections::HashSet<_>>();
+    {
+        let mut associations = associations.lock().await;
+        for (job, association) in associations.iter_mut() {
+            if accepted_ready.contains(job) {
+                association.ready_emitted = true;
+            }
+        }
+    }
     let association_snapshot = associations.lock().await.clone();
     let samples = {
         let registry = registry.lock().await;
@@ -742,6 +803,17 @@ async fn publish_backend_state(
             let progress = nzbd_engine::backend::TransferProgress {
                 downloaded_bytes: stats.progress_bytes,
                 verified_bytes: stats.progress_bytes,
+                file_progress_bytes: association
+                    .files
+                    .iter()
+                    .map(|path| {
+                        stats
+                            .content_files
+                            .iter()
+                            .find(|file| &file.relative_path == path)
+                            .map_or(0, |file| file.progress_bytes.min(file.size_bytes))
+                    })
+                    .collect(),
                 uploaded_bytes,
                 download_bps: stats.download_bps,
                 upload_bps: stats.upload_bps,
@@ -767,24 +839,19 @@ async fn publish_backend_state(
                     .await
                     .ok()
                     .and_then(Result::ok);
-            let (fact, durable_ready) = match durable {
-                Some(content_path) => (BackendFact::Ready { job, content_path }, true),
-                None => (
-                    BackendFact::Stopped {
-                        job,
-                        reason: StopReason::MissingContent,
-                    },
-                    false,
-                ),
+            let fact = match durable {
+                Some(content_path) => BackendFact::Ready { job, content_path },
+                None => BackendFact::Stopped {
+                    job,
+                    reason: StopReason::MissingContent,
+                },
             };
             if adapter.structural(fact).await.is_err() {
                 return;
             }
-            if durable_ready {
-                if let Some(association) = associations.lock().await.get_mut(&job) {
-                    association.ready_emitted = true;
-                }
-            }
+            // The next poll observes the queue owner's durable ready stamp
+            // before latching this association. Until then, retrying Ready is
+            // intentional: channel delivery is not owner acceptance.
         }
 
         if let Some(error) = error {
@@ -860,7 +927,21 @@ async fn apply_remove(
             });
         };
         match validate_removal_payload(&content_path, &files, &allowed_roots) {
-            Ok(()) => RemovalOutcome::DataDeleted,
+            Ok(()) => {
+                let command_path = std::fs::canonicalize(&content_path).ok();
+                let owned_path = std::fs::canonicalize(&association.content_path).ok();
+                let command_files = files
+                    .iter()
+                    .map(|file| file.path.clone())
+                    .collect::<Vec<_>>();
+                if command_path != owned_path || command_files != association.files {
+                    return Some(BackendFact::Removed {
+                        job,
+                        outcome: RemovalOutcome::RefusedInventoryMismatch,
+                    });
+                }
+                RemovalOutcome::DataDeleted
+            }
             Err(RemovalRefusal::UnsafeRoot) => RemovalOutcome::RefusedUnsafeRoot,
             Err(RemovalRefusal::InventoryMismatch) => RemovalOutcome::RefusedInventoryMismatch,
         }
@@ -895,7 +976,13 @@ async fn apply_pause_resume(
     associations: &Arc<tokio::sync::Mutex<HashMap<JobId, Association>>>,
 ) -> Option<BackendFact> {
     let Some(association) = associations.lock().await.get(&job).cloned() else {
-        return Some(control_failure(job));
+        // The durable queue commit precedes managed-engine association. A
+        // scheduler Start can cross that narrow boundary, so keep it
+        // retryable rather than terminally failing a valid admission.
+        return Some(BackendFact::Stopped {
+            job,
+            reason: StopReason::Transient,
+        });
     };
     if association.applied_pause == Some(pause) {
         return None;
@@ -972,8 +1059,12 @@ struct TypedSource {
 }
 
 pub fn router(service: TorrentAdmissionService) -> Router {
+    let body_limit = service.max_request_body_bytes().saturating_add(64 * 1024);
     Router::new()
-        .route("/api/v1/jobs", axum::routing::post(post_job))
+        .route(
+            "/api/v1/jobs",
+            axum::routing::post(post_job).layer(axum::extract::DefaultBodyLimit::max(body_limit)),
+        )
         .with_state(service)
 }
 
@@ -1012,6 +1103,13 @@ impl TorrentAdmissionService {
             "application/x-bittorrent" => self.admit_raw(body.to_vec(), raw_options).await,
             "application/json" => match serde_json::from_slice::<TypedRequest>(&body) {
                 Ok(request) => {
+                    if request.params.keys().any(|key| key.starts_with('*')) {
+                        return (
+                            StatusCode::UNPROCESSABLE_ENTITY,
+                            Json(json!({"error":"parameter keys starting with '*' are reserved"})),
+                        )
+                            .into_response();
+                    }
                     let source = match request.source.kind.as_str() {
                         "magnet" => TorrentSource::Magnet,
                         "torrent_url" => TorrentSource::Url,
@@ -1236,11 +1334,21 @@ mod tests {
             },
         )])));
         let (mut owner, adapter) = backend_channel(8, 8);
+        let engine = Engine::spawn(EngineConfig::single_node(
+            vec![],
+            tmp.path().join("executor-state"),
+            tmp.path().join("executor-dest"),
+            Tuning::default(),
+            None,
+        ))
+        .await
+        .unwrap();
         let executor = tokio::spawn(run_backend_executor(
             adapter,
             registry.clone(),
             associations,
             None,
+            engine.clone(),
         ));
 
         owner
@@ -1295,6 +1403,7 @@ mod tests {
 
         drop(owner);
         executor.await.unwrap();
+        engine.shutdown().await;
         session.stop().await;
     }
 
@@ -1489,7 +1598,7 @@ mod tests {
         let state = tmp.path().join("state");
         let secret = format!("http://{address}/source?passkey=restart-secret");
         let job = engine
-            .reserve_torrent_admission(TorrentSource::Url, secret.into_bytes())
+            .reserve_torrent_admission(TorrentSource::Url, secret.into_bytes(), AddOpts::default())
             .await
             .unwrap();
         let store = PendingSourceStore::open(&state).unwrap();

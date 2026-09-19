@@ -422,11 +422,13 @@ impl EngineHandle {
         &self,
         source: nzbd_types::TorrentSource,
         secret: Vec<u8>,
+        opts: AddOpts,
     ) -> Result<JobId, EngineError> {
         let (tx, rx) = oneshot::channel();
         self.send(QueueCommand::ReserveTorrentAdmission {
             source,
             secret,
+            opts,
             reply: tx,
         })
         .await?;

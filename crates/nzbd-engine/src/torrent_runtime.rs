@@ -351,17 +351,30 @@ pub fn reconcile_progress(job: &mut Job, progress: &TransferProgress) -> Reconci
     let Some(torrent) = torrent_mut(job) else {
         return ReconcileOutcome::default();
     };
-    // Only verified bytes are a trusted restart checkpoint. Downloaded bytes
-    // may include an incomplete piece that must be checked again.
-    let downloaded = progress.verified_bytes.min(torrent.selected_bytes);
+    // Only verified bytes are a trusted restart checkpoint. Keep the durable
+    // checkpoint monotonic: an engine may report zero while rechecking a
+    // restored payload, and regressing here would charge those local bytes to
+    // download quota a second time as verification catches back up.
+    let downloaded = torrent
+        .downloaded_bytes
+        .max(progress.verified_bytes.min(torrent.selected_bytes));
     let uploaded = torrent.uploaded_bytes.max(progress.uploaded_bytes);
     let activity = match (torrent.last_activity_unix, progress.last_activity_unix) {
         (Some(old), Some(new)) => Some(old.max(new)),
         (old, new) => old.or(new),
     };
+    let mut files_changed = false;
+    for (file, verified) in torrent.files.iter_mut().zip(&progress.file_progress_bytes) {
+        let verified = (*verified).min(file.length);
+        if verified > file.downloaded_bytes {
+            file.downloaded_bytes = verified;
+            files_changed = true;
+        }
+    }
     let changed = torrent.downloaded_bytes != downloaded
         || torrent.uploaded_bytes != uploaded
-        || torrent.last_activity_unix != activity;
+        || torrent.last_activity_unix != activity
+        || files_changed;
     torrent.downloaded_bytes = downloaded;
     torrent.uploaded_bytes = uploaded;
     torrent.last_activity_unix = activity;
@@ -380,6 +393,25 @@ pub fn reconcile_fact(
     latest: Option<&TransferProgress>,
     now_unix: i64,
     torrent_root: &Path,
+) -> ReconcileOutcome {
+    reconcile_fact_with_roots(
+        job,
+        fact,
+        latest,
+        now_unix,
+        std::slice::from_ref(&torrent_root.to_path_buf()),
+    )
+}
+
+/// Fold a structural backend fact while accepting every configured payload
+/// root. Category-specific roots are equal storage boundaries, not children
+/// of the default root.
+pub fn reconcile_fact_with_roots(
+    job: &mut Job,
+    fact: BackendFact,
+    latest: Option<&TransferProgress>,
+    now_unix: i64,
+    torrent_roots: &[PathBuf],
 ) -> ReconcileOutcome {
     if fact_job(&fact) != job.id {
         return ReconcileOutcome::default();
@@ -416,7 +448,10 @@ pub fn reconcile_fact(
             }
         }
         BackendFact::Ready { content_path, .. } => {
-            if !payload_is_within_root(&content_path, torrent_root) {
+            if !torrent_roots
+                .iter()
+                .any(|root| payload_is_within_root(&content_path, root))
+            {
                 return ReconcileOutcome::default();
             }
             let torrent = job.torrent.as_mut().unwrap();
@@ -425,6 +460,11 @@ pub fn reconcile_fact(
                 return ReconcileOutcome::default();
             }
             torrent.downloaded_bytes = torrent.selected_bytes;
+            for file in &mut torrent.files {
+                if file.selected {
+                    file.downloaded_bytes = file.length;
+                }
+            }
             torrent.ready_at_unix.get_or_insert(now_unix);
             torrent.content_path = Some(content_path);
             torrent.phase = if job.status == JobStatus::Paused {
@@ -672,11 +712,13 @@ mod tests {
                         path: "one".into(),
                         length: 1,
                         selected: true,
+                        downloaded_bytes: 1,
                     },
                     TorrentFileRecord {
                         path: "two".into(),
                         length: 1,
                         selected: false,
+                        downloaded_bytes: 0,
                     },
                 ],
                 total_bytes: 2,
@@ -1026,6 +1068,7 @@ mod tests {
         let progress = TransferProgress {
             downloaded_bytes: 1,
             verified_bytes: 1,
+            file_progress_bytes: vec![1, 0],
             uploaded_bytes: 7,
             download_bps: 900,
             upload_bps: 800,
@@ -1139,6 +1182,9 @@ mod tests {
                 ..Default::default()
             },
         );
+        assert_eq!(record.torrent.as_ref().unwrap().downloaded_bytes, 64);
+
+        reconcile_progress(&mut record, &TransferProgress::default());
         assert_eq!(record.torrent.as_ref().unwrap().downloaded_bytes, 64);
 
         let observed = HashMap::from([(
@@ -1331,7 +1377,8 @@ mod tests {
                 &[TorrentFileRecord {
                     path: "owned.bin".into(),
                     length: 5,
-                    selected: true
+                    selected: true,
+                    downloaded_bytes: 5,
                 }],
                 std::slice::from_ref(&root),
             ),
@@ -1343,7 +1390,8 @@ mod tests {
                 &[TorrentFileRecord {
                     path: "../sibling.bin".into(),
                     length: 1,
-                    selected: true
+                    selected: true,
+                    downloaded_bytes: 0,
                 }],
                 std::slice::from_ref(&root),
             ),

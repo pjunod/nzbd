@@ -814,6 +814,12 @@ fn run(
                     category_payload_roots.insert(category.name.clone(), std::fs::canonicalize(root)?);
                 }
             }
+            for (name, root) in nzbd_qbit_compat::load_overlay_category_roots(
+                &cfg.state_dir(),
+                &cfg.torrent_dir(),
+            ) {
+                category_payload_roots.entry(name).or_insert(root);
+            }
             let upload_limit_bps = (cfg.torrent.upload_limit_kib > 0)
                 .then_some(cfg.torrent.upload_limit_kib * 1024);
             let service = nzbd_api::torrent_admission::TorrentAdmissionService::new(
@@ -958,7 +964,7 @@ fn run(
                         .torrent_dir
                         .as_ref()
                         .map(|path| nzbd_config::expand_home(path))
-                        .unwrap_or_else(|| cfg.torrent_dir().join(&category.name));
+                        .unwrap_or_else(|| cfg.torrent_dir());
                     (category.name.clone(), path)
                 })
                 .collect();

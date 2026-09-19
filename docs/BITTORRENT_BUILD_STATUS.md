@@ -8,7 +8,7 @@ architecture and acceptance contract. This page records execution progress for
 the consolidated implementation branch. It is not an operator guide and does
 not authorize production use by itself.
 
-## Current position — single-node runtime active, native surfaces in progress
+## Current position — adversarial findings resolved, qualification pending
 
 | Workstream | State | Next observable result |
 |---|---|---|
@@ -20,7 +20,7 @@ not authorize production use by itself.
 | M2j daemon activation | implemented, unqualified | One configured session owns admission, recovery, watch ingestion, shutdown, and disabled-mode refusal |
 | M3 native web/mobile surface | implemented, unqualified | Typed add, detail/export/files/metrics, web controls, mobile file/magnet add, and torrent status are wired |
 | M4 Sonarr/Radarr compatibility | implemented, unqualified | Web API 2.8.1 routes, Bearer/Basic/SID auth, per-IP login limiting, durable categories, projections, and mutations are wired |
-| M5 release evidence | building | Documentation and policy checks reflect activation; adversarial review and one fast-lane qualification remain |
+| M5 release evidence | qualifying | Adversarial review completed and all 13 findings were addressed; one fast-lane qualification remains |
 
 ## Working rules — one consolidated review and qualification pass
 
@@ -60,3 +60,4 @@ not authorize production use by itself.
 | 2026-09-19 | Added category-root recovery containment and removed the obsolete Cargo feature flag | Persisted payloads restore only under the configured default or category roots |
 | 2026-09-19 | Added native web/mobile torrent workflows and observability | Dedicated detail/export/files, metrics, mobile file/magnet admission, and explicit payload deletion are present |
 | 2026-09-19 | Added the narrow qBittorrent Web API 2.8.1 projection | Required *arr routes use queue-owner mutations; category overlays persist without rewriting config |
+| 2026-09-19 | Completed adversarial review and addressed every finding | Fixed readiness acknowledgement/order, deletion ownership, pending recovery isolation and intent, authoritative category roots, request limits, quota high-water accounting, qBittorrent durability/sentinels, native web/mobile correctness, and stale CI feature invocations |

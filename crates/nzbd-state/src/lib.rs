@@ -378,11 +378,25 @@ impl Default for QueueSnapshotDoc {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PendingAdmission {
     pub job_id: JobId,
     pub source: TorrentSource,
     pub secret_ref: PathBuf,
+    #[serde(default)]
+    pub category: Option<String>,
+    #[serde(default)]
+    pub priority: i32,
+    #[serde(default)]
+    pub paused: bool,
+    #[serde(default)]
+    pub seed_ratio_limit: Option<f64>,
+    #[serde(default)]
+    pub seed_time_limit_secs: Option<u64>,
+    #[serde(default)]
+    pub params: Vec<(String, String)>,
+    #[serde(default)]
+    pub client: Option<String>,
 }
 
 /// Read only when the typed queue document fails. Unknown fields — including
@@ -973,6 +987,13 @@ mod tests {
             job_id: JobId(7),
             source: nzbd_types::TorrentSource::Magnet,
             secret_ref: "torrents/pending/7.source".into(),
+            category: Some("tv".into()),
+            priority: 10,
+            paused: true,
+            seed_ratio_limit: Some(1.5),
+            seed_time_limit_secs: Some(3_600),
+            params: vec![("source".into(), "test".into())],
+            client: Some("Sonarr".into()),
         };
         store
             .save(&QueueSnapshotDoc {
@@ -1012,6 +1033,7 @@ mod tests {
                 path: "payload.bin".into(),
                 length: 42,
                 selected: true,
+                downloaded_bytes: 0,
             }],
             total_bytes: 42,
             selected_bytes: 42,

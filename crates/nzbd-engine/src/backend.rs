@@ -100,6 +100,8 @@ pub enum BackendCommand {
 pub struct TransferProgress {
     pub downloaded_bytes: u64,
     pub verified_bytes: u64,
+    /// Hash-verified content-file bytes in the persisted inventory order.
+    pub file_progress_bytes: Vec<u64>,
     pub uploaded_bytes: u64,
     pub download_bps: u64,
     pub upload_bps: u64,

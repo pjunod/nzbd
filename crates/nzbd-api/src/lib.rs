@@ -741,7 +741,7 @@ async fn get_job_files(State(st): State<ApiState>, Path(id): Path<u32>) -> Respo
                             "id": index,
                             "filename": file.path,
                             "size_bytes": file.length,
-                            "downloaded_bytes": if torrent.ready_at_unix.is_some() && file.selected { file.length } else { 0 },
+                            "downloaded_bytes": file.downloaded_bytes,
                             "selected": file.selected,
                             "verified": torrent.ready_at_unix.is_some() && file.selected,
                         })
@@ -1736,7 +1736,9 @@ async fn metrics(State(st): State<ApiState>) -> Response {
             .map(|job| job.upload_rate_bps)
             .sum::<u64>()
     );
-    let _ = writeln!(m, "# TYPE nzbd_torrent_uploaded_bytes counter");
+    // This is the sum across jobs currently retained by the queue and can
+    // decrease when history is removed, so it is intentionally a gauge.
+    let _ = writeln!(m, "# TYPE nzbd_torrent_uploaded_bytes gauge");
     let _ = writeln!(
         m,
         "nzbd_torrent_uploaded_bytes {}",
@@ -2504,6 +2506,35 @@ async fn history_action(
     if action == "requeue" {
         return history_requeue(&st, db, job).await;
     }
+    if action == "delete-files" {
+        let lookup = db.clone();
+        let entry = tokio::task::spawn_blocking(move || {
+            lookup
+                .list_filtered(10_000, true)
+                .ok()
+                .and_then(|entries| entries.into_iter().find(|entry| entry.job == job))
+        })
+        .await
+        .ok()
+        .flatten();
+        if let Some(torrent) = entry.as_ref().and_then(|entry| entry.torrent.as_ref()) {
+            if torrent.payload == nzbd_types::TorrentPayloadDisposition::Retained {
+                return error(
+                    StatusCode::CONFLICT,
+                    "retained torrent payloads must be removed from the live torrent workflow, where the owned file inventory can be verified",
+                );
+            }
+            // The backend already confirmed deletion before history was
+            // written. Remove only the record; never recurse through a
+            // persisted torrent path after the live ownership proof is gone.
+            let deleted = tokio::task::spawn_blocking(move || db.delete(job)).await;
+            return match deleted {
+                Ok(Ok(true)) => Json(json!({ "ok": true, "files_removed": false })).into_response(),
+                Ok(Ok(false)) => not_found(),
+                _ => error(StatusCode::INTERNAL_SERVER_ERROR, "history store error"),
+            };
+        }
+    }
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
@@ -2564,9 +2595,17 @@ pub fn router_with(state: ApiState) -> Router {
         ..state
     };
     let clients = state.clients.clone();
+    let upload_body_limit = state.torrent.as_ref().map_or(2 * 1024 * 1024, |torrent| {
+        torrent.max_request_body_bytes().saturating_add(64 * 1024)
+    });
     Router::new()
         .route("/api/v1/status", get(get_status))
-        .route("/api/v1/jobs", get(list_jobs).post(add_job))
+        .route(
+            "/api/v1/jobs",
+            get(list_jobs)
+                .post(add_job)
+                .layer(axum::extract::DefaultBodyLimit::max(upload_body_limit)),
+        )
         .route("/api/v1/jobs/{id}", get(get_job))
         .route("/api/v1/jobs/{id}/priority", put(set_job_priority))
         .route("/api/v1/jobs/{id}/files", get(get_job_files))

@@ -867,6 +867,7 @@ function AddNzbModal({
       return;
     }
     setAsset(selected);
+    setTorrentSource('');
     setName(selected.name.replace(/\.(nzb|torrent)$/i, ''));
   };
 

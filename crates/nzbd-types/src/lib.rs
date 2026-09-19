@@ -128,6 +128,9 @@ pub struct TorrentFileRecord {
     pub path: PathBuf,
     pub length: u64,
     pub selected: bool,
+    /// Hash-verified bytes retained as an advisory per-file checkpoint.
+    #[serde(default)]
+    pub downloaded_bytes: u64,
 }
 
 /// Queue-owned BitTorrent control state. Engine resume data (piece maps,

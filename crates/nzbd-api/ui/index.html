@@ -1881,8 +1881,7 @@ function buildDetailRow(d) {
   d.style(spacer, "flex", "1");
   c.nzb = d.append(head, d.create("a", "btnlike"));
   d.attr(c.nzb, "download", "");
-  d.text(c.nzb, "download nzb");
-  d.prop(c.nzb, "title", "Download this job's NZB (regenerated from queue state — everything needed to re-add it anywhere).");
+  d.text(c.nzb, "download source");
   c.close = d.append(head, d.create("button", "small"));
   d.data(c.close, "action", "detail-close");
   d.text(c.close, "close");
@@ -2025,6 +2024,7 @@ function recoveryMax(j) {
 }
 
 function detailModel(j, nowMs) {
+  const torrent = j.kind === "torrent";
   const postStage = currentPostStage(j);
   const st = statusName(j.status, postStage);
   const cls = postStage != null || typeof j.status !== "string"
@@ -2042,12 +2042,17 @@ function detailModel(j, nowMs) {
     key: "__detail", kind: "detail", id: j.id, name: j.name, scope: "queue",
     pipe: pipelineModels(j, nowMs),
     st: statusLabel(j.status, postStage, j.ready).toUpperCase(), stCls: "st " + cls,
-    articles: "articles " + j.done_articles + "/" + j.total_articles +
+    articles: torrent ? "" : "articles " + j.done_articles + "/" + j.total_articles +
       (j.failed_articles ? " · " + j.failed_articles + " failed" : "") +
       (j.retried_articles ? " · " + j.retried_articles + " retried" : ""),
-    health: "health " + (j.health / 10).toFixed(1) + "%",
+    health: torrent ? "ratio " + Number(j.ratio || 0).toFixed(2) + "×" :
+      "health " + (j.health / 10).toFixed(1) + "%",
     dupe: j.dupe_key ? "dupe: " + j.dupe_key : "",
-    nzbHref: "/api/v1/jobs/" + j.id + "/nzb",
+    nzbHref: "/api/v1/jobs/" + j.id + (torrent ? "/torrent-file" : "/nzb"),
+    sourceLabel: torrent ? "download torrent" : "download nzb",
+    sourceTitle: torrent
+      ? "Download this job's retained .torrent metainfo."
+      : "Download this job's NZB regenerated from queue state.",
     nzbHidden: false,
     closeHidden: false,
     recoverHidden: !recoverMax,
@@ -2058,7 +2063,7 @@ function detailModel(j, nowMs) {
     metaOriginal: "", metaDestination: "",
     // Open: you opened a live job to watch its files fill in.
     filesOpen: true,
-    files: files ? files.map(fileModel) : null,
+    files: files ? files.map(torrent ? torrentFileModel : fileModel) : null,
     filesEmptyText: "no files yet",
     logs: logs,
   };
@@ -2104,6 +2109,22 @@ function fileModel(x) {
   };
 }
 
+function torrentFileModel(x) {
+  const size = Number(x.size_bytes || 0);
+  const downloaded = Math.min(size, Number(x.downloaded_bytes || 0));
+  const pct = size ? Math.floor(downloaded * 100 / size) : 0;
+  const state = !x.selected ? "SKIPPED" : x.verified ? "VERIFIED" : pct + "%";
+  return {
+    key: "tf" + x.id, kind: "file",
+    name: x.filename,
+    size: fmtBytes(size),
+    seg: fmtBytes(downloaded) + "/" + fmtBytes(size),
+    failed: "",
+    state,
+    stateCls: "st " + (x.verified ? "ok" : x.selected ? "dim" : "warn"),
+  };
+}
+
 function buildActivityRow(d) {
   return d.create("div", "lg");
 }
@@ -2137,6 +2158,8 @@ function applyDetail(tr, m, d) {
   metric("health", m.health);
   metric("dupe", m.dupe);
   w("nzbHref", m.nzbHref || "", v => d.attr(c.nzb, "href", v));
+  w("sourceLabel", m.sourceLabel || "download source", v => d.text(c.nzb, v));
+  w("sourceTitle", m.sourceTitle || "", v => d.prop(c.nzb, "title", v));
   // History has no NZB endpoint of its own — a parked NZB is reachable
   // only through requeue — so the button is absent rather than broken.
   w("nzbHidden", !!m.nzbHidden, v => d.prop(c.nzb, "hidden", v));
