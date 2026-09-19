@@ -48,6 +48,13 @@ pub struct JobSummary {
     /// is set only after selected payload bytes pass piece verification.
     pub ready: bool,
     pub ready_at_unix: Option<i64>,
+    /// Torrent-only transfer facts. Zero for Usenet jobs, preserving the
+    /// existing mixed queue shape without a parallel endpoint.
+    pub uploaded_bytes: u64,
+    pub upload_rate_bps: u64,
+    pub ratio: f64,
+    pub seeding_seconds: u64,
+    pub useful_peers: u32,
     /// Duplicate-detection metadata (empty key = no dupe tracking).
     pub dupe_key: String,
     pub dupe_score: i32,

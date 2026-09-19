@@ -12,7 +12,6 @@ use base64::Engine as _;
 
 pub mod eventhub;
 pub mod logbuf;
-#[cfg(feature = "torrent-admission")]
 pub mod torrent_admission;
 pub mod version;
 pub use eventhub::{EventHub, Replay};
@@ -30,6 +29,8 @@ use tokio_stream::StreamExt as _;
 #[derive(Clone)]
 pub struct ApiState {
     pub engine: EngineHandle,
+    /// Present only when the daemon started the single-node torrent session.
+    pub torrent: Option<torrent_admission::TorrentAdmissionService>,
     pub history: Option<Arc<HistoryDb>>,
     pub log: Option<Arc<LogBuffer>>,
     /// First-run setup mode: present when the daemon booted with a
@@ -706,6 +707,19 @@ async fn list_jobs(State(st): State<ApiState>) -> Response {
 async fn get_job(State(st): State<ApiState>, Path(id): Path<u32>) -> Response {
     let snap = st.engine.snapshot();
     match snap.jobs.iter().find(|j| j.id == JobId(id)) {
+        Some(job) if job.kind == nzbd_types::JobKind::Torrent => {
+            match st.engine.export_job(JobId(id)).await {
+                Ok(Some(record)) => {
+                    let mut value = serde_json::to_value(job).unwrap_or_else(|_| json!({}));
+                    if let Some(object) = value.as_object_mut() {
+                        object.insert("torrent".into(), json!(record.torrent));
+                    }
+                    Json(value).into_response()
+                }
+                Ok(None) => not_found(),
+                Err(err) => error(StatusCode::SERVICE_UNAVAILABLE, &err.to_string()),
+            }
+        }
         Some(job) => Json(job.clone()).into_response(),
         None => not_found(),
     }
@@ -717,6 +731,25 @@ async fn get_job_files(State(st): State<ApiState>, Path(id): Path<u32>) -> Respo
     use nzbd_types::SegmentState;
     match st.engine.export_job(JobId(id)).await {
         Ok(Some(job)) => {
+            if let Some(torrent) = &job.torrent {
+                let files = torrent
+                    .files
+                    .iter()
+                    .enumerate()
+                    .map(|(index, file)| {
+                        json!({
+                            "id": index,
+                            "filename": file.path,
+                            "size_bytes": file.length,
+                            "downloaded_bytes": file.downloaded_bytes,
+                            "selected": file.selected,
+                            "verified": torrent.ready_at_unix.is_some() && file.selected,
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                return Json(json!({ "job": job.id.0, "name": job.name, "files": files }))
+                    .into_response();
+            }
             let files: Vec<serde_json::Value> = job
                 .files
                 .iter()
@@ -753,6 +786,51 @@ async fn get_job_files(State(st): State<ApiState>, Path(id): Path<u32>) -> Respo
         }
         Ok(None) => not_found(),
         Err(e) => error(StatusCode::SERVICE_UNAVAILABLE, &e.to_string()),
+    }
+}
+
+async fn get_job_torrent(State(st): State<ApiState>, Path(id): Path<u32>) -> Response {
+    match st.engine.export_job(JobId(id)).await {
+        Ok(Some(job)) => match job.torrent {
+            Some(torrent) => Json(json!({
+                "job": id,
+                "info_hash_v1": torrent.info_hash_v1,
+                "phase": torrent.phase,
+                "content_path": torrent.content_path,
+                "selected_bytes": torrent.selected_bytes,
+                "downloaded_bytes": torrent.downloaded_bytes,
+                "uploaded_bytes": torrent.uploaded_bytes,
+                "ratio": if torrent.selected_bytes == 0 { 0.0 } else { torrent.uploaded_bytes as f64 / torrent.selected_bytes as f64 },
+                "seeding_seconds": torrent.seeding_seconds,
+                "seed_ratio_limit": torrent.seed_policy.ratio_limit,
+                "seed_time_limit_secs": torrent.seed_policy.time_limit_secs,
+                "ready_at_unix": torrent.ready_at_unix,
+                "last_activity_unix": torrent.last_activity_unix,
+                "last_error": torrent.last_error,
+            }))
+            .into_response(),
+            None => not_found(),
+        },
+        Ok(None) => not_found(),
+        Err(_) => error(StatusCode::SERVICE_UNAVAILABLE, "queue owner unavailable"),
+    }
+}
+
+async fn get_job_torrent_file(State(st): State<ApiState>, Path(id): Path<u32>) -> Response {
+    let Some(service) = &st.torrent else {
+        return error(StatusCode::SERVICE_UNAVAILABLE, "BitTorrent is disabled");
+    };
+    match service.export_metainfo(JobId(id)).await {
+        Ok(Some(bytes)) => (
+            [
+                (axum::http::header::CONTENT_TYPE, "application/x-bittorrent"),
+                (axum::http::header::CACHE_CONTROL, "no-store"),
+            ],
+            bytes,
+        )
+            .into_response(),
+        Ok(None) => not_found(),
+        Err(_) => error(StatusCode::INTERNAL_SERVER_ERROR, "torrent export failed"),
     }
 }
 
@@ -858,6 +936,34 @@ async fn add_job(
     headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
+    let content_type = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .unwrap_or("");
+    if matches!(
+        content_type,
+        "application/x-bittorrent" | "application/json"
+    ) {
+        let Some(torrent) = &st.torrent else {
+            return error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "BitTorrent is disabled in this daemon configuration",
+            );
+        };
+        return torrent
+            .handle_http_post_with_options(
+                headers,
+                body,
+                nzbd_engine::AddOpts {
+                    category: q.category,
+                    priority: q.priority.unwrap_or(0),
+                    paused: q.paused.unwrap_or(false),
+                    ..Default::default()
+                },
+            )
+            .await;
+    }
     let name = q.name.unwrap_or_default();
     let params = match q.params.as_deref().map(parse_add_params).transpose() {
         Ok(p) => p.unwrap_or_default(),
@@ -876,6 +982,7 @@ async fn add_job(
         // Who asked. Only used when the job's own documents name it
         // nothing — see `queue::requestor_name`.
         client: consumer_name(&headers).or_else(|| client_name(&headers)),
+        ..Default::default()
     };
     if let Some(url) = &q.url {
         return match st.engine.add_url(&name, url, opts).await {
@@ -1613,6 +1720,42 @@ async fn metrics(State(st): State<ApiState>) -> Response {
     for (k, v) in by_status {
         let _ = writeln!(m, "nzbd_jobs{{status=\"{k}\"}} {v}");
     }
+    let torrent_jobs = snap
+        .jobs
+        .iter()
+        .filter(|job| job.kind == nzbd_types::JobKind::Torrent)
+        .collect::<Vec<_>>();
+    let _ = writeln!(m, "# TYPE nzbd_torrent_jobs gauge");
+    let _ = writeln!(m, "nzbd_torrent_jobs {}", torrent_jobs.len());
+    let _ = writeln!(m, "# TYPE nzbd_torrent_upload_rate_bytes_per_second gauge");
+    let _ = writeln!(
+        m,
+        "nzbd_torrent_upload_rate_bytes_per_second {}",
+        torrent_jobs
+            .iter()
+            .map(|job| job.upload_rate_bps)
+            .sum::<u64>()
+    );
+    // This is the sum across jobs currently retained by the queue and can
+    // decrease when history is removed, so it is intentionally a gauge.
+    let _ = writeln!(m, "# TYPE nzbd_torrent_uploaded_bytes gauge");
+    let _ = writeln!(
+        m,
+        "nzbd_torrent_uploaded_bytes {}",
+        torrent_jobs
+            .iter()
+            .map(|job| job.uploaded_bytes)
+            .sum::<u64>()
+    );
+    let _ = writeln!(m, "# TYPE nzbd_torrent_useful_peers gauge");
+    let _ = writeln!(
+        m,
+        "nzbd_torrent_useful_peers {}",
+        torrent_jobs
+            .iter()
+            .map(|job| u64::from(job.useful_peers))
+            .sum::<u64>()
+    );
     let _ = writeln!(m, "# TYPE nzbd_up_since_seconds gauge");
     let _ = writeln!(m, "nzbd_up_since_seconds {}", snap.up_since_unix);
     // Integration observability: is the event stream actually producing,
@@ -1773,6 +1916,14 @@ async fn get_history(
                     let mut v = serde_json::to_value(&e).unwrap_or_else(|_| json!({}));
                     if let Some(o) = v.as_object_mut() {
                         o.insert("can_requeue".into(), json!(can));
+                        o.insert(
+                            "kind".into(),
+                            json!(e
+                                .record
+                                .as_ref()
+                                .map(|record| record.kind)
+                                .unwrap_or(nzbd_types::JobKind::Nzb)),
+                        );
                     }
                     v
                 })
@@ -1854,6 +2005,7 @@ fn error(code: StatusCode, msg: &str) -> Response {
 pub fn router(engine: EngineHandle) -> Router {
     router_with(ApiState {
         engine,
+        torrent: None,
         history: None,
         log: None,
         setup: None,
@@ -2190,6 +2342,11 @@ async fn put_config(
             .set_max_active_downloads(new_cfg.queue.max_active_downloads)
             .await;
     }
+    if live.contains(&"torrent upload limit") {
+        let bps = (new_cfg.torrent.upload_limit_kib > 0)
+            .then_some(new_cfg.torrent.upload_limit_kib * 1024);
+        let _ = st.engine.set_torrent_upload_limit(bps).await;
+    }
     // Connection counts: applied live, but only down to the number of
     // sockets that exist. Asking for more than a server spawned at boot
     // writes to the file and takes effect on the next start — and says
@@ -2310,6 +2467,7 @@ async fn history_requeue(st: &ApiState, db: Arc<HistoryDb>, job: JobId) -> Respo
             .filter(|(k, _)| !k.starts_with('*'))
             .cloned()
             .collect(),
+        ..Default::default()
     };
     let added = match (&nzb, &url) {
         (Some(bytes), _) => st.engine.add_nzb_opts(&entry.name, bytes, opts).await,
@@ -2347,6 +2505,39 @@ async fn history_action(
     let job = JobId(id);
     if action == "requeue" {
         return history_requeue(&st, db, job).await;
+    }
+    if action == "delete-files" {
+        let lookup = db.clone();
+        let entry = tokio::task::spawn_blocking(move || {
+            lookup
+                .list_filtered(10_000, true)
+                .ok()
+                .and_then(|entries| entries.into_iter().find(|entry| entry.job == job))
+        })
+        .await
+        .ok()
+        .flatten();
+        if let Some(torrent) = entry
+            .as_ref()
+            .and_then(|entry| entry.record.as_ref())
+            .and_then(|record| record.torrent.as_ref())
+        {
+            if torrent.payload == nzbd_types::TorrentPayloadDisposition::Retained {
+                return error(
+                    StatusCode::CONFLICT,
+                    "retained torrent payloads must be removed from the live torrent workflow, where the owned file inventory can be verified",
+                );
+            }
+            // The backend already confirmed deletion before history was
+            // written. Remove only the record; never recurse through a
+            // persisted torrent path after the live ownership proof is gone.
+            let deleted = tokio::task::spawn_blocking(move || db.delete(job)).await;
+            return match deleted {
+                Ok(Ok(true)) => Json(json!({ "ok": true, "files_removed": false })).into_response(),
+                Ok(Ok(false)) => not_found(),
+                _ => error(StatusCode::INTERNAL_SERVER_ERROR, "history store error"),
+            };
+        }
     }
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -2408,12 +2599,22 @@ pub fn router_with(state: ApiState) -> Router {
         ..state
     };
     let clients = state.clients.clone();
+    let upload_body_limit = state.torrent.as_ref().map_or(2 * 1024 * 1024, |torrent| {
+        torrent.max_request_body_bytes().saturating_add(64 * 1024)
+    });
     Router::new()
         .route("/api/v1/status", get(get_status))
-        .route("/api/v1/jobs", get(list_jobs).post(add_job))
+        .route(
+            "/api/v1/jobs",
+            get(list_jobs)
+                .post(add_job)
+                .layer(axum::extract::DefaultBodyLimit::max(upload_body_limit)),
+        )
         .route("/api/v1/jobs/{id}", get(get_job))
         .route("/api/v1/jobs/{id}/priority", put(set_job_priority))
         .route("/api/v1/jobs/{id}/files", get(get_job_files))
+        .route("/api/v1/jobs/{id}/torrent", get(get_job_torrent))
+        .route("/api/v1/jobs/{id}/torrent-file", get(get_job_torrent_file))
         .route("/api/v1/jobs/{id}/nzb", get(get_job_nzb))
         .route("/api/v1/jobs/{id}/actions/{action}", post(job_action))
         .route("/api/v1/queue/actions/{action}", post(queue_action))
@@ -2501,7 +2702,7 @@ mod tests {
 </file></nzb>"#;
 
     #[tokio::test]
-    async fn production_router_keeps_torrent_admission_unmounted_without_side_effects() {
+    async fn disabled_router_rejects_torrent_admission_without_side_effects() {
         let tmp = tempfile::tempdir().unwrap();
         let engine = test_engine(&tmp).await;
         let response = router(engine.clone())
@@ -2515,7 +2716,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert!(engine.snapshot().jobs.is_empty());
         let store =
             nzbd_state::torrent_sources::PendingSourceStore::open(&tmp.path().join("state"))
@@ -2549,6 +2750,11 @@ mod tests {
             pp_done: false,
             ready: false,
             ready_at_unix: None,
+            uploaded_bytes: 0,
+            upload_rate_bps: 0,
+            ratio: 0.0,
+            seeding_seconds: 0,
+            useful_peers: 0,
             dupe_key: String::new(),
             dupe_score: 0,
             params: vec![],
@@ -2797,6 +3003,7 @@ mod tests {
             Arc::new(HistoryDb::open(&tmp.path().join("history.sqlite"), Some(&shared)).unwrap());
         let app = router_with(ApiState {
             engine: engine.clone(),
+            torrent: None,
             history: Some(db.clone()),
             log: None,
             setup: None,
@@ -3373,6 +3580,7 @@ mod tests {
         }
         let app = router_with(ApiState {
             engine: engine.clone(),
+            torrent: None,
             history: Some(db.clone()),
             log: None,
             setup: None,
@@ -3467,6 +3675,7 @@ mod tests {
         let log = LogBuffer::new(500);
         let app = router_with(ApiState {
             engine: engine.clone(),
+            torrent: None,
             history: None,
             log: Some(log.clone()),
             setup: None,
@@ -3673,6 +3882,7 @@ mod tests {
         });
         let app = router_with(ApiState {
             engine: engine.clone(),
+            torrent: None,
             history: None,
             log: None,
             setup: Some(Arc::new(SetupHandle::for_running(

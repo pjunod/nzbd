@@ -1,4 +1,4 @@
-//! Dormant BitTorrent runtime ownership and restore reconciliation.
+//! BitTorrent runtime ownership and restore reconciliation.
 //!
 //! This module intentionally knows `JobId` but has no engine dependency. The
 //! maintained adapter receives only [`RestoreRequest`] values and returns
@@ -6,12 +6,59 @@
 
 use crate::backend::{BackendFact, RemovalOutcome, SafeError, StopReason, TransferProgress};
 use crate::queue::rename_job;
-use nzbd_types::{Job, JobId, JobKind, JobStatus, TorrentFileRecord, TorrentPhase};
+use nzbd_types::{
+    Job, JobId, JobKind, JobStatus, TorrentControlIntent, TorrentFileRecord, TorrentPhase,
+    TorrentRecord,
+};
 use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 
 pub const MAX_RESTORE_DIAGNOSTICS: usize = 64;
+pub const SEED_CHECKPOINT_SECS: u64 = 30;
+pub const SEED_CHECKPOINT_BYTES: u64 = 8 * 1024 * 1024;
 const STORAGE_FULL_ERROR: &str = "storage full";
+
+/// A zero ratio or time value is the public "unlimited" spelling. Normalize
+/// it once at admission so every later boundary can reason in `Option`s.
+pub fn normalized_seed_policy(
+    ratio: Option<f64>,
+    time_secs: Option<u64>,
+) -> nzbd_types::SeedPolicy {
+    nzbd_types::SeedPolicy {
+        ratio_limit: ratio.filter(|ratio| ratio.is_finite() && *ratio > 0.0),
+        time_limit_secs: time_secs.filter(|seconds| *seconds > 0),
+    }
+}
+
+/// Evaluate the durable cumulative counters, never a volatile instantaneous
+/// rate. Exact equality reaches the limit, and an empty selection cannot
+/// manufacture an infinite ratio.
+pub fn seed_policy_reached(torrent: &TorrentRecord) -> bool {
+    let ratio_reached = torrent.seed_policy.ratio_limit.is_some_and(|limit| {
+        torrent.selected_bytes > 0
+            && (torrent.uploaded_bytes as f64) >= (torrent.selected_bytes as f64 * limit)
+    });
+    let time_reached = torrent
+        .seed_policy
+        .time_limit_secs
+        .is_some_and(|limit| torrent.seeding_seconds >= limit);
+    ratio_reached || time_reached
+}
+
+/// Return whether the unsaved accounting window reached its durable bound.
+/// A crash can therefore only extend seeding by the latest 30 seconds or
+/// 8 MiB window; it can never make a limit fire early.
+pub fn seed_checkpoint_due(
+    torrent: &TorrentRecord,
+    saved_uploaded_bytes: u64,
+    saved_seeding_seconds: u64,
+) -> bool {
+    torrent.uploaded_bytes.saturating_sub(saved_uploaded_bytes) >= SEED_CHECKPOINT_BYTES
+        || torrent
+            .seeding_seconds
+            .saturating_sub(saved_seeding_seconds)
+            >= SEED_CHECKPOINT_SECS
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct EngineIdentity {
@@ -40,6 +87,7 @@ pub enum RestoreDiagnostic {
     DuplicateInfoHash,
     DuplicatePreferredIdentity,
     DeletedRecord,
+    RemovalIntent,
     UnsafePayloadRoot,
 }
 
@@ -85,6 +133,23 @@ pub fn plan_restore(
     torrent_root: &Path,
     scheduler_allowed: &HashSet<JobId>,
 ) -> RestorePlan {
+    plan_restore_with_roots(
+        jobs,
+        observed,
+        std::slice::from_ref(&torrent_root.to_path_buf()),
+        scheduler_allowed,
+    )
+}
+
+/// Build a restore plan while accepting every configured torrent payload
+/// root. Category roots are first-class storage boundaries and must survive a
+/// restart without weakening containment to arbitrary persisted paths.
+pub fn plan_restore_with_roots(
+    jobs: &[Job],
+    observed: &HashMap<String, ObservedResumeState>,
+    torrent_roots: &[PathBuf],
+    scheduler_allowed: &HashSet<JobId>,
+) -> RestorePlan {
     let mut plan = RestorePlan::default();
     let mut hashes = HashSet::new();
     let mut preferred_ids = HashSet::new();
@@ -93,6 +158,10 @@ pub fn plan_restore(
             push_diagnostic(&mut plan, RestoreDiagnostic::MissingTorrentRecord);
             continue;
         };
+        if record.removal_intent.is_some() {
+            push_diagnostic(&mut plan, RestoreDiagnostic::RemovalIntent);
+            continue;
+        }
         if job.status == JobStatus::Deleted {
             push_diagnostic(&mut plan, RestoreDiagnostic::DeletedRecord);
             continue;
@@ -105,11 +174,11 @@ pub fn plan_restore(
             push_diagnostic(&mut plan, RestoreDiagnostic::UnsafeMetadataPath);
             continue;
         }
-        if record
-            .content_path
-            .as_ref()
-            .is_some_and(|path| !payload_is_within_root(path, torrent_root))
-        {
+        if record.content_path.as_ref().is_some_and(|path| {
+            !torrent_roots
+                .iter()
+                .any(|root| payload_is_within_root(path, root))
+        }) {
             push_diagnostic(&mut plan, RestoreDiagnostic::UnsafePayloadRoot);
             continue;
         }
@@ -127,12 +196,12 @@ pub fn plan_restore(
             state.finished != record.ready_at_unix.is_some()
                 || state.verified_bytes != record.downloaded_bytes
         });
-        let resume_after_restore = scheduler_allowed.contains(&job.id)
-            && matches!(job.status, JobStatus::Queued | JobStatus::Downloading)
-            && !matches!(
+        let resume_after_restore = record.control_intent == TorrentControlIntent::Running
+            && !matches!(record.phase, TorrentPhase::Failed)
+            && (matches!(
                 record.phase,
-                TorrentPhase::PausedDownload | TorrentPhase::PausedSeed | TorrentPhase::Failed
-            );
+                TorrentPhase::Seeding | TorrentPhase::PausedSeed
+            ) || scheduler_allowed.contains(&job.id));
         plan.requests.push(RestoreRequest {
             job: job.id,
             info_hash_v1: record.info_hash_v1.clone(),
@@ -282,17 +351,30 @@ pub fn reconcile_progress(job: &mut Job, progress: &TransferProgress) -> Reconci
     let Some(torrent) = torrent_mut(job) else {
         return ReconcileOutcome::default();
     };
-    // Only verified bytes are a trusted restart checkpoint. Downloaded bytes
-    // may include an incomplete piece that must be checked again.
-    let downloaded = progress.verified_bytes.min(torrent.selected_bytes);
+    // Only verified bytes are a trusted restart checkpoint. Keep the durable
+    // checkpoint monotonic: an engine may report zero while rechecking a
+    // restored payload, and regressing here would charge those local bytes to
+    // download quota a second time as verification catches back up.
+    let downloaded = torrent
+        .downloaded_bytes
+        .max(progress.verified_bytes.min(torrent.selected_bytes));
     let uploaded = torrent.uploaded_bytes.max(progress.uploaded_bytes);
     let activity = match (torrent.last_activity_unix, progress.last_activity_unix) {
         (Some(old), Some(new)) => Some(old.max(new)),
         (old, new) => old.or(new),
     };
+    let mut files_changed = false;
+    for (file, verified) in torrent.files.iter_mut().zip(&progress.file_progress_bytes) {
+        let verified = (*verified).min(file.length);
+        if verified > file.downloaded_bytes {
+            file.downloaded_bytes = verified;
+            files_changed = true;
+        }
+    }
     let changed = torrent.downloaded_bytes != downloaded
         || torrent.uploaded_bytes != uploaded
-        || torrent.last_activity_unix != activity;
+        || torrent.last_activity_unix != activity
+        || files_changed;
     torrent.downloaded_bytes = downloaded;
     torrent.uploaded_bytes = uploaded;
     torrent.last_activity_unix = activity;
@@ -311,6 +393,25 @@ pub fn reconcile_fact(
     latest: Option<&TransferProgress>,
     now_unix: i64,
     torrent_root: &Path,
+) -> ReconcileOutcome {
+    reconcile_fact_with_roots(
+        job,
+        fact,
+        latest,
+        now_unix,
+        std::slice::from_ref(&torrent_root.to_path_buf()),
+    )
+}
+
+/// Fold a structural backend fact while accepting every configured payload
+/// root. Category-specific roots are equal storage boundaries, not children
+/// of the default root.
+pub fn reconcile_fact_with_roots(
+    job: &mut Job,
+    fact: BackendFact,
+    latest: Option<&TransferProgress>,
+    now_unix: i64,
+    torrent_roots: &[PathBuf],
 ) -> ReconcileOutcome {
     if fact_job(&fact) != job.id {
         return ReconcileOutcome::default();
@@ -347,7 +448,10 @@ pub fn reconcile_fact(
             }
         }
         BackendFact::Ready { content_path, .. } => {
-            if !payload_is_within_root(&content_path, torrent_root) {
+            if !torrent_roots
+                .iter()
+                .any(|root| payload_is_within_root(&content_path, root))
+            {
                 return ReconcileOutcome::default();
             }
             let torrent = job.torrent.as_mut().unwrap();
@@ -356,6 +460,11 @@ pub fn reconcile_fact(
                 return ReconcileOutcome::default();
             }
             torrent.downloaded_bytes = torrent.selected_bytes;
+            for file in &mut torrent.files {
+                if file.selected {
+                    file.downloaded_bytes = file.length;
+                }
+            }
             torrent.ready_at_unix.get_or_insert(now_unix);
             torrent.content_path = Some(content_path);
             torrent.phase = if job.status == JobStatus::Paused {
@@ -385,6 +494,11 @@ pub fn reconcile_fact(
                     torrent.last_error =
                         (reason == StopReason::StorageFull).then(|| STORAGE_FULL_ERROR.to_owned());
                     job.status = JobStatus::Paused;
+                }
+                StopReason::SchedulerYield => {
+                    torrent.phase = TorrentPhase::Queued;
+                    torrent.last_error = None;
+                    job.status = JobStatus::Queued;
                 }
                 StopReason::MissingContent => {
                     torrent.phase = TorrentPhase::MissingFiles;
@@ -587,19 +701,24 @@ mod tests {
                 info_hash_v1: hash.into(),
                 source: TorrentSource::Metainfo,
                 metadata_file: PathBuf::from("meta/selected.torrent"),
+                payload_root: PathBuf::new(),
                 phase: TorrentPhase::Downloading,
                 control_intent: nzbd_types::TorrentControlIntent::Running,
                 removal_intent: None,
+                removal_outcome: None,
+                removal_confirmed_at_unix: None,
                 files: vec![
                     TorrentFileRecord {
                         path: "one".into(),
                         length: 1,
                         selected: true,
+                        downloaded_bytes: 1,
                     },
                     TorrentFileRecord {
                         path: "two".into(),
                         length: 1,
                         selected: false,
+                        downloaded_bytes: 0,
                     },
                 ],
                 total_bytes: 2,
@@ -615,6 +734,49 @@ mod tests {
             }),
             stages: Vec::new(),
         }
+    }
+
+    #[test]
+    fn seed_policy_normalizes_unlimited_and_stops_on_exact_boundaries() {
+        assert_eq!(
+            normalized_seed_policy(Some(0.0), Some(0)),
+            SeedPolicy::default()
+        );
+
+        let mut record = job(
+            10,
+            "0123456789abcdef0123456789abcdef01234567",
+            JobStatus::Downloading,
+        );
+        let torrent = record.torrent.as_mut().unwrap();
+        torrent.selected_bytes = 100;
+        torrent.seed_policy = normalized_seed_policy(Some(1.5), Some(90));
+        torrent.uploaded_bytes = 149;
+        torrent.seeding_seconds = 89;
+        assert!(!seed_policy_reached(torrent));
+        torrent.uploaded_bytes = 150;
+        assert!(seed_policy_reached(torrent));
+        torrent.uploaded_bytes = 0;
+        torrent.seeding_seconds = 90;
+        assert!(seed_policy_reached(torrent));
+    }
+
+    #[test]
+    fn seed_checkpoint_bound_is_thirty_seconds_or_eight_mib() {
+        let mut record = job(
+            10,
+            "0123456789abcdef0123456789abcdef01234567",
+            JobStatus::Downloading,
+        );
+        let torrent = record.torrent.as_mut().unwrap();
+        torrent.uploaded_bytes = SEED_CHECKPOINT_BYTES - 1;
+        torrent.seeding_seconds = SEED_CHECKPOINT_SECS - 1;
+        assert!(!seed_checkpoint_due(torrent, 0, 0));
+        torrent.uploaded_bytes += 1;
+        assert!(seed_checkpoint_due(torrent, 0, 0));
+        torrent.uploaded_bytes = 0;
+        torrent.seeding_seconds += 1;
+        assert!(seed_checkpoint_due(torrent, 0, 0));
     }
 
     #[test]
@@ -652,6 +814,129 @@ mod tests {
         assert_eq!(request.preferred_engine_id, Some(7));
         assert_eq!(request.selected_files, vec![0]);
         assert!(plan.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn restore_obeys_durable_pause_and_resume_intent_over_stale_status() {
+        let hash = "0123456789abcdef0123456789abcdef01234567";
+        let mut paused = job(10, hash, JobStatus::Downloading);
+        paused.torrent.as_mut().unwrap().control_intent = TorrentControlIntent::Paused;
+        let paused_plan = plan_restore(
+            &[paused],
+            &HashMap::new(),
+            Path::new("/torrents"),
+            &HashSet::from([JobId(10)]),
+        );
+        assert!(paused_plan.requests[0].start_paused);
+        assert!(!paused_plan.requests[0].resume_after_restore);
+
+        let mut resumed = job(10, hash, JobStatus::Paused);
+        let torrent = resumed.torrent.as_mut().unwrap();
+        torrent.phase = TorrentPhase::PausedDownload;
+        torrent.control_intent = TorrentControlIntent::Running;
+        torrent.downloaded_bytes = 64;
+        let resumed_plan = plan_restore(
+            &[resumed],
+            &HashMap::from([(
+                hash.to_owned(),
+                ObservedResumeState {
+                    engine_id: 7,
+                    verified_bytes: 64,
+                    finished: false,
+                },
+            )]),
+            Path::new("/torrents"),
+            &HashSet::from([JobId(10)]),
+        );
+        assert!(resumed_plan.requests[0].resume_after_restore);
+        assert!(!resumed_plan.requests[0].force_recheck);
+        assert_eq!(resumed_plan.requests[0].trusted_downloaded_bytes, 64);
+    }
+
+    #[test]
+    fn restore_skips_every_durable_removal_intent_before_engine_recovery() {
+        let hash = "0123456789abcdef0123456789abcdef01234567";
+        for delete_data in [false, true] {
+            for (index, (status, phase)) in [
+                (JobStatus::Queued, TorrentPhase::Queued),
+                (JobStatus::Downloading, TorrentPhase::Downloading),
+                (JobStatus::Paused, TorrentPhase::PausedDownload),
+                (JobStatus::Downloading, TorrentPhase::Seeding),
+                (JobStatus::Paused, TorrentPhase::PausedSeed),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let job_id = JobId((index + 10) as u32);
+                let mut pending_removal = job(job_id.0, hash, status);
+                let torrent = pending_removal.torrent.as_mut().unwrap();
+                torrent.phase = phase;
+                torrent.removal_intent = Some(nzbd_types::TorrentRemovalIntent { delete_data });
+                let plan = plan_restore(
+                    &[pending_removal],
+                    &HashMap::new(),
+                    Path::new("/torrents"),
+                    &HashSet::from([job_id]),
+                );
+                assert!(plan.requests.is_empty());
+                assert_eq!(plan.diagnostics, vec![RestoreDiagnostic::RemovalIntent]);
+            }
+        }
+    }
+
+    #[test]
+    fn seeding_family_restores_without_a_download_slot_according_to_durable_intent() {
+        let hash = "0123456789abcdef0123456789abcdef01234567";
+        let mut running_seed = job(10, hash, JobStatus::Downloading);
+        let torrent = running_seed.torrent.as_mut().unwrap();
+        torrent.phase = TorrentPhase::Seeding;
+        torrent.ready_at_unix = Some(1);
+        let running_plan = plan_restore(
+            &[running_seed],
+            &HashMap::new(),
+            Path::new("/torrents"),
+            &HashSet::new(),
+        );
+        assert_eq!(running_plan.requests.len(), 1);
+        assert!(running_plan.requests[0].resume_after_restore);
+
+        let mut paused_seed = job(10, hash, JobStatus::Paused);
+        let torrent = paused_seed.torrent.as_mut().unwrap();
+        torrent.phase = TorrentPhase::PausedSeed;
+        torrent.ready_at_unix = Some(1);
+        torrent.control_intent = TorrentControlIntent::Paused;
+        let paused_plan = plan_restore(
+            &[paused_seed],
+            &HashMap::new(),
+            Path::new("/torrents"),
+            &HashSet::new(),
+        );
+        assert_eq!(paused_plan.requests.len(), 1);
+        assert!(!paused_plan.requests[0].resume_after_restore);
+
+        let mut resumed_seed = job(10, hash, JobStatus::Queued);
+        let torrent = resumed_seed.torrent.as_mut().unwrap();
+        torrent.phase = TorrentPhase::PausedSeed;
+        torrent.ready_at_unix = Some(1);
+        torrent.control_intent = TorrentControlIntent::Running;
+        torrent.downloaded_bytes = 1;
+        let resumed_plan = plan_restore(
+            &[resumed_seed],
+            &HashMap::from([(
+                hash.to_owned(),
+                ObservedResumeState {
+                    engine_id: 7,
+                    verified_bytes: 1,
+                    finished: true,
+                },
+            )]),
+            Path::new("/torrents"),
+            &HashSet::new(),
+        );
+        let request = &resumed_plan.requests[0];
+        assert!(request.start_paused);
+        assert!(request.resume_after_restore);
+        assert!(!request.force_recheck);
     }
 
     #[test]
@@ -783,6 +1068,7 @@ mod tests {
         let progress = TransferProgress {
             downloaded_bytes: 1,
             verified_bytes: 1,
+            file_progress_bytes: vec![1, 0],
             uploaded_bytes: 7,
             download_bps: 900,
             upload_bps: 800,
@@ -896,6 +1182,9 @@ mod tests {
                 ..Default::default()
             },
         );
+        assert_eq!(record.torrent.as_ref().unwrap().downloaded_bytes, 64);
+
+        reconcile_progress(&mut record, &TransferProgress::default());
         assert_eq!(record.torrent.as_ref().unwrap().downloaded_bytes, 64);
 
         let observed = HashMap::from([(
@@ -1088,7 +1377,8 @@ mod tests {
                 &[TorrentFileRecord {
                     path: "owned.bin".into(),
                     length: 5,
-                    selected: true
+                    selected: true,
+                    downloaded_bytes: 5,
                 }],
                 std::slice::from_ref(&root),
             ),
@@ -1100,7 +1390,8 @@ mod tests {
                 &[TorrentFileRecord {
                     path: "../sibling.bin".into(),
                     length: 1,
-                    selected: true
+                    selected: true,
+                    downloaded_bytes: 0,
                 }],
                 std::slice::from_ref(&root),
             ),

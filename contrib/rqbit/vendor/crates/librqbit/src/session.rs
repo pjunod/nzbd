@@ -134,6 +134,7 @@ pub struct Session {
     pub(crate) peer_semaphore_total: Option<Arc<tokio::sync::Semaphore>>,
     known_peer_limit: Option<usize>,
     known_peer_semaphore_total: Option<Arc<tokio::sync::Semaphore>>,
+    disable_pex: bool,
 
     pub blocklist: blocklist::Blocklist,
 
@@ -394,6 +395,8 @@ impl SessionPersistenceConfig {
 pub struct SessionOptions {
     /// Turn on to disable DHT.
     pub disable_dht: bool,
+    /// Disable BEP 11 peer exchange for every torrent in the session.
+    pub disable_pex: bool,
     /// Turn on to disable DHT persistence. By default it will re-use stored DHT
     /// configuration, including the port it listens on.
     pub disable_dht_persistence: bool,
@@ -712,6 +715,7 @@ impl Session {
                     .known_peer_limit_total
                     .map(|limit| Arc::new(tokio::sync::Semaphore::new(limit))),
                 trackers: opts.trackers,
+                disable_pex: opts.disable_pex,
                 #[cfg(feature = "disable-upload")]
                 _disable_upload: opts.disable_upload,
                 blocklist,
@@ -1230,6 +1234,7 @@ impl Session {
                     initial_peers: opts.initial_peers.clone().unwrap_or_default(),
                     peer_limit: opts.peer_limit.or(self.peer_limit),
                     known_peer_limit: opts.known_peer_limit.or(self.known_peer_limit),
+                    disable_pex: self.disable_pex,
                     known_peer_semaphore_total: self.known_peer_semaphore_total.clone(),
                     #[cfg(feature = "disable-upload")]
                     _disable_upload: self._disable_upload,

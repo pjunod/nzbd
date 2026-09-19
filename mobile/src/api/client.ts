@@ -4,6 +4,8 @@ import { File } from 'expo-file-system';
 import {
   AddNzbOptions,
   AddNzbResult,
+  AddTorrentOptions,
+  AddTorrentResult,
   ConnectionConfig,
   HistoryPage,
   JobSummary,
@@ -71,6 +73,7 @@ export class NzbdClient {
       | 'pause'
       | 'resume'
       | 'delete'
+      | 'delete-files'
       | 'move-top'
       | 'move-up'
       | 'move-down'
@@ -101,6 +104,34 @@ export class NzbdClient {
       body: file,
     });
     return this.readJson<AddNzbResult>(response);
+  }
+
+  async addTorrentFile(file: File, options: AddTorrentOptions): Promise<AddTorrentResult> {
+    const query = new URLSearchParams({
+      priority: String(options.priority),
+      paused: String(options.paused),
+    });
+    if (options.category?.trim()) query.set('category', options.category.trim());
+    const response = await this.request(`/api/v1/jobs?${query.toString()}`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/x-bittorrent' },
+      body: file,
+    });
+    return this.readJson<AddTorrentResult>(response);
+  }
+
+  async addTorrentSource(uri: string, options: AddTorrentOptions): Promise<AddTorrentResult> {
+    const response = await this.request('/api/v1/jobs', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        source: { type: uri.trim().startsWith('magnet:') ? 'magnet' : 'torrent_url', uri },
+        category: options.category,
+        priority: options.priority,
+        paused: options.paused,
+      }),
+    });
+    return this.readJson<AddTorrentResult>(response);
   }
 
   async openEventStream(signal: AbortSignal, lastEventId?: string): Promise<Response> {

@@ -125,7 +125,7 @@ NZBGet configuration and prints a mapping report.
 | [docs/MOBILE_REVIEW.md](docs/MOBILE_REVIEW.md) | Independent review of the mobile app (2026-08): code, performance, UI, release readiness, and the Google TV / Apple TV gap |
 | [docs/DEPLOY.md](docs/DEPLOY.md) | systemd, Docker Compose, Kubernetes, multi-node cluster deployment |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Design: the whole system, phase by phase |
-| [docs/BITTORRENT_PROPOSAL.md](docs/BITTORRENT_PROPOSAL.md) | Proposed first-class BitTorrent backend: engine choice, queue/storage contracts, *arr compatibility, security, rollout, and review decisions |
+| [docs/BITTORRENT_PROPOSAL.md](docs/BITTORRENT_PROPOSAL.md) | First-class BitTorrent backend: engine choice, queue/storage contracts, *arr compatibility, security, rollout, and review decisions |
 | [docs/BITTORRENT_M0_REPORT.md](docs/BITTORRENT_M0_REPORT.md) | BitTorrent engine spike: passing data-path evidence, measurements, and the API gaps blocking daemon integration |
 | [docs/BITTORRENT_GATE9_REVIEW.md](docs/BITTORRENT_GATE9_REVIEW.md) | Reviewer decision brief for the BitTorrent resource, dependency, license, and three constrained advisory exceptions |
 | [docs/BITTORRENT_RELEASE_REVIEW.md](docs/BITTORRENT_RELEASE_REVIEW.md) | Pre-release operations review: current no-go, public traffic, ports, paths, seeding, deletion, evidence, and sign-off conditions |

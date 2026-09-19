@@ -1,9 +1,9 @@
 # rqbit maintained engine — reproducible v8.1.1 boundary for nzbd
 
-**Status:** selected by ADR-19; isolated M0 dependency only · **Upstream base:**
+**Status:** active single-node BitTorrent engine · **Upstream base:**
 rqbit v8.1.1, commit `00b97485160ff5b5aa2b379ea0815d568ec665f0` ·
-**Stable patch delta:** 2,819 lines across exactly nine ordered patches ·
-**Production daemon:** still does not depend on or start rqbit
+**Stable patch delta:** 2,923 lines across exactly ten ordered patches ·
+**Production daemon:** starts it only when `[torrent].enabled = true`
 
 Companion to
 [BITTORRENT_PROPOSAL.md](../../docs/BITTORRENT_PROPOSAL.md) (the decision),
@@ -13,7 +13,7 @@ and [BITTORRENT_GATE9_REVIEW.md](../../docs/BITTORRENT_GATE9_REVIEW.md)
 
 This directory has two distinct jobs:
 
-1. define the exact rqbit source derivation used by nzbd's dormant M0 adapter;
+1. define the exact rqbit source derivation used by nzbd's single-node adapter;
 2. retain optional upstream contribution material without silently adding it
    to that dependency.
 
@@ -41,6 +41,7 @@ The maintained series is:
 | 7 | `0014-bound-discovery-pressure.patch` | Bound stable-line DHT and magnet-metadata queues, active work, and retained candidates. |
 | 8 | `0016-limit-peer-metadata-before-allocation.patch` | Enforce the adapter's 10 MiB BEP 9 ceiling before allocation or requests. |
 | 9 | `0018-propagate-file-sizing-errors.patch` | Stop initialization on the first selected-file sizing failure and preserve useful error context. |
+| 10 | `0019-disable-peer-exchange.patch` | Make the daemon's PEX setting authoritative for inbound messages and outgoing advertisement. |
 
 The checked-in [`vendor/`](vendor/) tree is generated from those inputs. It
 contains the derived upstream `LICENSE`, `README.md`, and `crates/` tree needed
@@ -53,7 +54,7 @@ gate-9 disposition. A broad semver update is not permitted.
 
 ## 2. Why this remains rqbit, not libtorrent
 
-The stable series is 2,819 patch lines, applies cleanly to one immutable source
+The stable series is 2,923 patch lines, applies cleanly to one immutable source
 archive, and has focused tests at every changed behavior boundary. It preserves
 the Rust/Tokio single-binary architecture and adds no FFI or second daemon.
 That stays within ADR-19's small-maintainable-fix branch, so the heavier
@@ -121,7 +122,8 @@ not affect the nzbd dependency:
 
 - `0003-expose-per-torrent-discovery-health.patch` and its `0004` main variant;
 - every even-numbered/current-main counterpart (`0002`, `0006`, `0008`,
-  `0011`, `0013`, `0015`, `0017`, and `0019`); and
+  `0011`, `0013`, `0015`, `0017`, and
+  `0019-propagate-file-sizing-errors-main.patch`); and
 - the issue/PR drafts next to those patches.
 
 Detailed tracker/DHT health is intentionally optional. The M0 public contract
@@ -149,8 +151,7 @@ A full hash recheck is a safe degradation path, not the normal ownership model.
 rqbit's private persistence schema is not copied into nzbd, and auto-restoring
 then removing ghost jobs is not accepted.
 
-This directory does not authorize production configuration, admission, a peer
-listener, tracker/DHT work, payload I/O, UI, or qBittorrent compatibility. It
-does not implement M2 daemon lifecycle or storage-fault routing. Passing all
-M0 checks authorizes the next milestone to be decomposed and reviewed; it does
-not make the dormant adapter reachable from `nzbd`.
+This directory owns the derived engine boundary, not operator policy. Runtime
+configuration, admission, lifecycle, storage-fault routing, native clients and
+qBittorrent compatibility are implemented in the surrounding nzbd crates and
+documented in the project BitTorrent proposal and configuration guide.

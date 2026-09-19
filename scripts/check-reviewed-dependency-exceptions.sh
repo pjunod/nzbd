@@ -90,6 +90,11 @@ quick_xml_packages="$(package_set <<<"$quick_xml_tree")"
 expected_quick_xml_packages="$(LC_ALL=C sort <<'EOF'
 librqbit v8.1.1
 librqbit-upnp v1.0.0
+nzbd (workspace)
+nzbd-api (workspace)
+nzbd-cluster (workspace)
+nzbd-compat (workspace)
+nzbd-qbit-compat (workspace)
 nzbd-torrent (workspace)
 quick-xml v0.37.5
 EOF
@@ -110,6 +115,10 @@ time_tree="$(
 time_packages="$(package_set <<<"$time_tree")"
 expected_time_packages="$(LC_ALL=C sort <<'EOF'
 nzbd (workspace)
+nzbd-api (workspace)
+nzbd-cluster (workspace)
+nzbd-compat (workspace)
+nzbd-qbit-compat (workspace)
 nzbd-torrent (workspace)
 rcgen v0.13.2
 time v0.3.41
@@ -150,6 +159,11 @@ librqbit-core v5.0.0
 librqbit-dht v5.3.1
 librqbit-peer-protocol v4.3.0
 librqbit-tracker-comms v3.0.0
+nzbd (workspace)
+nzbd-api (workspace)
+nzbd-cluster (workspace)
+nzbd-compat (workspace)
+nzbd-qbit-compat (workspace)
 nzbd-torrent (workspace)
 option-ext v0.2.0
 EOF
