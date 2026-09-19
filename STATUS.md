@@ -67,6 +67,16 @@ actions
 
 ## Cluster — C1 foundation ✅ (design ADR-13…16 accepted)
 
+**2026-09-19 reassessment:** C1/C2 are implemented, but their original
+acceptance scope is narrower than plurx's current transactional authority and
+recovery contracts. The remaining work includes ownership/publication
+hardening as well as C3. See the
+[source comparison and finite plan](docs/CLUSTERING_COMPLETION_PLAN.md) and
+[live progress page](docs/CLUSTERING_STATUS.md). This is documentation and
+planning only; it does not claim the proposed control store, deadlines, or
+segment execution are implemented. Physical Gluster qualification remains
+unrun in this pass.
+
 - ✅ Leader election on the shared volume: monotonic staleness observation, write–wait–verify, priority stagger (observing), epoch fencing via verify-before-commit snapshot guard
 - ✅ Node registry (presence, capabilities, load; seq-progression liveness)
 - ✅ Per-job fenced journals with union replay (`jobs/<id>/journal.<node>`) — overlap-safe reclaim without locks
@@ -76,9 +86,9 @@ actions
 - ✅ Any-node API: full API + shim everywhere, transparent proxy to the leader
 - ✅ `[cluster]` config + validation; single-node mode untouched
 - ✅ 5 multi-node e2e tests: single-leader invariant, distributed download via proxied add with budget held, worker-death reclaim (zero re-fetch), leader-death failover with lease adoption, restart persistence
-- ✅ C2: PP work leases — `LeaseKind::Post` in the poll/heartbeat/complete protocol; leader **anti-affinity scheduler** (idle PP nodes first, downloading nodes last, capacity-aware incl. in-flight backlog); fenced `.pp.<lease>/` staging with verify-lease-then-rename commit; superseded-staging GC; lease adoption across leader failover for PP too; dead-node delegation reconcile; download-only connection-budget divisor; per-node `history.<node>.jsonl` on the shared volume (cross-client O_APPEND is not trusted), union rebuild into each local SQLite index
+- ✅ C2: PP work leases — `LeaseKind::Post` in the poll/heartbeat/complete protocol; leader **anti-affinity scheduler** (idle PP nodes first, downloading nodes last, capacity-aware incl. in-flight backlog); `.pp.<lease>/` extraction staging with a local lease check before publication; staging cleanup; lease adoption across leader failover for PP too; dead-node delegation reconcile; provider budgets include PP recovery fetches; per-node `history.<node>.jsonl` on the shared volume (cross-client O_APPEND is not trusted), union rebuild into each local SQLite index. Whole-pipeline isolation, transactional publication, and expired-worker cancellation remain completion-plan work
 - ✅ C2 e2e: leader downloads a real par2-set job, the idle non-download node quick-verifies it, stamps it, appends shared history, hands it back — bit-identical payload, zero staging residue
-- ⬜ C3: segment-split downloads, weighted scheduling, budget rebalancing
+- ⬜ Cluster completion P0–P5: fast-lane delivery, transactional control authority, worker/PP lifetime, weighted scheduling and acknowledged budget transfer, segment-split downloads, advisory settings and passive diagnostics — [implementation order](docs/CLUSTERING_COMPLETION_PLAN.md#4-finite-delivery--six-milestones-one-implementation-pr)
 - 👤 Real-Gluster soak checklist (CLUSTERING.md §11): quorum on, node reboots, volume heal mid-download
 
 ## CI & quality gates ✅
@@ -216,7 +226,7 @@ actions
 - ⬜ COMPRESS DEFLATE (RFC 8054) — carried from phase 1; single-digit % on yEnc bodies
 - ⬜ io_uring file I/O — blocked on tokio-uring maturity; DirectWrite already avoids the copy-heavy paths
 - ⬜ Article-streaming / mount-mode groundwork — design work first (ARCHITECTURE.md §15)
-- ⬜ Cluster C3: segment-split downloads, weighted scheduling, budget rebalancing — the lease protocol carries a `kind` field so a `Segment` lease slots in without wire changes
+- ⬜ Cluster completion P0–P5: stronger transactional authority and worker lifetime, then segment-split downloads, weighted placement, acknowledged budget transfer, and advisory diagnostics. The existing `kind` field is only a starting point: range scope, exact tokens, and durable results need protocol changes. See [the completion plan](docs/CLUSTERING_COMPLETION_PLAN.md).
 - ✅ RSS feeds + filter language — shipped (see phase 4)
 - ⬜ `rapidyenc-sys` FFI + differential fuzzing — scalar decoder saturates typical line rates today
 - 🔶 UI v2 — live-by-construction dashboard (field report 2026-07-25 #6: innerHTML-per-tick rendering eats clicks; confirm() on delete; silent action failures). **All code milestones shipped 2026-07-25; M0 is the remaining operator step.** Decisions locked with Paul 2026-07-25; plan + wire contracts in [docs/UI_V2_PLAN.md](docs/UI_V2_PLAN.md), one commit per milestone:

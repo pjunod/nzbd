@@ -1,0 +1,45 @@
+# Cluster completion — progress and remaining work
+
+**Updated:** 2026-09-19 · **State:** analysis and documentation complete; implementation not started ·
+**Branch:** `codex/clustering-completion-plan`
+
+Companion to [CLUSTERING.md](CLUSTERING.md) (the existing implementation) and
+[CLUSTERING_COMPLETION_PLAN.md](CLUSTERING_COMPLETION_PLAN.md) (the finite
+completion plan). This is the status page for the remaining Usenet cluster
+work. Implementation, review, tests, and deployment are separate facts.
+
+## Current checkpoint
+
+Fresh standalone clones were taken from GitHub. The inspected revisions are
+`nzbd` at `7b81e84` and `plurx` at `8663d6c0`. Neither user's working checkout
+is used for this work. Forgejo's `forge.lan` and SSH's `lab3` names did not
+resolve from this environment; the reference is the pinned GitHub copy, not
+a claimed verification of a newer Forgejo tip or the deployed fleet.
+
+| Work | State | Evidence / next action |
+|---|---|---|
+| Current source comparison | Complete | Coordination, publication, transport recovery, PP ownership, provider budgets, and CI inspected at the revisions above |
+| Documentation and finite implementation plan | Complete | Existing claims reconciled; recommended dependency/migration decision and P0–P5 acceptance recorded in the linked plan |
+| P0 — delivery lane | Not started | Adapt nzbd to the current draft-to-ready fast-lane workflow |
+| P1 — transactional control authority | Not started | Reuse the maintained plurx coordination dependency and narrow contracts |
+| P2 — worker lifetime and publication | Not started | Exact leases, bounded calls, isolated outputs, durable completion |
+| P3 — weighted placement and account budgets | Not started | Capacity-based placement and acknowledged budget transfer |
+| P4 — segment distribution | Not started | Explicit ranges, isolated attempts, one assembler |
+| P5 — operator surface and final acceptance | Not started | Advisory requirements, live diagnostics, finite failure scenarios |
+| One adversarial review | Not requested | Request only when the implementation PR is ready to merge |
+| Fast lane | Not run | Run after review findings are addressed |
+| PR / merge / deployment | None | Documentation is committed on the named branch; no PR opened because the existing workflows would start full suites |
+
+## Working rules
+
+- Make normal, coherent commits; batch the implementation into one main-bound
+  PR. Do not create a PR train for these milestones.
+- During development, compile/format as useful; execute tests only after the
+  final adversarial review. Fix failures and repeat only the affected checks.
+- Full unit suites, coverage, soak campaigns, and release builds are separate
+  batch/manual work. Their absence is visible, not a runtime feature gate.
+- Operator enable/disable remains available. Requirements are advisory in
+  Settings → Dev; there is no evidence receipt, approval flag, or readiness
+  score that prevents enabling a feature.
+- Keep only the active working clone and necessary evidence. No deployed node is
+  stopped, upgraded, or reconfigured by this documentation pass.

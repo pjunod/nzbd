@@ -16,6 +16,9 @@ Optionally runs as a **multi-node cluster** over a shared work volume.
 > NZBGet-compatible JSON-RPC/XML-RPC API, embedded web UI, RSS feeds,
 > packaging, and cluster C1+C2 (distributed downloads *and* distributed
 > post-processing). See [STATUS.md](STATUS.md) for the live scoreboard.
+> The [cluster completion plan](docs/CLUSTERING_COMPLETION_PLAN.md) compares
+> the current plurx contracts and scopes the remaining authority, C3, and
+> operator work; [cluster progress](docs/CLUSTERING_STATUS.md) tracks delivery.
 
 ## Highlights
 
@@ -131,6 +134,8 @@ NZBGet configuration and prints a mapping report.
 | [docs/INTEGRATION_PLAN.md](docs/INTEGRATION_PLAN.md) | The event/cursor contract consumers build against, and how it was built |
 | [docs/DEFECT_HISTORY_DELETE.md](docs/DEFECT_HISTORY_DELETE.md) | Resolved defect: why history rows resurrected, why forget now means everywhere, and how portable tombstones converge |
 | [docs/CLUSTERING.md](docs/CLUSTERING.md) | Cluster design (ADR-13…16), failure matrix, operations |
+| [docs/CLUSTERING_COMPLETION_PLAN.md](docs/CLUSTERING_COMPLETION_PLAN.md) | Current plurx comparison, recommended authority changes, and the finite C3 implementation/CI plan |
+| [docs/CLUSTERING_STATUS.md](docs/CLUSTERING_STATUS.md) | Cluster completion progress, review, validation, and remaining external evidence |
 | [STATUS.md](STATUS.md) | What's done, what's next, with commit evidence |
 
 Deployable examples live under [`examples/`](examples/):
