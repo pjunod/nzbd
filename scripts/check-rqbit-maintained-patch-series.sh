@@ -6,7 +6,7 @@ readonly series_file="$repository_root/contrib/rqbit/maintained-series.txt"
 readonly checksum_file="$repository_root/contrib/rqbit/upstream-v8.1.1.sha256"
 readonly vendor_dir="$repository_root/contrib/rqbit/vendor"
 readonly upstream_url="https://github.com/ikatson/rqbit/archive/refs/tags/v8.1.1.tar.gz"
-readonly expected_series=$'0001-allow-persistence-without-auto-restore.patch\n0005-bound-tracker-requests.patch\n0007-bound-session-peers.patch\n0009-bound-pending-incoming-handshakes.patch\n0010-bound-known-peer-records.patch\n0012-bound-peer-response-backlog.patch\n0014-bound-discovery-pressure.patch\n0016-limit-peer-metadata-before-allocation.patch\n0018-propagate-file-sizing-errors.patch'
+readonly expected_series=$'0001-allow-persistence-without-auto-restore.patch\n0005-bound-tracker-requests.patch\n0007-bound-session-peers.patch\n0009-bound-pending-incoming-handshakes.patch\n0010-bound-known-peer-records.patch\n0012-bound-peer-response-backlog.patch\n0014-bound-discovery-pressure.patch\n0016-limit-peer-metadata-before-allocation.patch\n0018-propagate-file-sizing-errors.patch\n0019-disable-peer-exchange.patch'
 readonly expected_vendor_entries=$'LICENSE\nREADME.md\ncrates'
 
 if [[ "$(<"$series_file")" != "$expected_series" ]]; then
@@ -125,6 +125,7 @@ fi
     'dht_utils::tests::production_metadata_queues_close_at_exact_boundaries'
     'peer_info_reader::tests::configured_metadata_limit_is_checked_before_allocation'
     'torrent_state::initializing::tests::file_sizing_error_stops_initialization'
+    'torrent_state::live::pex_policy_tests::session_pex_toggle_and_private_flag_are_both_authoritative'
   )
   for exact_test in "${expected_librqbit_tests[@]}"; do
     if ! grep -Fxq "$exact_test: test" <<<"$librqbit_tests"; then
@@ -152,4 +153,4 @@ fi
   cargo check --workspace --exclude rqbit-desktop
 )
 
-echo "rqbit maintained patch series: nine revert-sensitive contracts passed"
+echo "rqbit maintained patch series: ten revert-sensitive contracts passed"

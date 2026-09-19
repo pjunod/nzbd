@@ -1394,9 +1394,9 @@ mod tests {
             .unwrap();
         assert_eq!(
             next_fact(&mut owner).await,
-            BackendFact::Failed {
+            BackendFact::Stopped {
                 job: JobId(8),
-                error: SafeError::from_redacted("torrent control target is unavailable"),
+                reason: StopReason::Transient,
             }
         );
 

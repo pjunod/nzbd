@@ -761,8 +761,8 @@ fn nonempty(value: &str) -> Option<String> {
 /// zero is nzbd's unlimited sentinel.
 fn add_ratio_limit(value: &str) -> Option<f64> {
     match value.trim().parse::<f64>().ok()? {
-        value if value == -2.0 => None,
-        value if value == -1.0 => Some(0.0),
+        -2.0 => None,
+        -1.0 => Some(0.0),
         value if value >= 0.0 && value.is_finite() => Some(value),
         _ => None,
     }
@@ -781,7 +781,7 @@ fn add_time_limit(value: &str) -> Option<u64> {
 /// replaces the job's already-materialized policy.
 fn share_ratio_limit(value: Option<&String>, global: f64) -> Option<f64> {
     match value.and_then(|value| value.trim().parse::<f64>().ok()) {
-        Some(value) if value == -2.0 => (global > 0.0 && global.is_finite()).then_some(global),
+        Some(-2.0) => (global > 0.0 && global.is_finite()).then_some(global),
         Some(value) if value > 0.0 && value.is_finite() => Some(value),
         _ => None,
     }
