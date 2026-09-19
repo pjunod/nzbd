@@ -4194,8 +4194,9 @@ mod tests {
         );
 
         let (reply, rx) = oneshot::channel();
-        owner.on_command(QueueCommand::Resume {
+        owner.on_command(QueueCommand::SetPriority {
             job: JobId(1),
+            priority: (MAX_PENDING_BACKEND_COMMANDS + 2) as i32,
             reply,
         });
         assert!(rx.await.unwrap());
@@ -4339,20 +4340,13 @@ mod tests {
         let (_tmp, mut owner, _adapter) = control_test_owner();
         owner.state.jobs.push(control_torrent_job());
 
-        for n in 0..=MAX_PENDING_BACKEND_COMMANDS {
+        for priority in 1..=MAX_PENDING_BACKEND_COMMANDS + 1 {
             let (reply, rx) = oneshot::channel();
-            let command = if n % 2 == 0 {
-                QueueCommand::Pause {
-                    job: JobId(1),
-                    reply,
-                }
-            } else {
-                QueueCommand::Resume {
-                    job: JobId(1),
-                    reply,
-                }
-            };
-            owner.on_command(command);
+            owner.on_command(QueueCommand::SetPriority {
+                job: JobId(1),
+                priority: priority as i32,
+                reply,
+            });
             assert!(rx.await.unwrap());
         }
         assert_eq!(
@@ -4370,7 +4364,10 @@ mod tests {
             owner.pending_backend_commands.len(),
             MAX_PENDING_BACKEND_COMMANDS
         );
-        assert_eq!(owner.state.job(JobId(1)).unwrap().status, JobStatus::Paused);
+        assert_eq!(
+            owner.state.job(JobId(1)).unwrap().priority,
+            (MAX_PENDING_BACKEND_COMMANDS + 1) as i32
+        );
     }
 
     #[test]

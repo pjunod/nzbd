@@ -9,7 +9,7 @@ diff --git a/crates/librqbit/src/session.rs b/crates/librqbit/src/session.rs
  
      pub blocklist: blocklist::Blocklist,
  
-@@ -394,6 +395,8 @@ pub struct SessionOptions {
+@@ -394,5 +395,7 @@ pub struct SessionOptions {
      /// Turn on to disable DHT.
      pub disable_dht: bool,
 +    /// Disable BEP 11 peer exchange for every torrent in the session.
@@ -70,7 +70,7 @@ diff --git a/crates/librqbit/src/torrent_state/live/mod.rs b/crates/librqbit/src
                      warn!(
                          "recieved noncompliant PEX message from {}, ignoring",
                          self.addr
-@@ -1240,7 +1247,10 @@ impl PeerHandler {
+@@ -1240,6 +1247,10 @@ impl PeerHandler {
      }
  
      fn on_extended_handshake(&self, hs: &ExtendedHandshake<ByteBuf>) -> anyhow::Result<()> {
@@ -79,7 +79,7 @@ diff --git a/crates/librqbit/src/torrent_state/live/mod.rs b/crates/librqbit/src
 +            self.state.metadata.info.private,
 +            self.state.shared.options.disable_pex,
 +        ) && hs.ut_pex().is_some()
-         {
++        {
              self.state.clone().spawn(
                  error_span!(
 @@ -2046,6 +2056,19 @@ impl PeerHandler {
