@@ -161,7 +161,7 @@ impl TorrentAdmissionService {
         &self,
         source: TorrentSource,
         secret: String,
-        mut opts: AddOpts,
+        opts: AddOpts,
     ) -> Result<AdmissionResult, AdmissionError> {
         match source {
             TorrentSource::Magnet => {
@@ -408,7 +408,7 @@ impl TorrentAdmissionService {
         pending: Option<JobId>,
         bytes: Vec<u8>,
         source: TorrentSource,
-        opts: AddOpts,
+        mut opts: AddOpts,
     ) -> Result<AdmissionResult, AdmissionError> {
         if bytes.len() > self.source_fetch_limits.max_metainfo_bytes {
             return Err(AdmissionError::MetainfoTooLarge);
