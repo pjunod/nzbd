@@ -19,7 +19,7 @@ use crate::rate::{RateLimiter, SpeedMeter};
 use crate::snapshot::{JobSummary, QueueSnapshot, SharedSnapshot, StorageVolumeSnapshot};
 use crate::volumes::DiskGuardReading;
 use crate::writer::{spawn_writer, WriteCmd, WriterHandle};
-use crate::Tuning;
+use crate::{AddOpts, Tuning};
 use arc_swap::ArcSwap;
 use nzbd_nzb::ParsedNzb;
 use nzbd_state::{FsJournal, JobJournals, JournalRecord, SnapshotStore, UncleanMarker};
