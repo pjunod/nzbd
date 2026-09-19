@@ -189,6 +189,7 @@ async fn nzbd_authoritative_restore_survives_process_kill_without_promoting_unve
             expected_info_hash_v1: expected_hash,
             preferred_id: Some(preferred_id),
             selected_files: None,
+            output_root: None,
         }])
         .await
         .unwrap();

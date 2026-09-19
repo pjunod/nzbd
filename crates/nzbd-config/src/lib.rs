@@ -792,14 +792,19 @@ impl Config {
 
     fn validate_torrent(&self) -> Result<(), ConfigError> {
         let torrent = &self.torrent;
-        if torrent.listen_port == 0 {
+        if torrent.listen_port == 0 || torrent.listen_port == u16::MAX {
             return Err(ConfigError::Invalid(
-                "[torrent] listen_port must be one explicit non-zero port".into(),
+                "[torrent] listen_port must be one explicit port between 1 and 65534".into(),
             ));
         }
         if torrent.upnp_port_forwarding {
             return Err(ConfigError::Invalid(
                 "[torrent] upnp_port_forwarding is unavailable in the maintained backend".into(),
+            ));
+        }
+        if torrent.local_discovery {
+            return Err(ConfigError::Invalid(
+                "[torrent] local_discovery is unavailable in the maintained backend".into(),
             ));
         }
         if torrent.max_peers_per_torrent == 0
@@ -825,9 +830,35 @@ impl Config {
                 "[torrent] default_seed_ratio must be a finite non-negative number".into(),
             ));
         }
+        let rqbit_max_kib = u64::from(u32::MAX) / 1024;
+        if torrent.upload_limit_kib > rqbit_max_kib {
+            return Err(ConfigError::Invalid(format!(
+                "[torrent] upload_limit_kib must not exceed {rqbit_max_kib}"
+            )));
+        }
+        if torrent.enabled
+            && self
+                .queue
+                .speed_limit_kib
+                .is_some_and(|limit| limit > rqbit_max_kib)
+        {
+            return Err(ConfigError::Invalid(format!(
+                "[queue] speed_limit_kib must not exceed {rqbit_max_kib} while the torrent backend is configured"
+            )));
+        }
         if !(1..=100).contains(&torrent.metainfo_max_mib) {
             return Err(ConfigError::Invalid(
                 "[torrent] metainfo_max_mib must be between 1 and 100".into(),
+            ));
+        }
+        if torrent.source_redirects > 5 {
+            return Err(ConfigError::Invalid(
+                "[torrent] source_redirects must be between 0 and 5".into(),
+            ));
+        }
+        if torrent.default_seed_minutes > u64::MAX / 60 {
+            return Err(ConfigError::Invalid(
+                "[torrent] default_seed_minutes is too large".into(),
             ));
         }
         match (
@@ -868,15 +899,19 @@ impl Config {
                     )));
                 }
             }
+            if category
+                .seed_minutes
+                .is_some_and(|minutes| minutes > u64::MAX / 60)
+            {
+                return Err(ConfigError::Invalid(format!(
+                    "category '{}' seed_minutes is too large",
+                    category.name
+                )));
+            }
         }
         if torrent.enabled && self.cluster.enabled {
             return Err(ConfigError::Invalid(
                 "[torrent] cannot be enabled while [cluster] is enabled; M6 is not approved".into(),
-            ));
-        }
-        if torrent.enabled {
-            return Err(ConfigError::Invalid(
-                "[torrent] backend not activated; enabled must remain false until final M2 activation".into(),
             ));
         }
         Ok(())
@@ -1618,7 +1653,7 @@ source_redirects = 5
     }
 
     #[test]
-    fn torrent_negative_contract_is_named_and_fail_closed() {
+    fn torrent_negative_contract_rejects_unsupported_or_unsafe_settings() {
         let invalid = [
             ("listen_port = 0", "listen_port"),
             ("upnp_port_forwarding = true", "upnp_port_forwarding"),
@@ -1635,6 +1670,7 @@ source_redirects = 5
             ("upload_limit_kib = -1", "upload_limit_kib"),
             ("source_redirects = -1", "source_redirects"),
             ("default_seed_minutes = -1", "default_seed_minutes"),
+            ("local_discovery = true", "local_discovery"),
             (
                 "socks_proxy_url = \"socks5://user:pw@localhost:1080\"",
                 "credential-free",
@@ -1644,7 +1680,6 @@ source_redirects = 5
                 "socks_proxy_url = \"socks5://localhost:1080\"\ndht = true",
                 "dht must be false",
             ),
-            ("enabled = true", "backend not activated"),
         ];
         for (body, expected) in invalid {
             let error = Config::from_toml(&format!("[torrent]\n{body}\n"))

@@ -1592,6 +1592,7 @@ function rowModel(j, ctx) {
   const busy = pend ? pend.busy(j.id) : false;   // an action is in flight
   const section = ctx.section || sectionOf(j);
   const active = section !== "waiting";
+  const torrent = j.kind === "torrent";
 
   // A URL job has no articles until its NZB arrives — "0 B of 0 B" reads as
   // broken; say what it is actually doing instead.
@@ -1600,6 +1601,11 @@ function rowModel(j, ctx) {
   if (dl && j.rate_bps > 0) {
     rest.push(" · " + fmtRate(j.rate_bps));
     rest.push(" · ~" + fmtEta(Math.max(0, j.remaining_bytes), j.rate_bps));
+  }
+  if (torrent) {
+    if (j.upload_rate_bps > 0) rest.push(" · ▲ " + fmtRate(j.upload_rate_bps));
+    rest.push(" · ratio " + Number(j.ratio || 0).toFixed(2));
+    if (j.useful_peers > 0) rest.push(" · " + j.useful_peers + " peers");
   }
   // A post-processing row's own heading already names the stage, so the
   // line under the bar answers the question the heading raises instead:
@@ -1645,7 +1651,8 @@ function rowModel(j, ctx) {
             "job-" + section + (busy ? " pending" : ""),
     name: j.name,
     nameTip: j.name + " — click for details",
-    sub: "#" + j.id + (j.category ? " · " + j.category : "") +
+    sub: "#" + j.id + (torrent ? " · BITTORRENT" : " · USENET") +
+         (j.category ? " · " + j.category : "") +
          (j.assigned_node ? " · on " + j.assigned_node : "") + " ",
     st: (shownSt === "completed" && j.ready
       ? "ready" : (STATUS_HUMAN[shownSt] || shownSt)).toUpperCase(),
@@ -1673,10 +1680,10 @@ function rowModel(j, ctx) {
       ? "Articles that failed and were re-downloaded — this is bandwidth the header rate spends that never lands in the file. A high count means a flaky server or an aging post."
       : "",
     size: fetching ? "—" : fmtBytes(total),
-    health: fetching ? "—" : (j.health / 10).toFixed(1) + "%",
-    healthColor: fetching ? "" : healthColor(j.health, j.critical_health),
-    healthTip: fetching ? "" : healthTip(j.health, j.critical_health),
-    hNote: fetching ? "" : hNote,
+    health: fetching ? "—" : (torrent ? Number(j.ratio || 0).toFixed(2) + "×" : (j.health / 10).toFixed(1) + "%"),
+    healthColor: fetching || torrent ? "" : healthColor(j.health, j.critical_health),
+    healthTip: fetching ? "" : (torrent ? "uploaded / selected payload bytes" : healthTip(j.health, j.critical_health)),
+    hNote: fetching ? "" : (torrent ? fmtDur((j.seeding_seconds || 0) * 1000) + " seeding" : hNote),
     hNoteCls: fetching ? "hnote" : hNoteCls,
     hNoteTip: hNoteTip,
     upDisabled: ctx.idx === 0,
@@ -1688,6 +1695,8 @@ function rowModel(j, ctx) {
     pauseHidden: fetching,
     pauseLabel: (over || st) === "paused" ? "resume" : "pause",
     pauseAction: (over || st) === "paused" ? "resume" : "pause",
+    deleteDataHidden: !torrent,
+    deleteDataLabel: armIsSet("q" + j.id) ? "sure?" : "delete data",
     // `detail` is the joined line the row shows; kept as one string for
     // readability and for the DOM test's assertions.
     detail: (fetching ? "fetching the NZB from the indexer…"
@@ -1743,6 +1752,8 @@ function buildJobRow(d) {
   c.pause = mk("", "pause", "pause", "");
   c.del = mk("del", "delete", "delete",
     "Remove this job from the queue. One click — no dialog; you get 8 seconds to undo it.");
+  c.delData = mk("del", "delete-data", "delete data",
+    "Forget this torrent and delete only its validated payload inventory. Click twice to confirm.");
   tr.__c = c;
   return tr;
 }
@@ -1789,6 +1800,8 @@ function applyRow(tr, m, d) {
   w("pauseHidden", m.pauseHidden, v => d.prop(c.pause, "hidden", v));
   w("pauseLabel", m.pauseLabel, v => d.text(c.pause, v));
   w("pauseAction", m.pauseAction, v => d.data(c.pause, "action", v));
+  w("deleteDataHidden", m.deleteDataHidden, v => d.prop(c.delData, "hidden", v));
+  w("deleteDataLabel", m.deleteDataLabel, v => d.text(c.delData, v));
 }
 KINDS.job = { build: buildJobRow, apply: applyRow };
 
@@ -1868,8 +1881,7 @@ function buildDetailRow(d) {
   d.style(spacer, "flex", "1");
   c.nzb = d.append(head, d.create("a", "btnlike"));
   d.attr(c.nzb, "download", "");
-  d.text(c.nzb, "download nzb");
-  d.prop(c.nzb, "title", "Download this job's NZB (regenerated from queue state — everything needed to re-add it anywhere).");
+  d.text(c.nzb, "download source");
   c.close = d.append(head, d.create("button", "small"));
   d.data(c.close, "action", "detail-close");
   d.text(c.close, "close");
@@ -2012,6 +2024,7 @@ function recoveryMax(j) {
 }
 
 function detailModel(j, nowMs) {
+  const torrent = j.kind === "torrent";
   const postStage = currentPostStage(j);
   const st = statusName(j.status, postStage);
   const cls = postStage != null || typeof j.status !== "string"
@@ -2029,12 +2042,17 @@ function detailModel(j, nowMs) {
     key: "__detail", kind: "detail", id: j.id, name: j.name, scope: "queue",
     pipe: pipelineModels(j, nowMs),
     st: statusLabel(j.status, postStage, j.ready).toUpperCase(), stCls: "st " + cls,
-    articles: "articles " + j.done_articles + "/" + j.total_articles +
+    articles: torrent ? "" : "articles " + j.done_articles + "/" + j.total_articles +
       (j.failed_articles ? " · " + j.failed_articles + " failed" : "") +
       (j.retried_articles ? " · " + j.retried_articles + " retried" : ""),
-    health: "health " + (j.health / 10).toFixed(1) + "%",
+    health: torrent ? "ratio " + Number(j.ratio || 0).toFixed(2) + "×" :
+      "health " + (j.health / 10).toFixed(1) + "%",
     dupe: j.dupe_key ? "dupe: " + j.dupe_key : "",
-    nzbHref: "/api/v1/jobs/" + j.id + "/nzb",
+    nzbHref: "/api/v1/jobs/" + j.id + (torrent ? "/torrent-file" : "/nzb"),
+    sourceLabel: torrent ? "download torrent" : "download nzb",
+    sourceTitle: torrent
+      ? "Download this job's retained .torrent metainfo."
+      : "Download this job's NZB regenerated from queue state.",
     nzbHidden: false,
     closeHidden: false,
     recoverHidden: !recoverMax,
@@ -2045,7 +2063,7 @@ function detailModel(j, nowMs) {
     metaOriginal: "", metaDestination: "",
     // Open: you opened a live job to watch its files fill in.
     filesOpen: true,
-    files: files ? files.map(fileModel) : null,
+    files: files ? files.map(torrent ? torrentFileModel : fileModel) : null,
     filesEmptyText: "no files yet",
     logs: logs,
   };
@@ -2091,6 +2109,22 @@ function fileModel(x) {
   };
 }
 
+function torrentFileModel(x) {
+  const size = Number(x.size_bytes || 0);
+  const downloaded = Math.min(size, Number(x.downloaded_bytes || 0));
+  const pct = size ? Math.floor(downloaded * 100 / size) : 0;
+  const state = !x.selected ? "SKIPPED" : x.verified ? "VERIFIED" : pct + "%";
+  return {
+    key: "tf" + x.id, kind: "file",
+    name: x.filename,
+    size: fmtBytes(size),
+    seg: fmtBytes(downloaded) + "/" + fmtBytes(size),
+    failed: "",
+    state,
+    stateCls: "st " + (x.verified ? "ok" : x.selected ? "dim" : "warn"),
+  };
+}
+
 function buildActivityRow(d) {
   return d.create("div", "lg");
 }
@@ -2124,6 +2158,8 @@ function applyDetail(tr, m, d) {
   metric("health", m.health);
   metric("dupe", m.dupe);
   w("nzbHref", m.nzbHref || "", v => d.attr(c.nzb, "href", v));
+  w("sourceLabel", m.sourceLabel || "download source", v => d.text(c.nzb, v));
+  w("sourceTitle", m.sourceTitle || "", v => d.prop(c.nzb, "title", v));
   // History has no NZB endpoint of its own — a parked NZB is reachable
   // only through requeue — so the button is absent rather than broken.
   w("nzbHidden", !!m.nzbHidden, v => d.prop(c.nzb, "hidden", v));
@@ -3435,8 +3471,8 @@ function armIsSet(key) { return armed.key === key; }
 function armButton(key) {
   if (armed.timer) clearTimeout(armed.timer);
   armed.key = key;
-  armed.timer = setTimeout(() => { armed.key = null; armed.timer = null; renderHistory(); }, ARM_MS);
-  renderHistory();
+  armed.timer = setTimeout(() => { armed.key = null; armed.timer = null; renderHistory(); renderQueue(); }, ARM_MS);
+  renderHistory(); renderQueue();
 }
 function disarmButton() {
   if (armed.timer) clearTimeout(armed.timer);
@@ -3453,7 +3489,7 @@ document.addEventListener("click", (ev) => {
   const scope = row ? row.dataset.scope : "queue";
   // Any other click disarms a pending two-step button: aiming somewhere
   // else is as clear a "no" as waiting it out.
-  if (action !== "h-delete-files" && armed.key) { disarmButton(); renderHistory(); }
+  if (action !== "h-delete-files" && action !== "delete-data" && armed.key) { disarmButton(); renderHistory(); renderQueue(); }
   if (PAGE_MOVES[action]) { PAGE_MOVES[action](); return; }
   // One panel serves both tabs, so its close button is the same button in
   // both — the row it sits in says which list is holding it open.
@@ -3486,6 +3522,18 @@ document.addEventListener("click", (ev) => {
   }
   if (action === "delete") {
     deleteJob(id, name);
+    return;
+  }
+  if (action === "delete-data") {
+    const key = "q" + id;
+    if (!armIsSet(key)) { armButton(key); return; }
+    disarmButton();
+    jobAction(id, "delete-files", {
+      key: pending.key(id, "delete"), kind: "delete", jobId: id,
+      label: "Deleting torrent payload for “" + name + "”",
+    }).then(r => {
+      if (r) toast({ text: "Deleted “" + name + "” and its validated torrent payload" });
+    });
     return;
   }
   if (action === "pause" || action === "resume") {
@@ -3850,6 +3898,8 @@ const SETTINGS_SECTIONS = [
     ["paths.dest_dir", "completed downloads", "text"],
     ["paths.inter_dir", "intermediate dir (optional)", "text?"],
     ["paths.nzb_watch_dir", "watch dir for dropped .nzb (optional)", "text?"],
+    ["paths.torrent_dir", "torrent payload dir (optional)", "text?"],
+    ["paths.torrent_watch_dir", "watch dir for dropped .torrent (optional)", "text?"],
   ]},
   { key: "servers", title: "News servers", desc: "Tier 0 is tried first; higher tiers are backups. Fill servers only see missing articles. Connection counts apply immediately when lowered; raising one above what the daemon started with needs a restart.", array: true },
   { key: "queue", title: "Speed & queue", desc: "Speed limit and simultaneous downloads apply immediately on save; the rest needs a restart.", fields: [
@@ -3866,6 +3916,22 @@ const SETTINGS_SECTIONS = [
     ["queue.direct_write", "direct write", "check"],
     ["queue.crc_check", "CRC check", "check"],
     ["queue.continue_partial", "resume partials on restart", "check"],
+  ]},
+  { key: "torrent", title: "BitTorrent", desc: "Single-node v1 BitTorrent. Enabling starts a public peer listener after restart. The active-download limit is shared with Usenet; seeding is unlimited unless you set a ratio or time. Cluster mode, UPnP, local discovery, IPv6, uTP and v2 torrents are not supported.", fields: [
+    ["torrent.enabled", "enable BitTorrent after restart", "check"],
+    ["torrent.listen_port", "peer TCP listen port", "num"],
+    ["torrent.dht", "DHT discovery", "check"],
+    ["torrent.pex", "peer exchange (PEX)", "check"],
+    ["torrent.upload_limit_kib", "upload limit (KiB/s, 0 = unlimited)", "num"],
+    ["torrent.default_seed_ratio", "default seed ratio (0 = unlimited)", "num"],
+    ["torrent.default_seed_minutes", "default seed time (minutes, 0 = unlimited)", "num"],
+    ["torrent.metainfo_max_mib", "maximum metainfo size (MiB)", "num"],
+    ["torrent.source_redirects", "maximum source URL redirects", "num"],
+    ["torrent.max_peers_per_torrent", "live peers per torrent", "num"],
+    ["torrent.max_peers_total", "live peers for the daemon", "num"],
+    ["torrent.socks_proxy_url", "SOCKS proxy URL (optional; requires DHT off)", "text?"],
+    ["torrent.socks_proxy_username", "SOCKS username (optional)", "text?"],
+    ["torrent.socks_proxy_password", "SOCKS password (empty = keep current)", "secret"],
   ]},
   { key: "api", title: "Web UI & API", desc: "Changing bind, auth or TLS restarts the listener — you may need to sign in again or change the URL.", fields: [
     ["api.bind", "listen address", "text"],
@@ -4003,6 +4069,9 @@ function categoryCard(cIdx) {
     <div class="cfg-grid">
       ${fieldControl(p("name"), "name", "text")}
       ${fieldControl(p("dest_dir"), "destination (optional)", "text?")}
+      ${fieldControl(p("torrent_dir"), "torrent payload dir (optional)", "text?")}
+      ${fieldControl(p("seed_ratio"), "torrent seed ratio (empty = global)", "num?")}
+      ${fieldControl(p("seed_minutes"), "torrent seed minutes (empty = global)", "num?")}
       ${fieldControl(p("unpack"), "unpack override", "select3")}
     </div>
   </div>`;

@@ -188,6 +188,7 @@ pub async fn poll_feed(
                 }),
                 params: Vec::new(), // feeds add on their own behalf
                 client: Some(format!("feed:{}", feed.name)),
+                ..Default::default()
             };
             match engine.add_url(&item.title, &item.url, add).await {
                 Ok(id) => {

@@ -15,6 +15,40 @@ use tokio::sync::{mpsc, watch};
 /// this long yields its shared download slot. It remains live in the backend
 /// and competes again as soon as a later fact advances `last_activity_unix`.
 pub const STALLED_SLOT_YIELD_SECS: i64 = 60;
+pub const SHARED_DOWNLOAD_FLOOR_BPS: u64 = 1024 * 1024;
+
+/// Divide the operator's aggregate ceiling across active protocol backends.
+/// An observed under-user returns its unused share on the next one-second
+/// interval while retaining a 1 MiB/s probe floor when the aggregate permits.
+pub fn allocate_download_budget(
+    aggregate: Option<u64>,
+    usenet_active: bool,
+    torrent_active: bool,
+    usenet_rate_bps: u64,
+    torrent_rate_bps: u64,
+) -> (Option<u64>, Option<u64>) {
+    let Some(limit) = aggregate else {
+        return (None, None);
+    };
+    match (usenet_active, torrent_active) {
+        (true, false) => (Some(limit), None),
+        (false, true) => (None, Some(limit)),
+        (false, false) => (Some(limit), None),
+        (true, true) => {
+            let half = limit / 2;
+            let floor = SHARED_DOWNLOAD_FLOOR_BPS.min(half);
+            if usenet_rate_bps < half {
+                let usenet = usenet_rate_bps.max(floor).min(half);
+                (Some(usenet), Some(limit.saturating_sub(usenet)))
+            } else if torrent_rate_bps < half {
+                let torrent = torrent_rate_bps.max(floor).min(half);
+                (Some(limit.saturating_sub(torrent)), Some(torrent))
+            } else {
+                (Some(half), Some(limit.saturating_sub(half)))
+            }
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BackendCommand {
@@ -22,6 +56,22 @@ pub enum BackendCommand {
         job: JobId,
     },
     Pause {
+        job: JobId,
+    },
+    /// Pause an active seed because its durable ratio or time policy reached
+    /// the configured boundary. This stays distinct from an operator pause so
+    /// the structural fact and durable phase remain honest.
+    PauseForSeedPolicy {
+        job: JobId,
+    },
+    /// Pause incomplete torrent I/O under the shared disk guard. Completed
+    /// seeds remain live so verified bytes may still be uploaded.
+    PauseForStorage {
+        job: JobId,
+    },
+    /// Yield an incomplete transfer that is outside the queue owner's shared
+    /// active set. This does not change the operator's running intent.
+    PauseForScheduler {
         job: JobId,
     },
     Resume {
@@ -41,12 +91,17 @@ pub enum BackendCommand {
     SetDownloadLimit {
         bytes_per_sec: Option<u64>,
     },
+    SetUploadLimit {
+        bytes_per_sec: Option<u64>,
+    },
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TransferProgress {
     pub downloaded_bytes: u64,
     pub verified_bytes: u64,
+    /// Hash-verified content-file bytes in the persisted inventory order.
+    pub file_progress_bytes: Vec<u64>,
     pub uploaded_bytes: u64,
     pub download_bps: u64,
     pub upload_bps: u64,
@@ -72,6 +127,7 @@ pub enum StopReason {
     /// The write path hit ENOSPC or EDQUOT. This is a live hold, not a
     /// terminal engine failure.
     StorageFull,
+    SchedulerYield,
     /// Previously admitted payload is absent or no longer matches metadata.
     /// The job remains recoverable through restore/recheck.
     MissingContent,
@@ -273,14 +329,38 @@ mod tests {
     use super::*;
     use nzbd_types::{SeedPolicy, TorrentSource};
 
+    #[test]
+    fn shared_budget_returns_unused_share_without_starving_a_backend() {
+        let limit = 10 * 1024 * 1024;
+        assert_eq!(
+            allocate_download_budget(Some(limit), true, false, 0, 0),
+            (Some(limit), None)
+        );
+        assert_eq!(
+            allocate_download_budget(Some(limit), false, true, 0, 0),
+            (None, Some(limit))
+        );
+        assert_eq!(
+            allocate_download_budget(Some(limit), true, true, 0, limit),
+            (Some(SHARED_DOWNLOAD_FLOOR_BPS), Some(9 * 1024 * 1024))
+        );
+        assert_eq!(
+            allocate_download_budget(None, true, true, limit, limit),
+            (None, None)
+        );
+    }
+
     fn torrent(phase: TorrentPhase, last_activity_unix: Option<i64>) -> TorrentRecord {
         TorrentRecord {
             info_hash_v1: "0123456789abcdef0123456789abcdef01234567".into(),
             source: TorrentSource::Magnet,
             metadata_file: "meta/example.torrent".into(),
+            payload_root: PathBuf::new(),
             phase,
             control_intent: nzbd_types::TorrentControlIntent::Running,
             removal_intent: None,
+            removal_outcome: None,
+            removal_confirmed_at_unix: None,
             files: Vec::new(),
             total_bytes: 100,
             selected_bytes: 100,

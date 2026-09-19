@@ -35,9 +35,10 @@ pub const PRIORITY_FORCE: i32 = 900;
 // Jobs, files, segments
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum JobKind {
+    #[default]
     Nzb,
     Url,
     Torrent,
@@ -92,6 +93,16 @@ pub struct TorrentRemovalIntent {
     pub delete_data: bool,
 }
 
+/// Confirmed disposition of a torrent payload after its engine handle was
+/// removed. Persisting this before terminal history is written makes the
+/// final transition retryable without repeating filesystem deletion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TorrentPayloadDisposition {
+    Retained,
+    Deleted,
+}
+
 impl TorrentPhase {
     /// Whether this phase may compete for a shared active-download slot.
     pub fn wants_download_slot(self) -> bool {
@@ -117,6 +128,9 @@ pub struct TorrentFileRecord {
     pub path: PathBuf,
     pub length: u64,
     pub selected: bool,
+    /// Hash-verified bytes retained as an advisory per-file checkpoint.
+    #[serde(default)]
+    pub downloaded_bytes: u64,
 }
 
 /// Queue-owned BitTorrent control state. Engine resume data (piece maps,
@@ -129,6 +143,9 @@ pub struct TorrentRecord {
     pub source: TorrentSource,
     /// Relative to the configured torrent state root.
     pub metadata_file: PathBuf,
+    /// Canonical configured root selected for this job at admission.
+    #[serde(default)]
+    pub payload_root: PathBuf,
     pub phase: TorrentPhase,
     /// Defaulted so records written before owner-side control routing retain
     /// their historical (running) meaning.
@@ -137,6 +154,13 @@ pub struct TorrentRecord {
     /// Defaulted so rows written before durable removal routing remain valid.
     #[serde(default)]
     pub removal_intent: Option<TorrentRemovalIntent>,
+    /// Set only after the backend has confirmed removal. A queue record with
+    /// this value is waiting solely for its durable terminal history write.
+    #[serde(default)]
+    pub removal_outcome: Option<TorrentPayloadDisposition>,
+    /// Stable terminal-history key captured with `removal_outcome`.
+    #[serde(default)]
+    pub removal_confirmed_at_unix: Option<i64>,
     pub files: Vec<TorrentFileRecord>,
     pub total_bytes: u64,
     pub selected_bytes: u64,

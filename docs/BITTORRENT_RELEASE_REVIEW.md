@@ -1,33 +1,26 @@
-# BitTorrent release review — prove the boundary before enabling it
+# BitTorrent release review — single-node release candidate
 
-**Status:** pre-release review surface; production BitTorrent remains disabled ·
-**Decision:** maintained rqbit M0 and independent review are accepted; remaining
-M2 slices are tracked by #154–#160, #163 retains sole activation ownership, and
-M5 release evidence remains ·
+**Status:** single-node implementation complete; consolidated review and fast
+qualification remain ·
+**Decision:** maintained rqbit M0 and independent review are accepted; M2–M4
+are implemented on the consolidated branch and M5 owns final qualification ·
 **Owner:** ADR-19 in [BITTORRENT_PROPOSAL.md](BITTORRENT_PROPOSAL.md)
 
-This is the short operations and release-review surface for nzbd's proposed
-BitTorrent backend. It tells a reviewer what network traffic, ports, storage,
-seeding, and deletion behavior must be true before the feature can ship. It is
-not an operator setup guide: the daemon accepts dormant `[torrent]`
-configuration, but validation rejects `enabled = true`; it has no torrent
-admission API, listener, or session lifecycle today.
-
-> **No production wiring:** do not add a production switch or weaken the
-> daemon-isolation check before final activation #163. Accepted M0 evidence
-> permits dependency-ordered M2 work; it does not prove that production daemon
-> lifecycle, storage, admission, or operator behavior exists.
+This is the short operations and release-review surface for nzbd's BitTorrent
+backend. It tells a reviewer what network traffic, ports, storage, seeding,
+deletion, native API, and qBittorrent-compatible behavior the implementation
+owns. It is not a substitute for the executable release evidence.
 
 ## 1. Decision at a glance
 
 | Review area | Current truth | Condition for release |
 |---|---|---|
-| Production reachability | None; `nzbd` does not depend on `nzbd-torrent` or `librqbit` | A separately reviewed milestone may wire the backend only after every stop gate passes |
+| Production reachability | `[torrent].enabled = true` starts one maintained session, admission route, watch scanner, backend executor, and bounded shutdown path | Consolidated adversarial review and fast qualification must pass before merge |
 | Public observability | **M0 pass** — required facts and bounded error are exposed; unavailable tracker/DHT diagnostics are explicit `unknown` | M2 state, API, and UI contract tests must preserve that honest boundary |
-| Authoritative restore | **M0 pass** — automatic restore is disabled and the kill/restart proof admits only the selected durable record | M2 must connect selective restore to nzbd's durable queue |
+| Authoritative restore | Queue-authorized descriptors restore paused-first under only the configured default/category roots; pending secret sidecars reconcile independently | Restart and containment evidence remains green |
 | Resource and dependency decision | **M0 pass** — accepted limits and refreshed measurements are green on all five native targets | The maintained series and accepted limits in [BITTORRENT_GATE9_REVIEW.md](BITTORRENT_GATE9_REVIEW.md) must stay green across the native matrix |
 | Adversarial M5 work | In progress | The remaining resource, mounted-filesystem, production shutdown, auth-limiting, and sustained-fuzz evidence is green |
-| Operator action today | Leave the dormant section disabled; `enabled = true` fails closed | Do not publish a peer port or claim the reserved settings are usable before final activation #163 |
+| Operator action today | Leave disabled unless the peer port, immutable payload root, seeding policy, and public-discovery implications are understood | The Settings warnings and this review agree with the running configuration |
 
 The release decision is conjunctive. Passing one row never compensates for a
 failed row, and a green workflow never changes the recorded gate state by
@@ -38,10 +31,9 @@ itself.
 ### Current boundary
 
 The production daemon starts no peer listener, tracker client, DHT node, PEX
-exchange, local discovery, or payload transfer. `make bittorrent-policy`
-proves the daemon's normal dependency graph contains neither `nzbd-torrent`
-nor any `librqbit*` package. Any change to that result is a release-boundary
-change and requires its own reviewed milestone.
+exchange, or payload transfer while BitTorrent is disabled. Enabling it starts
+one TCP/IPv4 session with the configured port and discovery policy. Local
+discovery and UPnP remain unavailable, and cluster plus torrent is rejected.
 
 ### First-release contract
 
@@ -69,10 +61,7 @@ session starts.
 
 ## 3. Ports
 
-There is no BitTorrent port to publish today. The existing nzbd API port is
-unrelated to peer traffic.
-
-The proposed first release owns exactly one explicit, non-zero TCP/IPv4 peer
+The first release owns exactly one explicit TCP/IPv4 peer
 port, defaulting to `6881` only after the feature is deliberately enabled.
 There is no port range probe, random fallback, ephemeral port, automatic
 router mutation, or UPnP. Failure to bind the configured port is a startup
@@ -88,10 +77,9 @@ upgrade with torrent support disabled must open no new socket.
 
 ## 4. Paths
 
-M2a added dormant `paths.torrent_dir`, `paths.torrent_watch_dir`, and category
-overrides, and M2b added a dormant runtime boundary, but the production daemon
-does not consume those paths while activation is rejected.
-The production storage contract separates immutable seed payloads from the
+The production daemon consumes `paths.torrent_dir`,
+`paths.torrent_watch_dir`, and category overrides only while enabled. The
+storage contract separates immutable seed payloads from the
 existing completed-media destination:
 
 | Path role | Required behavior |
@@ -101,7 +89,7 @@ existing completed-media destination:
 | Category override | Must remain inside an authorized root and preserve the same portable path rules |
 | *arr-visible path | The path nzbd reports must be mounted identically in nzbd and the media manager |
 
-The dormant adapter rejects traversal, symlinks declared by metainfo, unsafe
+The adapter rejects traversal, symlinks declared by metainfo, unsafe
 existing prefixes, duplicate or prefix-overlapping files, reserved Windows
 names, and portable Unicode/case aliases before storage construction. The
 hosted native probes describe their temporary filesystems; they do not prove
@@ -147,8 +135,9 @@ mount guarantee.
 
 ## 5. Seeding
 
-Dormant configuration reserves the default seed ratio and time contract, but no
-production seed policy executes because no production torrent can be admitted.
+The queue owner checkpoints cumulative uploaded bytes and seeding time, applies
+per-add → category → global limits at exact boundaries, and pauses without
+deleting payloads.
 
 The first-release contract marks a verified torrent `ready` while it may still
 seed. The default seed ratio and seed time are unlimited until the caller or
@@ -236,8 +225,8 @@ the following:
 - Disabled upgrades open no peer socket and admit no torrent.
 - Rollback and downgrade drain/export steps have been exercised.
 
-This document's drift check intentionally pins the selected maintained engine,
-the eleven-gate M0 evidence, and today's disabled production boundary. M2 and
-later production-wiring changes must update the proposal, M0 report, this
-review, and the check together. Bypassing the check is not a substitute for
-that decision.
+This document's drift check pins the selected maintained engine, the
+eleven-gate M0 evidence, and the active single-node boundary. Any future engine,
+network, cluster, or compatibility expansion must update the proposal, M0
+report, this review, and the check together. Bypassing the check is not a
+substitute for that decision.

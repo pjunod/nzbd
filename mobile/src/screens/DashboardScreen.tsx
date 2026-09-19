@@ -31,6 +31,7 @@ import {
 } from '../api/format';
 import {
   AddNzbOptions,
+  AddTorrentOptions,
   ConnectionConfig,
   ConnectionState,
   JobSummary,
@@ -74,6 +75,8 @@ export function DashboardScreen({ config, onEditConnection }: Props) {
     jobAction,
     setJobPriority,
     addNzb,
+    addTorrentFile,
+    addTorrentSource,
   } = useNzbd(config);
 
   const status = snapshot?.status;
@@ -85,6 +88,7 @@ export function DashboardScreen({ config, onEditConnection }: Props) {
       | 'pause'
       | 'resume'
       | 'delete'
+      | 'delete-files'
       | 'move-top'
       | 'move-up'
       | 'move-down'
@@ -92,7 +96,7 @@ export function DashboardScreen({ config, onEditConnection }: Props) {
   ) => {
     try {
       const result = await jobAction(job.id, action);
-      if (action === 'delete') {
+      if (action === 'delete' || action === 'delete-files') {
         setExpanded(null);
         setNotice(result.parked ? `${job.name} removed. It can be restored from history.` : `${job.name} removed.`);
       }
@@ -102,13 +106,22 @@ export function DashboardScreen({ config, onEditConnection }: Props) {
   };
 
   const confirmDelete = (job: JobSummary) => {
+    const choices = job.kind === 'torrent'
+      ? [
+          { text: 'Cancel', style: 'cancel' as const },
+          { text: 'Keep files', onPress: () => void mutateJob(job, 'delete') },
+          { text: 'Delete files', style: 'destructive' as const, onPress: () => void mutateJob(job, 'delete-files') },
+        ]
+      : [
+          { text: 'Cancel', style: 'cancel' as const },
+          { text: 'Remove', style: 'destructive' as const, onPress: () => void mutateJob(job, 'delete') },
+        ];
     Alert.alert(
       'Remove this job?',
-      `Remove “${job.name}” from the queue? Downloaded files are left in place.`,
-      [
-        { text: 'Cancel', style: 'cancel' },
-        { text: 'Remove', style: 'destructive', onPress: () => void mutateJob(job, 'delete') },
-      ],
+      job.kind === 'torrent'
+        ? `Remove “${job.name}”? Choose whether its payload is retained.`
+        : `Remove “${job.name}” from the queue? Downloaded files are left in place.`,
+      choices,
     );
   };
 
@@ -137,6 +150,18 @@ export function DashboardScreen({ config, onEditConnection }: Props) {
     const result = await addNzb(file, options);
     setAddOpen(false);
     setNotice(`Added ${options.name} as job #${result.id}.`);
+  };
+
+  const submitTorrentFile = async (file: File, options: AddTorrentOptions) => {
+    const result = await addTorrentFile(file, options);
+    setAddOpen(false);
+    setNotice(`Added torrent as job #${result.id}.`);
+  };
+
+  const submitTorrentSource = async (uri: string, options: AddTorrentOptions) => {
+    const result = await addTorrentSource(uri, options);
+    setAddOpen(false);
+    setNotice(`Added torrent as job #${result.id}.`);
   };
 
   const plexBottom = layout === 'plex' && !wide;
@@ -205,7 +230,7 @@ export function DashboardScreen({ config, onEditConnection }: Props) {
               onPress={() => void toggleQueue()}
             />
           ) : null}
-          <ActionButton compact label="Add NZB" onPress={() => setAddOpen(true)} variant="primary" />
+          <ActionButton compact label="Add" onPress={() => setAddOpen(true)} variant="primary" />
           <ActionButton compact label="Server" onPress={onEditConnection} variant="ghost" />
         </View>
       </View>
@@ -273,11 +298,11 @@ export function DashboardScreen({ config, onEditConnection }: Props) {
                   <Text style={styles.emptyTitle}>{snapshot ? 'Queue is empty' : 'Loading queue'}</Text>
                   <Text style={styles.emptyText}>
                     {snapshot
-                      ? 'Pick an NZB from Files or Android’s document picker to start a download.'
+                      ? 'Pick an NZB or torrent, or paste a magnet link, to start a download.'
                       : 'Waiting for the first snapshot from Runner.'}
                   </Text>
                   {snapshot ? (
-                    <ActionButton label="Add an NZB" onPress={() => setAddOpen(true)} variant="primary" />
+                    <ActionButton label="Add a download" onPress={() => setAddOpen(true)} variant="primary" />
                   ) : null}
                 </View>
               ) : (
@@ -343,6 +368,8 @@ export function DashboardScreen({ config, onEditConnection }: Props) {
         busy={busyKey === 'add'}
         onClose={() => setAddOpen(false)}
         onSubmit={submitNzb}
+        onSubmitTorrentFile={submitTorrentFile}
+        onSubmitTorrentSource={submitTorrentSource}
         open={addOpen}
       />
     </SafeAreaView>
@@ -575,6 +602,7 @@ function JobCard({
             <Text style={styles.jobPercent}>{Math.floor(progress * 100)}%</Text>
           ) : null}
         </View>
+        {job.kind === 'torrent' ? <Text style={styles.eyebrow}>BITTORRENT</Text> : null}
         {!postProcessing ? (
           <View style={styles.progressTrack}>
             <View style={[styles.progressFill, { width: `${Math.max(progress * 100, 1)}%` }]} />
@@ -609,6 +637,14 @@ function JobCard({
             <Fact label="Files" styles={styles} value={`${job.files_done}/${job.files_total}`} />
             <Fact label="Priority" styles={styles} value={downloadPriorityLabel(job.priority)} />
             <Fact label="Category" styles={styles} value={job.category || '—'} />
+            {job.kind === 'torrent' ? (
+              <>
+                <Fact label="Uploaded" styles={styles} value={formatBytes(job.uploaded_bytes ?? 0)} />
+                <Fact label="Ratio" styles={styles} value={(job.ratio ?? 0).toFixed(2)} />
+                <Fact label="Peers" styles={styles} value={String(job.useful_peers ?? 0)} />
+                <Fact label="Seeding" styles={styles} value={formatDuration(job.seeding_seconds ?? 0)} />
+              </>
+            ) : null}
           </View>
           <View style={styles.jobPriorityEditor}>
             <Text style={styles.inputLabel}>Download priority</Text>
@@ -797,11 +833,15 @@ function AddNzbModal({
   busy,
   onClose,
   onSubmit,
+  onSubmitTorrentFile,
+  onSubmitTorrentSource,
 }: {
   open: boolean;
   busy: boolean;
   onClose: () => void;
   onSubmit: (file: File, options: AddNzbOptions) => Promise<void>;
+  onSubmitTorrentFile: (file: File, options: AddTorrentOptions) => Promise<void>;
+  onSubmitTorrentSource: (uri: string, options: AddTorrentOptions) => Promise<void>;
 }) {
   const theme = useTheme();
   const styles = useMemo(() => makeStyles(theme), [theme]);
@@ -811,6 +851,7 @@ function AddNzbModal({
   const [priority, setPriority] = useState(0);
   const [paused, setPaused] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [torrentSource, setTorrentSource] = useState('');
 
   const pick = async () => {
     setError(null);
@@ -821,32 +862,48 @@ function AddNzbModal({
     });
     if (result.canceled) return;
     const selected = result.assets[0];
-    if (!selected.name.toLowerCase().endsWith('.nzb')) {
-      setError('Choose a file ending in .nzb. Compressed NZBs are not accepted by this endpoint.');
+    if (!/\.(nzb|torrent)$/i.test(selected.name)) {
+      setError('Choose a file ending in .nzb or .torrent.');
       return;
     }
     setAsset(selected);
-    setName(selected.name.replace(/\.nzb$/i, ''));
+    setTorrentSource('');
+    setName(selected.name.replace(/\.(nzb|torrent)$/i, ''));
   };
 
   const submit = async () => {
-    if (!asset) {
-      setError('Choose an NZB file first.');
+    if (!asset && !torrentSource.trim()) {
+      setError('Choose an NZB or torrent file, or paste a magnet/HTTP torrent URL.');
       return;
     }
     setError(null);
     try {
-      await onSubmit(new File(asset.uri), {
-        name: name.trim() || asset.name.replace(/\.nzb$/i, ''),
-        category: category.trim() || undefined,
-        priority,
-        paused,
-      });
+      if (torrentSource.trim()) {
+        await onSubmitTorrentSource(torrentSource.trim(), {
+          category: category.trim() || undefined,
+          priority,
+          paused,
+        });
+      } else if (asset?.name.toLowerCase().endsWith('.torrent')) {
+        await onSubmitTorrentFile(new File(asset.uri), {
+          category: category.trim() || undefined,
+          priority,
+          paused,
+        });
+      } else if (asset) {
+        await onSubmit(new File(asset.uri), {
+          name: name.trim() || asset.name.replace(/\.nzb$/i, ''),
+          category: category.trim() || undefined,
+          priority,
+          paused,
+        });
+      }
       setAsset(null);
       setName('');
       setCategory('');
       setPriority(0);
       setPaused(false);
+      setTorrentSource('');
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : 'Runner could not add this file.');
     }
@@ -860,7 +917,7 @@ function AddNzbModal({
           <View style={styles.modalHeading}>
             <View>
               <Text style={styles.eyebrow}>NEW DOWNLOAD</Text>
-              <Text style={styles.modalTitle}>Add an NZB</Text>
+              <Text style={styles.modalTitle}>Add a download</Text>
             </View>
             <ActionButton compact disabled={busy} label="Close" onPress={onClose} variant="ghost" />
           </View>
@@ -871,7 +928,7 @@ function AddNzbModal({
             onPress={() => void pick()}
             style={styles.filePicker}
           >
-            <Text style={styles.filePickerTitle}>{asset ? asset.name : 'Choose NZB from Files'}</Text>
+            <Text style={styles.filePickerTitle}>{asset ? asset.name : 'Choose NZB or torrent file'}</Text>
             <Text style={styles.filePickerMeta}>
               {asset
                 ? asset.size
@@ -880,6 +937,22 @@ function AddNzbModal({
                 : 'iCloud Drive, On My iPhone/iPad, or an Android document provider'}
             </Text>
           </Pressable>
+
+          <Text style={styles.inputLabel}>Magnet or torrent URL</Text>
+          <TextInput
+            autoCapitalize="none"
+            autoCorrect={false}
+            editable={!busy}
+            multiline
+            onChangeText={(value) => {
+              setTorrentSource(value);
+              if (value.trim()) setAsset(null);
+            }}
+            placeholder="magnet:?xt=urn:btih:… or https://…/file.torrent"
+            placeholderTextColor={theme.textMuted}
+            style={styles.input}
+            value={torrentSource}
+          />
 
           <Text style={styles.inputLabel}>Display name</Text>
           <TextInput
@@ -939,7 +1012,7 @@ function AddNzbModal({
             </View>
           ) : null}
           <ActionButton
-            disabled={!asset}
+            disabled={!asset && !torrentSource.trim()}
             label="Add to queue"
             loading={busy}
             onPress={() => void submit()}

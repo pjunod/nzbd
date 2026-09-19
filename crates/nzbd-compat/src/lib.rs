@@ -569,6 +569,7 @@ async fn append(state: &CompatState, params: &Value) -> Result<Value, (i64, &'st
                 // separate `editqueue`/`GroupSetParameter` call as before.
                 params: Vec::new(),
                 client: Some(current_client(state)),
+                ..Default::default()
             };
             match state.engine.add_nzb_opts(&filename, &bytes, opts).await {
                 Ok(id) => Ok(json!(id.0)),
@@ -589,6 +590,7 @@ async fn append(state: &CompatState, params: &Value) -> Result<Value, (i64, &'st
                 // separate `editqueue`/`GroupSetParameter` call as before.
                 params: Vec::new(),
                 client: Some(current_client(state)),
+                ..Default::default()
             };
             match state.engine.add_url(&filename, &url, opts).await {
                 Ok(id) => Ok(json!(id.0)),

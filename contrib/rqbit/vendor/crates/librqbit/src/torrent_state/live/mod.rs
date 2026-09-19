@@ -112,6 +112,10 @@ use super::{
     ManagedTorrentShared, TorrentMetadata,
 };
 
+fn pex_enabled(private_torrent: bool, session_disabled: bool) -> bool {
+    !private_torrent && !session_disabled
+}
+
 #[derive(Debug)]
 struct InflightPiece {
     peer: PeerHandle,
@@ -1195,7 +1199,10 @@ impl PeerConnectionHandler for &PeerHandler {
                 }
             }
             Message::Extended(ExtendedMessage::UtPex(pex)) => {
-                if self.state.metadata.info.private {
+                if !pex_enabled(
+                    self.state.metadata.info.private,
+                    self.state.shared.options.disable_pex,
+                ) {
                     warn!(
                         "recieved noncompliant PEX message from {}, ignoring",
                         self.addr
@@ -1240,7 +1247,11 @@ impl PeerConnectionHandler for &PeerHandler {
     }
 
     fn on_extended_handshake(&self, hs: &ExtendedHandshake<ByteBuf>) -> anyhow::Result<()> {
-        if !self.state.metadata.info.private && hs.ut_pex().is_some() {
+        if pex_enabled(
+            self.state.metadata.info.private,
+            self.state.shared.options.disable_pex,
+        ) && hs.ut_pex().is_some()
+        {
             self.state.clone().spawn(
                 error_span!(
                     parent: self.state.shared.span.clone(),
@@ -1301,6 +1312,19 @@ impl PeerConnectionHandler for &PeerHandler {
         }
         self.peer_response_budget.advertise(handshake);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod pex_policy_tests {
+    use super::pex_enabled;
+
+    #[test]
+    fn session_pex_toggle_and_private_flag_are_both_authoritative() {
+        assert!(pex_enabled(false, false));
+        assert!(!pex_enabled(true, false));
+        assert!(!pex_enabled(false, true));
+        assert!(!pex_enabled(true, true));
     }
 }
 

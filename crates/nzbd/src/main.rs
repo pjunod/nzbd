@@ -486,6 +486,25 @@ fn spawn_watch_dir(
     });
 }
 
+fn spawn_torrent_watch_dir(
+    service: nzbd_api::torrent_admission::TorrentAdmissionService,
+    dir: PathBuf,
+    cancel: tokio_util::sync::CancellationToken,
+    tracker: &tokio_util::task::TaskTracker,
+) {
+    tracker.spawn(async move {
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => break,
+                _ = tokio::time::sleep(Duration::from_secs(30)) => {}
+            }
+            if let Err(error) = service.scan_watch_once(&dir).await {
+                tracing::warn!(error = %error, "torrent watch scan failed");
+            }
+        }
+    });
+}
+
 /// Resolves on SIGINT (ctrl-c) or SIGTERM — the latter is what
 /// `docker stop`, tini and systemd send. Both mean the same thing:
 /// finish in-flight writes, sync journals, exit clean (no unclean
@@ -712,33 +731,164 @@ fn run(
     engine_cfg.max_active_downloads = cfg.max_active_downloads();
 
     runtime.block_on(async move {
+        // History is a queue-terminal dependency for torrents even when
+        // Usenet post-processing is disabled: payload disposition must be
+        // durable before a confirmed removal can leave the active queue.
+        let history_db = if cfg.post.enabled || cfg.torrent.enabled {
+            let state_dir = cfg.state_dir();
+            Some(open_history(
+                &state_dir,
+                &state_dir.join("history"),
+                None,
+                history_retention(&cfg),
+            )?)
+        } else {
+            None
+        };
+        engine_cfg.history = history_db.clone();
         let engine = Engine::spawn(engine_cfg).await.map_err(with_fs_hint)?;
+        if !cfg.torrent.enabled {
+            let live_torrents = engine
+                .snapshot()
+                .jobs
+                .iter()
+                .filter(|job| job.kind == nzbd_types::JobKind::Torrent)
+                .count();
+            if live_torrents > 0 {
+                engine.shutdown().await;
+                return Err(anyhow_lite::Error::msg(format!(
+                    "[torrent] is disabled but {live_torrents} live torrent queue record(s) remain; re-enable BitTorrent and explicitly remove or drain them before disabling"
+                )));
+            }
+        }
+
+        let torrent_cancel = tokio_util::sync::CancellationToken::new();
+        let torrent_tracker = tokio_util::task::TaskTracker::new();
+        let mut torrent_executor = None;
+        let torrent_service = if cfg.torrent.enabled {
+            let proxy = cfg.torrent.socks_proxy_url.as_ref().map(|url| {
+                nzbd_torrent::TorrentProxyConfig {
+                    url: url.clone(),
+                    username: cfg.torrent.socks_proxy_username.clone(),
+                    password: cfg.torrent.socks_proxy_password.clone(),
+                }
+            });
+            let listen_end = cfg
+                .torrent
+                .listen_port
+                .checked_add(1)
+                .expect("validated torrent listen port");
+            let session = nzbd_torrent::TorrentSession::start(
+                cfg.torrent_dir(),
+                nzbd_torrent::TorrentSessionConfig {
+                    dht: cfg.torrent.dht,
+                    pex: cfg.torrent.pex,
+                    listen_port_range: Some(cfg.torrent.listen_port..listen_end),
+                    proxy,
+                    persistence_dir: Some(cfg.state_dir().join("torrents/session")),
+                    max_peers_per_torrent: Some(cfg.torrent.max_peers_per_torrent as usize),
+                    max_peers_total: Some(cfg.torrent.max_peers_total as usize),
+                    max_known_peers_per_torrent: Some(
+                        cfg.torrent.max_known_peers_per_torrent as usize,
+                    ),
+                    max_known_peers_total: Some(cfg.torrent.max_known_peers_total as usize),
+                    metainfo_max_bytes: Some(cfg.torrent.metainfo_max_mib * 1024 * 1024),
+                },
+            )
+            .await
+            .map_err(|error| anyhow_lite::Error::msg(format!("torrent session: {error}")))?;
+
+            let mut category_seed_policies = std::collections::HashMap::new();
+            let mut category_payload_roots = std::collections::HashMap::new();
+            for category in &cfg.categories {
+                category_seed_policies.insert(
+                    category.name.clone(),
+                    nzbd_types::SeedPolicy {
+                        ratio_limit: category.seed_ratio,
+                        time_limit_secs: category.seed_minutes.map(|minutes| minutes * 60),
+                    },
+                );
+                if let Some(root) = &category.torrent_dir {
+                    let root = nzbd_config::expand_home(root);
+                    std::fs::create_dir_all(&root)?;
+                    category_payload_roots.insert(category.name.clone(), std::fs::canonicalize(root)?);
+                }
+            }
+            for (name, root) in nzbd_qbit_compat::load_overlay_category_roots(
+                &cfg.state_dir(),
+                &cfg.torrent_dir(),
+            ) {
+                category_payload_roots.entry(name).or_insert(root);
+            }
+            let upload_limit_bps = (cfg.torrent.upload_limit_kib > 0)
+                .then_some(cfg.torrent.upload_limit_kib * 1024);
+            let service = nzbd_api::torrent_admission::TorrentAdmissionService::new(
+                engine.clone(),
+                session,
+                cfg.state_dir(),
+                cfg.torrent.socks_proxy_url.is_some(),
+                cfg.torrent.dht,
+            )
+            .with_transfer_policy(
+                nzbd_types::SeedPolicy {
+                    ratio_limit: (cfg.torrent.default_seed_ratio > 0.0)
+                        .then_some(cfg.torrent.default_seed_ratio),
+                    time_limit_secs: (cfg.torrent.default_seed_minutes > 0)
+                        .then_some(cfg.torrent.default_seed_minutes * 60),
+                },
+                category_seed_policies,
+                upload_limit_bps,
+            )
+            .with_category_payload_roots(category_payload_roots)
+            .with_source_fetch_limits(nzbd_torrent::TorrentSourceFetchLimits {
+                max_metainfo_bytes: cfg.torrent.metainfo_max_mib as usize * 1024 * 1024,
+                max_redirects: cfg.torrent.source_redirects as usize,
+                ..Default::default()
+            });
+            service
+                .recover()
+                .await
+                .map_err(|error| anyhow_lite::Error::msg(format!("torrent recovery: {error}")))?;
+            torrent_executor = Some(service.spawn_backend_executor().map_err(|error| {
+                anyhow_lite::Error::msg(format!("torrent backend executor: {error}"))
+            })?);
+            if let Some(watch) = &cfg.paths.torrent_watch_dir {
+                let dir = nzbd_config::expand_home(watch);
+                std::fs::create_dir_all(&dir)?;
+                spawn_torrent_watch_dir(
+                    service.clone(),
+                    dir,
+                    torrent_cancel.clone(),
+                    &torrent_tracker,
+                );
+            }
+            tracing::info!(
+                port = cfg.torrent.listen_port,
+                "single-node BitTorrent backend active"
+            );
+            Some(service)
+        } else {
+            None
+        };
+        torrent_tracker.close();
 
         // Post-processing manager (par verify/repair → unpack → cleanup →
         // scripts), watching the engine's finish events.
         let pp_cancel = tokio_util::sync::CancellationToken::new();
         let pp_tracker = tokio_util::task::TaskTracker::new();
-        let mut history = None;
+        let history = history_db.clone();
         // Shared with the API so `/metrics` can report stage durations
         // measured where they actually happen.
         let mut pp_stats = None;
         let mut pp_manager = None;
         if cfg.post.enabled {
-            let state_dir = cfg.state_dir();
-            let db = open_history(
-                &state_dir,
-                &state_dir.join("history"),
-                None,
-                history_retention(&cfg),
-            )?;
-            history = Some(db.clone());
             let slots = nzbd_post::manager::strategy_slots(&cfg.post.strategy);
             let stats = Arc::new(nzbd_types::metrics::PpStageStats::new());
             pp_stats = Some(stats.clone());
             pp_manager = Some(nzbd_post::manager::spawn_post_manager(
                 engine.clone(),
                 post_config(&cfg, slots, Some(stats)),
-                db,
+                history_db.expect("post-processing history opened above"),
                 cfg.dest_dir(),
                 None, // single node: always the authority
                 pp_cancel.clone(),
@@ -783,9 +933,15 @@ fn run(
         // so graceful shutdown can drain and a restart isn't held open by an
         // open `/api/v1/events` connection.
         let (sse_shutdown_tx, sse_shutdown_rx) = tokio::sync::watch::channel(false);
-        let app = nzbd_api::require_auth(
+        let auth = nzbd_api::AuthConfig {
+            username: cfg.api.username.clone(),
+            password: cfg.api.password.clone(),
+            token: cfg.api.token.clone(),
+        };
+        let mut app = nzbd_api::require_auth(
             nzbd_api::router_with(nzbd_api::ApiState {
                 engine: engine.clone(),
+                torrent: torrent_service.clone(),
                 history,
                 log: Some(logbuf.clone()),
                 setup: setup.clone(),
@@ -796,12 +952,40 @@ fn run(
                 events: None, // router_with starts the hub
             })
             .merge(nzbd_compat::router(compat_state)),
-            nzbd_api::AuthConfig {
-                username: cfg.api.username.clone(),
-                password: cfg.api.password.clone(),
-                token: cfg.api.token.clone(),
-            },
+            auth.clone(),
         );
+        if let Some(torrent) = torrent_service.clone() {
+            let qbit_save_path = torrent.output_root().to_path_buf();
+            let configured_categories = cfg
+                .categories
+                .iter()
+                .map(|category| {
+                    let path = category
+                        .torrent_dir
+                        .as_ref()
+                        .map(|path| nzbd_config::expand_home(path))
+                        .unwrap_or_else(|| cfg.torrent_dir());
+                    (category.name.clone(), path)
+                })
+                .collect();
+            app = app.merge(nzbd_qbit_compat::router(nzbd_qbit_compat::QbitState::new(
+                engine.clone(),
+                torrent,
+                nzbd_qbit_compat::QbitAuth {
+                    username: auth.username,
+                    password: auth.password,
+                    token: auth.token,
+                },
+                cfg.state_dir(),
+                qbit_save_path,
+                configured_categories,
+                cfg.torrent.dht,
+                true,
+                cfg.torrent.default_seed_ratio,
+                cfg.torrent.default_seed_minutes,
+                Some(clients_registry.clone()),
+            )));
+        }
 
         // A second view of the shutdown signal for the drain deadline below.
         let mut force_rx = sse_shutdown_tx.subscribe();
@@ -845,7 +1029,11 @@ fn run(
             None => {
                 tracing::info!(%bind, "nzbd listening");
                 let serve = std::future::IntoFuture::into_future(
-                    axum::serve(listener, app).with_graceful_shutdown(shutdown),
+                    axum::serve(
+                        listener,
+                        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+                    )
+                    .with_graceful_shutdown(shutdown),
                 );
                 tokio::pin!(serve, force);
                 tokio::select! {
@@ -872,9 +1060,17 @@ fn run(
         // Tokio runtime teardown wait for it.
         feed_cancel.cancel();
         pp_cancel.cancel();
+        torrent_cancel.cancel();
+        if let Some(service) = &torrent_service {
+            service.shutdown().await;
+        }
+        if let Some(executor) = torrent_executor.take() {
+            executor.abort();
+        }
         let subsystems = async {
             feed_tracker.wait().await;
             pp_tracker.wait().await;
+            torrent_tracker.wait().await;
         };
         if tokio::time::timeout(Duration::from_secs(10), subsystems)
             .await
@@ -913,9 +1109,11 @@ async fn serve_tls(
         tokio::select! {
             _ = &mut shutdown => break,
             accepted = listener.accept() => {
-                let Ok((stream, _peer)) = accepted else { continue };
+                let Ok((stream, peer)) = accepted else { continue };
                 let acceptor = acceptor.clone();
-                let app = app.clone();
+                let app = app
+                    .clone()
+                    .layer(axum::Extension(axum::extract::ConnectInfo(peer)));
                 tokio::spawn(async move {
                     let Ok(stream) = acceptor.accept(stream).await else {
                         return; // handshake failure (scanner, plain HTTP, …)

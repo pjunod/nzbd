@@ -7,6 +7,8 @@ import { SseParser } from '../api/sse';
 import {
   AddNzbOptions,
   AddNzbResult,
+  AddTorrentOptions,
+  AddTorrentResult,
   ConnectionConfig,
   ConnectionState,
   QueueSnapshot,
@@ -26,6 +28,7 @@ interface HookResult {
       | 'pause'
       | 'resume'
       | 'delete'
+      | 'delete-files'
       | 'move-top'
       | 'move-up'
       | 'move-down'
@@ -33,6 +36,8 @@ interface HookResult {
   ) => Promise<{ ok: boolean; parked?: boolean }>;
   setJobPriority: (id: number, priority: number) => Promise<void>;
   addNzb: (file: File, options: AddNzbOptions) => Promise<AddNzbResult>;
+  addTorrentFile: (file: File, options: AddTorrentOptions) => Promise<AddTorrentResult>;
+  addTorrentSource: (uri: string, options: AddTorrentOptions) => Promise<AddTorrentResult>;
 }
 
 export function useNzbd(config: ConnectionConfig): HookResult {
@@ -171,5 +176,9 @@ export function useNzbd(config: ConnectionConfig): HookResult {
     setJobPriority: (id, priority) =>
       mutate(`job:${id}:priority`, () => client.setJobPriority(id, priority)),
     addNzb: (file, options) => mutate('add', () => client.addNzb(file, options)),
+    addTorrentFile: (file, options) =>
+      mutate('add', () => client.addTorrentFile(file, options)),
+    addTorrentSource: (uri, options) =>
+      mutate('add', () => client.addTorrentSource(uri, options)),
   };
 }
