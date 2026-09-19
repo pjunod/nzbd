@@ -2517,7 +2517,11 @@ async fn history_action(
         .await
         .ok()
         .flatten();
-        if let Some(torrent) = entry.as_ref().and_then(|entry| entry.torrent.as_ref()) {
+        if let Some(torrent) = entry
+            .as_ref()
+            .and_then(|entry| entry.record.as_ref())
+            .and_then(|record| record.torrent.as_ref())
+        {
             if torrent.payload == nzbd_types::TorrentPayloadDisposition::Retained {
                 return error(
                     StatusCode::CONFLICT,

@@ -151,7 +151,7 @@ impl TorrentAdmissionService {
     pub async fn admit_raw(
         &self,
         bytes: Vec<u8>,
-        mut opts: AddOpts,
+        opts: AddOpts,
     ) -> Result<AdmissionResult, AdmissionError> {
         self.finish(None, bytes, TorrentSource::Metainfo, opts)
             .await
@@ -161,7 +161,7 @@ impl TorrentAdmissionService {
         &self,
         source: TorrentSource,
         secret: String,
-        opts: AddOpts,
+        mut opts: AddOpts,
     ) -> Result<AdmissionResult, AdmissionError> {
         match source {
             TorrentSource::Magnet => {

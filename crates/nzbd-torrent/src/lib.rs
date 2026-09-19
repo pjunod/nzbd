@@ -1199,6 +1199,7 @@ fn exact_add_options(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn session_options(
     dht: bool,
     pex: bool,
