@@ -201,7 +201,7 @@ index c2defd32..da7dc931 100644
 +                    let Some((id, addr, depth)) = r else {
 +                        break;
                      };
-+                    debug_assert!(futs.try_push(request_one(id, addr, depth)).is_ok());
++                    assert!(futs.try_push(request_one(id, addr, depth)).is_ok());
 +                },
 +                Some(f) = futs.next(), if !futs.is_empty() => {
                      if f.is_ok() {
@@ -239,7 +239,7 @@ index c2defd32..da7dc931 100644
 +                        addr = node_rx.recv(), if !futs.is_full() => {
                              let (id, addr, depth) = addr.unwrap();
 -                            futs.push(
-+                            debug_assert!(futs.try_push(
++                            assert!(futs.try_push(
                                  this.request_one(id, addr, depth)
                                      .map_err(|e| debug!("error: {e:#}"))
                                      .instrument(debug_span!("addr", addr=addr.to_string()))
@@ -540,7 +540,7 @@ index c2defd32..da7dc931 100644
                          .map(|n| n.addr())
                          .take(8).collect::<Vec<_>>();
 -                    futs.push(
-+                    debug_assert!(futs.try_push(
++                    assert!(futs.try_push(
                          RecursiveRequest::find_node_for_routing_table(
                              self.dht.clone(), random_id, addrs.into_iter()
                          ).instrument(debug_span!("refresh_bucket"))
@@ -581,7 +581,7 @@ index c2defd32..da7dc931 100644
 +                r = rx.recv(), if !futs.is_full() => {
                      let (id, addr) = r.unwrap();
 -                    futs.push(async move {
-+                    debug_assert!(futs.try_push(async move {
++                    assert!(futs.try_push(async move {
                          table.write().mark_outgoing_request(&id, now());
                          match self.dht.request(Request::Ping, addr).await {
                              Ok(_) => {
