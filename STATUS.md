@@ -1,5 +1,20 @@
 # nzbd — Project Status
 
+## Settings save repair — 2026-09-20
+
+**Status:** implementation ready; adversarial review and final fast lane pending.
+
+- Fixed the API response so default BitTorrent values are present when the
+  settings form first enables the feature; the compact TOML format is retained.
+- Save confirmations remain visible after reload; form collection failures
+  produce an error instead of an unhandled rejection.
+- Regression coverage checks persistence, restart advice, save feedback, and
+  retryable validation failures.
+- Work is isolated in an agent-owned clone on `codex/settings-save-repair`.
+- Final fast lane: formatting, UI boot, UI DOM, and the targeted API settings
+  persistence regression. Full-suite failures are tracked separately.
+- No new release gate or automatic restart is introduced.
+
 The explicit ledger of what this project intends to do and whether it is
 done. **Update this file in every feature commit.** Derived from the
 roadmaps in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) §16 and

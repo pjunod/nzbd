@@ -1742,6 +1742,71 @@ const models = (jobs) => jobs.map((j, i) => T.rowModel(j, { idx: i, count: jobs.
     seen.length = 0;
   }
 
+  // Settings saves must submit the enabled flag, retain defaults, and leave
+  // visible feedback after the form is refreshed from the saved config.
+  {
+    routes.clear();
+    const doc = sandbox.document;
+    const form = doc.getElementById("cfg-form");
+    const save = doc.getElementById("cfg-save");
+    const msg = doc.getElementById("cfg-msg");
+    const config = {
+      paths: {}, queue: {}, post: {}, history: {}, server: [], category: [],
+      torrent: { enabled: false, listen_port: 6881, pex: true },
+    };
+    let stored = config, submitted, rejectSave = false;
+    routes.set("/api/v1/config", (_url, init) => {
+      if (init && init.method === "PUT") {
+        submitted = init.body;
+        if (rejectSave) return { status: 422, body: { error: "invalid torrent settings" } };
+        if (init.headers["content-type"] === "application/json") stored = JSON.parse(init.body);
+        return { status: 200, body: {
+          applied_live: [], restart_required: ["torrent"], connection_notes: [],
+        } };
+      }
+      return { status: 200, body: {
+        config: stored, path: "/tmp/nzbd.toml", writable: true,
+        toml: "[torrent]\nenabled = true", pending_restart: stored.torrent.enabled ? ["torrent"] : [],
+      } };
+    });
+    await vm.runInContext("loadSettings(true)", sandbox);
+    ok(form.innerHTML.includes('data-path="torrent.listen_port" data-type="num" value="6881"'),
+      "the BitTorrent form renders the API's default listen port");
+    const enable = { dataset: { path: "torrent.enabled", type: "check" }, checked: true };
+    const originalQuery = form.querySelectorAll;
+    form.querySelectorAll = sel => sel === "[data-path]" ? [enable] : [];
+    form.oninput();
+    eq(save.disabled, false, "editing enables Save changes");
+    await save.onclick();
+    eq(JSON.parse(submitted).torrent.enabled, true, "Save changes submits BitTorrent enabled");
+    eq(JSON.parse(submitted).torrent.listen_port, 6881, "save preserves the default listen port");
+    eq(msg.textContent, "saved", "save confirmation survives the settings reload");
+    eq(doc.getElementById("restart-banner").hidden, false, "enabling BitTorrent requests a restart");
+    eq(save.disabled, true, "a successful save clears the dirty state");
+
+    rejectSave = true;
+    enable.checked = false;
+    form.oninput();
+    await save.onclick();
+    eq(msg.textContent, "invalid torrent settings", "validation failure stays visible");
+    eq(save.disabled, false, "a rejected save remains retryable");
+    eq(enable.checked, false, "a rejected save retains the edit");
+
+    submitted = null;
+    enable.dataset.path = "missing.enabled";
+    await save.onclick();
+    eq(submitted, null, "a collection error does not send a partial config");
+    ok(msg.textContent.startsWith("Could not read settings:"), "collection errors are visible");
+    eq(save.disabled, false, "a collection error leaves Save changes enabled");
+    enable.dataset.path = "torrent.enabled";
+
+    rejectSave = false;
+    await doc.getElementById("adv-save").onclick();
+    eq(msg.textContent, "TOML saved", "advanced save confirmation survives reload");
+    form.querySelectorAll = originalQuery;
+    routes.clear();
+  }
+
   if (failures.length) {
     console.error("UI DOM FAILURES:");
     for (const f of failures) console.error("  - " + f);
