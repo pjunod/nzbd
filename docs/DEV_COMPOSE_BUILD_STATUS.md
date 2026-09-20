@@ -1,6 +1,6 @@
 # Dev Compose build status — local image ownership
 
-**Status:** ready for adversarial review · **Branch:**
+**Status:** adversarial review clean, qualification pending · **Branch:**
 `codex/fix-dev-compose-build` · **Updated:** 2026-09-19
 
 Companion to [STATUS.md](../STATUS.md), which owns the project-wide ledger.
@@ -14,7 +14,7 @@ This page records the isolated fix for the dev Compose build failure reported on
 | Reproduction and diagnosis | complete | The image-only discovery service is identified as the registry pull owner |
 | Compose image ownership | implemented | Both services resolve the same local build definition |
 | Regression contract | implemented | A source-level test rejects an image-only dev discovery service |
-| Adversarial review | pending | Independent review of the merge-ready diff |
+| Adversarial review | complete | No actionable P0–P3 findings |
 | Fast-lane qualification | pending | Focused config tests and Compose model validation pass after review remediation |
 | Merge | pending | Reviewed, green head lands on `main` |
 
@@ -48,3 +48,4 @@ This page records the isolated fix for the dev Compose build failure reported on
 | 2026-09-19 | Reproduced the resolved Compose model from the reported checkout | Only `nzbd` owned a build; `nzbd-discovery` referenced `nzbd:dev` as an image |
 | 2026-09-19 | Moved work into an isolated GitHub clone | Clean branch `codex/fix-dev-compose-build` from `origin/main` |
 | 2026-09-19 | Shared the build definition and added the regression contract | Source inspection complete; tests intentionally deferred until after review |
+| 2026-09-19 | Completed the single adversarial merge-readiness review | No actionable P0–P3 correctness, compatibility, test, documentation, or side-effect findings |
