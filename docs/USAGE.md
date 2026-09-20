@@ -20,9 +20,10 @@ local or remote. Logs go to stderr; set `RUST_LOG` for verbosity
 (`RUST_LOG=debug nzbd run …`), and the same stream feeds the in-daemon
 log ring visible in the UI and API.
 
-Other ways to queue work: drop `.nzb` files into `paths.nzb_watch_dir`,
-let a feed rule accept items ([CONFIGURATION.md](CONFIGURATION.md)
-`[[feed]]`), POST to the native API, or let Sonarr/Radarr do it.
+Other ways to queue work: drop `.nzb` files into `paths.nzb_watch_dir`, drop
+`.torrent` files into `paths.torrent_watch_dir`, let a feed rule accept items
+([CONFIGURATION.md](CONFIGURATION.md) `[[feed]]`), POST to the native API, or
+let Sonarr/Radarr do it.
 
 ## The web UI
 
@@ -31,6 +32,17 @@ deploy): live queue with per-job and per-file actions, pause/resume,
 speed limit control, history, log tail, settings, layouts and color schemes. It updates
 over SSE at 1 Hz — progress bars, rates and the sparkline move without
 you touching anything.
+
+**Adding downloads.** **+ add nzb** uploads one or more local NZB files.
+**+ add torrent** opens an inline form for a magnet link, remote `.torrent`
+URL, or local `.torrent` file, with category, priority, and add-paused options.
+BitTorrent intake requires `[torrent].enabled = true` and a restart; the
+button remains visible when disabled so configuration is advisory rather than
+a second UI gate, and the daemon's rejection says when the running session is
+still disabled. Torrent rows stay in the same queue while downloading and
+seeding; their protocol chip, ratio, upload rate, peers, seeding time,
+pause/resume, and keep/delete-payload controls identify the different
+lifecycle.
 
 **Display** in the control row keeps three browser-local choices. **Layout**
 offers Classic, Plex, and Theater; Classic is the exact nzbd layout from before

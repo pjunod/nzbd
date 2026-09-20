@@ -142,7 +142,12 @@ function wrapChild(tag, id, cls) {
 const routes = new Map();
 const seen = [];
 async function routeFetch(url, init) {
-  seen.push({ url, method: (init && init.method) || "GET" });
+  seen.push({
+    url,
+    method: (init && init.method) || "GET",
+    headers: (init && init.headers) || {},
+    body: init && init.body,
+  });
   for (const [frag, entry] of routes) {
     if (!String(url).includes(frag)) continue;
     // A route may be a function when a test needs consecutive calls to
@@ -1131,6 +1136,63 @@ const models = (jobs) => jobs.map((j, i) => T.rowModel(j, { idx: i, count: jobs.
 (async () => {
   const stack = sandbox.document.getElementById("toasts");
   const reset = () => { stack.children.length = 0; routes.clear(); seen.length = 0; T.pending.clear(); };
+
+  // --- 21b. BitTorrent intake is reachable from the dashboard ------------
+  // The backend and Settings toggle shipped before an add surface did. Pin
+  // both wire forms here: typed JSON for magnet/URL and raw metainfo bytes.
+  reset();
+  const addPanel = sandbox.document.getElementById("torrent-add-form");
+  addPanel.hidden = true;
+  T.showTorrentAdd();
+  eq(addPanel.hidden, false, "+ add torrent reveals the intake form");
+  T.showTorrentAdd(false);
+  eq(addPanel.hidden, true, "the torrent form closes without changing the queue");
+  T.setTorrentBusy(true);
+  eq(sandbox.document.getElementById("btn-torrent-uri").disabled, true,
+    "a pending admission disables duplicate submits");
+  eq(sandbox.document.getElementById("btn-torrent-uri").textContent, "Adding…",
+    "the pending button says what it is waiting on");
+  T.setTorrentBusy(false);
+  const magnetRequest = T.torrentRequest(" magnet:?xt=urn:btih:abc ", {
+    category: " tv ", priority: "50", paused: true,
+  });
+  eq(magnetRequest.source.type, "magnet",
+    "magnet links use typed magnet admission");
+  eq(magnetRequest.category, "tv", "typed admission trims the category");
+  eq(magnetRequest.priority, 50, "typed admission carries priority");
+  eq(magnetRequest.paused, true, "typed admission carries the paused intent");
+  eq(T.torrentRequest("https://tracker.example/file.torrent").source.type, "torrent_url",
+    ".torrent URLs use typed URL admission");
+  eq(T.torrentRequest("   "), null, "an empty source never reaches the daemon");
+
+  routes.set("/api/v1/jobs", { status: 201, body: { id: 41, info_hash: "abc" } });
+  await T.addTorrentUri("magnet:?xt=urn:btih:abc", { category: "tv", priority: 50, paused: true });
+  let add = seen.find(r => r.url === "/api/v1/jobs" && r.method === "POST");
+  ok(add, "a magnet submits to the native jobs endpoint");
+  eq(add.headers["content-type"], "application/json", "a magnet is typed JSON");
+  eq(JSON.parse(add.body).source.type, "magnet", "the JSON names the source kind");
+  eq(JSON.parse(add.body).category, "tv", "the JSON carries add options");
+
+  seen.length = 0;
+  const bytes = new Uint8Array([100, 3, 102, 111, 111, 51, 98, 97, 114, 101]).buffer;
+  const uploaded = await T.addTorrentFiles(
+    [{ name: "example.torrent", arrayBuffer: async () => bytes }],
+    { category: "movies & tv", priority: -50, paused: true });
+  add = seen.find(r => r.url.startsWith("/api/v1/jobs?") && r.method === "POST");
+  eq(uploaded.added, 1, "a .torrent file is reported as added");
+  eq(uploaded.failed, 0, "a successful .torrent upload is not reported as failed");
+  eq(add.headers["content-type"], "application/x-bittorrent", "a .torrent sends raw metainfo");
+  eq(add.body, bytes, "the uploaded bytes are not rewritten in the browser");
+  ok(add.url.includes("priority=-50") && add.url.includes("paused=true"),
+    "raw metainfo carries priority and paused options in the query");
+  ok(add.url.includes("category=movies%20%26%20tv"), "the raw category is URL encoded");
+
+  routes.set("/api/v1/jobs", { status: 503, body: { error: "BitTorrent is disabled" } });
+  await T.addTorrentUri("magnet:?xt=urn:btih:def", {});
+  const torrentMsg = sandbox.document.getElementById("addtorrent-msg");
+  ok(torrentMsg.textContent.includes("BitTorrent is disabled"),
+    "torrent intake shows the daemon's actionable rejection");
+  eq(torrentMsg.className, "bad", "a rejected torrent is visibly an error");
 
   // (a) a parked delete offers Undo
   reset();
