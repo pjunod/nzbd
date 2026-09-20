@@ -1,6 +1,6 @@
 # Dev Compose build status — local image ownership
 
-**Status:** adversarial review clean, qualification pending · **Branch:**
+**Status:** reviewed and fast-lane green, merge pending · **Branch:**
 `codex/fix-dev-compose-build` · **Updated:** 2026-09-19
 
 Companion to [STATUS.md](../STATUS.md), which owns the project-wide ledger.
@@ -15,7 +15,7 @@ This page records the isolated fix for the dev Compose build failure reported on
 | Compose image ownership | implemented | Both services resolve the same local build definition |
 | Regression contract | implemented | A source-level test rejects an image-only dev discovery service |
 | Adversarial review | complete | No actionable P0–P3 findings |
-| Fast-lane qualification | pending | Focused config tests and Compose model validation pass after review remediation |
+| Fast-lane qualification | complete | Formatting, six config tests, Compose validation, and build-ownership assertion pass |
 | Merge | pending | Reviewed, green head lands on `main` |
 
 ## Working rules — one review and one qualification pass
@@ -49,3 +49,4 @@ This page records the isolated fix for the dev Compose build failure reported on
 | 2026-09-19 | Moved work into an isolated GitHub clone | Clean branch `codex/fix-dev-compose-build` from `origin/main` |
 | 2026-09-19 | Shared the build definition and added the regression contract | Source inspection complete; tests intentionally deferred until after review |
 | 2026-09-19 | Completed the single adversarial merge-readiness review | No actionable P0–P3 correctness, compatibility, test, documentation, or side-effect findings |
+| 2026-09-19 | Ran the single fast-lane qualification pass | Workspace formatting, six shipped-config tests, Compose schema resolution, and both-service build ownership are green |
