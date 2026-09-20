@@ -195,8 +195,24 @@ impl Engine {
         let shared = new_shared_snapshot();
         let (events, _) = broadcast::channel(512);
         let (epoch_tx, epoch_rx) = watch::channel(0u64);
-        let (budget_tx, budget_rx) =
-            watch::channel(std::collections::HashMap::<nzbd_types::ServerId, u16>::new());
+        let initial_budgets = pool::BudgetEnvelope {
+            generation: 0,
+            allowances: cfg
+                .servers
+                .iter()
+                .map(|server| {
+                    (
+                        server.id,
+                        if cfg.download_enabled && server.active {
+                            server.max_connections.max(1)
+                        } else {
+                            0
+                        },
+                    )
+                })
+                .collect(),
+        };
+        let (budget_tx, budget_rx) = watch::channel(initial_budgets);
         let (engine_tx, engine_rx) = mpsc::channel::<EngineMsg>(1024);
         // The owner gets the command-producing half. Keep the adapter half
         // with the engine handle until the runtime executor takes it; this
@@ -208,6 +224,13 @@ impl Engine {
         let cancel = CancellationToken::new();
         let tracker = TaskTracker::new();
         let servers = Arc::new(cfg.servers.clone());
+        let budget_tracker = Arc::new(pool::BudgetTracker::new(
+            servers
+                .iter()
+                .filter(|server| server.active)
+                .map(|server| usize::from(server.max_connections.max(1)))
+                .sum(),
+        ));
 
         // TLS configs once per server.
         let mut tls_by_server: Vec<Option<TlsClientConfig>> = Vec::new();
@@ -316,6 +339,7 @@ impl Engine {
                     engine_tx: engine_tx.clone(),
                     epoch: epoch_rx.clone(),
                     budgets: budget_rx.clone(),
+                    budget_tracker: budget_tracker.clone(),
                     limiter: limiter.clone(),
                     meter: meter.clone(),
                     cancel: cancel.clone(),
@@ -334,6 +358,7 @@ impl Engine {
             cancel,
             tracker,
             backend_adapter: Arc::new(std::sync::Mutex::new(Some(backend_adapter))),
+            budget_tracker,
         };
 
         for (job, url) in refetch {
@@ -409,6 +434,17 @@ pub struct EngineHandle {
     cancel: CancellationToken,
     tracker: TaskTracker,
     backend_adapter: Arc<std::sync::Mutex<Option<backend::BackendAdapterPort>>>,
+    budget_tracker: Arc<pool::BudgetTracker>,
+}
+
+#[derive(Clone, Debug)]
+pub struct BudgetApplyReceipt {
+    pub generation: u64,
+    pub allowances: std::collections::HashMap<nzbd_types::ServerId, u16>,
+    /// Every spawned connection task observed the generation between NNTP
+    /// batches. False means the caller must conservatively reserve the old
+    /// capacity until a later acknowledgement.
+    pub drained: bool,
 }
 
 impl EngineHandle {
@@ -569,6 +605,24 @@ impl EngineHandle {
                 }
             }
         });
+    }
+
+    /// Restart durable URL placeholders after cluster authority takeover.
+    /// Duplicate execution is harmless: completion applies only while the
+    /// job remains `Fetching`, and the control adapter revision-checks the
+    /// single winning resolution.
+    pub async fn resume_url_fetches(&self) -> Result<(), EngineError> {
+        for summary in &self.snapshot().jobs {
+            if summary.status != nzbd_types::JobStatus::Fetching {
+                continue;
+            }
+            if let Some(job) = self.export_job(summary.id).await? {
+                if let Some((_, url)) = job.params.iter().find(|(key, _)| key == "*URL") {
+                    self.spawn_url_fetch(job.id, url.clone());
+                }
+            }
+        }
+        Ok(())
     }
 
     async fn fail_url_fetch(&self, job: JobId, error: String) -> Result<(), EngineError> {
@@ -836,8 +890,24 @@ impl EngineHandle {
     pub async fn set_server_budgets(
         &self,
         budgets: std::collections::HashMap<nzbd_types::ServerId, u16>,
-    ) -> Result<(), EngineError> {
-        self.roundtrip_unit(|reply| QueueCommand::SetServerBudgets { budgets, reply })
+    ) -> Result<BudgetApplyReceipt, EngineError> {
+        let (tx, rx) = oneshot::channel();
+        self.send(QueueCommand::SetServerBudgets { budgets, reply: tx })
+            .await?;
+        let (generation, allowances) = rx.await.map_err(|_| EngineError::Closed)?;
+        let drained = self
+            .budget_tracker
+            .wait_for(generation, std::time::Duration::from_secs(10))
+            .await;
+        Ok(BudgetApplyReceipt {
+            generation,
+            allowances,
+            drained,
+        })
+    }
+
+    pub async fn set_download_enabled(&self, enabled: bool) -> Result<(), EngineError> {
+        self.roundtrip_unit(|reply| QueueCommand::SetDownloadEnabled { enabled, reply })
             .await
     }
 
@@ -864,6 +934,14 @@ impl EngineHandle {
         rx.await
             .map_err(|_| EngineError::Closed)?
             .map_err(EngineError::State)
+    }
+
+    pub async fn adopt_replicated_authority(
+        &self,
+        jobs: Vec<nzbd_types::Job>,
+    ) -> Result<(), EngineError> {
+        self.roundtrip_unit(|reply| QueueCommand::AdoptReplicatedAuthority { jobs, reply })
+            .await
     }
 
     /// Crash-only demotion: keep only `keep` (leases still executing),

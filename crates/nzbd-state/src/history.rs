@@ -452,8 +452,11 @@ impl HistoryDb {
 
     fn row_count(&self) -> Result<u64, StateError> {
         let conn = self.conn.lock().unwrap();
-        conn.query_row("SELECT COUNT(*) FROM history", [], |r| r.get::<_, u64>(0))
-            .map_err(|e| StateError::Corrupt(format!("sqlite count: {e}")))
+        let count = conn
+            .query_row("SELECT COUNT(*) FROM history", [], |r| r.get::<_, i64>(0))
+            .map_err(|e| StateError::Corrupt(format!("sqlite count: {e}")))?;
+        u64::try_from(count)
+            .map_err(|e| StateError::Corrupt(format!("sqlite count was negative: {e}")))
     }
 
     /// Visible row count — what the pager divides into pages.
@@ -467,8 +470,11 @@ impl HistoryDb {
                 "WHERE hidden = 0"
             }
         );
-        conn.query_row(&sql, [], |r| r.get::<_, u64>(0))
-            .map_err(|e| StateError::Corrupt(format!("sqlite count: {e}")))
+        let count = conn
+            .query_row(&sql, [], |r| r.get::<_, i64>(0))
+            .map_err(|e| StateError::Corrupt(format!("sqlite count: {e}")))?;
+        u64::try_from(count)
+            .map_err(|e| StateError::Corrupt(format!("sqlite count was negative: {e}")))
     }
 
     // -----------------------------------------------------------------

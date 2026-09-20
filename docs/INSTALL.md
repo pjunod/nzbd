@@ -68,7 +68,7 @@ brew services start nzbd     # launchd-managed daemon
 
 ## 4. Building from source
 
-Requirements: **Rust 1.85+** (the workspace pins `rust-version = "1.85"`)
+Requirements: **Rust 1.95+** (the workspace pins `rust-version = "1.95"`)
 and a C toolchain (rusqlite builds bundled SQLite).
 
 ```sh

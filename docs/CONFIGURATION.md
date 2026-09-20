@@ -392,6 +392,7 @@ Off by default; a single-node daemon needs none of this. Full semantics:
 ```toml
 [cluster]
 enabled = true
+cluster_id = "media-home"                 # identical and stable on all nodes
 node_name = "node-a"                      # unique + stable per node
 shared_dir = "/mnt/work"                  # the shared POSIX volume (all nodes)
 advertise_url = "http://10.0.0.11:6789"   # how PEERS reach this node
@@ -399,14 +400,54 @@ secret_file = "/etc/nzbd/cluster.secret"  # same secret on every node
 # secret = "inline-secret"                # alternative to secret_file
 coordinator = true          # eligible for leader election
 priority = 10               # lower = preferred leader
-download = true             # takes download-job leases
+download = true             # takes leases while this node is a worker
 max_download_jobs = 2
 post_process = true         # PP executor (anti-affinity prefers idle nodes)
 pp_slots = 1
 lease_interval_secs = 5     # heartbeat cadence
 takeover_after_secs = 20    # leader considered dead after this silence
 worker_ttl_secs = 30        # work lease expiry (another node then adopts)
+control_dir = "/var/lib/nzbd/control"      # local durable disk, never shared_dir
+control_node_id = 1                        # unique + stable voter identity
+control_raft_bind = "10.0.0.11:8810"
+control_api_bind = "10.0.0.11:8820"
+download_weight = 2         # positive relative placement weight
+pp_weight = 1
+
+[[cluster.control_peers]]    # identical fixed roster on every voter
+id = 1
+raft_addr = "10.0.0.11:8810"
+api_addr = "10.0.0.11:8820"
+
+[[cluster.control_peers]]
+id = 2
+raft_addr = "10.0.0.12:8810"
+api_addr = "10.0.0.12:8820"
+
+[[cluster.control_peers]]
+id = 3
+raft_addr = "10.0.0.13:8810"
+api_addr = "10.0.0.13:8820"
 ```
+
+An empty `control_peers` list is a supported single-voter configuration. A
+production HA cluster normally uses a fixed odd roster of at least three.
+Membership changes are stopped-cluster operations.
+
+The elected authority never consumes its own download or PP capacity. Keep at
+least one other eligible executor online when work must advance; a coordinator
+becomes an executor again automatically after it is no longer authority.
+
+Settings → **Dev · Usenet cluster** exposes the enable switch and common
+fields. Its met/unmet/unknown requirements are advisory only. The form never
+requires an approval receipt or readiness score. Configuration validation
+still rejects malformed identities, missing authentication, and invalid bind
+or voter definitions because those values cannot execute safely.
+
+Provider account budgets use the `[[server]].name` as the shared account key in
+this release. Nodes using the same account must use the same name and the same
+account-wide `connections` ceiling. See [CLUSTERING.md](CLUSTERING.md) for
+acknowledged budget transfer and migration/rollback behavior.
 
 ## Complete minimal example
 

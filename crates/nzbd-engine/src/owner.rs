@@ -243,6 +243,13 @@ pub(crate) enum QueueCommand {
     /// account budgets). Absent entry = local config limit.
     SetServerBudgets {
         budgets: HashMap<ServerId, u16>,
+        reply: oneshot::Sender<(u64, HashMap<ServerId, u16>)>,
+    },
+    /// Enable or park ordinary Usenet selection without restarting. Cluster
+    /// nodes use this at role transitions so the elected authority remains a
+    /// projection/scheduler and never executes unfenced local work.
+    SetDownloadEnabled {
+        enabled: bool,
         reply: oneshot::Sender<()>,
     },
     /// Become the queue authority: load the shared snapshot (local jobs
@@ -251,6 +258,12 @@ pub(crate) enum QueueCommand {
     /// without changing the local queue or shared snapshot.
     AdoptAuthority {
         reply: oneshot::Sender<Result<(), nzbd_state::StateError>>,
+    },
+    /// Replace the queue projection from replicated control. Local-only rows
+    /// must not survive takeover or rollback after a failed quorum commit.
+    AdoptReplicatedAuthority {
+        jobs: Vec<Job>,
+        reply: oneshot::Sender<()>,
     },
     /// Crash-only demotion: drop authority persistence and every job not
     /// in `keep` (the leases this node still executes).
@@ -545,7 +558,8 @@ pub(crate) struct Owner {
     /// engines run with this off; journals stay on regardless.
     persist: bool,
     persist_guard: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
-    budget_tx: watch::Sender<HashMap<ServerId, u16>>,
+    budget_tx: watch::Sender<crate::pool::BudgetEnvelope>,
+    budget_generation: u64,
     /// Cluster's share-out of a provider's account-wide connection limit.
     cluster_budgets: HashMap<ServerId, u16>,
     /// The operator's per-server connection count, changed from Settings
@@ -685,7 +699,7 @@ impl Owner {
         persist: bool,
         journal_suffix: &str,
         persist_guard: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
-        budget_tx: watch::Sender<HashMap<ServerId, u16>>,
+        budget_tx: watch::Sender<crate::pool::BudgetEnvelope>,
         shared: SharedSnapshot,
         events: broadcast::Sender<Event>,
         epoch_tx: watch::Sender<u64>,
@@ -812,6 +826,7 @@ impl Owner {
             persist,
             persist_guard,
             budget_tx,
+            budget_generation: 0,
             cluster_budgets: HashMap::new(),
             user_conn_caps: HashMap::new(),
             shared,
@@ -921,7 +936,7 @@ impl Owner {
     /// Publish the effective per-server connection allowance: the smaller
     /// of what the cluster grants this node and what the operator asked
     /// for. An absent entry on either side means "no opinion".
-    fn publish_conn_budgets(&mut self) {
+    fn publish_conn_budgets(&mut self) -> HashMap<ServerId, u16> {
         let mut out: HashMap<ServerId, u16> = self.cluster_budgets.clone();
         for (id, want) in &self.user_conn_caps {
             let eff = match out.get(id) {
@@ -930,10 +945,15 @@ impl Owner {
             };
             out.insert(*id, eff);
         }
-        let _ = self.budget_tx.send(out);
+        self.budget_generation = self.budget_generation.saturating_add(1);
+        let _ = self.budget_tx.send(crate::pool::BudgetEnvelope {
+            generation: self.budget_generation,
+            allowances: out.clone(),
+        });
         // Raising an allowance unparks tasks asleep on the budget
         // channel; they also need telling there may be work.
         self.bump_epoch();
+        out
     }
 
     fn startup_pass(&mut self) {
@@ -1200,6 +1220,7 @@ impl Owner {
                     tracing::info!(job = job.0, "url fetch complete; queued");
                     self.save_snapshot();
                     self.publish_now();
+                    self.emit(Event::UrlFetchResolved { job });
                     self.bump_epoch();
                 }
                 let _ = reply.send(ok);
@@ -1222,6 +1243,7 @@ impl Owner {
                         status: JobStatus::Failed,
                         health: 0,
                     });
+                    self.emit(Event::UrlFetchResolved { job });
                     self.bump_epoch();
                 }
                 let _ = reply.send(());
@@ -1648,7 +1670,13 @@ impl Owner {
             QueueCommand::SetServerBudgets { budgets, reply } => {
                 tracing::info!(?budgets, "connection budgets updated");
                 self.cluster_budgets = budgets;
-                self.publish_conn_budgets();
+                let applied = self.publish_conn_budgets();
+                let _ = reply.send((self.budget_generation, applied));
+            }
+            QueueCommand::SetDownloadEnabled { enabled, reply } => {
+                self.download_enabled = enabled;
+                self.bump_epoch();
+                self.publish_now();
                 let _ = reply.send(());
             }
             QueueCommand::SetServerConnectionCaps { caps, reply } => {
@@ -1679,6 +1707,30 @@ impl Owner {
             QueueCommand::AdoptAuthority { reply } => {
                 let result = self.adopt_authority();
                 let _ = reply.send(result);
+            }
+            QueueCommand::AdoptReplicatedAuthority { jobs, reply } => {
+                self.state.jobs = jobs;
+                self.state.pending_admissions.clear();
+                self.state.next_job_id = self
+                    .state
+                    .jobs
+                    .iter()
+                    .map(|job| job.id.0)
+                    .max()
+                    .unwrap_or(0);
+                self.state.next_file_id = self
+                    .state
+                    .jobs
+                    .iter()
+                    .flat_map(|job| job.files.iter().map(|file| file.id.0))
+                    .max()
+                    .unwrap_or(0);
+                self.state.recompute_all_totals();
+                self.dirty = true;
+                self.save_snapshot();
+                self.publish_now();
+                self.bump_epoch();
+                let _ = reply.send(());
             }
             QueueCommand::SetJobStatus { job, status, reply } => {
                 let ok = match self.state.job_mut(job) {
@@ -3028,7 +3080,7 @@ impl Owner {
             guards_ms = guards_ms.saturating_add(t.elapsed().as_millis() as u64);
         }
         let mut volumes_ms = 0u64;
-        if self.guard_tick % 30 == 0 {
+        if self.guard_tick.is_multiple_of(30) {
             let t = Instant::now();
             self.volumes.save_if_dirty();
             volumes_ms = t.elapsed().as_millis() as u64;
@@ -4056,7 +4108,7 @@ mod tests {
         crate::backend::BackendAdapterPort,
     ) {
         let tmp = tempfile::tempdir().unwrap();
-        let (budget_tx, _) = watch::channel(HashMap::new());
+        let (budget_tx, _) = watch::channel(crate::pool::BudgetEnvelope::default());
         let (events, _) = broadcast::channel(1);
         let (epoch_tx, epoch_rx) = watch::channel(0);
         let (engine_tx, _) = mpsc::channel(1);
@@ -4098,7 +4150,7 @@ mod tests {
         persist_guard: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
     ) -> (tempfile::TempDir, Owner, crate::backend::BackendAdapterPort) {
         let tmp = tempfile::tempdir().unwrap();
-        let (budget_tx, _) = watch::channel(HashMap::new());
+        let (budget_tx, _) = watch::channel(crate::pool::BudgetEnvelope::default());
         let (events, _) = broadcast::channel(1);
         let (epoch_tx, _) = watch::channel(0);
         let (engine_tx, _) = mpsc::channel(1);

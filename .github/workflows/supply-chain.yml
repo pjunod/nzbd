@@ -5,6 +5,7 @@ on:
     branches: [main]
     tags: ["v*"]
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review, converted_to_draft]
   schedule:
     # Refresh the RustSec result even when the lockfile has not changed.
     - cron: "17 6 * * *"
@@ -19,13 +20,14 @@ env:
 jobs:
   reviewed-exceptions:
     name: reviewed dependency exceptions
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     runs-on: ${{ fromJSON((vars.CI_RUNNER_MODE == 'github' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && '["ubuntu-24.04"]' || '["self-hosted","Linux","X64","lab","general"]') }}
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.85"
+          toolchain: "1.95"
       - uses: Swatinem/rust-cache@v2
         with:
           key: reviewed-dependency-exceptions
@@ -36,6 +38,7 @@ jobs:
 
   policy:
     name: licenses, bans, and sources
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     runs-on: ${{ fromJSON((vars.CI_RUNNER_MODE == 'github' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && '["ubuntu-24.04"]' || '["self-hosted","Linux","X64","lab","general"]') }}
     steps:
       - uses: actions/checkout@v5
@@ -43,17 +46,31 @@ jobs:
       # revision so the supply-chain gate cannot change underneath a run.
       - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25
         with:
-          rust-version: "1.85"
+          rust-version: "1.95"
           command: check bans licenses sources
           arguments: --all-features --locked
 
   advisories:
     name: RustSec advisories
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     runs-on: ${{ fromJSON((vars.CI_RUNNER_MODE == 'github' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && '["ubuntu-24.04"]' || '["self-hosted","Linux","X64","lab","general"]') }}
     steps:
       - uses: actions/checkout@v5
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit@0.22.0
+      - name: Restore vendored crates to registry provenance
+        run: scripts/vendor-audit-lock --output target/vendor-audit/Cargo.lock
+      - name: Audit workspace and vendored release identities
+        # The repository exception contract freezes these exact identifiers,
+        # dependency paths, and feature sets before this job. cargo-audit does
+        # not read deny.toml, so keep its invocation aligned explicitly.
+        run: >-
+          cargo audit --file target/vendor-audit/Cargo.lock
+          --ignore RUSTSEC-2026-0194
+          --ignore RUSTSEC-2026-0195
       - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25
         with:
-          rust-version: "1.85"
+          rust-version: "1.95"
           command: check advisories
           arguments: --all-features --locked

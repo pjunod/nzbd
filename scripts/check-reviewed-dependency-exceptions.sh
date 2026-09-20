@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Repository policy permits three exact RustSec exceptions and one exact
+# Repository policy permits two exact RustSec exceptions and one exact
 # MPL-2.0 package only while their reviewed dependency and feature boundaries
 # remain intact. Fail closed on output drift, but do not make a workspace
 # version bump look like a third-party dependency change.
@@ -31,12 +31,6 @@ package_set() {
       fi
     done |
     LC_ALL=C sort -u
-}
-
-feature_set() {
-  sed -E 's/ \(\*\)$//' |
-    grep -E '^time feature "' |
-    LC_ALL=C sort -u || true
 }
 
 require_exact_set() {
@@ -105,44 +99,6 @@ require_exact_set \
   "$quick_xml_packages" \
   "$expected_quick_xml_packages"
 
-time_tree="$(
-  inverse_tree \
-    'RUSTSEC-2026-0009 time scope' \
-    'time@0.3.41' \
-    'features' \
-    're-run cargo deny, then remove or replace the time ignore in deny.toml and update the reviewed MSRV evidence'
-)"
-time_packages="$(package_set <<<"$time_tree")"
-expected_time_packages="$(LC_ALL=C sort <<'EOF'
-nzbd (workspace)
-nzbd-api (workspace)
-nzbd-cluster (workspace)
-nzbd-compat (workspace)
-nzbd-qbit-compat (workspace)
-nzbd-torrent (workspace)
-rcgen v0.13.2
-time v0.3.41
-yasna v0.5.2
-EOF
-)"
-require_exact_set \
-  'RUSTSEC-2026-0009 time' \
-  'dependency package set' \
-  "$time_packages" \
-  "$expected_time_packages"
-
-time_features="$(feature_set <<<"$time_tree")"
-expected_time_features="$(LC_ALL=C sort <<'EOF'
-time feature "alloc"
-time feature "std"
-EOF
-)"
-require_exact_set \
-  'RUSTSEC-2026-0009 time' \
-  'feature set' \
-  "$time_features" \
-  "$expected_time_features"
-
 option_ext_tree="$(
   inverse_tree \
     'MPL-2.0 option-ext scope' \
@@ -180,7 +136,6 @@ ignored_advisories="$(
     LC_ALL=C sort -u || true
 )"
 expected_ignored_advisories="$(LC_ALL=C sort <<'EOF'
-RUSTSEC-2026-0009
 RUSTSEC-2026-0194
 RUSTSEC-2026-0195
 EOF

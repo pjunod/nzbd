@@ -152,12 +152,12 @@ or version fails the blocking policy job.
 |---|---|---|---|
 | [RUSTSEC-2026-0194](https://rustsec.org/advisories/RUSTSEC-2026-0194.html) | `quick-xml 0.37.5` | Attribute iteration can consume quadratic CPU on hostile XML | The only normal path is `librqbit-upnp 1.0.0`; the adapter has no UPnP input and always passes `enable_upnp_port_forwarding: false`. |
 | [RUSTSEC-2026-0195](https://rustsec.org/advisories/RUSTSEC-2026-0195.html) | `quick-xml 0.37.5` | `NsReader` can allocate unbounded namespace state on hostile XML | Same compiled-but-disabled UPnP path. UPnP remains unavailable until the affected dependency is removed or patched. |
-| [RUSTSEC-2026-0009](https://rustsec.org/advisories/RUSTSEC-2026-0009.html) | `time 0.3.41` | RFC 2822 parsing can exhaust the stack | The daemon's TLS tests and the torrent adapter's private-CA test reach `time` only through `rcgen`/`yasna`; Cargo's resolved feature graph contains `alloc` and `std`, not `parsing`. |
+| [RUSTSEC-2026-0009](https://rustsec.org/advisories/RUSTSEC-2026-0009.html) | `time 0.3.41` (historical) | RFC 2822 parsing can exhaust the stack | Resolved on 2026-09-19: the clustering compiler upgrade moved the locked graph to fixed `time 0.3.51`, so the exception was removed. |
 
 The distinction matters: `quick-xml` is still compiled, so the exception is
 not proof the crate is safe. It is acceptable only while nzbd cannot construct
-the affected UPnP runtime path. The `time` functions named by its advisory are
-not compiled without the `parsing` feature.
+the affected UPnP runtime path. The historical `time` exception is no longer
+part of the repository policy.
 
 [`scripts/check-reviewed-dependency-exceptions.sh`](../scripts/check-reviewed-dependency-exceptions.sh)
 turns those statements into a repository-wide blocking graph check. It fails
@@ -167,10 +167,9 @@ if:
   chain (`nzbd`, its API/compat/cluster routing crates, `nzbd-torrent`,
   `librqbit`, and `librqbit-upnp`); the broader workspace reach reflects
   activation, while the affected UPnP runtime path remains unconstructable;
-- `time 0.3.41` gains another package path or its exact `alloc`/`std` feature
-  set changes;
 - the exact MPL-2.0 `option-ext 0.2.0` path changes; or
-- `deny.toml` ignores any RustSec identifier other than the three above.
+- `deny.toml` ignores any RustSec identifier other than the two `quick-xml`
+  advisories above.
 
 Workspace package versions are normalized before comparison, so an nzbd
 release bump does not masquerade as third-party graph drift. If a pinned
@@ -179,7 +178,7 @@ entry that must be reconsidered instead of exposing Cargo's unmatched-package
 error as the only diagnosis.
 
 The check lives in the repository-wide Supply chain workflow because the
-`time` exception and complete RustSec ignore set are not BitTorrent-only. That
+complete RustSec ignore set is repository-wide. That
 workflow runs on every pull request and push plus a daily schedule. The daily
 run refreshes RustSec data; the locked graph assertions rerun alongside it but
 can change only when tracked dependency inputs change.
@@ -233,8 +232,8 @@ evidence all hold:
    identities, and exact MPL-2.0 exception are acceptable.
 3. **UPnP restriction.** Compiling the affected `quick-xml` is acceptable only
    because the first release cannot enable UPnP and CI guards that boundary.
-4. **`time` restriction.** Retaining `time 0.3.41` for Rust 1.85 is acceptable
-   only while its vulnerable parsing feature remains absent.
+4. **`time` restriction.** Resolved: the Rust 1.95 clustering upgrade permits
+   fixed `time 0.3.51`; no exception remains.
 5. **Renewal rule.** Any engine, feature, advisory, dependency-path, or MSRV
    change reopens this decision; a previous green run is not a waiver.
 6. **Runtime peer budgets.** The maintained engine must enforce the proposed
@@ -289,7 +288,7 @@ the disposition of record; §4 remains the statement of what was asked.
 | 1 | **Accepted provisionally** | The one-sample 9.64 MiB harness, 8.41 MiB idle RSS, and the preliminary 32 MiB / 64 MiB sampled-growth guards are acceptable prototype costs. The final daemon must be remeasured on every supported native target; a materially larger result reopens this item. |
 | 2 | **Accepted as locked** | The 222-package normal closure, 178 new lockfile identities, and exactly one MPL-2.0 package (`option-ext 0.2.0`) are acceptable. CI must continue to reject dependency and license drift. |
 | 3 | **Accepted as a capability restriction** | Compiling `quick-xml 0.37.5` is acceptable only while UPnP cannot be enabled and CI proves that boundary. The first release ships without UPnP; enabling it requires a patched or replaced dependency and a new review. |
-| 4 | **Accepted as a capability restriction** | Retaining `time 0.3.41` is acceptable only while the `parsing` feature is absent from the resolved graph and CI proves the exact feature set. Feature drift fails closed and reopens this item. |
+| 4 | **Accepted; resolved 2026-09-19** | The compiler-floor upgrade selected fixed `time 0.3.51`; CI removed the obsolete exception and its feature-path allowance. |
 | 5 | **Accepted** | Renewal is automatic: any engine, dependency-path, feature, advisory, MSRV, or relevant policy change reopens this decision. A previously green run is not a waiver. |
 | 6 | **Accepted as a required boundary** | A stable engine limit of **80 live peers per torrent** and **400 across the nzbd session** is required. Stable 8.1.1's hard-coded 128-per-torrent-only behavior is explicitly not accepted. Production stays disabled until both limits ship and are tested. |
 | 7 | **Accepted as a required boundary** | A **30-second** complete tracker-request deadline, **1 MiB** decoded response cap, and **60-second** minimum unforced HTTP/UDP reannounce interval are required before tracker networking is authorized. |

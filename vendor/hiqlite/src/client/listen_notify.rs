@@ -1,0 +1,235 @@
+use crate::client::stream::{ClientKVPayload, ClientStreamReq};
+use crate::helpers::deserialize;
+use crate::network::api::ApiStreamResponsePayload;
+use crate::network::serialize_network;
+use crate::store::state_machine::memory::state_machine::CacheRequest;
+use crate::{Client, Error};
+use chrono::Utc;
+use serde::{Deserialize, Serialize};
+use tokio::sync::oneshot;
+
+/// The "listen_notify" feature currently enables _remote_.
+#[cfg(feature = "listen_notify")]
+pub(crate) mod remote {
+    use crate::NodeId;
+    use crate::network::HEADER_NAME_SECRET;
+    use cryptr::utils::b64_decode;
+    use eventsource_client::{Client as ClientES, SSE};
+    use futures_util::StreamExt;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::sync::RwLock;
+    use tokio::{task, time};
+    use tracing::{debug, error, info};
+
+    pub(crate) struct RemoteListener;
+
+    impl RemoteListener {
+        pub(crate) fn spawn(
+            leader_cache: Arc<RwLock<(NodeId, String)>>,
+            tls: bool,
+            api_secret: String,
+            shutdown: tokio::sync::watch::Receiver<bool>,
+        ) -> (flume::Receiver<(i64, Vec<u8>)>, task::JoinHandle<()>) {
+            let (tx, rx) = flume::unbounded();
+            let handle = task::spawn(Self::handler(leader_cache, api_secret, tls, tx, shutdown));
+            (rx, handle)
+        }
+
+        async fn handler(
+            leader_cache: Arc<RwLock<(NodeId, String)>>,
+            api_secret: String,
+            tls: bool,
+            tx: flume::Sender<(i64, Vec<u8>)>,
+            mut shutdown: tokio::sync::watch::Receiver<bool>,
+        ) {
+            'main: loop {
+                let client = {
+                    let url = {
+                        let scheme = if tls { "https" } else { "http" };
+                        let lock = leader_cache.read().await;
+                        format!("{}://{}/listen", scheme, lock.1)
+                    };
+                    info!("Connecting to listen SSE stream: {}", url);
+
+                    // TODO what about tls_no_verify in this case?
+                    let builder = eventsource_client::ClientBuilder::for_url(&url)
+                        .expect("invalid listen SSE URL")
+                        .header(HEADER_NAME_SECRET, &api_secret)
+                        .unwrap();
+                    if tls {
+                        Box::new(builder.build()) as Box<dyn ClientES>
+                    } else {
+                        // The HTTPS connector loads the native trust store even
+                        // for an http:// URL. Headless runners may have no
+                        // keychain, and plaintext listeners do not need one.
+                        Box::new(builder.build_http()) as Box<dyn ClientES>
+                    }
+                };
+
+                let mut stream = client.stream();
+                loop {
+                    let res = tokio::select! {
+                        _ = shutdown.changed() => break 'main,
+                        res = stream.next() => res,
+                    };
+                    let Some(res) = res else {
+                        break;
+                    };
+                    match res {
+                        Ok(sse) => match sse {
+                            SSE::Connected(c) => {
+                                info!("Opened /listen events stream: {:?}", c);
+                            }
+                            SSE::Event(event) => {
+                                let (ts, data) = event
+                                    .data
+                                    .split_once(' ')
+                                    .expect("Invalid listen event from server");
+                                let ts = ts
+                                    .parse::<i64>()
+                                    .expect("Cannot parse ts to i64 from listen event");
+                                let bytes =
+                                    b64_decode(data).expect("Cannot decode data from listen event");
+
+                                if let Err(err) = tx.send((ts, bytes)) {
+                                    error!("Error sending listen event to Client: {}", err);
+                                    break 'main;
+                                }
+                            }
+                            SSE::Comment(_) => {}
+                        },
+                        Err(err) => {
+                            error!("{:?}", err);
+                            break;
+                        }
+                    }
+                }
+
+                tokio::select! {
+                    _ = shutdown.changed() => break,
+                    () = time::sleep(Duration::from_secs(1)) => {}
+                }
+            }
+
+            debug!("RemoteListener exiting");
+        }
+    }
+}
+
+impl Client {
+    /// Listen to events on the distributed event bus
+    pub async fn listen<T>(&self) -> Result<T, Error>
+    where
+        T: for<'de> Deserialize<'de>,
+    {
+        let (_ts, bytes) = self.listen_rx().recv_async().await?;
+        Ok(deserialize(&bytes)?)
+    }
+
+    /// Listen to events on the distributed event bus and get the raw bytes response
+    pub async fn listen_bytes(&self) -> Result<(i64, Vec<u8>), Error> {
+        Ok(self.listen_rx().recv_async().await?)
+    }
+
+    /// Tries to receive an event and returns immediately, if none is currently waiting.
+    pub fn try_listen<T>(&self) -> Result<Option<T>, Error>
+    where
+        T: for<'de> Deserialize<'de>,
+    {
+        if let Ok((_, bytes)) = self.listen_rx().try_recv() {
+            Ok(Some(deserialize(&bytes)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Listen to events on the distributed event bus when their unix timestamp in microseconds
+    /// is > `after_ts_micros`. This is helpful in case of applications restarts when cache
+    /// events may be replayed to avoid duplicate event handling, if this applies to your case.
+    pub async fn listen_after<T>(&self, after_ts_micros: i64) -> Result<T, Error>
+    where
+        T: for<'de> Deserialize<'de>,
+    {
+        let rx = self.listen_rx();
+        loop {
+            let (ts, bytes) = rx.recv_async().await?;
+            if ts > after_ts_micros {
+                return Ok(deserialize(&bytes)?);
+            }
+        }
+    }
+
+    /// Listen to events on the distributed event bus that are "new" in the sense that they must
+    /// have been created after this application has been started.
+    pub async fn listen_after_start<T>(&self) -> Result<T, Error>
+    where
+        T: for<'de> Deserialize<'de>,
+    {
+        self.listen_after(self.inner.app_start).await
+    }
+
+    #[inline]
+    fn listen_rx(&self) -> &flume::Receiver<(i64, Vec<u8>)> {
+        if let Some(state) = &self.inner.state {
+            &state.raft_cache.rx_notify
+        } else {
+            self.inner
+                .rx_notify
+                .as_ref()
+                .expect("a remote client must always have Some(_) inner.rx_notify")
+        }
+    }
+
+    /// Notify all other Raft members with this new event data.
+    pub async fn notify<P>(&self, payload: &P) -> Result<(), Error>
+    where
+        P: Serialize,
+    {
+        self.rate_limit_cache().await?;
+        let now = Utc::now().timestamp_micros();
+
+        match self
+            .notify_req(CacheRequest::Notify((now, serialize_network(payload))))
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(err) => {
+                if self
+                    .was_leader_update_error(&err, &self.inner.leader_cache)
+                    .await
+                {
+                    self.notify_req(CacheRequest::Notify((now, serialize_network(payload))))
+                        .await
+                } else {
+                    Err(err)
+                }
+            }
+        }
+    }
+
+    pub(crate) async fn notify_req(&self, cache_req: CacheRequest) -> Result<(), Error> {
+        if let Some(state) = self.is_leader_cache_with_state().await {
+            state.raft_cache.raft.client_write(cache_req).await?;
+            Ok(())
+        } else {
+            let (ack, rx) = oneshot::channel();
+            self.inner
+                .tx_client_cache
+                .send_async(ClientStreamReq::Notify(ClientKVPayload {
+                    request_id: self.new_request_id(),
+                    cache_req,
+                    ack,
+                }))
+                .await
+                .map_err(|err| Error::Error(err.to_string().into()))?;
+            let res = rx
+                .await
+                .map_err(|_| Error::Connect("client stream manager stopped".into()))??;
+            match res {
+                ApiStreamResponsePayload::Notify(res) => res,
+                _ => unreachable!(),
+            }
+        }
+    }
+}

@@ -1,0 +1,108 @@
+name: Main fast lane
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review, converted_to_draft]
+
+env:
+  CARGO_TERM_COLOR: always
+  NZBD_REQUIRE_TOOLS: 1
+
+concurrency:
+  group: main-fast-lane-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  scope:
+    name: Select affected validation
+    if: github.event.pull_request.draft == false
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    outputs:
+      rust: ${{ steps.scope.outputs.rust }}
+      mobile: ${{ steps.scope.outputs.mobile }}
+      docs_only: ${{ steps.scope.outputs.docs_only }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - id: scope
+        env:
+          VALIDATION_BASE: ${{ github.event.pull_request.base.sha }}
+        run: scripts/ci-scope "$VALIDATION_BASE" >> "$GITHUB_OUTPUT"
+
+  preflight:
+    name: Static contracts
+    needs: scope
+    runs-on: ubuntu-24.04
+    timeout-minutes: 3
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - run: scripts/check-fast-lane-contract
+      - name: Exercise the embedded application JavaScript
+        run: node crates/nzbd/tests/ui_boot_harness.js crates/nzbd-api/ui/index.html
+      - name: Documentation-only lane
+        if: needs.scope.outputs.docs_only == 'true'
+        run: echo "Documentation-only diff; compiler jobs are skipped."
+
+  rust:
+    name: Rust merge candidate
+    needs: [scope, preflight]
+    if: needs.scope.outputs.rust == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.97.1"
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Install bounded post-processing dependencies
+        run: sudo apt-get update && sudo apt-get install -y par2 p7zip-full
+      - run: make fast-check-rust
+
+  mobile:
+    name: Mobile compile and unit lane
+    needs: [scope, preflight]
+    if: needs.scope.outputs.mobile == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    defaults:
+      run:
+        working-directory: mobile
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: mobile/package-lock.json
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+
+  gate:
+    name: Main promotion gate
+    if: always() && github.event.pull_request.draft == false
+    needs: [scope, preflight, rust, mobile]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    steps:
+      - name: Require every selected lane
+        env:
+          SCOPE: ${{ needs.scope.result }}
+          PREFLIGHT: ${{ needs.preflight.result }}
+          RUST: ${{ needs.rust.result }}
+          MOBILE: ${{ needs.mobile.result }}
+        run: |
+          for result in "$SCOPE" "$PREFLIGHT" "$RUST" "$MOBILE"; do
+            case "$result" in
+              success|skipped) ;;
+              *) echo "Selected lane ended with: $result"; exit 1 ;;
+            esac
+          done

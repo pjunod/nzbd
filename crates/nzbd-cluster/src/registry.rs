@@ -37,6 +37,8 @@ pub fn spawn_registry(
                 download: cfg.download,
                 post_process: cfg.post_process,
                 max_download_jobs: cfg.max_download_jobs,
+                download_weight: cfg.download_weight,
+                pp_weight: cfg.pp_weight,
                 active_download_jobs: active,
                 disk_guard_capable: true,
                 disk_low: snap.disk_low,

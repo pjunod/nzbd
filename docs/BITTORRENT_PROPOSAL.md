@@ -1887,6 +1887,14 @@ whose prefix merely resembles the configured root. The existing job
 
 ## 12. Clustering — exclusive whole-torrent leases, after single-node
 
+**Reference refresh, 2026-09-19:** the
+[Usenet cluster completion plan](CLUSTERING_COMPLETION_PLAN.md) compares
+plurx `8663d6c0` and recommends a shared control-store/lease foundation that
+M6 can reuse. It does not implement torrent leases or prove torrent-specific
+payload, peer-session, resume, or upload ownership. The older pinned baselines
+elsewhere in this proposal remain historical evidence; consult the new plan
+before selecting another coordinator or copying an older transport version.
+
 ### 12.1 First release behavior
 
 If `[cluster].enabled = true` and `[torrent].enabled = true`, startup fails

@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+lane=.github/workflows/main-fast-lane.yml
+grep -Fq 'ready_for_review' "$lane"
+grep -Fq 'converted_to_draft' "$lane"
+grep -Fq 'github.event.pull_request.draft == false' "$lane"
+grep -Fq 'cancel-in-progress: true' "$lane"
+grep -Fq 'name: Main promotion gate' "$lane"
+
+for workflow in ci.yml lint.yml coverage.yml; do
+  grep -A2 '^on:' ".github/workflows/$workflow" | grep -Fq 'workflow_dispatch:'
+  if grep -A3 '^on:' ".github/workflows/$workflow" | grep -Eq 'pull_request:|push:'; then
+    echo "$workflow must remain manually dispatched" >&2
+    exit 1
+  fi
+done
+
+if grep -Eq '^  pull_request:' .github/workflows/bittorrent-fuzz.yml; then
+  echo "BitTorrent fuzz must not run for pull requests" >&2
+  exit 1
+fi
+if grep -Eq '^  pull_request:' .github/workflows/bittorrent-m0.yml; then
+  echo "BitTorrent M0 matrix must not run for pull requests" >&2
+  exit 1
+fi
+grep -Fq 'workflow_dispatch:' .github/workflows/bittorrent-fuzz.yml
+grep -Fq 'schedule:' .github/workflows/bittorrent-fuzz.yml
+test "$(grep -c "github.event.pull_request.draft == false" .github/workflows/supply-chain.yml)" -eq 3

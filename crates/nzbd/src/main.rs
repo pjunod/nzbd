@@ -280,7 +280,11 @@ fn cluster_runtime_config(
         .map_err(|e| anyhow_lite::Error::msg(e.to_string()))?;
     let shared_dir =
         nzbd_config::expand_home(c.shared_dir.as_ref().expect("validated: shared_dir set"));
+    let default_control_dir = cfg.paths.main_dir.join(".nzbd-control").join(&c.node_name);
+    let control_dir =
+        nzbd_config::expand_home(c.control_dir.as_ref().unwrap_or(&default_control_dir));
     let runtime = nzbd_cluster::ClusterConfig {
+        cluster_id: c.cluster_id.clone(),
         node_name: c.node_name.clone(),
         shared_dir: shared_dir.clone(),
         advertise_url: c.advertise_url.clone(),
@@ -294,6 +298,21 @@ fn cluster_runtime_config(
         lease_interval: Duration::from_secs(c.lease_interval_secs.max(1)),
         takeover_after: Duration::from_secs(c.takeover_after_secs.max(2)),
         worker_ttl: Duration::from_secs(c.worker_ttl_secs.max(3)),
+        control_dir,
+        control_node_id: c.control_node_id,
+        control_raft_bind: c.control_raft_bind.clone(),
+        control_api_bind: c.control_api_bind.clone(),
+        control_peers: c
+            .control_peers
+            .iter()
+            .map(|peer| nzbd_cluster::ControlPeer {
+                id: peer.id,
+                raft_addr: peer.raft_addr.clone(),
+                api_addr: peer.api_addr.clone(),
+            })
+            .collect(),
+        download_weight: c.download_weight.max(1),
+        pp_weight: c.pp_weight.max(1),
         disk_guard_roots: disk_guard_roots(cfg),
         torrent_payload_roots: torrent_payload_roots(cfg),
     };

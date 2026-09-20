@@ -19,7 +19,7 @@ members = [
     "crates/nzbd-torrent",
     "crates/nzbd-qbit-compat",
 ]
-exclude = ["contrib/rqbit/vendor"]
+exclude = ["contrib/rqbit/vendor", "vendor/hiqlite", "vendor/hiqlite-wal"]
 
 [workspace.package]
 # Releases are git tags `v<this>` — see docs/DEPLOY.md, "Cutting a
@@ -27,7 +27,7 @@ exclude = ["contrib/rqbit/vendor"]
 # on every commit; this is only the release the count is measured from.
 version = "0.2.0"
 edition = "2021"
-rust-version = "1.85"
+rust-version = "1.95"
 # License note: this code is written from scratch against a behavioral spec
 # (docs/ARCHITECTURE.md §3). If any implementation is ever ported closely from
 # nzbget source (GPL-2.0-or-later), the affected crate must switch to GPL.
@@ -79,7 +79,8 @@ crc32fast = "1"
 base64 = "0.22"
 libc = "0.2"
 md-5 = "0.10"
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
+hiqlite = { version = "=0.14.0", default-features = false, features = ["auto-heal", "macros", "sqlite"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 arc-swap = "1"
@@ -92,6 +93,12 @@ icu_normalizer = { version = "=2.1.1", default-features = false, features = ["co
 icu_casemap = { version = "=2.1.1", default-features = false, features = ["compiled_data"] }
 librqbit = { version = "=8.1.1", path = "contrib/rqbit/vendor/crates/librqbit", default-features = false, features = ["rust-tls"] }
 url = "2"
+
+[patch.crates-io]
+# Pinned from plurx 8663d6c0. Keep the transport flush, terminal writer,
+# bounded snapshot recovery, and WAL repair changes together.
+hiqlite = { path = "vendor/hiqlite" }
+hiqlite-wal = { path = "vendor/hiqlite-wal" }
 
 [profile.release]
 lto = "thin"

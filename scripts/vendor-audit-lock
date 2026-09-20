@@ -1,0 +1,60 @@
+#!/usr/bin/env python3
+"""Restore registry provenance for vendored crates in a RustSec lockfile."""
+
+from __future__ import annotations
+
+import argparse
+import re
+from pathlib import Path
+
+
+VENDORED = (("hiqlite", "0.14.0"), ("hiqlite-wal", "0.14.0"))
+
+
+def package_block(text: str, name: str, version: str) -> str:
+    pattern = re.compile(
+        rf'(?ms)^\[\[package\]\]\nname = "{re.escape(name)}"\n'
+        rf'version = "{re.escape(version)}"\n.*?(?=^\[\[package\]\]|\Z)'
+    )
+    matches = pattern.findall(text)
+    if len(matches) != 1:
+        raise ValueError(f"expected one {name} {version} package block, found {len(matches)}")
+    return matches[0]
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--root", type=Path, default=Path("Cargo.lock"))
+    parser.add_argument(
+        "--registry-evidence",
+        type=Path,
+        default=Path("ci/vendor-registry-evidence.lock"),
+    )
+    parser.add_argument("--output", type=Path, required=True)
+    args = parser.parse_args()
+
+    result = args.root.read_text(encoding="utf-8")
+    evidence = args.registry_evidence.read_text(encoding="utf-8")
+    for name, version in VENDORED:
+        upstream = package_block(evidence, name, version)
+        source = re.search(r'^source = "([^"]+)"$', upstream, re.MULTILINE)
+        checksum = re.search(r'^checksum = "([^"]+)"$', upstream, re.MULTILINE)
+        if source is None or checksum is None:
+            raise ValueError(f"registry evidence for {name} {version} is incomplete")
+        patched = package_block(result, name, version)
+        if re.search(r"^source = ", patched, re.MULTILINE):
+            raise ValueError(f"vendored {name} unexpectedly has registry provenance")
+        replacement = patched.replace(
+            f'version = "{version}"\n',
+            f'version = "{version}"\nsource = "{source.group(1)}"\n'
+            f'checksum = "{checksum.group(1)}"\n',
+            1,
+        )
+        result = result.replace(patched, replacement, 1)
+
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    args.output.write_text(result, encoding="utf-8")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,14 +1,6 @@
 name: BitTorrent fuzz
 
 on:
-  pull_request:
-    paths:
-      - Makefile
-      - Cargo.lock
-      - crates/nzbd-torrent/**
-      - fuzz/**
-      - scripts/check-bittorrent-fuzz-deps.sh
-      - .github/workflows/bittorrent-fuzz.yml
   push:
     branches: [main]
     paths:

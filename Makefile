@@ -13,7 +13,7 @@ RUSTUP_PATH_PREFIX ?= $(if $(shell command -v $(RUSTUP)),$(dir $(shell command -
 # The daemon binary package (cargo -p nzbd).
 DAEMON  := nzbd
 # Minimum supported Rust (keep in sync with Cargo.toml rust-version).
-MSRV    := 1.85
+MSRV    := 1.95
 FUZZ_TOOLCHAIN ?= nightly-2026-08-01
 FUZZ_TARGET ?=
 FUZZ_RUNS ?= 20000
@@ -134,7 +134,7 @@ lint: ## Clippy across all targets with warnings denied (CI gate)
 	$(CARGO) clippy --workspace --all-targets -- -D warnings
 
 .PHONY: msrv
-msrv: ## Type-check on the minimum supported Rust (1.85)
+msrv: ## Type-check on the minimum supported Rust (1.95)
 	$(RUSTUP) run $(MSRV) $(CARGO) check --workspace --all-targets
 
 .PHONY: coverage
@@ -191,6 +191,21 @@ bittorrent-policy: ## Verify adapter, daemon, review-doc, and dependency policie
 .PHONY: check
 check: fmt-check lint test msrv ## Core Rust gates (run before pushing)
 	@echo "OK - all local gates passed"
+
+.PHONY: fast-check-rust
+fast-check-rust: ## Reviewed merge candidate: compile/lint Rust and run bounded cluster regressions
+	$(CARGO) fmt --all --check
+	$(CARGO) check --workspace --all-targets --locked
+	$(CARGO) clippy --workspace --all-targets --locked -- -D warnings
+	$(CARGO) test --locked -p nzbd-cluster --lib
+	$(CARGO) test --locked -p nzbd-cluster --test cluster_e2e -- --test-threads=1
+
+.PHONY: fast-check
+fast-check: ## Final affected fast lane; run once after the combined adversarial review
+	scripts/check-fast-lane-contract
+	$(MAKE) ui-test
+	$(MAKE) fast-check-rust
+	@echo "OK - merge-candidate fast lane passed"
 
 .PHONY: gate
 gate: ## Deterministic release gate: core checks + BitTorrent policy + fuzz contracts

@@ -1,0 +1,5 @@
+# Hiqlite declares Rust 1.95; nzbd pins the same compiler used to validate the
+# maintained plurx source rather than depending on a floating stable channel.
+[toolchain]
+channel = "1.97.1"
+components = ["rustfmt", "clippy"]

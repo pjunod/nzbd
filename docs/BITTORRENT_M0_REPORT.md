@@ -787,8 +787,10 @@ advice or final acceptance.
 The initial resolver selected 2026 transitive releases requiring Rust 1.86 or
 1.88. The lockfile now pins compatible releases in the allowed semver ranges,
 including `serde_with 3.14.1`, `idna_adapter 1.2.1`, and ICU4X 2.1.x. With the
-existing `time 0.3.41` MSRV pin restored, the actual Rust 1.85.1 toolchain
-passes `cargo check --workspace --all-targets` on macOS.
+then-existing `time 0.3.41` MSRV pin restored, the actual Rust 1.85.1
+toolchain passed `cargo check --workspace --all-targets` on macOS. The
+2026-09-19 clustering compiler-floor upgrade moved the repository to Rust
+1.95 and fixed `time 0.3.51`; that historical pin and exception are gone.
 
 The checked-in [`deny.toml`](../deny.toml) policy passes locally with
 cargo-deny 0.20.2 across all features and the locked graph. It fails on an
@@ -800,7 +802,7 @@ file-level copyleft is accepted at that exact version.
 The first advisory run found and removed the daemon's direct
 `rustls-pemfile 2.2.0` dependency. The daemon now parses certificates and
 private keys through the maintained `rustls-pki-types` API already re-exported
-by rustls. Three exact advisory exceptions remain:
+by rustls. Two exact advisory exceptions remain:
 
 - [`RUSTSEC-2026-0194`](https://rustsec.org/advisories/RUSTSEC-2026-0194)
   and
@@ -810,12 +812,9 @@ by rustls. Three exact advisory exceptions remain:
   no longer exposes an UPnP input and unconditionally constructs rqbit with
   port forwarding false. A production gate must remove both exceptions or
   keep UPnP unavailable.
-- [`RUSTSEC-2026-0009`](https://rustsec.org/advisories/RUSTSEC-2026-0009)
-  affects `time`'s RFC 2822 parser. The daemon's TLS tests and the torrent
-  adapter's private-CA test reach it through rcgen, which compiles `time`
-  without its parsing feature, so the vulnerable parser is absent. The fixed
-  `time 0.3.47` raises its MSRV to Rust 1.88, while nzbd's verified floor is
-  Rust 1.85.
+
+The former `RUSTSEC-2026-0009` allowance was removed when the Rust 1.95
+compiler floor selected fixed `time 0.3.51`.
 
 [`supply-chain.yml`](../.github/workflows/supply-chain.yml) pins
 `cargo-deny-action` to an immutable revision and runs separate blocking policy
