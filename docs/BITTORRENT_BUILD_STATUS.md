@@ -1,6 +1,6 @@
 # BitTorrent build status — single-node release candidate
 
-**Status:** web intake follow-up implemented, review pending · **Base:** `main`
+**Status:** web intake review addressed, fast lane pending · **Base:** `main`
 `23f6c54` · **Updated:** 2026-09-19
 
 Companion to [BITTORRENT_PROPOSAL.md](BITTORRENT_PROPOSAL.md), which owns the
@@ -8,7 +8,7 @@ architecture and acceptance contract. This page records execution progress for
 the consolidated implementation branch. It is not an operator guide and does
 not authorize production use by itself.
 
-## Current position — reviewed and fast-lane green
+## Current position — qualified base, follow-up fast lane pending
 
 | Workstream | State | Next observable result |
 |---|---|---|
@@ -18,9 +18,9 @@ not authorize production use by itself.
 | M2h enforcing disk guard | qualified | Incomplete torrents pause on guard/ENOSPC while completed seeds remain live |
 | M2i terminal history | qualified | Confirmed payload outcome is durable before retry-safe mixed-protocol history retirement |
 | M2j daemon activation | qualified | One configured session owns admission, recovery, watch ingestion, shutdown, and disabled-mode refusal |
-| M3 native web/mobile surface | follow-up in progress | The dashboard now exposes magnet, remote `.torrent`, and local `.torrent` intake; adversarial review and the fast lane remain |
+| M3 native web/mobile surface | review addressed | The dashboard now exposes magnet, remote `.torrent`, and local `.torrent` intake; the fast lane remains |
 | M4 Sonarr/Radarr compatibility | qualified | Web API 2.8.1 routes, Bearer/Basic/SID auth, per-IP login limiting, durable categories, projections, and mutations are wired |
-| M5 release evidence | complete | Adversarial review findings are resolved and the requested fast lane is green |
+| M5 release evidence | follow-up pending | The base release evidence is complete; this web-intake follow-up still needs its one fast-lane run |
 
 ## Working rules — one consolidated review and qualification pass
 
@@ -62,3 +62,4 @@ not authorize production use by itself.
 | 2026-09-19 | Completed adversarial review and addressed every finding | Fixed readiness acknowledgement/order, deletion ownership, pending recovery isolation and intent, authoritative category roots, request limits, quota high-water accounting, qBittorrent durability/sentinels, native web/mobile correctness, and stale CI feature invocations |
 | 2026-09-19 | Qualified the reviewed release candidate | Workspace format and strict Clippy, focused Rust packages, BitTorrent policy/reproducibility, embedded web smoke, mobile typecheck and 55 Jest tests, plus Plurx syntax and 26 settings contracts are green; the full suite was intentionally not run |
 | 2026-09-19 | Added the missing native web intake surface | The queue toolbar now submits magnets and remote `.torrent` URLs as typed JSON and local `.torrent` files as raw metainfo; category, priority, paused intent, bounded feedback, and DOM coverage apply to both wire contracts |
+| 2026-09-19 | Addressed the web-intake adversarial review | Magnet admission no longer races a client abort against a durable hidden reservation, the progress table distinguishes base evidence from follow-up evidence, and closing the form restores keyboard focus |

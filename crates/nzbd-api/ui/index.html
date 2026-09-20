@@ -3392,14 +3392,15 @@ async function refreshJobDetail() {
 const POST_TIMEOUT_MS = 20000;
 async function post(url, init) {
   let r;
-  const timeoutMs = init && init.timeoutMs ? init.timeoutMs : POST_TIMEOUT_MS;
+  const hasCustomTimeout = init && Object.prototype.hasOwnProperty.call(init, "timeoutMs");
+  const timeoutMs = hasCustomTimeout ? init.timeoutMs : POST_TIMEOUT_MS;
   const options = Object.assign(
     { method: "POST", headers: CLIENT_HDRS },
     init || {});
   delete options.timeoutMs;
   const ctrl = typeof AbortController !== "undefined" ? new AbortController() : null;
   if (ctrl) options.signal = ctrl.signal;
-  const timer = ctrl ? setTimeout(() => ctrl.abort(), timeoutMs) : null;
+  const timer = ctrl && timeoutMs != null ? setTimeout(() => ctrl.abort(), timeoutMs) : null;
   try {
     r = await jfetch(url, options);
   } catch (e) {
@@ -3771,11 +3772,13 @@ function torrentQuery(rawOptions) {
 }
 function showTorrentAdd(open) {
   const panel = $("torrent-add-form");
+  const wasOpen = !panel.hidden;
   const nextOpen = open == null ? panel.hidden : open;
   panel.hidden = !nextOpen;
   $("btn-addtorrent").classList.toggle("active", nextOpen);
   $("btn-addtorrent").setAttribute("aria-expanded", String(nextOpen));
   if (nextOpen) $("torrent-uri").focus();
+  else if (wasOpen) $("btn-addtorrent").focus();
 }
 function torrentMessage(text, cls) {
   const msg = $("addtorrent-msg");
@@ -3804,7 +3807,11 @@ async function addTorrentUri(raw, rawOptions) {
     res = await post("/api/v1/jobs", {
       headers: { "content-type": "application/json", ...CLIENT_HDRS },
       body: JSON.stringify(request),
-      timeoutMs: 45000,
+      // Magnet resolution has no atomic backend timeout/cleanup contract:
+      // aborting here can report failure after the durable reservation exists.
+      // Remote .torrent fetches are server-bounded at 30 s, so 45 s still
+      // protects that path from a dead connection without racing its limit.
+      timeoutMs: request.source.type === "magnet" ? null : 45000,
     });
   } finally {
     setTorrentBusy(false);

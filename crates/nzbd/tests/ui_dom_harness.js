@@ -110,7 +110,7 @@ function stubEl(id) {
       const s = t.parentNode.children;
       return s[s.indexOf(t) + 1] || null;
     },
-    select() {}, click() {}, focus() {}, matches: () => false,
+    select() {}, click() {}, focus() { t.focused = true; }, matches: () => false,
     reportValidity: () => true,
     setAttribute(k, v) { t.attrs[k] = v; }, removeAttribute() {}, getAttribute: () => null,
     closest: () => null,
@@ -1147,6 +1147,8 @@ const models = (jobs) => jobs.map((j, i) => T.rowModel(j, { idx: i, count: jobs.
   eq(addPanel.hidden, false, "+ add torrent reveals the intake form");
   T.showTorrentAdd(false);
   eq(addPanel.hidden, true, "the torrent form closes without changing the queue");
+  eq(sandbox.document.getElementById("btn-addtorrent").focused, true,
+    "closing the form returns keyboard focus to its toggle");
   T.setTorrentBusy(true);
   eq(sandbox.document.getElementById("btn-torrent-uri").disabled, true,
     "a pending admission disables duplicate submits");
