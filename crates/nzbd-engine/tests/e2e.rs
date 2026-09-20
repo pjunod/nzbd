@@ -165,6 +165,41 @@ async fn spawn_engine(dir: &Path, servers: Vec<ServerDef>) -> EngineHandle {
 }
 
 #[tokio::test]
+async fn single_node_startup_restores_torrent_rows_before_backend_attachment() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state_dir = tmp.path().join("state");
+    let store = nzbd_state::SnapshotStore::open(&state_dir).unwrap();
+    let mut job = dormant_torrent_job();
+    job.torrent.as_mut().unwrap().last_activity_unix = Some(1);
+    let id = job.id;
+    let mut torrent = job.torrent.clone();
+    torrent.as_mut().unwrap().phase = nzbd_types::TorrentPhase::Queued;
+    store
+        .save(&nzbd_state::QueueSnapshotDoc {
+            jobs: vec![job],
+            next_job_id: 78,
+            max_active_downloads: 1,
+            ..Default::default()
+        })
+        .unwrap();
+    let engine = spawn_engine(tmp.path(), Vec::new()).await;
+    assert_eq!(engine.snapshot().jobs.len(), 1);
+    assert_eq!(engine.snapshot().jobs[0].id, id);
+    engine.shutdown().await;
+    let saved = store.load().unwrap().unwrap();
+    assert_eq!(saved.jobs.len(), 1);
+    let recovered_activity = saved.jobs[0].torrent.as_ref().unwrap().last_activity_unix;
+    assert!(recovered_activity > torrent.as_ref().unwrap().last_activity_unix);
+    torrent.as_mut().unwrap().last_activity_unix = recovered_activity;
+    assert_eq!(saved.jobs[0].torrent, torrent);
+    assert!(nzbd_engine::backend::torrent_wants_download_slot(
+        saved.jobs[0].torrent.as_ref().unwrap(),
+        saved.jobs[0].queued_at_unix,
+        1_800_001_000,
+    ));
+}
+
+#[tokio::test]
 async fn cluster_authority_adoption_refuses_dormant_torrent_rows_without_rewrite() {
     let tmp = tempfile::tempdir().unwrap();
     let state_dir = tmp.path().join("state");

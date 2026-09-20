@@ -22,6 +22,7 @@ jobs:
     outputs:
       rust: ${{ steps.scope.outputs.rust }}
       mobile: ${{ steps.scope.outputs.mobile }}
+      torrent: ${{ steps.scope.outputs.torrent }}
       docs_only: ${{ steps.scope.outputs.docs_only }}
     steps:
       - uses: actions/checkout@v5
@@ -65,6 +66,9 @@ jobs:
       - name: Install bounded post-processing dependencies
         run: sudo apt-get update && sudo apt-get install -y par2 p7zip-full
       - run: make fast-check-rust
+      - name: Torrent transfer and recovery regressions
+        if: needs.scope.outputs.torrent == 'true'
+        run: make fast-check-torrent
 
   mobile:
     name: Mobile compile and unit lane

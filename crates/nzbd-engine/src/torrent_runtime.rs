@@ -533,6 +533,9 @@ pub fn reconcile_fact_with_roots(
             let torrent = job.torrent.as_mut().unwrap();
             torrent.last_error = None;
             if job.status != JobStatus::Paused {
+                // A newly started backend needs a fresh discovery window;
+                // the previous run's idle clock cannot immediately yield it.
+                torrent.last_activity_unix = Some(now_unix);
                 torrent.phase = if torrent.ready_at_unix.is_some() {
                     TorrentPhase::Seeding
                 } else {
@@ -1288,6 +1291,7 @@ mod tests {
 
         let mut downloading = job(10, hash, JobStatus::Queued);
         downloading.torrent.as_mut().unwrap().phase = TorrentPhase::PausedDownload;
+        downloading.torrent.as_mut().unwrap().last_activity_unix = Some(1);
         assert!(
             reconcile_fact(
                 &mut downloading,
@@ -1299,6 +1303,11 @@ mod tests {
             .durable_changed
         );
         assert_eq!(downloading.status, JobStatus::Downloading);
+        assert!(crate::backend::torrent_wants_download_slot(
+            downloading.torrent.as_ref().unwrap(),
+            downloading.queued_at_unix,
+            101,
+        ));
         assert_eq!(
             downloading.torrent.as_ref().unwrap().phase,
             TorrentPhase::Downloading

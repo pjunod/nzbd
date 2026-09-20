@@ -100,6 +100,26 @@ if [[ "${RQBIT_SERIES_DERIVE_ONLY:-0}" == "1" ]]; then
   exit 0
 fi
 
+check_dht_dispatch() (
+  cd "$source_dir"
+  # Compile the production dispatch path with release assertion semantics.
+  export CARGO_PROFILE_TEST_DEBUG_ASSERTIONS=false
+  readonly dispatch_test='dht::queue_budget_tests::recursive_lookup_dispatches_requests_without_debug_assertions'
+  dispatch_tests="$(cargo test --locked -p librqbit-dht --lib --no-default-features --features sha1-ring -- --list)"
+  if ! grep -Fxq "$dispatch_test: test" <<<"$dispatch_tests"; then
+    echo "maintained rqbit DHT dispatch proof was not discovered" >&2
+    exit 1
+  fi
+  cargo test --locked -p librqbit-dht --lib --no-default-features \
+    --features sha1-ring "$dispatch_test" -- --exact
+)
+
+if [[ "${RQBIT_SERIES_DISPATCH_ONLY:-0}" == "1" ]]; then
+  check_dht_dispatch
+  echo "rqbit fast lane: maintained derivation and release DHT dispatch passed"
+  exit 0
+fi
+
 (
   cd "$source_dir"
   cargo fmt --all -- --check
@@ -150,6 +170,7 @@ fi
   cargo test -p librqbit --lib --no-default-features --features rust-tls
   cargo test -p librqbit-tracker-comms --lib --no-default-features --features sha1-ring
   cargo test -p librqbit-dht --lib --no-default-features --features sha1-ring
+  check_dht_dispatch
   cargo check --workspace --exclude rqbit-desktop
 )
 

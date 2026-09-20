@@ -1,12 +1,62 @@
 # BitTorrent build status — single-node release candidate
 
-**Status:** web intake follow-up qualified, merge pending · **Base:** `main`
-`23f6c54` · **Updated:** 2026-09-19
+**Status:** runtime repair reviewed; qualification and merge tracked in PR #231 · **Updated:** 2026-09-20
 
 Companion to [BITTORRENT_PROPOSAL.md](BITTORRENT_PROPOSAL.md), which owns the
 architecture and acceptance contract. This page records execution progress for
 the consolidated implementation branch. It is not an operator guide and does
 not authorize production use by itself.
+
+## Runtime repair — Ubuntu transfer incident on nuc3
+
+**Status:** implementation and review fixes complete · **Base:**
+`main` `c77edbc` · **Updated:** 2026-09-20
+
+[PR #231](https://github.com/pjunod/nzbd/pull/231) replaces the emergency uncommitted fixes with reviewed
+commits. Work for the PR happens in an independent disposable clone. The
+previous incident investigation changed local and nuc3 checkouts; those exact
+changes will be reconciled after merge without overwriting other work.
+
+| Workstream | State | Next observable result |
+|---|---|---|
+| Release DHT request dispatch | implemented | Reviewer verifies all four bounded request queues execute without debug assertions |
+| Queue progress and rate display | implemented | Torrent bytes, selected files, rates, and aggregate totals agree |
+| Startup and resume | implemented | Saved torrents restart; old activity timestamps cannot prevent discovery |
+| Adversarial review | addressed | Fixed stalled-retry slot monopoly and missing CI dependency/type scope |
+| Fast-lane qualification | [live checks](https://github.com/pjunod/nzbd/pull/231/checks) | Current-head `Main promotion gate` includes focused torrent regressions |
+| Merge and cleanup | [live PR status](https://github.com/pjunod/nzbd/pull/231) | PR description records qualification and cleanup completion |
+
+The Ubuntu ISO finished on nuc3: 6,482,409,472 bytes verified, phase `seeding`,
+with no reported error. The adversarial review ran without tests. Its P1
+finding is addressed by ranking expired automatic torrent retries behind fresh
+work in both torrent and NNTP scheduling; retries still use spare capacity.
+Startup and explicit resume receive a fresh discovery interval. A deterministic
+regression covers repeated yield/resume cycles and shared NNTP ordering. The P2
+finding is addressed by selecting torrent qualification for dependency, toolchain,
+durable type, state, daemon, configuration, and scope-script changes.
+
+### Decisions and validation boundaries
+
+1. **One PR, focused commits.** Discovery, engine recovery/display, and CI
+   qualification belong to one incident repair, so they ship together.
+2. **Review before tests.** The incident investigation already ran tests and
+   demonstrated 96,090,965 bytes/s with 57 peers on nuc3. Those observations
+   are historical evidence, not qualification of this PR. No new tests run
+   until the adversarial review and its fixes are complete.
+3. **Bounded qualification.** The fast lane adds torrent engine regressions,
+   startup/cluster-boundary checks, maintained-patch derivation, and DHT
+   dispatch with debug assertions disabled. The full rqbit matrix remains
+   available on schedule/manual dispatch; unrelated full-unit failures belong
+   to the separate batch process. Earlier broad engine runs left three pool
+   connection tests hanging; this PR does not claim to fix those tests.
+4. **No new feature gate.** These are fixes to the enabled nzbd runtime. Plurx
+   already has a Developer enablement section with advisory readiness; this
+   repair does not introduce an additional enablement prerequisite or move
+   nzbd configuration into Plurx.
+5. **GitHub only.** Per the 2026-09-20 clarification, repository and PR work
+   use `pjunod/nzbd` on GitHub. Forgejo is outside this task.
+
+## Earlier implementation evidence
 
 ## Current position — reviewed and follow-up fast-lane green
 

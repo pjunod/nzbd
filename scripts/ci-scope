@@ -7,6 +7,7 @@ mapfile -t changed < <(git diff --name-only "$base"...HEAD)
 
 rust=false
 mobile=false
+torrent=false
 docs_only=true
 
 for path in "${changed[@]}"; do
@@ -24,6 +25,11 @@ for path in "${changed[@]}"; do
       mobile=true
       ;;
   esac
+  case "$path" in
+    Cargo.toml|Cargo.lock|rust-toolchain.toml|crates/nzbd/*|crates/nzbd-config/*|crates/nzbd-types/*|crates/nzbd-state/*|crates/nzbd-engine/*|crates/nzbd-torrent/*|crates/nzbd-api/src/torrent_admission.rs|contrib/rqbit/*|Makefile|scripts/ci-scope|scripts/check-fast-lane-contract|scripts/check-rqbit-maintained-patch-series.sh|.github/workflows/main-fast-lane.yml)
+      torrent=true
+      ;;
+  esac
 done
 
-printf 'rust=%s\nmobile=%s\ndocs_only=%s\n' "$rust" "$mobile" "$docs_only"
+printf 'rust=%s\nmobile=%s\ntorrent=%s\ndocs_only=%s\n' "$rust" "$mobile" "$torrent" "$docs_only"

@@ -379,7 +379,7 @@ impl RecursiveRequest<RecursiveRequestCallbacksFindNodes> {
                     let Some((id, addr, depth)) = r else {
                         break;
                     };
-                    debug_assert!(futs.try_push(request_one(id, addr, depth)).is_ok());
+                    assert!(futs.try_push(request_one(id, addr, depth)).is_ok());
                 },
                 Some(f) = futs.next(), if !futs.is_empty() => {
                     if f.is_ok() {
@@ -435,7 +435,7 @@ impl RecursiveRequest<RecursiveRequestCallbacksGetPeers> {
                     tokio::select! {
                         addr = node_rx.recv(), if !futs.is_full() => {
                             let (id, addr, depth) = addr.unwrap();
-                            debug_assert!(futs.try_push(
+                            assert!(futs.try_push(
                                 this.request_one(id, addr, depth)
                                     .map_err(|e| debug!("error: {e:#}"))
                                     .instrument(error_span!("addr", addr=addr.to_string()))
@@ -1059,7 +1059,7 @@ impl DhtWorker {
                         .iter()
                         .map(|n| n.addr())
                         .take(8).collect::<Vec<_>>();
-                    debug_assert!(futs.try_push(
+                    assert!(futs.try_push(
                         RecursiveRequest::find_node_for_routing_table(
                             self.dht.clone(), random_id, addrs.into_iter()
                         ).instrument(error_span!("refresh_bucket"))
@@ -1103,7 +1103,7 @@ impl DhtWorker {
                 _ = &mut looper => {},
                 r = rx.recv(), if !futs.is_full() => {
                     let (id, addr) = r.unwrap();
-                    debug_assert!(futs.try_push(async move {
+                    assert!(futs.try_push(async move {
                         self.dht.routing_table.write().mark_outgoing_request(&id);
                         match self.dht.request(Request::Ping, addr).await {
                             Ok(_) => {
@@ -1352,6 +1352,32 @@ mod queue_budget_tests {
                 }),
             },
             addr: SocketAddr::from(([127, 0, 0, 1], 6881)),
+        }
+    }
+
+    #[tokio::test]
+    async fn recursive_lookup_dispatches_requests_without_debug_assertions() {
+        let (worker_tx, mut worker_rx) = worker_send_channel();
+        let id = Id20::new([1; 20]);
+        let addr = SocketAddr::from(([127, 0, 0, 1], 6881));
+        let dht = Arc::new(DhtState::new_internal(
+            id,
+            worker_tx,
+            None,
+            addr,
+            PeerStore::new(id),
+            CancellationToken::new(),
+        ));
+        let lookup = RecursiveRequest::find_node_for_routing_table(dht, id, std::iter::once(addr));
+        tokio::pin!(lookup);
+        tokio::select! {
+            request = worker_rx.recv() => {
+                let request = request.expect("lookup must dispatch a request");
+                assert_eq!(request.addr, addr);
+                assert!(matches!(request.message.kind, MessageKind::FindNodeRequest(_)));
+            }
+            result = &mut lookup => panic!("lookup exited before dispatch: {result:?}"),
+            _ = tokio::time::sleep(Duration::from_secs(1)) => panic!("lookup did not dispatch"),
         }
     }
 
