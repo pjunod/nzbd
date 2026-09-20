@@ -60,6 +60,9 @@ a claimed verification of a newer Forgejo tip or the deployed fleet.
 - Provider capacity held by an unreachable process is released only after all
   its durable work leases expire and its process-local deadline has drained
   connections. Missing a heartbeat alone never reallocates sockets.
+- Coordinator priority remains a sub-interval election bias. Extending it into
+  a deterministic multi-interval preference would consume worker lease time;
+  replicated lease ownership, not priority, is the authority boundary.
 
 ## Bounded acceptance inventory
 

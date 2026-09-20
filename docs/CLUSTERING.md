@@ -63,6 +63,10 @@ returns a retryable `503` while an elected process is still adopting the
 replicated projection, so a successful write cannot be erased by the tail of
 takeover recovery.
 
+Coordinator priority is a bounded cold-start bias, not a deterministic claim:
+the delay remains below one election interval so failover cannot consume a
+worker's lease deadline, and the replicated compare-and-set decides the winner.
+
 The elected authority schedules and projects state but performs no local
 download or post-processing. A coordinator's configured executor capacity is
 available whenever it is a worker; while elected, work goes to another node so

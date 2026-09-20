@@ -125,13 +125,15 @@ async fn replicated_election_task(
                 }
             }
         } else if cfg.eligible {
-            // Preserve the configured coordinator preference at the
-            // replicated authority boundary. Without this stagger, fixed
-            // voters cold-starting together race their first SQL lease and
-            // a lower-priority standby can take office arbitrarily.
-            let step = cfg.lease_interval * 3;
-            let jitter_ms = hash_jitter(&cfg.node) % cfg.lease_interval.as_millis().max(1) as u64;
-            let stagger = step * cfg.priority.min(16) + Duration::from_millis(jitter_ms);
+            // Bias simultaneous replicated claims by configured priority,
+            // but keep the whole stagger below one election interval. A
+            // multi-interval delay can outlive a worker's conservative lease
+            // deadline and turn a live-leader handoff into needless reclaim.
+            let interval_ms = cfg.lease_interval.as_millis().max(1) as u64;
+            let step_ms = (interval_ms / 17).max(1);
+            let priority_ms = step_ms * u64::from(cfg.priority.min(16));
+            let jitter_ms = hash_jitter(&cfg.node) % step_ms;
+            let stagger = Duration::from_millis(priority_ms + jitter_ms);
             sleep_or_cancel(&cancel, stagger).await;
             if cancel.is_cancelled() {
                 break;
