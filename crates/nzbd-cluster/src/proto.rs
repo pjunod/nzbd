@@ -53,6 +53,8 @@ pub struct Grant {
     /// partitioning, §6.3). PP grants carry it too because delayed PAR
     /// recovery may fetch explicitly selected recovery volumes.
     pub server_budgets: HashMap<String, u16>,
+    #[serde(default)]
+    pub budget_generation: u64,
     /// Rolling-upgrade capability: true only when the granting leader counts
     /// PP leases in those budgets. Missing/false must keep PP NNTP disabled.
     #[serde(default)]
@@ -69,6 +71,9 @@ pub struct LeaseProgress {
     pub lease_id: String,
     pub token: LeaseToken,
     pub job: JobId,
+    pub kind: LeaseKind,
+    pub job_revision: u64,
+    pub control_revision: u64,
     pub stats: MirrorStats,
 }
 
@@ -76,6 +81,17 @@ pub struct LeaseProgress {
 pub struct HeartbeatRequest {
     pub node: String,
     pub leases: Vec<LeaseProgress>,
+    /// Last node-local engine generation that observed the complete budget
+    /// update between NNTP batches.
+    #[serde(default)]
+    pub budget_ack: Option<BudgetAck>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BudgetAck {
+    pub cluster_generation: u64,
+    pub engine_generation: u64,
+    pub drained: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize, Default)]
@@ -91,6 +107,8 @@ pub struct HeartbeatResponse {
     pub controls: HashMap<String, u64>,
     /// Refreshed connection budgets (membership changed since the grant).
     pub server_budgets: Option<HashMap<String, u16>>,
+    #[serde(default)]
+    pub budget_generation: u64,
     /// Same rolling-upgrade capability as [`Grant::post_fetch_budgeted`].
     #[serde(default)]
     pub post_fetch_budgeted: bool,
@@ -127,6 +145,20 @@ pub struct RejectRequest {
 #[derive(Debug, Serialize, Deserialize, Default)]
 pub struct RejectResponse {
     pub released: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ScriptReceiptRequest {
+    pub node: String,
+    pub lease_id: String,
+    pub token: LeaseToken,
+    pub receipt_id: String,
+    pub finish: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ScriptReceiptResponse {
+    pub decision: String,
 }
 
 /// Node presence record (registry file on the shared volume).

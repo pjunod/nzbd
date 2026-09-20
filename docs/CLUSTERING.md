@@ -1,393 +1,226 @@
-# nzbd — Clustering Design (ADR-13…16)
+# Usenet clustering
 
 | | |
 |---|---|
-| Status | **C1/C2 implemented; completion reassessed 2026-09-19** — original ADRs accepted 2026-07-17; current limits and proposed amendments are distinguished below |
-| Date | 2026-07-17 |
-| Deciders | Paul (owner) |
-| Parent | [`ARCHITECTURE.md`](ARCHITECTURE.md) — §15 ADR table entries 13–16 summarize this document |
-| Scope | Distribute work across multiple nzbd nodes sharing one work volume (GlusterFS), so a node running par-repair/unpack is not also fighting for CPU/disk with downloads |
+| Status | Implemented; merge-candidate validation tracked in [CLUSTERING_STATUS.md](CLUSTERING_STATUS.md) |
+| Scope | Trusted-LAN nzbd nodes, fixed control voters, shared POSIX payload volume |
+| Decision record | Supersedes the file-election limits recorded by ADR-13–16 |
+| Delivery plan | [CLUSTERING_COMPLETION_PLAN.md](CLUSTERING_COMPLETION_PLAN.md) |
 
-Companion to [CLUSTERING_COMPLETION_PLAN.md](CLUSTERING_COMPLETION_PLAN.md)
-(the current plurx comparison and finite remaining work) and
-[CLUSTERING_STATUS.md](CLUSTERING_STATUS.md) (progress). This file describes
-the existing shared-filesystem implementation. It does not claim the proposed
-replicated control store or C3 has shipped. Source reconciliation below is
-against nzbd `7b81e84`.
+nzbd can distribute Usenet downloads and post-processing while presenting one
+queue and one API authority. Hiqlite orders control state. The existing shared
+volume carries article data, immutable result generations, journals, and the
+leader-discovery projection.
 
----
+BitTorrent remains single-node and cannot run in cluster mode. WAN clustering,
+dynamic voter membership, and object-storage payloads are out of scope.
 
-## 1. Context
+## Architecture
 
-A single nzbd node serializes two workloads with very different profiles:
-download (network + TLS + decode + sequential disk) and post-processing
-(par2 GF(2^16) math, unrar — CPU and random I/O heavy). Running both on one
-box degrades both; the operator already runs multiple nodes with a shared
-GlusterFS work volume mounted on all of them.
-
-Forces:
-
-- **Product constraints carry over**: single static binary, no external
-  runtime dependencies (ARCHITECTURE.md §2), crash-only design (§4.6),
-  single-writer queue state (§4.2 / ADR 3).
-- **Sonarr/Radarr reach one URL.** Whatever the cluster does internally,
-  the *arr ecosystem speaks to a single nzbget-shaped endpoint.
-- **The shared volume exists** and is the natural data plane: articles
-  decoded on any node are visible to every node.
-- **A network filesystem is a treacherous lock service.** POSIX locks over
-  FUSE/Gluster are configuration-sensitive; wall clocks across home-lab
-  nodes are not trustworthy.
-- C2 implements post-processing leases. Whole-pipeline isolation and stronger
-  publication authority are remaining work identified by the 2026-09-19
-  comparison.
-
-## 2. Decisions
-
-| # | Decision | Chosen |
-|---|---|---|
-| ADR-13 | Coordination topology | **Elected coordinator ("leader") + workers, work leased over HTTP; the shared volume carries data and the election lease, never fine-grained locks** |
-| ADR-14 | Work granularity | **Whole-job download leases + whole-pipeline PP leases** (the original stage-level design became one `Post` lease; segment splitting remains deferred) |
-| ADR-15 | Client reachability & HA | **Automatic failover: leadership is elected; every node serves the API and transparently proxies to the current leader** |
-| ADR-16 | State placement | **Queue snapshot + per-job/per-node journals + article data on the shared volume; snapshot commit has a pre-rename epoch check; SQLite stays local** |
-
-These are the implemented choices. The
-[completion decision](CLUSTERING_COMPLETION_PLAN.md#2-recommended-decision--a-small-control-store-existing-data-plane)
-recommends amending ADR-13/15/16 to reuse plurx's maintained transactional
-coordination dependency; the original alternatives below retain their
-historical rationale.
-
-### 2.1 Options considered — topology (ADR-13)
-
-| Option | Complexity | Deps | Failure story | Verdict |
-|---|---|---|---|---|
-| **Leader + workers over HTTP** (chosen) | Medium | none | Single writer preserved; leader loss handled by election (ADR-15) | ✅ Extends §4.2's owner-task pattern across the wire: workers pull job leases exactly like connection tasks pull segment leases |
-| Symmetric peers, lease files only | High | none | Every mutation is a distributed-lock problem on a network FS; fencing bugs surface as silent queue corruption | ❌ Hardest to test; Gluster lock semantics vary by version/config |
-| External coordinator (etcd/redis/NATS) | Medium | +1 service | Battle-tested primitives | ❌ Breaks the no-runtime-deps ethos for a media-server product |
-| Embedded Raft (openraft) | Very high | big crate | Real consensus | ❌ Log replication machinery to protect a download queue; the shared FS already provides shared storage |
-
-### 2.2 Options considered — granularity (ADR-14)
-
-| Option | Wins | Costs | Verdict |
-|---|---|---|---|
-| PP-only offload | Simplest protocol | Leader still pays TLS+decode+disk while PPing elsewhere | ❌ partial fix |
-| **Whole-job downloads + PP offload** (chosen) | Node A repairs job 1 while node B downloads job 2; per-node roles | Connection-budget partitioning needed (see §6.3); C2 implements one whole-pipeline `Post` lease | ✅ |
-| Segment-split downloads across nodes | Aggregate bandwidth when nodes have separate WAN links | Cross-node segment scheduling, per-article fan-in | Deferred to C3 — the job-lease protocol does not preclude it |
-
-### 2.3 Options considered — HA (ADR-15)
-
-| Option | Verdict |
-|---|---|
-| Workers idle while leader down | ❌ Rejected by owner — cluster must ride through node loss |
-| **Election + any-node API proxy** (chosen) | ✅ Leadership is a role, not a node. Election arbitrates via the shared volume — the same resource being protected — so a node that cannot reach Gluster can neither lead nor corrupt state (fate-sharing). Sonarr may point at any node (or an LB across all); non-leaders proxy |
-| VIP/keepalived only | Viable operator add-on, but proxying makes it optional rather than required |
-
-## 3. System overview
-
-```
-      Sonarr ──▶ http://any-node:6789 ── non-leader proxies ──▶ leader
- ┌────────────────────────────────────────────────────────────────────┐
- │ Gluster volume (shared_dir)                                        │
- │  .nzbd-cluster/leader.json        ← election lease {epoch,node,seq}│
- │  .nzbd-cluster/nodes/<name>.json  ← presence/caps/stats heartbeats │
- │  .nzbd-cluster/queue.json         ← queue authority snapshot       │
- │  .nzbd-cluster/jobs/<id>/journal.<node>   ← per-node job journals  │
- │  complete/<job>/<file>[.part]     ← DirectWrite article data       │
- └────────────────────────────────────────────────────────────────────┘
-   node A: leader+worker         node B: worker          node C: worker
-   ┌───────────────────┐         ┌──────────────┐        ┌──────────────┐
-   │ engine (authority)│  grant  │ engine (empty│        │ engine       │
-   │ + cluster sched.  │ ───────▶│ queue; leased│        │ (PP exec in  │
-   │ + own executors   │ ◀─────── │ jobs only)  │        │  phase C2)   │
-   └───────────────────┘  hb/done└──────────────┘        └──────────────┘
+```text
+client ──▶ any node ──proxy──▶ current API authority
+                                │
+                    Hiqlite fixed-voter quorum
+                    jobs · revisions · exact leases
+                    receipts · budgets · migration
+                                │
+       ┌────────────────────────┼────────────────────────┐
+       ▼                        ▼                        ▼
+ download worker          range worker              PP worker
+ private attempt          private range             private tree
+       └──────── sealed immutable generations ──────────┘
+                                │
+                     fenced authority publication
+                                ▼
+                       selected final output
 ```
 
-Every node runs the same binary and the same subsystems; behavior differs
-only by which roles are currently active: **leader** (queue authority +
-scheduler + API authority), **download executor**, **PP executor** (C2).
-The leader is also an executor by default — a 2-node cluster is leader+both
-and worker+both.
+The control and data planes have different jobs:
 
-## 4. Election (ADR-15 mechanism)
+- The replicated control store is the authority for job identity and revision,
+  exact work leases, command/publication receipts, provider-budget handoffs,
+  and the one-time legacy migration marker.
+- The shared payload volume is not a lock service. It stores large data,
+  per-node article journals, private attempts, and immutable manifests.
+- `leader.json` is a discovery projection. Losing or corrupting it does not
+  create authority; a node must hold the replicated election lease.
+- Each node keeps its Hiqlite directory locally. Never place `control_dir` on
+  the shared payload mount.
 
-State: one file, `<shared>/.nzbd-cluster/leader.json` =
-`{epoch, node, api_url, seq}`; all writes are tmp+rename (atomic on
-Gluster).
+## Control authority
 
-- **Renewal.** The leader rewrites the file every `lease_interval` (5 s)
-  with `seq += 1`.
-- **Staleness is observed, not computed from wall clocks.** Every node
-  polls the file and remembers `(epoch, seq)` plus the *local monotonic*
-  time it last saw them change. No change for `takeover_after` (20 s)
-  ⇒ the leader is presumed dead. Clock skew between nodes is irrelevant.
-- **Candidacy** (nodes with `coordinator = true`): stagger by
-  `min(priority, 16) × 3 × lease_interval + jitter`, observing progression
-  throughout, then **write–wait–verify**:
-  write `{epoch+1, me, seq=1}`, wait `2 × lease_interval`, re-read. If the
-  file names someone else with an epoch ≥ ours, stand down. Two racing
-  candidates converge in the ordinary harness scenarios. This is not an
-  atomic claim protocol, and pre-write checks have the limits in §6.4.
-- **Taking office**: load `queue.json`, fold every per-job journal, adopt
-  in-flight leases (§6.2), start scheduling, begin renewal.
-- **Deposition** (a leader observes a higher epoch): crash-only demotion —
-  abort local authority (state is safe in journals/snapshot), rejoin as a
-  worker. No graceful state handoff to maintain.
-- **Epoch source**: candidacy reads `leader.json` and increments its epoch.
-  Missing, corrupt, and unreadable data all become `None`; this path starts
-  again from epoch 1. Recovery from a durable maximum in snapshots/node files
-  was in the original design but is not implemented. An existing leader can
-  also reassert its old epoch if the file is missing/older. Durable monotone
-  authority is completion-plan work.
+Every mutable job has a stable incarnation and monotonically increasing
+revision. Queue changes are reconciled into idempotent command receipts. A
+worker completion names the exact job revision it executed; a newer pause,
+delete, file edit, or other intent makes that completion conflict.
 
-**Operational requirement:** Gluster must be configured for consistency
-(server-side quorum / replica 3 or arbiter). A volume that itself
-split-brains gives two sides two truths; no application protocol survives
-that. Documented in ARCHITECTURE.md §17.
+A lease token is exact, not merely “owned by this node”:
 
-## 5. Node registry
-
-Each node renews `<shared>/.nzbd-cluster/nodes/<name>.json` with its roles,
-capacity, load, disk-guard capability/state, and sequence. Staleness is judged
-by observed non-progression, same as the election. The registry feeds the
-scheduler and authenticated `GET /api/v1/cluster`. During a rolling upgrade, a
-new leader excludes legacy workers that cannot publish disk admission state;
-new workers also reject a grant if their local guard changes after polling.
-
-## 6. Work distribution
-
-### 6.1 Protocol
-
-Cluster endpoints share the API port, mounted under `/cluster/v1/*`,
-authenticated with a shared `secret` (constant-time compare; TLS or
-trusted LAN assumed — provider credentials never cross this channel, §6.5).
-
-| Endpoint | Semantics |
-|---|---|
-| `POST /cluster/v1/work/poll` | Worker offers `{node, free_download_slots, free_pp_slots}`; leader returns grants containing `{lease_id, epoch, kind, job, server_budgets, post_fetch_budgeted}` for download or PP |
-| `POST /cluster/v1/work/heartbeat` | Worker renews `{lease_ids, per-job progress counters}`; reply may carry `{cancel: [lease_id]}` |
-| `POST /cluster/v1/work/complete` | Worker returns the **final `Job` value** (serde) + outcome; leader swaps it into authority state |
-| `POST /cluster/v1/work/reject` | Worker rejects a just-issued grant when its local disk admission state changed after the poll; leader releases the delegation immediately |
-| `GET /cluster/v1/leader` | `{epoch, node, api_url}` for proxying and diagnostics |
-
-`lease_id = "L<epoch>-<counter>"` is the work-map and PP staging identifier.
-Its uniqueness depends on the epoch not being reused (§4). Download journals
-actually use the node-name suffix, not the lease ID.
-
-### 6.2 Lease lifecycle
-
-Granted → renewed by heartbeat (TTL `worker_ttl` = 30 s, observed
-monotonically) → completed | reclaimed | cancelled.
-
-- **Reclaim** (worker presumed dead): leader clears the delegation, folds
-  the job's journals (union), and reschedules — locally or to another node.
-  Exactly the phase-1 crash-recovery path, applied per job across nodes.
-- **Adoption** (leader died, worker lives): workers keep executing through
-  an election; the first heartbeat to the new leader lists leases it does
-  not know. If the job is unassigned (or assigned to that same node), the
-  new leader adopts the lease as-is — no work is thrown away. Otherwise it
-  replies `cancel`.
-- **Cancellation**: heartbeat handling cancels a lease whose job is absent
-  or whose lease belongs to another node. There is no complete revisioned
-  pause/resume/file-control propagation protocol. Heartbeat failure only
-  logs; the worker has no independent lease-expiry watchdog. Do not infer
-  bounded cancellation or publication safety from the leader's TTL sweep.
-
-### 6.3 Connection budgets
-
-Provider `max_connections` is a per-account limit that must hold
-**cluster-wide**. Server definitions (and credentials) stay in each node's
-local config, keyed by server name; the leader partitions each account's
-connection budget across nodes with active leases, including PP recovery
-fetches, plus a reserved leader share. Each share is integer division plus
-its stable-name remainder; zero shares are allowed. Shares are refreshed on
-grants, heartbeats, and sweeps. The granted map sums to at most the configured
-cap. Missing server names receive zero on a worker, so this is not a general
-heterogeneous-provider placement protocol.
-
-A worker caps its pool at the smaller local/granted value. Delivery and socket
-closure are asynchronous: there is no drain acknowledgement before another
-node's share grows. Thus the arithmetic invariant alone is not a proof of a
-hard simultaneous connection cap during rebalance. P3 in the completion plan
-specifies acknowledged transfers and uncertain-socket accounting.
-
-### 6.4 Fencing — existing recovery mechanism and remaining races
-
-The implementation uses download journal union and staged extraction without
-shared-file locking. Its current guarantees are narrower than transactional
-publication fencing:
-
-- Per-job journals are written to
-  `jobs/<id>/journal.<node_name>` — one file per node/job, append-only.
-  Recovery/fold **unions the Done records across all journal files** of
-  that job; duplicates are idempotent (same segment ⇒ same offset/len/crc,
-  since article content is immutable). This recovers completed articles; it
-  does not fence arbitrary queue changes, file finalization, or PP effects.
-- Identical positional article writes can converge on content. Final resize,
-  rename, deletion, and concurrent file-writer lifetime require additional
-  ownership; they cannot be justified by identical article bytes alone.
-- PP extraction uses `<job_dir>/.pp.<lease_id>/`. Repair, deobfuscation,
-  cleanup, scripts, and category moves are not all isolated there. Remote
-  `commit_ok` checks the worker's local active map; startup removes other
-  `.pp.*` directories without an authoritative live-lease query. Whole-attempt
-  isolation, expiry cancellation, and safe GC remain P2 work.
-- Queue-authority writes (snapshot) re-verify `leader.json` (epoch+node)
-  immediately before the commit rename. A pause between check and rename can
-  still allow an obsolete snapshot to overwrite its successor. Journal union
-  does not recover lost queue-control mutations. This is a documented
-  limitation of the original design, not linearizable consensus. The proposed
-  control-store transaction closes that publication race.
-
-### 6.5 Security
-
-Cluster calls carry the shared secret (config `secret`/`secret_file`,
-required when clustering is enabled). Provider credentials never leave the
-node that configured them — job specs reference servers by name only.
-The existing API/auth story (phase 3) applies unchanged to client traffic;
-`/cluster/v1/*` rejects unauthenticated calls regardless.
-
-## 7. Engine changes (executor-ready core)
-
-The phase-1 engine keeps its architecture; six contained changes make it a
-cluster executor:
-
-1. **Per-job fenced journals** — `state/jobs/<id>/journal.<suffix>`
-   replaces the global journal; replay unions all files per job.
-   Single-node uses suffix `local` (a legacy `segments.journal` is folded
-   once at boot and removed by the next snapshot compact).
-2. **Optional snapshot persistence** — leader (authority) on; worker
-   engines run queue-persistence-off (their truth is the leader + fenced
-   journals; a restarted worker starts empty and receives leases anew).
-3. **Job import/export** — `import_job(Job, fold_journals, emit_finished)`
-   preserving ids; `export_job` returns the final `Job` for
-   `work/complete`. JobIds are minted only by the authority, so ids never
-   collide across engines.
-4. **Delegation set** — delegated jobs are skipped by the local scheduler
-   and carry `assigned_node` in snapshots/summaries.
-5. **Connection-budget watch** — connection task *i* for a server parks
-   while `i ≥ budget(server)`; the leader's grants update the watch.
-6. **Remote progress mirroring** — heartbeat counters overlay delegated
-   jobs' summaries (segment-level truth stays in the shared journals and
-   the final export).
-
-## 8. API surface
-
-- Every node serves the full native API + compat shim; non-leaders proxy
-  to the leader (streaming reverse proxy; `X-Nzbd-Forwarded: <node>`
-  guards loops). Election gaps surface as brief 502/503 — *arr clients
-  retry.
-- Authenticated `GET /api/v1/cluster` currently returns
-  `{leader, epoch, self, is_leader, nodes[]}` from the local node's view.
-  `leases[]`, freshness, and desired/applied budget state are planned, not
-  present. The handler reads registry files on request.
-- Job assignment is observable through `JobAssigned`. Dedicated leader/node
-  lifecycle events from the original design must not be assumed available;
-  P5 specifies the final diagnostics/event contract.
-
-## 9. Configuration
-
-```toml
-[cluster]
-enabled = true
-node_name = "node-a"            # unique, stable
-shared_dir = "/mnt/work"        # the Gluster mount
-advertise_url = "http://10.0.0.11:6789"   # how peers reach this node
-secret_file = "/etc/nzbd/cluster.secret"  # or: secret = "…"
-coordinator = true               # eligible for election
-priority = 10                    # lower = preferred leader, staggers candidacy
-download = true
-max_download_jobs = 2            # concurrent download-job leases on this node
-post_process = true              # PP executor (effective from phase C2)
-pp_slots = 1
-lease_interval_secs = 5
-takeover_after_secs = 20
-worker_ttl_secs = 30
+```text
+resource + owner node + owner process incarnation + fence + lease revision + expiry
 ```
 
-With `enabled = true`: queue authority, journals and job data live under
-`shared_dir` (`paths.dest_dir` defaults to `<shared_dir>/complete`;
-a dest outside the shared volume is a validation warning — remote PP could
-not see the files). `enabled = false`: phase-1 behavior, byte-for-byte
-(modulo the per-job journal layout, migrated automatically).
+Acquire, renew, release, and publication compare every field. Renewal returns a
+successor token. Replaying an earlier token cannot revive authority. Workers
+also keep a conservative monotonic deadline; failed or hung HTTP never extends
+it. Cluster JSON bodies are capped at 1 MiB and ordinary control calls have a
+3-second connect / 10-second total deadline. Streaming API proxy traffic keeps
+its separate streaming behavior.
 
-Clustered `failure_action = "park"` always uses
-`<shared_dir>/.nzbd-cluster/failed`, regardless of a node-local
-`post.failed_dir`. A leader can lose its lease after moving a failed tree but
-before stamping the queue row; the shared target lets its successor observe
-and complete that same idempotent action.
+## Migration and rollback
 
-## 10. Failure matrix
+The first start of the new control plane is a stopped-cluster conversion:
 
-| Failure | Behavior |
+1. Back up the legacy queue and history inputs under the node-local control
+   directory.
+2. Hash the source and transactionally import job/file IDs, job intent, and
+   counters.
+3. Commit the source fingerprint and target `cluster_id`.
+4. A retry with the same source resumes idempotently. A different source or
+   cluster identity is rejected.
+
+Do not run file-election and replicated-control binaries against the same
+state tree concurrently. Rollback means stopping the new cluster and restoring
+the pre-conversion backup, which loses later control changes, or deliberately
+exporting the newer state. It is not a live downgrade.
+
+## Scheduling
+
+Download and post-processing placement uses stable weighted load:
+
+```text
+assigned or leased work / configured node weight
+```
+
+Assigned-but-not-polled work consumes capacity. Low-disk or stale nodes receive
+no new writes. PP prefers a node that is not downloading, then applies the same
+weighted comparison. These are placement weights, not feature qualification.
+
+### Provider connection budgets
+
+Server name is the initial provider-account key. All nodes that use one account
+must configure the same name and account-wide connection ceiling.
+
+Budget transfers are generation based. A reduction is published first. Each
+NNTP connection task acknowledges only after reaching a batch boundary; a task
+above the new allowance closes its socket before acknowledging. The leader
+withholds increases until every old holder confirms the shrink. A stopped or
+unreachable holder therefore leaves capacity conservatively reserved and the
+diagnostic snapshot reports it as `uncertain_reserved_capacity`.
+
+Desired, commanded, acknowledged, and pending transfer state is replicated so
+a leader change does not forget an uncertain socket. Zero-connection shares are
+valid when an account has fewer sockets than executors.
+
+## Download execution
+
+Small and multi-file jobs retain whole-job leases. A one-file job with at least
+64 articles is divided into fixed 32-article ranges when at least two download
+workers are available. Range owners are chosen deterministically from node
+weights.
+
+Each range grant contains one file and only its inclusive article interval.
+Articles outside the interval are absent—not marked failed or complete. The
+worker writes to a fence-specific private directory and seals:
+
+- the partial job state and exact article offsets/lengths/CRCs;
+- payload hashes and byte counts;
+- job incarnation, owner node, fence, and result identity.
+
+Accepted ranges are durable control rows. Restart or reassignment reuses them;
+only missing ranges return to NNTP. When all ranges exist, one exact assembly
+lease reads the accepted manifests, validates every article CRC and offset,
+writes one private output, checks the final CRC, and returns one sealed result.
+No range worker renames the public file.
+
+## Post-processing and publication
+
+Remote post-processing begins by copying the completed input into a bounded,
+fence-specific private tree. PAR rename/verify/repair, unpack, cleanup,
+deobfuscation, and scripts operate there. Category publication is deferred to
+the authority. A lease check runs before every local commit and before final
+stamping.
+
+The authority accepts a result only when:
+
+- authentication succeeds;
+- the exact lease token is live;
+- job incarnation and expected revision still match;
+- the immutable generation stays within the cluster namespace;
+- every manifest path is safe and every length/hash matches.
+
+The publication receipt is committed before selection. Selection copies the
+verified generation to a temporary sibling, fsyncs it, preserves any prior
+directory under a uniquely named `.superseded-*` sibling, then atomically
+renames the new directory. The result marker makes retries idempotent. PP
+history uses the publication receipt timestamp, so a lost response retries the
+same logical row rather than inventing a second completion.
+
+Superseded directories are deliberately recoverable; inspect and remove them
+only after confirming the selected output. In-progress `.building-*` and
+private attempt directories are never selected as results.
+
+## API and diagnostics
+
+Every node serves the native API and NZBGet-compatible shim. A non-leader
+proxies client traffic to the discovered authority. Peer endpoints under
+`/cluster/v1/*` use the independent cluster secret.
+
+Authenticated `GET /api/v1/cluster` serves a two-second background snapshot,
+so an unavailable shared mount does not turn the HTTP request into an
+unbounded filesystem operation. It includes:
+
+- local role, current authority, epoch, and sampled time;
+- control mode and quorum-commit health (`true`, `false`, or `null` when the
+  node is not a voter);
+- registry rows and their disk/capacity observations;
+- exact live lease resource, kind, owner, fence, revision, age, and expiry;
+- desired/commanded provider budgets, pending shrink acknowledgements, and
+  uncertain reserved capacity.
+
+Settings → **Dev · Usenet cluster** contains the enable switch and common
+fields. The safe-enable list labels evidence as met, unmet, or unknown. It is
+advisory only: the operator can save `cluster.enabled = true` regardless.
+Authentication, stale-token checks, invalid configuration, and transaction
+conflicts still reject the operation they protect; they are correctness
+boundaries, not feature gates.
+
+## Configuration checklist
+
+Before enabling, normally verify:
+
+- an odd fixed voter roster (three voters is the normal minimum);
+- unique stable node names and control IDs;
+- node-local durable `control_dir` values;
+- identical shared-volume and completed-download mounts;
+- matching provider account names and account-wide caps;
+- working cluster secret distribution and trusted-LAN transport;
+- NTP/clock monitoring (leases use durable expiry plus local conservative
+  deadlines; wildly wrong clocks remain operationally harmful);
+- sufficient temporary capacity for private PP copies and range generations.
+
+These checks are advice, not an activation receipt.
+
+## Failure behavior
+
+| Failure | Result |
 |---|---|
-| Worker dies mid-download | TTL expiry → reclaim → journal-union fold → resume elsewhere; journaled segments are never re-fetched |
-| Worker dies mid-PP (C2) | Leader reclaims and retries; stopped/resumed workers, destructive PP overlap, and arbitrary script effects have the §6.4 limits |
-| Leader dies | Detection + priority stagger + verification + recovery; priority 10 and 5 s interval contribute 150 s stagger alone, so ~30 s is not a valid default bound; workers may be adopted |
-| Deposed leader wakes | Observing replacement demotes it; a stopped process's stale check/rename window remains (§6.4) |
-| Gluster unreachable from one node | Returned renewal failure demotes the leader; a filesystem syscall that never returns is not currently bounded by the election loop |
-| Gluster down everywhere | Payload progress cannot continue; no tested bound for every shared-filesystem call or complete recovery is claimed |
-| Network partition, volume still shared | Leader TTL can reclaim unreachable workers, but failed worker heartbeats do not expire local execution; stale publication remains a completion-plan concern |
+| Minority loses quorum | Cannot acquire/renew/publish control authority; cached diagnostics remain available |
+| Worker or leader resumes after expiry | Old exact token is rejected; committed ranges remain reusable |
+| Heartbeat hangs or response is lost | Worker deadline expires; a publication retry resolves by receipt ID |
+| Pause/delete races completion | Reconciled job revision wins; stale result changes no queue/history state |
+| Worker dies during a range | Accepted ranges remain; incomplete range alone is retried |
+| PP attempts overlap | Each has private bytes; only the accepted fence is selected |
+| Budget holder disappears | Its uncertain sockets remain reserved; other nodes do not receive that capacity |
+| Shared volume stalls | Control and cached diagnostics stay bounded; payload publication reports incomplete |
 
-## 11. Testing
+## Limits
 
-In-process multi-node harness: N cluster runtimes over one tempdir
-"shared volume" + `nzbd-nserv` providers, real loopback HTTP between
-nodes; time-compressed lease intervals.
-
-- Exactly-one-leader under concurrent candidacy (loop N rounds).
-- Distributed download: jobs added via a *worker's* API (proxy), spread
-  across nodes, bit-identical output, budgets respected.
-- Worker runtime shutdown mid-download → reclaim, cross-node resume, zero re-fetch of
-  journaled segments (nserv hit counts).
-- Leader runtime shutdown mid-download+mid-delegation → failover within the test's configured bound, lease
-  adoption (no restart of the delegated job), completion, zero re-fetch.
-- Fencing units: journal union with overlapping journal files; snapshot
-  commit rejected when the lease file changed under the writer.
-- Single-node-cluster parity with the phase-1 e2e suite.
-- CI runs on local FS; a documented manual soak checklist covers real
-  Gluster (quorum on, node reboots, volume heal during downloads).
-
-The harness uses multiple runtimes in one process and `shutdown()` to remove
-a node. It does not substitute for `SIGSTOP`/`SIGCONT`, kernel-blocked mounts,
-or power-loss tests. See the finite
-[completion acceptance scenarios](CLUSTERING_COMPLETION_PLAN.md#6-acceptance--a-short-set-of-failure-scenarios).
-
-## 12. Consequences
-
-Easier: PP/download separation (the original goal); rolling restarts;
-adding capacity = mount volume + join with a secret; phase-2 PP arrives
-cluster-native (a second lease type on an existing protocol).
-
-Harder: two config knobs that must be right (Gluster quorum, shared
-secret); per-job journal migration; connection-budget correctness across
-nodes; more failure modes to test (mitigated by crash-only + union
-fencing).
-
-Next: the finite [P0–P5 completion plan](CLUSTERING_COMPLETION_PLAN.md),
-including C3 ranges, static weighted placement, and budget handoff. Adaptive
-performance models and WAN-separated nodes remain outside this effort.
-
-**Stateful, non-idempotent workloads.** This shared-filesystem protocol is not
-a generic template for torrent sessions or other work whose late writes cannot
-be made harmless by journal union or isolated staging. BitTorrent M6 follows
-the separately approved contract in
-[BITTORRENT_PROPOSAL.md](BITTORRENT_PROPOSAL.md#12-clustering--exclusive-whole-torrent-leases-after-single-node):
-start from the pinned merged plurx monotone-lease and transactional-publication
-semantics, select a linearizable coordination topology in an ADR, store bytes
-in fence-scoped generations, and prove deadline self-fencing with real stopped
-and resumed processes. The current residual leader window is explicitly not
-evidence that torrent clustering is safe.
-
-**Filesystem portability.** Gluster is the reference shared payload volume.
-Atomic rename, cross-client visibility, and durability must be established on
-the actual mount configuration. Neither the name of a filesystem nor the
-local-tempdir tests establish distributed compare-and-swap or crash safety.
-Other POSIX/network filesystems need their own validation. The completion plan
-retains shared payload storage and moves control publication to a transactional
-store; raw object storage remains outside this effort.
-
-## 13. Phasing
-
-| Phase | Scope | Exit criteria |
-|---|---|---|
-| **C1 — foundation** (now) | Election + registry + fenced per-job state + work protocol + distributed whole-job downloads + any-node API proxy + `[cluster]` config | Multi-node harness green: failover mid-download with adoption, worker reclaim without re-fetch, single-leader invariant, single-node parity |
-| **C2** (implemented) | PP lease type and anti-affinity; extraction staging, with whole-pipeline authority limits documented in §6.4 | A job downloaded on one node post-processes on another |
-| **Completion P0–P5** (planned) | Transactional authority and worker lifetime, then C3 segment splitting, weighted placement, budget handoff, and advisory diagnostics | [Finite plan and acceptance](CLUSTERING_COMPLETION_PLAN.md) |
+- Fixed voters only; changing membership is a stopped-cluster operation.
+- Trusted LAN only. Use network policy or a private overlay; this is not a WAN
+  protocol.
+- One shared POSIX payload namespace is required.
+- Range splitting intentionally starts with one large active file and fixed
+  range size; no live resharding or adaptive range migration.
+- Provider accounts are keyed by server name in this release.
+- Deployment and node restarts are separate from merging the software.

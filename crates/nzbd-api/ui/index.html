@@ -1021,7 +1021,7 @@ try {
     <div id="cfg-meta" class="cfg-meta"></div>
     <form id="cfg-form" onsubmit="return false"></form>
     <details id="cfg-advanced">
-      <summary>Advanced: edit the raw nzbd.toml (feeds &amp; cluster live here)</summary>
+      <summary>Advanced: edit the raw nzbd.toml (feeds and voter roster live here)</summary>
       <p class="sub" id="adv-masked-note" hidden style="color: var(--warn)">Secrets are
         shown as <code>***unchanged***</code>, not their real values. <b>This text is a
         display, not a backup</b> — saving it back here restores your secrets, but a copy
@@ -3969,7 +3969,40 @@ const SETTINGS_SECTIONS = [
       "NZBGet calls this KeepHistory. An entry older than this goes even if the count bound is nowhere near."],
   ]},
   { key: "categories", title: "Categories", desc: "Per-category destination and unpack overrides (what the *arrs select).", array: true },
+  { key: "dev", title: "Dev · Usenet cluster", desc: "Enable multi-node Usenet execution after restart. Requirements are advisory: nzbd reports what it can verify but never locks this switch.", fields: [
+    ["cluster.enabled", "enable Usenet clustering after restart", "check"],
+    ["cluster.cluster_id", "cluster identity", "text"],
+    ["cluster.node_name", "unique node name", "text"],
+    ["cluster.shared_dir", "shared payload directory", "text?"],
+    ["cluster.advertise_url", "advertised API URL", "text"],
+    ["cluster.secret", "cluster secret (empty = keep current)", "secret"],
+    ["cluster.secret_file", "cluster secret file (optional)", "text?"],
+    ["cluster.coordinator", "control-plane voter", "check"],
+    ["cluster.control_dir", "local control directory", "text?"],
+    ["cluster.control_node_id", "stable control node ID", "num"],
+    ["cluster.control_raft_bind", "Raft bind", "text"],
+    ["cluster.control_api_bind", "control API bind", "text"],
+    ["cluster.download", "accept download work", "check"],
+    ["cluster.max_download_jobs", "download slots", "num"],
+    ["cluster.download_weight", "download weight", "num"],
+    ["cluster.post_process", "accept post-processing work", "check"],
+    ["cluster.pp_slots", "post-processing slots", "num"],
+    ["cluster.pp_weight", "post-processing weight", "num"],
+  ]},
 ];
+
+function clusterAdvisory() {
+  const c = cfgModel.cluster || {};
+  const peers = Array.isArray(c.control_peers) ? c.control_peers : [];
+  const item = (state, message) => `<li><b>${state}</b> · ${esc(message)}</li>`;
+  return `<div class="cfg-sub"><b>Safe-enable advisory</b><ul>` +
+    item(c.shared_dir ? "met" : "unmet", "A shared payload directory is configured and mounted identically on every node.") +
+    item((c.secret || c.secret_file) ? "met" : "unmet", "Cluster RPC authentication has a secret or secret file.") +
+    item(c.control_dir ? "met" : "unmet", "Replicated control state uses a node-local durable directory.") +
+    item(peers.length >= 3 ? "met" : (peers.length ? "unmet" : "unknown"), "A fixed odd voter roster of at least three nodes is configured (edit control_peers in Advanced TOML).") +
+    item("unknown", "Clock synchronization, shared-volume durability, provider account identity, and cross-node reachability require an operator check.") +
+    `</ul><p class="desc">These signals never prevent enabling. Invalid credentials, stale lease tokens, and transactional conflicts are still rejected when operations run.</p></div>`;
+}
 
 const getPath = (obj, path) => path.split(".").reduce((o, k) => (o ? o[k] : undefined), obj);
 const setPath = (obj, path, v) => {
@@ -4090,6 +4123,7 @@ function renderSettingsForm() {
     } else {
       body = `<div class="cfg-grid">` +
         sec.fields.map(([p, l, t, o, help]) => fieldControl(p, l, t, o, help)).join("") + `</div>`;
+      if (sec.key === "dev") body += clusterAdvisory();
     }
     return `<div class="cfg-card"><h3>${esc(sec.title)}</h3><p class="desc">${esc(sec.desc)}</p>${body}</div>`;
   }).join("");

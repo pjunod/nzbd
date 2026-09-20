@@ -2722,6 +2722,7 @@ name = "nzbd-cluster"
 version = "0.2.0"
 dependencies = [
  "axum",
+ "crc32fast",
  "hiqlite",
  "http-body-util",
  "hyper",

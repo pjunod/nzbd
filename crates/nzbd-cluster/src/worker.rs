@@ -33,10 +33,14 @@ pub struct LeaseState {
     /// PP leases only: the pipeline finished locally; the stamped job is
     /// ready to hand to the leader.
     pub pp_ready: bool,
+    /// Assembly leases do not import into the download engine. Their
+    /// completed, verified job is retained here until durable publication.
+    pub ready_job: Option<Box<nzbd_types::Job>>,
 }
 
 /// Lease-id → state map, shared with the demotion path (`retain_jobs`).
 pub type ActiveLeases = Arc<Mutex<HashMap<String, LeaseState>>>;
+type BudgetReceipt = Arc<Mutex<Option<BudgetAck>>>;
 
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_worker(
@@ -52,6 +56,7 @@ pub fn spawn_worker(
     cancel: CancellationToken,
     tracker: &TaskTracker,
 ) {
+    let budget_receipt = Arc::new(Mutex::new(None));
     let t2 = tracker.clone();
     tracker.spawn(worker_task(
         cfg,
@@ -63,6 +68,7 @@ pub fn spawn_worker(
         pp,
         dest_dir,
         owner_incarnation,
+        budget_receipt,
         cancel,
         t2,
     ));
@@ -79,6 +85,7 @@ async fn worker_task(
     pp: Option<PpSetup>,
     dest_dir: PathBuf,
     owner_incarnation: String,
+    budget_receipt: BudgetReceipt,
     cancel: CancellationToken,
     tracker: TaskTracker,
 ) {
@@ -95,7 +102,16 @@ async fn worker_task(
             // (adopt_authority kept them); the scheduler takes over.
             active.lock().unwrap().clear();
         } else if let Some(url) = v.leader_url().map(|s| s.to_string()) {
-            heartbeat_and_cancel(&cfg, &servers, &engine, &client, &active, &url).await;
+            heartbeat_and_cancel(
+                &cfg,
+                &servers,
+                &engine,
+                &client,
+                &active,
+                &budget_receipt,
+                &url,
+            )
+            .await;
             report_completions(&cfg, &engine, &client, &active, &url, &dest_dir).await;
             poll_for_work(
                 &cfg,
@@ -108,6 +124,7 @@ async fn worker_task(
                 &tracker,
                 &url,
                 &owner_incarnation,
+                &budget_receipt,
             )
             .await;
         }
@@ -142,6 +159,7 @@ async fn heartbeat_and_cancel(
     engine: &EngineHandle,
     client: &ClusterClient,
     active: &ActiveLeases,
+    budget_receipt: &BudgetReceipt,
     leader_url: &str,
 ) {
     let leases: Vec<LeaseProgress> = active
@@ -152,15 +170,16 @@ async fn heartbeat_and_cancel(
             lease_id: id.clone(),
             token: st.token.clone(),
             job: st.job,
+            kind: st.kind,
+            job_revision: st.job_revision,
+            control_revision: st.control_revision,
             stats: progress_of(engine, st.job),
         })
         .collect();
-    if leases.is_empty() {
-        return;
-    }
     let req = HeartbeatRequest {
         node: cfg.node_name.clone(),
         leases,
+        budget_ack: budget_receipt.lock().unwrap().clone(),
     };
     match client
         .post_json::<_, HeartbeatResponse>(leader_url, "/cluster/v1/work/heartbeat", &req)
@@ -203,9 +222,23 @@ async fn heartbeat_and_cancel(
                     )
                 };
                 if has_post && pp_budget_must_park(post_fetch_budgeted, has_download) {
-                    apply_budgets(engine, servers, &HashMap::new()).await;
+                    apply_budgets(
+                        engine,
+                        servers,
+                        &HashMap::new(),
+                        resp.budget_generation,
+                        budget_receipt,
+                    )
+                    .await;
                 } else {
-                    apply_budgets(engine, servers, &budgets).await;
+                    apply_budgets(
+                        engine,
+                        servers,
+                        &budgets,
+                        resp.budget_generation,
+                        budget_receipt,
+                    )
+                    .await;
                 }
             }
         }
@@ -233,15 +266,23 @@ async fn report_completions(
             // A PP job arrives already Completed — only hand it back once
             // the pipeline stamped it.
             LeaseKind::Post => st.pp_ready,
-            LeaseKind::Segment | LeaseKind::Assemble => false,
+            LeaseKind::Segment => snapshot.jobs.iter().any(|j| {
+                j.id == st.job && matches!(j.status, JobStatus::Completed | JobStatus::Failed)
+            }),
+            LeaseKind::Assemble => st.ready_job.is_some(),
         })
         .map(|(id, st)| (id.clone(), st.clone()))
         .collect();
 
     for (lease_id, lease) in finished {
         let job_id = lease.job;
-        let Ok(Some(job)) = engine.export_job(job_id).await else {
-            continue;
+        let job = if let Some(job) = lease.ready_job.as_deref().cloned() {
+            job
+        } else {
+            let Ok(Some(job)) = engine.export_job(job_id).await else {
+                continue;
+            };
+            job
         };
         let sealed = match seal_generation(cfg, dest_dir, &job, &lease).await {
             Ok(sealed) => sealed,
@@ -293,6 +334,7 @@ async fn poll_for_work(
     tracker: &TaskTracker,
     leader_url: &str,
     owner_incarnation: &str,
+    budget_receipt: &BudgetReceipt,
 ) {
     let disk_low = engine.snapshot().disk_low;
     let (dl_held, pp_held) = {
@@ -331,7 +373,7 @@ async fn poll_for_work(
             return;
         }
     };
-    for grant in resp.grants {
+    for mut grant in resp.grants {
         let job_id = grant.job.id;
         if engine.snapshot().disk_low {
             reject_remote_grant(cfg, client, leader_url, &grant.lease_id, &grant.token).await;
@@ -340,7 +382,14 @@ async fn poll_for_work(
         match grant.kind {
             LeaseKind::Download => {
                 tracing::info!(job = job_id.0, lease = %grant.lease_id, "download lease received");
-                apply_budgets(engine, servers, &grant.server_budgets).await;
+                apply_budgets(
+                    engine,
+                    servers,
+                    &grant.server_budgets,
+                    grant.budget_generation,
+                    budget_receipt,
+                )
+                .await;
                 // Fold shared journals on import: resume work another node did.
                 if engine.import_job(grant.job, true, false).await.is_ok() {
                     if engine.snapshot().disk_low {
@@ -360,6 +409,7 @@ async fn poll_for_work(
                             control_revision: grant.control_revision,
                             deadline: conservative_deadline(cfg),
                             pp_ready: false,
+                            ready_job: None,
                         },
                     );
                 }
@@ -368,7 +418,14 @@ async fn poll_for_work(
                 let Some(setup) = pp else { continue };
                 tracing::info!(job = job_id.0, lease = %grant.lease_id, "pp lease received");
                 if grant.post_fetch_budgeted {
-                    apply_budgets(engine, servers, &grant.server_budgets).await;
+                    apply_budgets(
+                        engine,
+                        servers,
+                        &grant.server_budgets,
+                        grant.budget_generation,
+                        budget_receipt,
+                    )
+                    .await;
                 } else if !active
                     .lock()
                     .unwrap()
@@ -379,7 +436,22 @@ async fn poll_for_work(
                     // in heartbeat budgets. Keep a PP-only recovery lane
                     // parked. A concurrent Download lease is safe: the old
                     // leader already counts this node through that lease.
-                    apply_budgets(engine, servers, &HashMap::new()).await;
+                    apply_budgets(
+                        engine,
+                        servers,
+                        &HashMap::new(),
+                        grant.budget_generation,
+                        budget_receipt,
+                    )
+                    .await;
+                }
+                if let Err(error) =
+                    prepare_pp_attempt(dest_dir, &mut grant.job, grant.token.fence).await
+                {
+                    tracing::warn!(job = job_id.0, %error, "private PP attempt could not be prepared");
+                    reject_remote_grant(cfg, client, leader_url, &grant.lease_id, &grant.token)
+                        .await;
+                    continue;
                 }
                 if engine.import_job(grant.job, false, false).await.is_ok() {
                     if engine.snapshot().disk_low {
@@ -399,6 +471,7 @@ async fn poll_for_work(
                             control_revision: grant.control_revision,
                             deadline: conservative_deadline(cfg),
                             pp_ready: false,
+                            ready_job: None,
                         },
                     );
                     run_pp_lease(
@@ -415,9 +488,66 @@ async fn poll_for_work(
                     );
                 }
             }
-            LeaseKind::Segment | LeaseKind::Assemble => {
-                tracing::warn!(job = job_id.0, lease = %grant.lease_id, "range grant received by a whole-job-only executor");
-                reject_remote_grant(cfg, client, leader_url, &grant.lease_id, &grant.token).await;
+            LeaseKind::Segment => {
+                tracing::info!(job = job_id.0, lease = %grant.lease_id, "article-range lease received");
+                apply_budgets(
+                    engine,
+                    servers,
+                    &grant.server_budgets,
+                    grant.budget_generation,
+                    budget_receipt,
+                )
+                .await;
+                if engine.import_job(grant.job, false, false).await.is_ok() {
+                    active.lock().unwrap().insert(
+                        grant.lease_id,
+                        LeaseState {
+                            job: job_id,
+                            kind: LeaseKind::Segment,
+                            token: grant.token,
+                            job_incarnation: grant.job_incarnation,
+                            job_revision: grant.job_revision,
+                            control_revision: grant.control_revision,
+                            deadline: conservative_deadline(cfg),
+                            pp_ready: false,
+                            ready_job: None,
+                        },
+                    );
+                }
+            }
+            LeaseKind::Assemble => {
+                let Ok(scope) = serde_json::from_value::<crate::range::AssembleScope>(grant.scope)
+                else {
+                    reject_remote_grant(cfg, client, leader_url, &grant.lease_id, &grant.token)
+                        .await;
+                    continue;
+                };
+                let lease_id = grant.lease_id.clone();
+                let token = grant.token.clone();
+                let fence = token.fence;
+                active.lock().unwrap().insert(
+                    lease_id.clone(),
+                    LeaseState {
+                        job: job_id,
+                        kind: LeaseKind::Assemble,
+                        token,
+                        job_incarnation: grant.job_incarnation,
+                        job_revision: grant.job_revision,
+                        control_revision: grant.control_revision,
+                        deadline: conservative_deadline(cfg),
+                        pp_ready: false,
+                        ready_job: None,
+                    },
+                );
+                run_assembly(
+                    grant.job,
+                    scope,
+                    dest_dir.to_path_buf(),
+                    fence,
+                    active.clone(),
+                    lease_id,
+                    tracker,
+                );
             }
         }
     }
@@ -457,7 +587,7 @@ async fn reject_remote_grant(
 #[allow(clippy::too_many_arguments)]
 fn run_pp_lease(
     engine: EngineHandle,
-    setup: PpSetup,
+    mut setup: PpSetup,
     dest_dir: PathBuf,
     active: ActiveLeases,
     lease_id: String,
@@ -467,6 +597,11 @@ fn run_pp_lease(
     client: ClusterClient,
     leader_url: String,
 ) {
+    // A remote attempt may transform only its private generation. Category
+    // publication is selected by the authority after the result receipt.
+    for rule in &mut setup.post.categories {
+        rule.dest_dir = None;
+    }
     tracker.spawn(async move {
         let Some(initial) = active.lock().unwrap().get(&lease_id).cloned() else {
             return;
@@ -488,8 +623,61 @@ fn run_pp_lease(
                 .await;
             return;
         }
+        let script_receipt: nzbd_post::manager::ScriptReceiptHook = Arc::new({
+            let active = active.clone();
+            let lease_id = lease_id.clone();
+            let node = node.clone();
+            let client = client.clone();
+            let leader_url = leader_url.clone();
+            let job_incarnation = initial.job_incarnation.clone();
+            move |action| {
+                let active = active.clone();
+                let lease_id = lease_id.clone();
+                let node = node.clone();
+                let client = client.clone();
+                let leader_url = leader_url.clone();
+                let job_incarnation = job_incarnation.clone();
+                Box::pin(async move {
+                    use nzbd_post::manager::{ScriptReceiptAction, ScriptReceiptDecision};
+                    use sha2::{Digest, Sha256};
+                    let (script, finish) = match action {
+                        ScriptReceiptAction::Begin { script } => (script, false),
+                        ScriptReceiptAction::Finish { script } => (script, true),
+                    };
+                    let token = active
+                        .lock()
+                        .unwrap()
+                        .get(&lease_id)
+                        .map(|state| state.token.clone())
+                        .ok_or_else(|| "PP lease is no longer active".to_owned())?;
+                    let script_key = format!("{:x}", Sha256::digest(script.as_bytes()));
+                    let request = ScriptReceiptRequest {
+                        node,
+                        lease_id,
+                        token,
+                        receipt_id: format!("script:{job_incarnation}:{script_key}"),
+                        finish,
+                    };
+                    let response: ScriptReceiptResponse = client
+                        .post_json(
+                            &leader_url,
+                            "/cluster/v1/work/script-receipt",
+                            &request,
+                        )
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    Ok(match response.decision.as_str() {
+                        "run" => ScriptReceiptDecision::Run,
+                        "done" => ScriptReceiptDecision::AlreadyDone,
+                        _ => ScriptReceiptDecision::Ambiguous,
+                    })
+                })
+            }
+        });
         let ctx = PpCtx {
             tag: lease_id.clone(),
+            publish_history: false,
+            script_receipt: Some(script_receipt),
             commit_ok: Arc::new({
                 let active = active.clone();
                 let lease_id = lease_id.clone();
@@ -520,10 +708,96 @@ fn run_pp_lease(
     });
 }
 
+async fn prepare_pp_attempt(
+    dest_dir: &std::path::Path,
+    job: &mut nzbd_types::Job,
+    fence: u64,
+) -> Result<(), String> {
+    let original_dir = nzbd_engine::queue::job_dir_name(job);
+    let source = dest_dir.join(&original_dir);
+    let relative = PathBuf::from(format!(
+        ".nzbd-cluster/pp-work/job-{}/fence-{fence}",
+        job.id.0
+    ));
+    let target = dest_dir.join(&relative);
+    let limit = job
+        .totals
+        .size
+        .saturating_mul(2)
+        .saturating_add(64 * 1024 * 1024);
+    let source_for_copy = source.clone();
+    let target_for_copy = target.clone();
+    tokio::task::spawn_blocking(move || {
+        if target_for_copy.exists() {
+            return Ok::<(), String>(());
+        }
+        let parent = target_for_copy
+            .parent()
+            .ok_or_else(|| "private PP target has no parent".to_owned())?;
+        std::fs::create_dir_all(parent)
+            .map_err(|error| format!("create private PP parent: {error}"))?;
+        let building = parent.join(format!(".building-fence-{fence}"));
+        if building.exists() {
+            std::fs::remove_dir_all(&building)
+                .map_err(|error| format!("remove abandoned PP build: {error}"))?;
+        }
+        std::fs::create_dir(&building)
+            .map_err(|error| format!("create private PP build: {error}"))?;
+        let mut bytes = 0;
+        let mut files = Vec::new();
+        copy_generation_tree(
+            &source_for_copy,
+            &building,
+            std::path::Path::new(""),
+            limit,
+            &mut bytes,
+            &mut files,
+        )?;
+        std::fs::rename(&building, &target_for_copy)
+            .map_err(|error| format!("publish private PP input: {error}"))?;
+        Ok::<(), String>(())
+    })
+    .await
+    .map_err(|error| format!("private PP copy task failed: {error}"))??;
+    job.dir_name = relative.to_string_lossy().into_owned();
+    job.params
+        .push(("*Cluster:original-dir".into(), original_dir));
+    Ok(())
+}
+
+fn run_assembly(
+    job: nzbd_types::Job,
+    scope: crate::range::AssembleScope,
+    dest_dir: PathBuf,
+    fence: u64,
+    active: ActiveLeases,
+    lease_id: String,
+    tracker: &TaskTracker,
+) {
+    tracker.spawn(async move {
+        let result = tokio::task::spawn_blocking(move || {
+            crate::range::assemble(job, &scope, &dest_dir, fence)
+        })
+        .await;
+        match result {
+            Ok(Ok(job)) => {
+                if let Some(state) = active.lock().unwrap().get_mut(&lease_id) {
+                    if state.deadline > Instant::now() {
+                        state.ready_job = Some(Box::new(job));
+                    }
+                }
+            }
+            Ok(Err(error)) => tracing::warn!(%lease_id, %error, "range assembly failed"),
+            Err(error) => tracing::warn!(%lease_id, %error, "range assembly task failed"),
+        }
+    });
+}
+
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct GenerationManifest {
     job_id: u32,
     job_incarnation: String,
+    owner_node_id: String,
     fence: u64,
     result_id: String,
     files: Vec<GenerationFile>,
@@ -554,10 +828,13 @@ async fn seal_generation(
     let job = job.clone();
     let lease = lease.clone();
     tokio::task::spawn_blocking(move || {
+        use sha2::{Digest, Sha256};
+        let resource_key = format!("{:x}", Sha256::digest(lease.token.resource.as_bytes()));
         let root = cfg
             .shared_dir
             .join(".nzbd-cluster/generations")
-            .join(format!("job-{}", job.id.0));
+            .join(format!("job-{}", job.id.0))
+            .join(format!("work-{}", &resource_key[..16]));
         let final_dir = root.join(format!("fence-{}", lease.token.fence));
         let manifest_path = final_dir.join("manifest.json");
         if manifest_path.exists() {
@@ -616,11 +893,11 @@ async fn seal_generation(
         let identity =
             serde_json::to_vec(&(job.id.0, &lease.job_incarnation, lease.token.fence, &files))
                 .map_err(|error| format!("encode generation identity: {error}"))?;
-        use sha2::{Digest, Sha256};
         let result_id = format!("sha256:{:x}", Sha256::digest(identity));
         let manifest = GenerationManifest {
             job_id: job.id.0,
             job_incarnation: lease.job_incarnation,
+            owner_node_id: lease.token.owner_node_id,
             fence: lease.token.fence,
             result_id: result_id.clone(),
             files,
@@ -642,6 +919,18 @@ async fn seal_generation(
             .map_err(|error| format!("flush generation manifest: {error}"))?;
         std::fs::rename(&manifest_tmp, building.join("manifest.json"))
             .map_err(|error| format!("seal generation manifest: {error}"))?;
+        let job_tmp = building.join("job.json.tmp");
+        std::fs::write(
+            &job_tmp,
+            serde_json::to_vec_pretty(&job)
+                .map_err(|error| format!("encode generation job: {error}"))?,
+        )
+        .map_err(|error| format!("write generation job: {error}"))?;
+        std::fs::File::open(&job_tmp)
+            .and_then(|file| file.sync_all())
+            .map_err(|error| format!("flush generation job: {error}"))?;
+        std::fs::rename(&job_tmp, building.join("job.json"))
+            .map_err(|error| format!("seal generation job: {error}"))?;
         match std::fs::rename(&building, &final_dir) {
             Ok(()) => {}
             Err(error) if final_dir.join("manifest.json").exists() => {
@@ -750,13 +1039,24 @@ async fn apply_budgets(
     engine: &EngineHandle,
     servers: &[ServerDef],
     by_name: &HashMap<String, u16>,
+    cluster_generation: u64,
+    budget_receipt: &BudgetReceipt,
 ) {
     // Missing is zero, not "keep whatever the previous leader granted".
     // Old leaders send an empty map on PP grants; failing closed is what
     // keeps a rolling-upgrade PP worker inside the account connection cap.
     let by_id = budgets_by_id(servers, by_name);
     if !by_id.is_empty() {
-        let _ = engine.set_server_budgets(by_id).await;
+        match engine.set_server_budgets(by_id).await {
+            Ok(receipt) => {
+                *budget_receipt.lock().unwrap() = Some(BudgetAck {
+                    cluster_generation,
+                    engine_generation: receipt.generation,
+                    drained: receipt.drained,
+                });
+            }
+            Err(error) => tracing::warn!(%error, "connection budget application failed"),
+        }
     }
 }
 
@@ -818,6 +1118,7 @@ mod tests {
                 kind: LeaseKind::Download,
                 job: state.job,
                 server_budgets: HashMap::new(),
+                budget_generation: 0,
                 post_fetch_budgeted: false,
             }],
         })
@@ -976,6 +1277,7 @@ mod tests {
         let active: ActiveLeases = Default::default();
         let tracker = TaskTracker::new();
         let dest = tmp.path().join("dest");
+        let budget_receipt: BudgetReceipt = Default::default();
 
         let poll = poll_for_work(
             &cfg,
@@ -988,6 +1290,7 @@ mod tests {
             &tracker,
             &leader_url,
             "test-incarnation",
+            &budget_receipt,
         );
         let transition = async {
             let _ = state.poll_seen.acquire().await.unwrap();

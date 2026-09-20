@@ -24,6 +24,12 @@ const CONTROL_SCHEMA: &[&str] = &[
         name TEXT PRIMARY KEY,
         value INTEGER NOT NULL CHECK (value >= 0)
     ) STRICT",
+    "CREATE TABLE IF NOT EXISTS provider_budget_state (
+        cluster_id TEXT PRIMARY KEY,
+        revision INTEGER NOT NULL CHECK (revision > 0),
+        state_json TEXT NOT NULL,
+        updated_at_ms INTEGER NOT NULL
+    ) STRICT",
     "CREATE TABLE IF NOT EXISTS control_jobs (
         job_id INTEGER PRIMARY KEY,
         incarnation TEXT NOT NULL,
@@ -69,7 +75,42 @@ const CONTROL_SCHEMA: &[&str] = &[
         expected_job_revision INTEGER NOT NULL,
         result_id TEXT NOT NULL UNIQUE,
         result_ref TEXT NOT NULL,
+        result_job_json TEXT NOT NULL,
         accepted_at_ms INTEGER NOT NULL
+    ) STRICT",
+    "CREATE TRIGGER IF NOT EXISTS command_validate
+     BEFORE INSERT ON command_receipts
+     BEGIN
+       SELECT CASE WHEN NOT EXISTS (
+         SELECT 1 FROM control_jobs
+          WHERE job_id = NEW.job_id AND revision = NEW.expected_revision
+       ) THEN RAISE(ABORT, 'stale job revision') END;
+     END",
+    "CREATE TRIGGER IF NOT EXISTS command_apply
+     AFTER INSERT ON command_receipts
+     BEGIN
+       UPDATE control_jobs SET
+         revision = NEW.applied_revision,
+         intent_json = json_extract(NEW.command_json, '$.next_intent'),
+         deleted = json_extract(NEW.command_json, '$.deleted'),
+         updated_at_ms = NEW.applied_at_ms
+       WHERE job_id = NEW.job_id AND revision = NEW.expected_revision;
+     END",
+    "CREATE TABLE IF NOT EXISTS range_results (
+        resource TEXT PRIMARY KEY,
+        job_id INTEGER NOT NULL,
+        scope_json TEXT NOT NULL,
+        result_id TEXT NOT NULL UNIQUE,
+        result_ref TEXT NOT NULL,
+        accepted_at_ms INTEGER NOT NULL
+    ) STRICT",
+    "CREATE TABLE IF NOT EXISTS script_receipts (
+        receipt_id TEXT PRIMARY KEY,
+        resource TEXT NOT NULL,
+        job_id INTEGER NOT NULL,
+        state TEXT NOT NULL CHECK (state IN ('started','done')),
+        started_at_ms INTEGER NOT NULL,
+        finished_at_ms INTEGER
     ) STRICT",
     "CREATE TRIGGER IF NOT EXISTS publication_validate
      BEFORE INSERT ON publication_receipts
@@ -93,15 +134,23 @@ const CONTROL_SCHEMA: &[&str] = &[
            AND j.deleted = 0
        ) THEN RAISE(ABORT, 'stale job revision') END;
      END",
-    "CREATE TRIGGER IF NOT EXISTS publication_apply
+    "DROP TRIGGER IF EXISTS publication_apply",
+    "CREATE TRIGGER publication_apply
      AFTER INSERT ON publication_receipts
      BEGIN
+       INSERT INTO range_results
+         (resource,job_id,scope_json,result_id,result_ref,accepted_at_ms)
+       SELECT l.resource,l.job_id,l.scope_json,NEW.result_id,NEW.result_ref,NEW.accepted_at_ms
+         FROM work_leases l
+        WHERE l.resource = NEW.resource AND l.kind = 'segment';
        UPDATE control_jobs SET
          result_ref = NEW.result_ref,
          result_id = NEW.result_id,
+         intent_json = NEW.result_job_json,
          revision = revision + 1,
          updated_at_ms = NEW.accepted_at_ms
-       WHERE job_id = (SELECT job_id FROM work_leases WHERE resource = NEW.resource);
+       WHERE job_id = (SELECT job_id FROM work_leases
+                         WHERE resource = NEW.resource AND kind <> 'segment');
        UPDATE work_leases SET terminal = 1, revision = revision + 1,
          updated_at_ms = NEW.accepted_at_ms
        WHERE resource = NEW.resource;
@@ -137,6 +186,14 @@ pub enum LeaseClaim {
 pub enum MutationOutcome {
     Applied { revision: u64 },
     Duplicate { revision: u64 },
+    Conflict,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScriptReceiptOutcome {
+    Run,
+    AlreadyDone,
+    Ambiguous,
     Conflict,
 }
 
@@ -208,6 +265,12 @@ impl ControlStore {
             .shutdown()
             .await
             .map_err(|error| format!("shutdown replicated control node: {error}"))
+    }
+
+    pub async fn is_healthy(&self) -> bool {
+        tokio::time::timeout(Duration::from_secs(2), self.client.is_healthy_db())
+            .await
+            .is_ok_and(|result| result.is_ok())
     }
 
     /// Import the stopped legacy queue exactly once. The caller owns making a
@@ -482,6 +545,72 @@ impl ControlStore {
             .collect()
     }
 
+    /// Reconcile the queue owner's current intent into the replicated row.
+    /// The receipt id is content-addressed, so repeated event delivery or a
+    /// crash after commit reuses the same logical command.
+    pub async fn reconcile_job(
+        &self,
+        job_id: u64,
+        job: Option<&nzbd_types::Job>,
+    ) -> Result<Option<(String, u64, bool)>, String> {
+        let desired = job
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|error| format!("encode replicated job intent: {error}"))?;
+        for _ in 0..4 {
+            let rows = self
+                .client
+                .query_consistent_map::<ControlJobStateRow, _>(
+                    "SELECT incarnation,revision,intent_json,deleted FROM control_jobs WHERE job_id=$1",
+                    params!(i64_value("job id", job_id)?),
+                )
+                .await
+                .map_err(|error| format!("read replicated job for reconciliation: {error}"))?;
+            let Some(row) = rows.into_iter().next() else {
+                let Some(intent) = desired.as_deref() else {
+                    return Ok(None);
+                };
+                let incarnation = format!("job-{:x}", Sha256::digest(intent.as_bytes()));
+                self.seed_job(job_id, &incarnation, intent).await?;
+                continue;
+            };
+            let deleted = desired.is_none();
+            if row.deleted == deleted
+                && desired
+                    .as_deref()
+                    .is_none_or(|intent| intent == row.intent_json)
+            {
+                return Ok(Some((
+                    row.incarnation,
+                    u64::try_from(row.revision).map_err(|error| error.to_string())?,
+                    row.deleted,
+                )));
+            }
+            let expected = u64::try_from(row.revision).map_err(|error| error.to_string())?;
+            let next = desired.as_deref().unwrap_or(&row.intent_json);
+            let command_json = serde_json::json!({
+                "op": if deleted { "delete" } else { "replace_intent" },
+                "job_id": job_id,
+            })
+            .to_string();
+            let receipt_material = format!("{job_id}:{expected}:{deleted}:{next}");
+            let command_id = format!(
+                "reconcile:{:x}",
+                Sha256::digest(receipt_material.as_bytes())
+            );
+            match self
+                .apply_command(&command_id, job_id, expected, &command_json, next, deleted)
+                .await?
+            {
+                MutationOutcome::Applied { revision } | MutationOutcome::Duplicate { revision } => {
+                    return Ok(Some((row.incarnation, revision, deleted)));
+                }
+                MutationOutcome::Conflict => continue,
+            }
+        }
+        Err("replicated job reconciliation remained conflicted".into())
+    }
+
     pub async fn apply_command(
         &self,
         command_id: &str,
@@ -498,26 +627,15 @@ impl ControlStore {
         let next_revision = expected_revision
             .checked_add(1)
             .ok_or_else(|| "job revision exhausted".to_owned())?;
-        let changed = self
+        let envelope = serde_json::to_string(&serde_json::json!({
+            "command": serde_json::from_str::<serde_json::Value>(command_json)
+                .unwrap_or_else(|_| serde_json::Value::String(command_json.to_owned())),
+            "next_intent": next_intent_json,
+            "deleted": deleted,
+        }))
+        .map_err(|error| format!("encode command receipt: {error}"))?;
+        let inserted = self
             .client
-            .execute(
-                "UPDATE control_jobs SET revision=$1,intent_json=$2,deleted=$3,updated_at_ms=$4
-             WHERE job_id=$5 AND revision=$6",
-                params!(
-                    i64_value("next revision", next_revision)?,
-                    next_intent_json,
-                    i64::from(deleted),
-                    now,
-                    i64_value("job id", job_id)?,
-                    i64_value("expected revision", expected_revision)?
-                ),
-            )
-            .await
-            .map_err(|error| format!("apply command: {error}"))?;
-        if changed != 1 {
-            return Ok(MutationOutcome::Conflict);
-        }
-        self.client
             .execute(
                 "INSERT INTO command_receipts
              (command_id,job_id,expected_revision,applied_revision,command_json,applied_at_ms)
@@ -527,15 +645,19 @@ impl ControlStore {
                     i64_value("job id", job_id)?,
                     i64_value("expected revision", expected_revision)?,
                     i64_value("applied revision", next_revision)?,
-                    command_json,
+                    envelope,
                     now
                 ),
             )
-            .await
-            .map_err(|error| format!("record command receipt: {error}"))?;
-        Ok(MutationOutcome::Applied {
-            revision: next_revision,
-        })
+            .await;
+        match inserted {
+            Ok(1) => Ok(MutationOutcome::Applied {
+                revision: next_revision,
+            }),
+            Ok(_) => Ok(MutationOutcome::Conflict),
+            Err(error) if error.to_string().contains("stale") => Ok(MutationOutcome::Conflict),
+            Err(error) => Err(format!("apply command transaction: {error}")),
+        }
     }
 
     pub async fn publish_result(
@@ -545,6 +667,7 @@ impl ControlStore {
         expected_job_revision: u64,
         result_id: &str,
         result_ref: &str,
+        result_job_json: &str,
     ) -> Result<MutationOutcome, String> {
         if let Some(revision) = self.publication_receipt(receipt_id).await? {
             return Ok(MutationOutcome::Duplicate { revision });
@@ -556,8 +679,8 @@ impl ControlStore {
                 "INSERT INTO publication_receipts
              (receipt_id,resource,owner_node_id,owner_incarnation,fence,
               lease_revision,lease_expiry_ms,expected_job_revision,result_id,
-              result_ref,accepted_at_ms)
-             VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)",
+              result_ref,result_job_json,accepted_at_ms)
+             VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)",
                 params!(
                     receipt_id,
                     &token.resource,
@@ -569,6 +692,7 @@ impl ControlStore {
                     i64_value("expected job revision", expected_job_revision)?,
                     result_id,
                     result_ref,
+                    result_job_json,
                     now
                 ),
             )
@@ -581,6 +705,147 @@ impl ControlStore {
             Err(error) if error.to_string().contains("stale") => Ok(MutationOutcome::Conflict),
             Err(error) => Err(format!("publish result: {error}")),
         }
+    }
+
+    pub async fn accepted_ranges(
+        &self,
+        job_id: u64,
+    ) -> Result<Vec<(String, String, String)>, String> {
+        let rows = self
+            .client
+            .query_consistent_map::<RangeResultRow, _>(
+                "SELECT resource,scope_json,result_ref FROM range_results WHERE job_id=$1 ORDER BY resource",
+                params!(i64_value("job id", job_id)?),
+            )
+            .await
+            .map_err(|error| format!("read accepted ranges: {error}"))?;
+        Ok(rows
+            .into_iter()
+            .map(|row| (row.resource, row.scope_json, row.result_ref))
+            .collect())
+    }
+
+    pub async fn begin_script(
+        &self,
+        receipt_id: &str,
+        token: &LeaseToken,
+    ) -> Result<ScriptReceiptOutcome, String> {
+        let now = unix_ms()?;
+        let inserted = self
+            .client
+            .execute(
+                "INSERT INTO script_receipts(receipt_id,resource,job_id,state,started_at_ms)
+                 SELECT $1,resource,job_id,'started',$2 FROM work_leases
+                  WHERE resource=$3 AND owner_node_id=$4 AND owner_incarnation=$5
+                    AND fence=$6 AND revision=$7 AND expires_at_ms=$8
+                    AND expires_at_ms>$2 AND terminal=0
+                 ON CONFLICT(receipt_id) DO NOTHING",
+                params!(
+                    receipt_id,
+                    now,
+                    &token.resource,
+                    &token.owner_node_id,
+                    &token.owner_incarnation,
+                    i64_value("fence", token.fence)?,
+                    i64_value("lease revision", token.revision)?,
+                    token.expires_at_unix_ms
+                ),
+            )
+            .await
+            .map_err(|error| format!("begin script receipt: {error}"))?;
+        if inserted == 1 {
+            return Ok(ScriptReceiptOutcome::Run);
+        }
+        Ok(match self.script_state(receipt_id).await? {
+            Some(state) if state == "done" => ScriptReceiptOutcome::AlreadyDone,
+            Some(_) => ScriptReceiptOutcome::Ambiguous,
+            None => ScriptReceiptOutcome::Conflict,
+        })
+    }
+
+    pub async fn finish_script(
+        &self,
+        receipt_id: &str,
+        token: &LeaseToken,
+    ) -> Result<ScriptReceiptOutcome, String> {
+        let now = unix_ms()?;
+        let updated = self
+            .client
+            .execute(
+                "UPDATE script_receipts SET state='done',finished_at_ms=$1
+                  WHERE receipt_id=$2 AND resource=$3 AND state='started'
+                    AND EXISTS (SELECT 1 FROM work_leases
+                      WHERE resource=$3 AND owner_node_id=$4 AND owner_incarnation=$5
+                        AND fence=$6 AND revision=$7 AND expires_at_ms=$8
+                        AND expires_at_ms>$1 AND terminal=0)",
+                params!(
+                    now,
+                    receipt_id,
+                    &token.resource,
+                    &token.owner_node_id,
+                    &token.owner_incarnation,
+                    i64_value("fence", token.fence)?,
+                    i64_value("lease revision", token.revision)?,
+                    token.expires_at_unix_ms
+                ),
+            )
+            .await
+            .map_err(|error| format!("finish script receipt: {error}"))?;
+        if updated == 1 || self.script_state(receipt_id).await?.as_deref() == Some("done") {
+            Ok(ScriptReceiptOutcome::AlreadyDone)
+        } else {
+            Ok(ScriptReceiptOutcome::Conflict)
+        }
+    }
+
+    async fn script_state(&self, receipt_id: &str) -> Result<Option<String>, String> {
+        let rows = self
+            .client
+            .query_consistent_map::<ScriptStateRow, _>(
+                "SELECT state FROM script_receipts WHERE receipt_id=$1",
+                params!(receipt_id),
+            )
+            .await
+            .map_err(|error| format!("read script receipt: {error}"))?;
+        Ok(rows.into_iter().next().map(|row| row.state))
+    }
+
+    pub async fn save_budget_state(
+        &self,
+        cluster_id: &str,
+        revision: u64,
+        state_json: &str,
+    ) -> Result<(), String> {
+        self.client
+            .execute(
+                "INSERT INTO provider_budget_state(cluster_id,revision,state_json,updated_at_ms)
+                 VALUES($1,$2,$3,$4)
+                 ON CONFLICT(cluster_id) DO UPDATE SET
+                   revision=excluded.revision,state_json=excluded.state_json,
+                   updated_at_ms=excluded.updated_at_ms
+                 WHERE provider_budget_state.revision < excluded.revision",
+                params!(
+                    cluster_id,
+                    i64_value("budget revision", revision)?,
+                    state_json,
+                    unix_ms()?
+                ),
+            )
+            .await
+            .map_err(|error| format!("persist provider budget state: {error}"))?;
+        Ok(())
+    }
+
+    pub async fn load_budget_state(&self, cluster_id: &str) -> Result<Option<String>, String> {
+        let rows = self
+            .client
+            .query_consistent_map::<BudgetStateRow, _>(
+                "SELECT state_json FROM provider_budget_state WHERE cluster_id=$1",
+                params!(cluster_id),
+            )
+            .await
+            .map_err(|error| format!("load provider budget state: {error}"))?;
+        Ok(rows.into_iter().next().map(|row| row.state_json))
     }
 
     async fn command_receipt(&self, command_id: &str) -> Result<Option<u64>, String> {
@@ -596,6 +861,48 @@ impl ControlStore {
             "SELECT expected_job_revision+1 AS revision FROM publication_receipts WHERE receipt_id=$1",
             receipt_id,
         ).await
+    }
+
+    pub async fn publication_accepted_at(&self, receipt_id: &str) -> Result<Option<i64>, String> {
+        let rows = self
+            .client
+            .query_consistent_map::<AcceptedAtRow, _>(
+                "SELECT accepted_at_ms FROM publication_receipts WHERE receipt_id=$1",
+                params!(receipt_id),
+            )
+            .await
+            .map_err(|error| format!("read publication timestamp: {error}"))?;
+        Ok(rows.into_iter().next().map(|row| row.accepted_at_ms))
+    }
+
+    pub async fn published_results(
+        &self,
+    ) -> Result<Vec<(String, String, nzbd_types::Job, u64, i64, String)>, String> {
+        let rows = self
+            .client
+            .query_consistent_map::<PublishedResultRow, _>(
+                "SELECT p.result_id,p.result_ref,p.result_job_json,p.fence,p.accepted_at_ms,l.kind
+                   FROM publication_receipts p
+                   JOIN work_leases l ON l.resource=p.resource
+                  WHERE l.kind <> 'segment' ORDER BY p.accepted_at_ms",
+                params!(),
+            )
+            .await
+            .map_err(|error| format!("load published results: {error}"))?;
+        rows.into_iter()
+            .map(|row| {
+                let job: nzbd_types::Job = serde_json::from_str(&row.result_job_json)
+                    .map_err(|error| format!("decode published result job: {error}"))?;
+                Ok((
+                    row.result_id,
+                    row.result_ref,
+                    job,
+                    u64::try_from(row.fence).map_err(|error| error.to_string())?,
+                    row.accepted_at_ms,
+                    row.kind,
+                ))
+            })
+            .collect()
     }
 
     async fn scalar_revision(&self, sql: &'static str, id: &str) -> Result<Option<u64>, String> {
@@ -653,6 +960,36 @@ impl TryFrom<LeaseRow> for LeaseToken {
 struct RevisionRow {
     revision: i64,
 }
+struct AcceptedAtRow {
+    accepted_at_ms: i64,
+}
+struct PublishedResultRow {
+    result_id: String,
+    result_ref: String,
+    result_job_json: String,
+    fence: i64,
+    accepted_at_ms: i64,
+    kind: String,
+}
+impl From<&mut Row<'_>> for PublishedResultRow {
+    fn from(row: &mut Row<'_>) -> Self {
+        Self {
+            result_id: row.get("result_id"),
+            result_ref: row.get("result_ref"),
+            result_job_json: row.get("result_job_json"),
+            fence: row.get("fence"),
+            accepted_at_ms: row.get("accepted_at_ms"),
+            kind: row.get("kind"),
+        }
+    }
+}
+impl From<&mut Row<'_>> for AcceptedAtRow {
+    fn from(row: &mut Row<'_>) -> Self {
+        Self {
+            accepted_at_ms: row.get("accepted_at_ms"),
+        }
+    }
+}
 
 struct MigrationRow {
     cluster_id: String,
@@ -672,6 +1009,22 @@ struct ControlJobRow {
     revision: i64,
     incarnation: String,
 }
+struct ControlJobStateRow {
+    incarnation: String,
+    revision: i64,
+    intent_json: String,
+    deleted: bool,
+}
+impl From<&mut Row<'_>> for ControlJobStateRow {
+    fn from(row: &mut Row<'_>) -> Self {
+        Self {
+            incarnation: row.get("incarnation"),
+            revision: row.get("revision"),
+            intent_json: row.get("intent_json"),
+            deleted: row.get::<i64>("deleted") != 0,
+        }
+    }
+}
 impl From<&mut Row<'_>> for ControlJobRow {
     fn from(row: &mut Row<'_>) -> Self {
         Self {
@@ -685,6 +1038,40 @@ impl From<&mut Row<'_>> for ControlJobRow {
 struct JobIdentityRow {
     incarnation: String,
     revision: i64,
+}
+struct RangeResultRow {
+    resource: String,
+    scope_json: String,
+    result_ref: String,
+}
+struct BudgetStateRow {
+    state_json: String,
+}
+struct ScriptStateRow {
+    state: String,
+}
+impl From<&mut Row<'_>> for ScriptStateRow {
+    fn from(row: &mut Row<'_>) -> Self {
+        Self {
+            state: row.get("state"),
+        }
+    }
+}
+impl From<&mut Row<'_>> for BudgetStateRow {
+    fn from(row: &mut Row<'_>) -> Self {
+        Self {
+            state_json: row.get("state_json"),
+        }
+    }
+}
+impl From<&mut Row<'_>> for RangeResultRow {
+    fn from(row: &mut Row<'_>) -> Self {
+        Self {
+            resource: row.get("resource"),
+            scope_json: row.get("scope_json"),
+            result_ref: row.get("result_ref"),
+        }
+    }
 }
 impl From<&mut Row<'_>> for JobIdentityRow {
     fn from(row: &mut Row<'_>) -> Self {

@@ -243,7 +243,7 @@ pub(crate) enum QueueCommand {
     /// account budgets). Absent entry = local config limit.
     SetServerBudgets {
         budgets: HashMap<ServerId, u16>,
-        reply: oneshot::Sender<()>,
+        reply: oneshot::Sender<(u64, HashMap<ServerId, u16>)>,
     },
     /// Become the queue authority: load the shared snapshot (local jobs
     /// win on conflict — the executor copy is fresher), fold all journals,
@@ -552,7 +552,8 @@ pub(crate) struct Owner {
     /// engines run with this off; journals stay on regardless.
     persist: bool,
     persist_guard: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
-    budget_tx: watch::Sender<HashMap<ServerId, u16>>,
+    budget_tx: watch::Sender<crate::pool::BudgetEnvelope>,
+    budget_generation: u64,
     /// Cluster's share-out of a provider's account-wide connection limit.
     cluster_budgets: HashMap<ServerId, u16>,
     /// The operator's per-server connection count, changed from Settings
@@ -692,7 +693,7 @@ impl Owner {
         persist: bool,
         journal_suffix: &str,
         persist_guard: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
-        budget_tx: watch::Sender<HashMap<ServerId, u16>>,
+        budget_tx: watch::Sender<crate::pool::BudgetEnvelope>,
         shared: SharedSnapshot,
         events: broadcast::Sender<Event>,
         epoch_tx: watch::Sender<u64>,
@@ -819,6 +820,7 @@ impl Owner {
             persist,
             persist_guard,
             budget_tx,
+            budget_generation: 0,
             cluster_budgets: HashMap::new(),
             user_conn_caps: HashMap::new(),
             shared,
@@ -928,7 +930,7 @@ impl Owner {
     /// Publish the effective per-server connection allowance: the smaller
     /// of what the cluster grants this node and what the operator asked
     /// for. An absent entry on either side means "no opinion".
-    fn publish_conn_budgets(&mut self) {
+    fn publish_conn_budgets(&mut self) -> HashMap<ServerId, u16> {
         let mut out: HashMap<ServerId, u16> = self.cluster_budgets.clone();
         for (id, want) in &self.user_conn_caps {
             let eff = match out.get(id) {
@@ -937,10 +939,15 @@ impl Owner {
             };
             out.insert(*id, eff);
         }
-        let _ = self.budget_tx.send(out);
+        self.budget_generation = self.budget_generation.saturating_add(1);
+        let _ = self.budget_tx.send(crate::pool::BudgetEnvelope {
+            generation: self.budget_generation,
+            allowances: out.clone(),
+        });
         // Raising an allowance unparks tasks asleep on the budget
         // channel; they also need telling there may be work.
         self.bump_epoch();
+        out
     }
 
     fn startup_pass(&mut self) {
@@ -1655,8 +1662,8 @@ impl Owner {
             QueueCommand::SetServerBudgets { budgets, reply } => {
                 tracing::info!(?budgets, "connection budgets updated");
                 self.cluster_budgets = budgets;
-                self.publish_conn_budgets();
-                let _ = reply.send(());
+                let applied = self.publish_conn_budgets();
+                let _ = reply.send((self.budget_generation, applied));
             }
             QueueCommand::SetServerConnectionCaps { caps, reply } => {
                 // Clamp to what was actually spawned at boot: there are
@@ -4074,7 +4081,7 @@ mod tests {
         crate::backend::BackendAdapterPort,
     ) {
         let tmp = tempfile::tempdir().unwrap();
-        let (budget_tx, _) = watch::channel(HashMap::new());
+        let (budget_tx, _) = watch::channel(crate::pool::BudgetEnvelope::default());
         let (events, _) = broadcast::channel(1);
         let (epoch_tx, epoch_rx) = watch::channel(0);
         let (engine_tx, _) = mpsc::channel(1);
@@ -4116,7 +4123,7 @@ mod tests {
         persist_guard: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
     ) -> (tempfile::TempDir, Owner, crate::backend::BackendAdapterPort) {
         let tmp = tempfile::tempdir().unwrap();
-        let (budget_tx, _) = watch::channel(HashMap::new());
+        let (budget_tx, _) = watch::channel(crate::pool::BudgetEnvelope::default());
         let (events, _) = broadcast::channel(1);
         let (epoch_tx, _) = watch::channel(0);
         let (engine_tx, _) = mpsc::channel(1);

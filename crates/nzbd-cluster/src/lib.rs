@@ -14,11 +14,12 @@ pub mod layout;
 pub mod leader;
 pub mod proto;
 pub mod proxy;
+pub mod range;
 pub mod registry;
 pub mod worker;
 
 use axum::routing::get;
-use axum::{middleware, Json, Router};
+use axum::{middleware, response::IntoResponse, Json, Router};
 use control::ControlStore;
 use election::{persist_guard, spawn_election, spawn_replicated_election, ElectionCfg, LeaderView};
 use http::ClusterClient;
@@ -100,6 +101,7 @@ pub struct ClusterRuntime {
     pp: Option<PpSetup>,
     pp_manager: Option<nzbd_post::manager::PostManagerHandle>,
     control: Option<ControlStore>,
+    diagnostics: watch::Receiver<serde_json::Value>,
     cancel: CancellationToken,
     tracker: TaskTracker,
 }
@@ -201,10 +203,12 @@ impl ClusterRuntime {
         let leader_shared = LeaderShared::new(
             engine.clone(),
             layout.clone(),
+            dest_dir.clone(),
             cfg.clone(),
             servers.clone(),
             view.clone(),
             control.clone(),
+            pp.as_ref().map(|setup| setup.history.clone()),
             owner_incarnation.clone(),
         );
         spawn_leader_task(leader_shared.clone(), cancel.clone(), &tracker);
@@ -215,6 +219,84 @@ impl ClusterRuntime {
             cancel.clone(),
             &tracker,
         );
+        if let Some(control_store) = control.clone() {
+            let mut events = engine.subscribe();
+            let event_engine = engine.clone();
+            let event_view = view.clone();
+            let event_cancel = cancel.clone();
+            tracker.spawn(async move {
+                loop {
+                    tokio::select! {
+                        _ = event_cancel.cancelled() => break,
+                        event = events.recv() => match event {
+                            Ok(nzbd_engine::Event::JobDeleted { job }) if event_view.borrow().is_me => {
+                                if let Err(error) = control_store.reconcile_job(job.0.into(), None).await {
+                                    tracing::warn!(job = job.0, %error, "job deletion receipt replication failed");
+                                }
+                            }
+                            Ok(nzbd_engine::Event::JobAdded { job, .. }
+                                | nzbd_engine::Event::JobAssigned { job, .. }
+                                | nzbd_engine::Event::JobFinished { job, .. })
+                                if event_view.borrow().is_me => {
+                                if let Ok(Some(current)) = event_engine.export_job(job).await {
+                                    let _ = control_store.reconcile_job(job.0.into(), Some(&current)).await;
+                                }
+                            }
+                            Ok(_) => {}
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                        }
+                    }
+                }
+            });
+        }
+
+        // Filesystem and control-plane inspection stays off request paths.
+        // The endpoint below serves this bounded background snapshot.
+        let initial_diagnostics = serde_json::json!({"status": "starting"});
+        let (diagnostics_tx, diagnostics) = watch::channel(initial_diagnostics);
+        {
+            let diagnostic_layout = layout.clone();
+            let diagnostic_view = view.clone();
+            let diagnostic_leader = leader_shared.clone();
+            let diagnostic_node = cfg.node_name.clone();
+            let diagnostic_control = control.clone();
+            let diagnostic_cancel = cancel.clone();
+            tracker.spawn(async move {
+                loop {
+                    let v = diagnostic_view.borrow().clone();
+                    let leader = diagnostic_leader.diagnostic_snapshot();
+                    let control_healthy = match &diagnostic_control {
+                        Some(control) => Some(control.is_healthy().await),
+                        None => None,
+                    };
+                    let _ = diagnostics_tx.send(serde_json::json!({
+                        "self": diagnostic_node,
+                        "role": if v.is_me { "leader" } else { "worker" },
+                        "is_leader": v.is_me,
+                        "epoch": v.epoch(),
+                        "leader": v.record.as_ref().map(|record| serde_json::json!({
+                            "node": record.node,
+                            "api_url": record.api_url,
+                        })),
+                        "control": {
+                            "mode": "hiqlite-fixed-voters",
+                            "authority_available": v.record.is_some(),
+                            "quorum_commit_healthy": control_healthy,
+                        },
+                        "nodes": registry::read_nodes(&diagnostic_layout),
+                        "work": leader,
+                        "sampled_at_unix_ms": std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default().as_millis(),
+                    }));
+                    tokio::select! {
+                        _ = diagnostic_cancel.cancelled() => break,
+                        _ = tokio::time::sleep(Duration::from_secs(2)) => {}
+                    }
+                }
+            });
+        }
 
         let active: ActiveLeases = Default::default();
         spawn_worker(
@@ -313,6 +395,7 @@ impl ClusterRuntime {
             pp,
             pp_manager,
             control,
+            diagnostics,
             cancel,
             tracker,
         })
@@ -400,6 +483,10 @@ impl ClusterRuntime {
             auth.clone(),
         )
         .layer(middleware::from_fn_with_state(
+            self.diagnostics.clone(),
+            require_control_for_mutation,
+        ))
+        .layer(middleware::from_fn_with_state(
             ProxyState {
                 node: self.cfg.node_name.clone(),
                 view: self.view.clone(),
@@ -409,10 +496,7 @@ impl ClusterRuntime {
         ));
 
         let info = ClusterInfoState {
-            node: self.cfg.node_name.clone(),
-            layout: SharedLayout::new(&self.cfg.shared_dir, &self.cfg.node_name)
-                .expect("layout exists"),
-            view: self.view.clone(),
+            snapshot: self.diagnostics.clone(),
         };
         let diagnostics = nzbd_api::require_auth(
             Router::new().route("/api/v1/cluster", get(cluster_info).with_state(info)),
@@ -435,6 +519,30 @@ impl ClusterRuntime {
             }
         }
     }
+}
+
+async fn require_control_for_mutation(
+    axum::extract::State(snapshot): axum::extract::State<watch::Receiver<serde_json::Value>>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let safe = matches!(
+        *request.method(),
+        axum::http::Method::GET | axum::http::Method::HEAD | axum::http::Method::OPTIONS
+    );
+    let current = snapshot.borrow().clone();
+    let local_leader = current["is_leader"].as_bool() == Some(true);
+    let quorum_healthy = current["control"]["quorum_commit_healthy"].as_bool();
+    if !safe && local_leader && quorum_healthy != Some(true) {
+        return (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": "replicated control quorum is unavailable; mutation not accepted"
+            })),
+        )
+            .into_response();
+    }
+    next.run(request).await
 }
 
 async fn migrate_legacy_control(
@@ -612,9 +720,7 @@ mod tests {
 
 #[derive(Clone)]
 struct ClusterInfoState {
-    node: String,
-    layout: SharedLayout,
-    view: watch::Receiver<LeaderView>,
+    snapshot: watch::Receiver<serde_json::Value>,
 }
 
 /// Local (unproxied) cluster diagnostics: this node's view of leadership
@@ -622,16 +728,5 @@ struct ClusterInfoState {
 async fn cluster_info(
     axum::extract::State(s): axum::extract::State<ClusterInfoState>,
 ) -> Json<serde_json::Value> {
-    let v = s.view.borrow().clone();
-    let nodes = registry::read_nodes(&s.layout);
-    Json(serde_json::json!({
-        "self": s.node,
-        "is_leader": v.is_me,
-        "epoch": v.epoch(),
-        "leader": v.record.as_ref().map(|r| serde_json::json!({
-            "node": r.node,
-            "api_url": r.api_url,
-        })),
-        "nodes": nodes,
-    }))
+    Json(s.snapshot.borrow().clone())
 }

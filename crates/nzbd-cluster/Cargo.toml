@@ -25,6 +25,7 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 hiqlite = { workspace = true }
 sha2 = { workspace = true }
+crc32fast = { workspace = true }
 
 [dev-dependencies]
 nzbd-nserv = { workspace = true }

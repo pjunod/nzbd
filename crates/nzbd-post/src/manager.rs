@@ -17,6 +17,7 @@ use nzbd_types::metrics::PpStageStats;
 use nzbd_types::{Health, Job, JobId, JobStatus, PostStage};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
@@ -180,6 +181,28 @@ impl PpFinal {
 /// jobs assigned to it, and only the leader records health-failures.
 pub type PpGate = Option<Arc<dyn Fn(JobId) -> bool + Send + Sync>>;
 
+#[derive(Clone, Debug)]
+pub enum ScriptReceiptAction {
+    Begin { script: String },
+    Finish { script: String },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScriptReceiptDecision {
+    Run,
+    AlreadyDone,
+    Ambiguous,
+}
+
+pub type ScriptReceiptHook = Arc<
+    dyn Fn(
+            ScriptReceiptAction,
+        ) -> Pin<
+            Box<dyn std::future::Future<Output = Result<ScriptReceiptDecision, String>> + Send>,
+        > + Send
+        + Sync,
+>;
+
 /// Fencing context for one PP execution (CLUSTERING.md §6.4): `tag` names
 /// the staging dir (`.pp.<tag>/`) unpack extracts into, and `commit_ok`
 /// is re-checked immediately before every commit rename and before the
@@ -188,6 +211,10 @@ pub type PpGate = Option<Arc<dyn Fn(JobId) -> bool + Send + Sync>>;
 pub struct PpCtx {
     pub tag: String,
     pub commit_ok: Arc<dyn Fn() -> bool + Send + Sync>,
+    /// Remote cluster attempts publish history only after the replicated
+    /// result receipt is accepted by the authority.
+    pub publish_history: bool,
+    pub script_receipt: Option<ScriptReceiptHook>,
 }
 
 impl Default for PpCtx {
@@ -195,6 +222,8 @@ impl Default for PpCtx {
         PpCtx {
             tag: "local".into(),
             commit_ok: Arc::new(|| true),
+            publish_history: true,
+            script_receipt: None,
         }
     }
 }
@@ -1523,6 +1552,7 @@ async fn process_job_ctx_from(
 
     // ---- SCRIPT stage ------------------------------------------------------
     let mut script_ok = true;
+    let mut script_receipts = Vec::new();
     let mut final_dir = dir.to_string_lossy().into_owned();
     if let Some(scripts_dir) = &cfg.scripts_dir {
         let scripts = select_scripts(
@@ -1538,6 +1568,34 @@ async fn process_job_ctx_from(
             };
             let env = script_env(&job, &dir, par_ok, par_did_repair, unpack_ok, unpacked_any);
             for script in scripts {
+                let script_name = script
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| script.to_string_lossy().into_owned());
+                if let Some(receipt) = &ctx.script_receipt {
+                    match receipt(ScriptReceiptAction::Begin {
+                        script: script_name.clone(),
+                    })
+                    .await
+                    {
+                        Ok(ScriptReceiptDecision::Run) => {}
+                        Ok(ScriptReceiptDecision::AlreadyDone) => {
+                            script_receipts.push((
+                                format!("ClusterScript:{script_name}"),
+                                "already-done".into(),
+                            ));
+                            continue;
+                        }
+                        Ok(ScriptReceiptDecision::Ambiguous) | Err(_) => {
+                            script_receipts.push((
+                                format!("ClusterScript:{script_name}"),
+                                "unknown-not-replayed".into(),
+                            ));
+                            script_ok = false;
+                            continue;
+                        }
+                    }
+                }
                 match host.run(&script, &dir, &env).await {
                     Ok(out) => {
                         for (k, v) in &out.commands {
@@ -1568,6 +1626,23 @@ async fn process_job_ctx_from(
                     Err(e) => {
                         tracing::error!(job = job_id.0, error = %e, "script failed to run");
                         script_ok = false;
+                    }
+                }
+                if let Some(receipt) = &ctx.script_receipt {
+                    match receipt(ScriptReceiptAction::Finish {
+                        script: script_name.clone(),
+                    })
+                    .await
+                    {
+                        Ok(ScriptReceiptDecision::AlreadyDone) => script_receipts
+                            .push((format!("ClusterScript:{script_name}"), "done".into())),
+                        _ => {
+                            script_receipts.push((
+                                format!("ClusterScript:{script_name}"),
+                                "unknown-after-run".into(),
+                            ));
+                            script_ok = false;
+                        }
                     }
                 }
             }
@@ -1631,6 +1706,7 @@ async fn process_job_ctx_from(
             }
             fin.params.push(("Deobfuscate:Files".into(), list));
         }
+        fin.params.extend(script_receipts);
         fin.status = if outcome == PpFinal::Success {
             JobStatus::Completed
         } else {
@@ -1652,6 +1728,14 @@ async fn process_job_ctx_from(
                 .as_ref()
                 .map(|p| p.to_string_lossy().into_owned()),
         };
+        if !ctx.publish_history {
+            if let Some(path) = &final_dir {
+                fin.params.push(("*Cluster:final-dir".into(), path.clone()));
+            }
+            let _ = engine.import_job(fin, false, false).await;
+            stages.close();
+            return Ok(outcome);
+        }
         let entry = HistoryEntry {
             job: job_id,
             name: fin.name.clone(),

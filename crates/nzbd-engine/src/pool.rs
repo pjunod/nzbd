@@ -12,12 +12,64 @@ use crate::rate::{RateLimiter, SpeedMeter};
 use crate::writer::WriteCmd;
 use nzbd_nntp::transport::{NntpConnection, TlsClientConfig, TransportError};
 use nzbd_nntp::Command;
-use nzbd_types::ServerDef;
+use nzbd_types::{ServerDef, ServerId};
 use nzbd_yenc::{Status, YencDecoder};
-use std::sync::Arc;
-use tokio::sync::{mpsc, oneshot, watch};
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
+use tokio::sync::{mpsc, oneshot, watch, Notify};
 use tokio::time::Duration;
 use tokio_util::sync::CancellationToken;
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct BudgetEnvelope {
+    pub generation: u64,
+    pub allowances: HashMap<ServerId, u16>,
+}
+
+#[derive(Default)]
+pub(crate) struct BudgetTracker {
+    expected: usize,
+    seen: Mutex<HashMap<u64, HashSet<(ServerId, u16)>>>,
+    notify: Notify,
+}
+
+impl BudgetTracker {
+    pub(crate) fn new(expected: usize) -> Self {
+        Self {
+            expected,
+            ..Self::default()
+        }
+    }
+
+    fn acknowledge(&self, generation: u64, server: ServerId, index: u16) {
+        let mut seen = self.seen.lock().unwrap();
+        seen.entry(generation).or_default().insert((server, index));
+        seen.retain(|candidate, _| *candidate + 2 >= generation);
+        drop(seen);
+        self.notify.notify_waiters();
+    }
+
+    pub(crate) async fn wait_for(&self, generation: u64, timeout: Duration) -> bool {
+        if self.expected == 0 {
+            return true;
+        }
+        let wait = async {
+            loop {
+                if self
+                    .seen
+                    .lock()
+                    .unwrap()
+                    .get(&generation)
+                    .is_some_and(|seen| seen.len() >= self.expected)
+                {
+                    return;
+                }
+                self.notify.notified().await;
+            }
+        };
+        tokio::time::timeout(timeout, wait).await.is_ok()
+    }
+}
 
 pub(crate) struct ConnCtx {
     pub server: ServerDef,
@@ -27,7 +79,8 @@ pub(crate) struct ConnCtx {
     pub tls: Option<TlsClientConfig>,
     pub engine_tx: mpsc::Sender<EngineMsg>,
     pub epoch: watch::Receiver<u64>,
-    pub budgets: watch::Receiver<std::collections::HashMap<nzbd_types::ServerId, u16>>,
+    pub budgets: watch::Receiver<BudgetEnvelope>,
+    pub budget_tracker: Arc<BudgetTracker>,
     pub limiter: Arc<RateLimiter>,
     pub meter: Arc<SpeedMeter>,
     pub cancel: CancellationToken,
@@ -91,9 +144,9 @@ pub(crate) async fn connection_task(mut ctx: ConnCtx) {
         }
         // Cluster connection budget: park (and drop the socket) while this
         // task's index is beyond the server's current allowance.
-        let allowance = ctx
-            .budgets
-            .borrow_and_update()
+        let budget = ctx.budgets.borrow_and_update().clone();
+        let allowance = budget
+            .allowances
             .get(&ctx.server.id)
             .copied()
             .unwrap_or(u16::MAX);
@@ -101,12 +154,19 @@ pub(crate) async fn connection_task(mut ctx: ConnCtx) {
             if let Some(c) = conn.take() {
                 c.quit().await;
             }
+            ctx.budget_tracker
+                .acknowledge(budget.generation, ctx.server.id, ctx.conn_index);
             tokio::select! {
                 _ = ctx.cancel.cancelled() => break,
                 r = ctx.budgets.changed() => { if r.is_err() { break } }
             }
             continue;
         }
+        // A task below the allowance has applied the generation once it is
+        // between batches. Tasks busy in BODY reads do not acknowledge until
+        // the batch ends, so a shrink cannot be mistaken for a drained socket.
+        ctx.budget_tracker
+            .acknowledge(budget.generation, ctx.server.id, ctx.conn_index);
         // Mark the epoch seen *before* asking, so a bump that races the
         // request still wakes us.
         ctx.epoch.borrow_and_update();
@@ -409,13 +469,9 @@ mod adaptive_tests {
         server: ServerDef,
         engine_tx: mpsc::Sender<EngineMsg>,
         cancel: CancellationToken,
-    ) -> (
-        ConnCtx,
-        watch::Sender<u64>,
-        watch::Sender<std::collections::HashMap<ServerId, u16>>,
-    ) {
+    ) -> (ConnCtx, watch::Sender<u64>, watch::Sender<BudgetEnvelope>) {
         let (epoch_tx, epoch) = watch::channel(0);
-        let (budget_tx, budgets) = watch::channel(std::collections::HashMap::new());
+        let (budget_tx, budgets) = watch::channel(BudgetEnvelope::default());
         (
             ConnCtx {
                 server,
@@ -424,6 +480,7 @@ mod adaptive_tests {
                 engine_tx,
                 epoch,
                 budgets,
+                budget_tracker: Arc::new(BudgetTracker::new(1)),
                 limiter: Arc::new(RateLimiter::new(None)),
                 meter: Arc::new(SpeedMeter::new()),
                 cancel,

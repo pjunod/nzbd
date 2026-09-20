@@ -2,7 +2,7 @@
 //! process sharing a tempdir "shared volume" and real loopback HTTP, with
 //! nzbd-nserv as the provider. Lease intervals are time-compressed.
 
-use nzbd_cluster::{ClusterConfig, ClusterRuntime};
+use nzbd_cluster::{ClusterConfig, ClusterRuntime, ControlPeer};
 use nzbd_engine::Tuning;
 use nzbd_nserv::{build_post, prng_bytes, NservBuilder};
 use nzbd_types::{CertLevel, ServerDef, ServerId, TlsMode};
@@ -75,6 +75,37 @@ struct Node {
     serve_task: JoinHandle<()>,
 }
 
+#[derive(Clone)]
+struct TestControl {
+    id: u64,
+    raft_bind: String,
+    api_bind: String,
+    peers: Vec<ControlPeer>,
+}
+
+fn control_topology(count: u64) -> Vec<TestControl> {
+    let addresses: Vec<_> = (0..count).map(|_| (free_bind(), free_bind())).collect();
+    let peers: Vec<_> = addresses
+        .iter()
+        .enumerate()
+        .map(|(index, (raft_addr, api_addr))| ControlPeer {
+            id: index as u64 + 1,
+            raft_addr: raft_addr.clone(),
+            api_addr: api_addr.clone(),
+        })
+        .collect();
+    addresses
+        .into_iter()
+        .enumerate()
+        .map(|(index, (raft_bind, api_bind))| TestControl {
+            id: index as u64 + 1,
+            raft_bind,
+            api_bind,
+            peers: peers.clone(),
+        })
+        .collect()
+}
+
 async fn start_node(
     shared: &Path,
     name: &str,
@@ -101,10 +132,24 @@ async fn start_node_with_auth(
     connections: u16,
     auth: nzbd_api::AuthConfig,
 ) -> Node {
+    start_node_with_control(shared, name, opts, nserv_port, connections, auth, None).await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn start_node_with_control(
+    shared: &Path,
+    name: &str,
+    opts: NodeOpts,
+    nserv_port: u16,
+    connections: u16,
+    auth: nzbd_api::AuthConfig,
+    control: Option<TestControl>,
+) -> Node {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let url = format!("127.0.0.1:{port}");
 
+    let control = control.unwrap_or_else(|| control_topology(1).remove(0));
     let cfg = ClusterConfig {
         cluster_id: "e2e".into(),
         node_name: name.to_string(),
@@ -121,10 +166,10 @@ async fn start_node_with_auth(
         takeover_after: Duration::from_millis(900),
         worker_ttl: Duration::from_millis(1800),
         control_dir: shared.join(format!("control-{name}")),
-        control_node_id: 1,
-        control_raft_bind: "127.0.0.1:38120".into(),
-        control_api_bind: "127.0.0.1:38220".into(),
-        control_peers: Vec::new(),
+        control_node_id: control.id,
+        control_raft_bind: control.raft_bind,
+        control_api_bind: control.api_bind,
+        control_peers: control.peers,
         download_weight: 1,
         pp_weight: 1,
         disk_guard_roots: vec![nzbd_engine::volumes::DiskGuardRoot {
@@ -189,6 +234,11 @@ async fn start_node_with_auth(
         serve_cancel,
         serve_task,
     }
+}
+
+fn free_bind() -> String {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.local_addr().unwrap().to_string()
 }
 
 impl Node {
@@ -297,6 +347,22 @@ fn journaled_segments(shared: &Path) -> Vec<u32> {
         .into_iter()
         .map(|r| r.segment_number)
         .collect()
+}
+
+fn manifest_paths(root: &Path) -> Vec<std::path::PathBuf> {
+    let mut found = Vec::new();
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return found;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            found.extend(manifest_paths(&path));
+        } else if entry.file_name() == "manifest.json" {
+            found.push(path);
+        }
+    }
+    found
 }
 
 // ---------------------------------------------------------------------------
@@ -419,7 +485,7 @@ async fn cluster_diagnostics_route_requires_configured_user_auth() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
-async fn three_nodes_elect_exactly_one_leader() {
+async fn three_voters_keep_majority_and_reject_mutations_after_quorum_loss() {
     let tmp = tempfile::tempdir().unwrap();
     let post = build_post("idle", &[("x.bin", prng_bytes(1, 1000))], 1000);
     let ns = NservBuilder::new().with_post(&post).start().await.unwrap();
@@ -432,9 +498,36 @@ async fn three_nodes_elect_exactly_one_leader() {
         post_process: false,
         min_free_disk_bytes: 0,
     };
-    let a = start_node(tmp.path(), "a", opts(0), ns.port(), 4).await;
-    let b = start_node(tmp.path(), "b", opts(1), ns.port(), 4).await;
-    let c = start_node(tmp.path(), "c", opts(2), ns.port(), 4).await;
+    let topology = control_topology(3);
+    let (a, b, c) = tokio::join!(
+        start_node_with_control(
+            tmp.path(),
+            "a",
+            opts(0),
+            ns.port(),
+            4,
+            Default::default(),
+            Some(topology[0].clone())
+        ),
+        start_node_with_control(
+            tmp.path(),
+            "b",
+            opts(1),
+            ns.port(),
+            4,
+            Default::default(),
+            Some(topology[1].clone())
+        ),
+        start_node_with_control(
+            tmp.path(),
+            "c",
+            opts(2),
+            ns.port(),
+            4,
+            Default::default(),
+            Some(topology[2].clone())
+        ),
+    );
 
     wait_for("one agreed leader", 15, || {
         let views: Vec<_> = [&a, &b, &c]
@@ -456,9 +549,43 @@ async fn three_nodes_elect_exactly_one_leader() {
     })
     .await;
 
-    a.kill().await;
-    b.kill().await;
-    c.kill().await;
+    let leader_name = get_json(&a.url, "/api/v1/cluster")["leader"]["node"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let mut nodes = vec![a, b, c];
+    let first = nodes
+        .iter()
+        .position(|node| node.name != leader_name)
+        .unwrap();
+    nodes.remove(first).kill().await;
+    let leader_url = nodes
+        .iter()
+        .find(|node| node.name == leader_name)
+        .unwrap()
+        .url
+        .clone();
+    wait_for("majority remains healthy", 15, || {
+        get_json(&leader_url, "/api/v1/cluster")["control"]["quorum_commit_healthy"] == true
+    })
+    .await;
+    let second = nodes
+        .iter()
+        .position(|node| node.name != leader_name)
+        .unwrap();
+    nodes.remove(second).kill().await;
+    wait_for("minority reports quorum loss", 15, || {
+        get_json(&leader_url, "/api/v1/cluster")["control"]["quorum_commit_healthy"] == false
+    })
+    .await;
+    let (code, body) = http(
+        &leader_url,
+        "POST",
+        "/api/v1/jobs?name=blocked",
+        b"not-an-nzb",
+    );
+    assert_eq!(code, 503, "minority accepted a mutation: {body}");
+    nodes.pop().unwrap().kill().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
@@ -598,6 +725,104 @@ async fn distributed_download_via_any_node_with_budgets() {
 
     a.kill().await;
     b.kill().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn article_ranges_use_two_workers_and_one_authoritative_assembly() {
+    let tmp = tempfile::tempdir().unwrap();
+    let data = prng_bytes(19, 96 * 4096);
+    let post = build_post("ranged", &[("range.bin", data.clone())], 4096);
+    let ns = NservBuilder::new().with_post(&post).start().await.unwrap();
+
+    let leader = start_node(
+        tmp.path(),
+        "leader",
+        NodeOpts {
+            coordinator: true,
+            priority: 0,
+            download: false,
+            max_download_jobs: 0,
+            post_process: false,
+            min_free_disk_bytes: 0,
+        },
+        ns.port(),
+        4,
+    )
+    .await;
+    let (b, c) = tokio::join!(
+        start_node(
+            tmp.path(),
+            "b",
+            NodeOpts {
+                coordinator: false,
+                priority: 9,
+                download: true,
+                max_download_jobs: 2,
+                post_process: false,
+                min_free_disk_bytes: 0,
+            },
+            ns.port(),
+            4,
+        ),
+        start_node(
+            tmp.path(),
+            "c",
+            NodeOpts {
+                coordinator: false,
+                priority: 9,
+                download: true,
+                max_download_jobs: 2,
+                post_process: false,
+                min_free_disk_bytes: 0,
+            },
+            ns.port(),
+            4,
+        ),
+    );
+    wait_for("range workers registered", 15, || {
+        get_json(&leader.url, "/api/v1/cluster")["nodes"]
+            .as_array()
+            .is_some_and(|nodes| nodes.len() >= 3)
+    })
+    .await;
+
+    add_job(&leader.url, "ranged", post.nzb.as_bytes()).await;
+    wait_for("authoritative range assembly", 60, || {
+        get_json(&leader.url, "/api/v1/jobs")["jobs"][0]["status"] == "completed"
+            && tmp.path().join("complete/ranged/range.bin").is_file()
+    })
+    .await;
+    assert_eq!(
+        std::fs::read(tmp.path().join("complete/ranged/range.bin")).unwrap(),
+        data
+    );
+    for article in 1..=96 {
+        assert_eq!(
+            ns.hits(&post.message_id("range.bin", article)),
+            1,
+            "committed article {article} was fetched more than once"
+        );
+    }
+    let mut range_owners = std::collections::HashSet::new();
+    for manifest in manifest_paths(&tmp.path().join(".nzbd-cluster/generations")) {
+        let root = manifest.parent().unwrap();
+        let job: nzbd_types::Job =
+            serde_json::from_slice(&std::fs::read(root.join("job.json")).unwrap()).unwrap();
+        if job
+            .files
+            .first()
+            .is_some_and(|file| file.segments.len() <= 32)
+        {
+            let value: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&manifest).unwrap()).unwrap();
+            range_owners.insert(value["owner_node_id"].as_str().unwrap().to_string());
+        }
+    }
+    assert_eq!(range_owners.len(), 2, "ranges did not use both workers");
+
+    leader.kill().await;
+    b.kill().await;
+    c.kill().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
@@ -775,52 +1000,59 @@ async fn leader_death_fails_over_and_adopts_the_running_lease() {
     }
     let ns = builder.start().await.unwrap();
 
-    // a: leader, no downloads. b: pure worker. c: standby coordinator.
-    let a = start_node(
-        tmp.path(),
-        "a",
-        NodeOpts {
-            coordinator: true,
-            priority: 0,
-            download: false,
-            max_download_jobs: 0,
-            post_process: false,
-            min_free_disk_bytes: 0,
-        },
-        ns.port(),
-        4,
-    )
-    .await;
-    let b = start_node(
-        tmp.path(),
-        "b",
-        NodeOpts {
-            coordinator: false,
-            priority: 9,
-            download: true,
-            max_download_jobs: 2,
-            post_process: false,
-            min_free_disk_bytes: 0,
-        },
-        ns.port(),
-        4,
-    )
-    .await;
-    let c = start_node(
-        tmp.path(),
-        "c",
-        NodeOpts {
-            coordinator: true,
-            priority: 4,
-            download: false,
-            max_download_jobs: 0,
-            post_process: false,
-            min_free_disk_bytes: 0,
-        },
-        ns.port(),
-        4,
-    )
-    .await;
+    // Three fixed voters: a is preferred, b also executes downloads, c is
+    // the standby. Starting them together lets the initial quorum form.
+    let topology = control_topology(3);
+    let (a, b, c) = tokio::join!(
+        start_node_with_control(
+            tmp.path(),
+            "a",
+            NodeOpts {
+                coordinator: true,
+                priority: 0,
+                download: false,
+                max_download_jobs: 0,
+                post_process: false,
+                min_free_disk_bytes: 0,
+            },
+            ns.port(),
+            4,
+            Default::default(),
+            Some(topology[0].clone())
+        ),
+        start_node_with_control(
+            tmp.path(),
+            "b",
+            NodeOpts {
+                coordinator: true,
+                priority: 9,
+                download: true,
+                max_download_jobs: 2,
+                post_process: false,
+                min_free_disk_bytes: 0,
+            },
+            ns.port(),
+            4,
+            Default::default(),
+            Some(topology[1].clone())
+        ),
+        start_node_with_control(
+            tmp.path(),
+            "c",
+            NodeOpts {
+                coordinator: true,
+                priority: 4,
+                download: false,
+                max_download_jobs: 0,
+                post_process: false,
+                min_free_disk_bytes: 0,
+            },
+            ns.port(),
+            4,
+            Default::default(),
+            Some(topology[2].clone())
+        ),
+    );
 
     wait_for("every node sees a as leader", 15, || {
         [&a, &b, &c]
