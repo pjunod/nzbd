@@ -24,7 +24,7 @@ use control::ControlStore;
 use election::{persist_guard, spawn_election, spawn_replicated_election, ElectionCfg, LeaderView};
 use http::ClusterClient;
 use layout::SharedLayout;
-use leader::{spawn_leader_task, LeaderShared};
+use leader::{spawn_leader_task, LeaderDurability, LeaderShared};
 use nzbd_engine::{Engine, EngineConfig, EngineHandle, Tuning};
 use nzbd_types::ServerDef;
 use proxy::{proxy_to_leader, ProxyState};
@@ -209,9 +209,11 @@ impl ClusterRuntime {
             cfg.clone(),
             servers.clone(),
             view.clone(),
-            control.clone(),
-            pp.as_ref().map(|setup| setup.history.clone()),
-            owner_incarnation.clone(),
+            LeaderDurability::new(
+                control.clone(),
+                pp.as_ref().map(|setup| setup.history.clone()),
+                owner_incarnation.clone(),
+            ),
         );
         spawn_leader_task(leader_shared.clone(), cancel.clone(), &tracker);
         registry::spawn_registry(

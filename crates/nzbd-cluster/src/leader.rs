@@ -67,17 +67,35 @@ pub struct LeaderShared {
     pub(crate) mutation_serial: tokio::sync::Mutex<()>,
 }
 
+pub(crate) struct LeaderDurability {
+    control: Option<ControlStore>,
+    history: Option<Arc<nzbd_state::history::HistoryDb>>,
+    owner_incarnation: String,
+}
+
+impl LeaderDurability {
+    pub(crate) fn new(
+        control: Option<ControlStore>,
+        history: Option<Arc<nzbd_state::history::HistoryDb>>,
+        owner_incarnation: String,
+    ) -> Self {
+        Self {
+            control,
+            history,
+            owner_incarnation,
+        }
+    }
+}
+
 impl LeaderShared {
-    pub fn new(
+    pub(crate) fn new(
         engine: EngineHandle,
         layout: SharedLayout,
         dest_dir: PathBuf,
         cfg: ClusterConfig,
         servers: Vec<ServerDef>,
         view: watch::Receiver<LeaderView>,
-        control: Option<ControlStore>,
-        history: Option<Arc<nzbd_state::history::HistoryDb>>,
-        owner_incarnation: String,
+        durability: LeaderDurability,
     ) -> Arc<LeaderShared> {
         Arc::new(LeaderShared {
             engine,
@@ -86,9 +104,9 @@ impl LeaderShared {
             cfg,
             servers,
             view,
-            control,
-            history,
-            owner_incarnation,
+            control: durability.control,
+            history: durability.history,
+            owner_incarnation: durability.owner_incarnation,
             leases: Mutex::new(HashMap::new()),
             node_seen: Mutex::new(HashMap::new()),
             budgets: Mutex::new(BudgetHandoff::default()),
@@ -2160,9 +2178,7 @@ mod tests {
             cfg,
             vec![provider, scarce],
             view,
-            None,
-            None,
-            "test-incarnation".into(),
+            LeaderDurability::new(None, None, "test-incarnation".into()),
         );
         for (lease, node) in [("pp-a", "worker-a"), ("pp-b", "worker-b")] {
             shared.leases.lock().unwrap().insert(
@@ -2272,9 +2288,7 @@ mod tests {
             cfg,
             Vec::new(),
             view,
-            None,
-            None,
-            "test-incarnation".into(),
+            LeaderDurability::new(None, None, "test-incarnation".into()),
         );
         shared.leases.lock().unwrap().insert(
             "transition-lease".into(),

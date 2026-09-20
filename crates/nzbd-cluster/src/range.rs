@@ -192,10 +192,7 @@ pub fn assemble(
                 offset.saturating_add(u64::from(len)),
                 segment.number,
             ));
-            if terminal
-                .insert(segment.number, segment.state.clone())
-                .is_some()
-            {
+            if terminal.insert(segment.number, segment.state).is_some() {
                 return Err(format!(
                     "article {} was supplied more than once",
                     segment.number
