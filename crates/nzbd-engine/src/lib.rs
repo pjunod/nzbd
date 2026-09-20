@@ -195,7 +195,24 @@ impl Engine {
         let shared = new_shared_snapshot();
         let (events, _) = broadcast::channel(512);
         let (epoch_tx, epoch_rx) = watch::channel(0u64);
-        let (budget_tx, budget_rx) = watch::channel(pool::BudgetEnvelope::default());
+        let initial_budgets = pool::BudgetEnvelope {
+            generation: 0,
+            allowances: cfg
+                .servers
+                .iter()
+                .map(|server| {
+                    (
+                        server.id,
+                        if cfg.download_enabled && server.active {
+                            server.max_connections.max(1)
+                        } else {
+                            0
+                        },
+                    )
+                })
+                .collect(),
+        };
+        let (budget_tx, budget_rx) = watch::channel(initial_budgets);
         let (engine_tx, engine_rx) = mpsc::channel::<EngineMsg>(1024);
         // The owner gets the command-producing half. Keep the adapter half
         // with the engine handle until the runtime executor takes it; this
@@ -210,6 +227,7 @@ impl Engine {
         let budget_tracker = Arc::new(pool::BudgetTracker::new(
             servers
                 .iter()
+                .filter(|server| server.active)
                 .map(|server| usize::from(server.max_connections.max(1)))
                 .sum(),
         ));
@@ -589,6 +607,24 @@ impl EngineHandle {
         });
     }
 
+    /// Restart durable URL placeholders after cluster authority takeover.
+    /// Duplicate execution is harmless: completion applies only while the
+    /// job remains `Fetching`, and the control adapter revision-checks the
+    /// single winning resolution.
+    pub async fn resume_url_fetches(&self) -> Result<(), EngineError> {
+        for summary in &self.snapshot().jobs {
+            if summary.status != nzbd_types::JobStatus::Fetching {
+                continue;
+            }
+            if let Some(job) = self.export_job(summary.id).await? {
+                if let Some((_, url)) = job.params.iter().find(|(key, _)| key == "*URL") {
+                    self.spawn_url_fetch(job.id, url.clone());
+                }
+            }
+        }
+        Ok(())
+    }
+
     async fn fail_url_fetch(&self, job: JobId, error: String) -> Result<(), EngineError> {
         let (tx, rx) = oneshot::channel();
         self.send(QueueCommand::FailUrlFetch {
@@ -868,6 +904,11 @@ impl EngineHandle {
             allowances,
             drained,
         })
+    }
+
+    pub async fn set_download_enabled(&self, enabled: bool) -> Result<(), EngineError> {
+        self.roundtrip_unit(|reply| QueueCommand::SetDownloadEnabled { enabled, reply })
+            .await
     }
 
     /// Set the operator's per-server connection counts without a

@@ -145,11 +145,7 @@ pub(crate) async fn connection_task(mut ctx: ConnCtx) {
         // Cluster connection budget: park (and drop the socket) while this
         // task's index is beyond the server's current allowance.
         let budget = ctx.budgets.borrow_and_update().clone();
-        let allowance = budget
-            .allowances
-            .get(&ctx.server.id)
-            .copied()
-            .unwrap_or(u16::MAX);
+        let allowance = budget.allowances.get(&ctx.server.id).copied().unwrap_or(0);
         if ctx.conn_index >= allowance {
             if let Some(c) = conn.take() {
                 c.quit().await;

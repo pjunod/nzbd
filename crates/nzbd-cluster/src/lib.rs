@@ -177,7 +177,9 @@ impl ClusterRuntime {
         let guard = persist_guard(layout.clone(), view.clone(), cfg.node_name.clone());
         let engine = Engine::spawn(EngineConfig {
             servers: servers.clone(),
-            download_enabled: cfg.download,
+            // Cluster startup is fail-closed. Role transitions enable
+            // ordinary downloads only while this process is a worker.
+            download_enabled: false,
             state_dir: layout.state_dir(),
             dest_dir: dest_dir.clone(),
             torrent_payload_roots: cfg.torrent_payload_roots.clone(),
@@ -219,38 +221,41 @@ impl ClusterRuntime {
             cancel.clone(),
             &tracker,
         );
-        if let Some(control_store) = control.clone() {
+        // URL fetch is the one queue transition that completes after its API
+        // request. Its placeholder is already durable; resolve only that
+        // exact row, under the same revision and serialization rules.
+        {
             let mut events = engine.subscribe();
             let event_engine = engine.clone();
-            let event_view = view.clone();
+            let event_shared = leader_shared.clone();
             let event_cancel = cancel.clone();
             tracker.spawn(async move {
                 loop {
-                    tokio::select! {
+                    let job = tokio::select! {
                         _ = event_cancel.cancelled() => break,
                         event = events.recv() => match event {
-                            Ok(nzbd_engine::Event::JobDeleted { job }) if event_view.borrow().is_me => {
-                                if let Err(error) = control_store.reconcile_job(job.0.into(), None).await {
-                                    tracing::warn!(job = job.0, %error, "job deletion receipt replication failed");
-                                }
-                            }
-                            Ok(nzbd_engine::Event::JobAdded { job, .. }
-                                | nzbd_engine::Event::JobAssigned { job, .. }
-                                | nzbd_engine::Event::JobFinished { job, .. })
-                                if event_view.borrow().is_me => {
-                                if let Ok(Some(current)) = event_engine.export_job(job).await {
-                                    let _ = control_store.reconcile_job(job.0.into(), Some(&current)).await;
-                                }
-                            }
-                            Ok(_) => {}
-                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                            Ok(nzbd_engine::Event::UrlFetchResolved { job }) => job,
+                            Ok(_) => continue,
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                             Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                         }
+                    };
+                    if !event_shared.view.borrow().is_me {
+                        continue;
+                    }
+                    let _serial = event_shared.mutation_serial.lock().await;
+                    let desired = event_engine.export_job(job).await.ok().flatten();
+                    let result = match (&event_shared.control, desired) {
+                        (Some(control), Some(job)) => control.commit_url_resolution(&job).await,
+                        _ => Err("resolved URL job disappeared".into()),
+                    };
+                    if let Err(error) = result {
+                        tracing::error!(job = job.0, %error, "URL resolution rolled back");
+                        let _ = event_shared.restore_control_projection().await;
                     }
                 }
             });
         }
-
         // Filesystem and control-plane inspection stays off request paths.
         // The endpoint below serves this bounded background snapshot.
         let initial_diagnostics = serde_json::json!({"status": "starting"});
@@ -315,47 +320,10 @@ impl ClusterRuntime {
         let history = pp.as_ref().map(|s| s.history.clone());
         let _ = &history; // (kept alongside pp in the runtime below)
 
-        // Leader-local PP manager (C2): processes only jobs the scheduler
-        // assigned to THIS node, and only while it holds authority. Health-
-        // failed jobs (no PP) are history-recorded by the leader.
-        let mut pp_manager = None;
-        if let Some(setup) = &pp {
-            if cfg.post_process && cfg.pp_slots > 0 {
-                let gate: nzbd_post::manager::PpGate = Some(std::sync::Arc::new({
-                    let view = view.clone();
-                    let engine = engine.clone();
-                    let me = cfg.node_name.clone();
-                    let failure_action = setup.post.failure_action;
-                    let live_authority = guard.clone();
-                    move |job_id: nzbd_types::JobId| {
-                        let snap = engine.snapshot();
-                        match snap.jobs.iter().find(|j| j.id == job_id) {
-                            Some(j) => leader_local_pp_admits(
-                                live_authority(),
-                                view.borrow().is_me,
-                                snap.disk_low,
-                                j.status,
-                                j.assigned_node.as_deref(),
-                                &me,
-                                failure_action,
-                            ),
-                            None => false,
-                        }
-                    }
-                }));
-                let mut post = setup.post.clone();
-                post.slots = cfg.pp_slots.max(1) as usize;
-                pp_manager = Some(nzbd_post::manager::spawn_post_manager(
-                    engine.clone(),
-                    post,
-                    setup.history.clone(),
-                    dest_dir.clone(),
-                    gate,
-                    cancel.clone(),
-                    &tracker,
-                ));
-            }
-        }
+        // The elected authority is a scheduler/projection only. It does not
+        // execute unfenced local PP; all attempts run under remote leases and
+        // publish private immutable generations.
+        let pp_manager = None;
 
         // Crash-only demotion: on losing leadership, keep only the jobs we
         // still execute as a worker; drop authority state.
@@ -364,8 +332,12 @@ impl ClusterRuntime {
             let mut view_rx = view.clone();
             let active = active.clone();
             let demote_cancel = cancel.clone();
+            let worker_downloads = cfg.download;
             tracker.spawn(async move {
                 let mut was_me = view_rx.borrow().is_me;
+                let _ = engine
+                    .set_download_enabled(!was_me && worker_downloads)
+                    .await;
                 loop {
                     tokio::select! {
                         _ = demote_cancel.cancelled() => break,
@@ -374,6 +346,9 @@ impl ClusterRuntime {
                         }
                     }
                     let is_me = view_rx.borrow().is_me;
+                    let _ = engine
+                        .set_download_enabled(!is_me && worker_downloads)
+                        .await;
                     if was_me && !is_me {
                         let keep: Vec<_> =
                             active.lock().unwrap().values().map(|st| st.job).collect();
@@ -483,8 +458,8 @@ impl ClusterRuntime {
             auth.clone(),
         )
         .layer(middleware::from_fn_with_state(
-            self.diagnostics.clone(),
-            require_control_for_mutation,
+            self.leader_shared.clone(),
+            commit_control_mutation,
         ))
         .layer(middleware::from_fn_with_state(
             ProxyState {
@@ -521,8 +496,8 @@ impl ClusterRuntime {
     }
 }
 
-async fn require_control_for_mutation(
-    axum::extract::State(snapshot): axum::extract::State<watch::Receiver<serde_json::Value>>,
+async fn commit_control_mutation(
+    axum::extract::State(shared): axum::extract::State<Arc<LeaderShared>>,
     request: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
@@ -530,10 +505,15 @@ async fn require_control_for_mutation(
         *request.method(),
         axum::http::Method::GET | axum::http::Method::HEAD | axum::http::Method::OPTIONS
     );
-    let current = snapshot.borrow().clone();
-    let local_leader = current["is_leader"].as_bool() == Some(true);
-    let quorum_healthy = current["control"]["quorum_commit_healthy"].as_bool();
-    if !safe && local_leader && quorum_healthy != Some(true) {
+    if safe || !shared.view.borrow().is_me {
+        return next.run(request).await;
+    }
+    let _serial = shared.mutation_serial.lock().await;
+    let healthy = match &shared.control {
+        Some(control) => control.is_healthy().await,
+        None => false,
+    };
+    if !healthy {
         return (
             axum::http::StatusCode::SERVICE_UNAVAILABLE,
             Json(serde_json::json!({
@@ -542,7 +522,30 @@ async fn require_control_for_mutation(
         )
             .into_response();
     }
-    next.run(request).await
+    let before = match shared.engine_projection().await {
+        Ok(jobs) => jobs,
+        Err(error) => {
+            tracing::error!(%error, "could not capture queue projection before mutation");
+            return axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
+    };
+    let response = next.run(request).await;
+    if !response.status().is_success() {
+        let _ = shared.restore_control_projection().await;
+        return response;
+    }
+    if let Err(error) = shared.commit_mutation_delta(&before).await {
+        tracing::error!(%error, "queue mutation was rolled back after replicated commit failed");
+        let _ = shared.restore_control_projection().await;
+        return (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": "replicated control did not commit the mutation; local projection rolled back"
+            })),
+        )
+            .into_response();
+    }
+    response
 }
 
 async fn migrate_legacy_control(
@@ -552,13 +555,33 @@ async fn migrate_legacy_control(
 ) -> Result<(), String> {
     use sha2::{Digest, Sha256};
 
+    if let Some((cluster_id, fingerprint)) = control.migration_identity().await? {
+        if cluster_id == cfg.cluster_id {
+            tracing::debug!(%fingerprint, "legacy control migration already complete");
+            return Ok(());
+        }
+        return Err(format!(
+            "control store belongs to cluster {cluster_id}; refusing cluster {}",
+            cfg.cluster_id
+        ));
+    }
+
     let queue_path = layout.state_dir().join("queue.json");
     let bytes = match std::fs::read(&queue_path) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
         Err(error) => return Err(format!("read legacy queue for migration: {error}")),
     };
-    let fingerprint = format!("sha256:{:x}", Sha256::digest(&bytes));
+    let mut migration_hash = Sha256::new();
+    migration_hash.update(b"queue\0");
+    migration_hash.update(&bytes);
+    migration_hash.update(b"history\0");
+    hash_tree_if_present(
+        &layout.history_dir(),
+        &layout.history_dir(),
+        &mut migration_hash,
+    )?;
+    let fingerprint = format!("sha256:{:x}", migration_hash.finalize());
     let snapshot = if bytes.is_empty() {
         nzbd_state::QueueSnapshotDoc::default()
     } else {
@@ -616,106 +639,47 @@ fn copy_tree_if_present(source: &std::path::Path, target: &std::path::Path) -> R
     Ok(())
 }
 
-fn leader_local_pp_admits(
-    live_authority: bool,
-    is_leader: bool,
-    disk_low: bool,
-    status: nzbd_types::JobStatus,
-    assigned_node: Option<&str>,
-    local_node: &str,
-    failure_action: nzbd_post::manager::FailureAction,
-) -> bool {
-    if !live_authority || !is_leader {
-        return false;
+fn hash_tree_if_present(
+    root: &std::path::Path,
+    path: &std::path::Path,
+    hash: &mut sha2::Sha256,
+) -> Result<(), String> {
+    use sha2::Digest;
+    if !path.exists() {
+        return Ok(());
     }
-    if status == nzbd_types::JobStatus::Failed {
-        // Delete is deallocative and None is bookkeeping-only. Park can
-        // cross filesystems and copy the whole tree, so it waits for disk
-        // recovery and is retried by the post manager's queue scan.
-        return !disk_low || !matches!(failure_action, nzbd_post::manager::FailureAction::Park);
-    }
-    !disk_low && assigned_node == Some(local_node)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn local_pp_admission_closes_assignment_to_start_disk_transition() {
-        assert!(leader_local_pp_admits(
-            true,
-            true,
-            false,
-            nzbd_types::JobStatus::Completed,
-            Some("leader"),
-            "leader",
-            nzbd_post::manager::FailureAction::Delete,
-        ));
-        assert!(!leader_local_pp_admits(
-            true,
-            true,
-            true,
-            nzbd_types::JobStatus::Completed,
-            Some("leader"),
-            "leader",
-            nzbd_post::manager::FailureAction::Delete,
-        ));
-        // Park can copy across filesystems, so it is held and retried by the
-        // manager scan. Delete frees capacity; None writes no payload.
-        assert!(!leader_local_pp_admits(
-            true,
-            true,
-            true,
-            nzbd_types::JobStatus::Failed,
-            None,
-            "leader",
-            nzbd_post::manager::FailureAction::Park,
-        ));
-        assert!(leader_local_pp_admits(
-            true,
-            true,
-            false,
-            nzbd_types::JobStatus::Failed,
-            None,
-            "leader",
-            nzbd_post::manager::FailureAction::Park,
-        ));
-        for safe_action in [
-            nzbd_post::manager::FailureAction::Delete,
-            nzbd_post::manager::FailureAction::None,
-        ] {
-            assert!(leader_local_pp_admits(
-                true,
-                true,
-                true,
-                nzbd_types::JobStatus::Failed,
-                None,
-                "leader",
-                safe_action,
+    let mut entries = std::fs::read_dir(path)
+        .map_err(|error| format!("read legacy history {}: {error}", path.display()))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("read legacy history entry: {error}"))?;
+    entries.sort_by_key(std::fs::DirEntry::file_name);
+    for entry in entries {
+        let entry_path = entry.path();
+        let metadata = std::fs::symlink_metadata(&entry_path)
+            .map_err(|error| format!("stat legacy history {}: {error}", entry_path.display()))?;
+        if metadata.file_type().is_symlink() {
+            return Err(format!(
+                "legacy history contains unsupported symlink {}",
+                entry_path.display()
             ));
         }
-        assert!(!leader_local_pp_admits(
-            true,
-            false,
-            false,
-            nzbd_types::JobStatus::Failed,
-            None,
-            "leader",
-            nzbd_post::manager::FailureAction::Delete,
-        ));
-        // The watch view can lag a successor's epoch write. Every finalizer
-        // boundary must also consult the live epoch-file guard.
-        assert!(!leader_local_pp_admits(
-            false,
-            true,
-            false,
-            nzbd_types::JobStatus::Failed,
-            None,
-            "leader",
-            nzbd_post::manager::FailureAction::Delete,
-        ));
+        hash.update(
+            entry_path
+                .strip_prefix(root)
+                .unwrap_or(&entry_path)
+                .to_string_lossy()
+                .as_bytes(),
+        );
+        hash.update([0]);
+        if metadata.is_dir() {
+            hash_tree_if_present(root, &entry_path, hash)?;
+        } else {
+            hash.update(std::fs::read(&entry_path).map_err(|error| {
+                format!("read legacy history {}: {error}", entry_path.display())
+            })?);
+        }
     }
+    Ok(())
 }
 
 #[derive(Clone)]

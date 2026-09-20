@@ -95,6 +95,23 @@ pub fn assemble(
     dest_dir: &Path,
     fence: u64,
 ) -> Result<Job, String> {
+    if scope.job_id != job.id.0 {
+        return Err("assembly scope names another job".into());
+    }
+    let expected_scopes = scopes(&job);
+    if expected_scopes.is_empty() || expected_scopes.len() != scope.ranges.len() {
+        return Err("assembly does not contain the exact expected range set".into());
+    }
+    let expected_resources: std::collections::HashSet<_> =
+        expected_scopes.iter().map(resource).collect();
+    let supplied_resources: std::collections::HashSet<_> = scope
+        .ranges
+        .iter()
+        .map(|accepted| resource(&accepted.scope))
+        .collect();
+    if expected_resources != supplied_resources || supplied_resources.len() != scope.ranges.len() {
+        return Err("assembly ranges overlap, duplicate, or leave a gap".into());
+    }
     let original_dir = job.dir_name.clone();
     let file_index = job
         .files
@@ -102,6 +119,7 @@ pub fn assemble(
         .position(|file| file.id == FileId(scope.file_id))
         .ok_or_else(|| "assembly file disappeared".to_owned())?;
     let filename = job.files[file_index].filename.clone();
+    let advertised_crc = job.files[file_index].crc32;
     let private_dir = dest_dir.join(format!(
         ".nzbd-cluster/assembly/job-{}/file-{}/fence-{fence}",
         scope.job_id, scope.file_id
@@ -120,7 +138,11 @@ pub fn assemble(
 
     let mut terminal = std::collections::HashMap::new();
     let mut file_size = 0u64;
+    let mut spans = Vec::new();
     for accepted in &scope.ranges {
+        if accepted.scope.job_id != scope.job_id || accepted.scope.file_id != scope.file_id {
+            return Err("accepted range identity does not match assembly".into());
+        }
         let root = PathBuf::from(&accepted.result_ref);
         let partial: Job = serde_json::from_slice(
             &std::fs::read(root.join("job.json"))
@@ -132,9 +154,20 @@ pub fn assemble(
             .iter()
             .find(|file| file.id == FileId(scope.file_id))
             .ok_or_else(|| "accepted range names another file".to_owned())?;
+        if partial.id != job.id || partial.files.len() != 1 || partial_file.filename != filename {
+            return Err("accepted range job identity mismatch".into());
+        }
         let mut input = File::open(root.join("files").join(&partial_file.filename))
             .map_err(|error| format!("open accepted range payload: {error}"))?;
         for segment in &partial_file.segments {
+            if segment.number < accepted.scope.first_article
+                || segment.number > accepted.scope.last_article
+            {
+                return Err(format!(
+                    "article {} escaped its accepted range",
+                    segment.number
+                ));
+            }
             let SegmentState::Done { offset, len, crc } = segment.state else {
                 return Err(format!(
                     "article {} is not durably complete",
@@ -154,7 +187,20 @@ pub fn assemble(
                 .and_then(|_| output.write_all(&data))
                 .map_err(|error| format!("write article {}: {error}", segment.number))?;
             file_size = file_size.max(offset.saturating_add(u64::from(len)));
-            terminal.insert(segment.number, segment.state.clone());
+            spans.push((
+                offset,
+                offset.saturating_add(u64::from(len)),
+                segment.number,
+            ));
+            if terminal
+                .insert(segment.number, segment.state.clone())
+                .is_some()
+            {
+                return Err(format!(
+                    "article {} was supplied more than once",
+                    segment.number
+                ));
+            }
         }
     }
     let expected = &mut job.files[file_index];
@@ -163,17 +209,40 @@ pub fn assemble(
             .remove(&segment.number)
             .ok_or_else(|| format!("article {} has no accepted range", segment.number))?;
     }
+    if !terminal.is_empty() {
+        return Err("assembly supplied articles outside the authoritative file".into());
+    }
+    spans.sort_unstable_by_key(|(start, _, _)| *start);
+    let mut cursor = 0u64;
+    for (start, end, number) in &spans {
+        if *start != cursor || end <= start {
+            return Err(format!(
+                "article {number} creates an overlap or byte gap at {cursor}"
+            ));
+        }
+        cursor = *end;
+    }
+    if cursor != file_size {
+        return Err("assembled byte coverage is incomplete".into());
+    }
     output
         .set_len(file_size)
         .and_then(|_| output.sync_all())
         .map_err(|error| format!("flush assembly: {error}"))?;
     std::fs::rename(&building, &final_path)
         .map_err(|error| format!("publish private assembly: {error}"))?;
+    std::fs::File::open(&private_dir)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| format!("flush private assembly directory: {error}"))?;
     let mut data = Vec::new();
     File::open(&final_path)
         .and_then(|mut file| file.read_to_end(&mut data))
         .map_err(|error| format!("read assembled output: {error}"))?;
-    expected.crc32 = Some(crc32fast::hash(&data));
+    let whole_crc = crc32fast::hash(&data);
+    if advertised_crc.is_some_and(|expected| expected != whole_crc) {
+        return Err("assembled file CRC does not match the advertised whole-file CRC".into());
+    }
+    expected.crc32 = Some(whole_crc);
     expected.finalized = true;
     job.files.retain(|file| file.id == FileId(scope.file_id));
     job.dir_name = private_dir

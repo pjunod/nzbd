@@ -22,6 +22,12 @@ pub enum Event {
     JobDeleted {
         job: JobId,
     },
+    /// A URL admission resolved from its durable `Fetching` placeholder.
+    /// Cluster control uses this narrow event to commit the exact queued or
+    /// failed replacement before it is eligible for scheduling.
+    UrlFetchResolved {
+        job: JobId,
+    },
     FileFinished {
         job: JobId,
         file: FileId,

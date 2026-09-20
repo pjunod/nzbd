@@ -1,6 +1,6 @@
 # Cluster completion — progress and remaining work
 
-**Updated:** 2026-09-19 · **State:** implementation in progress ·
+**Updated:** 2026-09-19 · **State:** adversarial findings addressed; final validation pending ·
 **Branch:** `codex/clustering-completion`
 
 Companion to [CLUSTERING.md](CLUSTERING.md) (the existing implementation) and
@@ -20,15 +20,15 @@ a claimed verification of a newer Forgejo tip or the deployed fleet.
 |---|---|---|
 | Current source comparison | Complete | Coordination, publication, transport recovery, PP ownership, provider budgets, and CI inspected at the revisions above |
 | Documentation and finite implementation plan | Complete | Existing claims reconciled; recommended dependency/migration decision and P0–P5 acceptance recorded in the linked plan |
-| P0 — delivery lane | Implemented; not yet reviewed or tested | Draft PRs allocate no validation jobs; readiness starts the affected lane; full suites remain explicit |
-| P1 — transactional control authority | Implemented; compile-checked; not reviewed or tested | Pinned plurx Hiqlite/WAL, Rust 1.95 floor / 1.97.1 pin, fixed voter config, exact durable leases, receipts, and resumable one-time queue migration |
-| P2 — worker lifetime and publication | Implemented; compile-checked; not reviewed or tested | Bounded RPCs and deadlines; revision cancellation; full private PP attempts; script started/done/ambiguous receipts; verified immutable generations; authority-side publication and idempotent history |
-| P3 — weighted placement and account budgets | Implemented; compile-checked; not reviewed or tested | Weighted backlog-aware placement plus persisted generation handoff; pool tasks acknowledge at batch boundaries; uncertain sockets remain reserved |
-| P4 — segment distribution | Implemented; compile-checked; not reviewed or tested | Fixed explicit article ranges, durable accepted-range rows, sparse private range outputs, CRC/offset validation, and one exact assembly lease |
-| P5 — operator surface and final acceptance | Implemented; compile-checked; not reviewed or tested | Cached native diagnostics, unrestricted Settings → Dev enable controls with advisory evidence, updated behavior/config docs, and bounded range/quorum harness coverage |
-| One adversarial review | Not requested | Request only when the implementation PR is ready to merge |
+| P0 — delivery lane | Implemented; reviewed; not yet tested | Draft PRs allocate no validation jobs; readiness starts the affected lane; full suites remain explicit; unrelated BitTorrent fuzzing no longer runs on PR events |
+| P1 — transactional control authority | Implemented; reviewed; compile-checked; not yet tested | Pinned plurx Hiqlite/WAL, atomic schema install, request-atomic queue deltas with rollback, exact projection takeover, durable full lease reconstruction, and idempotent migration startup |
+| P2 — worker lifetime and publication | Implemented; reviewed; compile-checked; not yet tested | Bounded RPCs/deadlines; immediate PP cancellation; exact lost-response receipts; job-bound, fsynced immutable generations; immutable result references and idempotent history |
+| P3 — weighted placement and account budgets | Implemented; reviewed; compile-checked; not yet tested | Weighted remote-only execution plus persisted generation handoff; only active pool tasks acknowledge at batch boundaries; startup is fail-closed and uncertain sockets remain reserved |
+| P4 — segment distribution | Implemented; reviewed; compile-checked; not yet tested | Fixed explicit article ranges; failed ranges cannot publish; exact range-set/byte coverage and CRC validation; one exact assembly lease |
+| P5 — operator surface and final acceptance | Implemented; reviewed; compile-checked; not yet tested | Cached diagnostics, unrestricted Settings → Dev enable controls with advisory evidence, updated behavior/config docs, bounded acceptance harnesses, and vendored RustSec inventory |
+| One adversarial review | Complete; findings addressed | Independent combined-change review found authority, failover, publication, budget, range, acceptance, audit, and CI gaps; all actionable findings were implemented before validation |
 | Fast lane | Not run | Run after review findings are addressed |
-| PR / merge / deployment | None | Implementation is being prepared for its one combined adversarial review; no deployment is part of this task |
+| PR / merge / deployment | None | Next: commit review fixes, run the one final fast lane, open/ready the combined PR, satisfy required checks, and merge; deployment remains separate |
 
 ## Implementation decisions
 
@@ -45,13 +45,29 @@ a claimed verification of a newer Forgejo tip or the deployed fleet.
   `done` becomes a visible `unknown-not-replayed` result and a script failure.
 - The maintained Hiqlite/WAL source is pinned to the inspected plurx revision;
   nzbd's Rust floor is 1.95 and the repository toolchain is 1.97.1.
+- The authority does not execute downloads or PP locally. This is the bounded
+  way to make every output-producing path use one lease/generation contract;
+  configured capacity returns automatically when that node is a worker.
+- The familiar completed directory is a compatibility alias. Durable history
+  and `*Cluster:result-ref` expose the immutable selected generation.
+
+## Bounded acceptance inventory
+
+The final fast lane includes the `nzbd-cluster` library plus its complete
+bounded E2E target. Together they cover three-voter quorum loss and concurrent
+startup migration, mutation rejection, leader and worker death, running-lease
+adoption, shared-volume journal reuse, two-worker range assembly, low-disk
+admission, provider budgets, remote PP/history, queue restart, exact
+lost-response matching, and process-local expiry cancellation. The range and
+PP scenarios exercise private generations and single-winner publication; the
+worker/leader death scenarios exercise reassign/adopt behavior.
 
 ## Compile evidence
 
-`cargo check --workspace --all-targets` is green at the implementation
-checkpoint. This is static development evidence, not the final fast lane. Per
-the delivery contract, no test target has run yet; tests run once after the
-combined adversarial review.
+`cargo check --workspace --all-targets` is green after the adversarial fixes.
+This is static development evidence, not the final fast lane. Per the delivery
+contract, no test target has run yet; the tests run once at the final
+merge-candidate stage.
 
 ## Working rules
 

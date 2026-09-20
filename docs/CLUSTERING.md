@@ -50,9 +50,18 @@ The control and data planes have different jobs:
 ## Control authority
 
 Every mutable job has a stable incarnation and monotonically increasing
-revision. Queue changes are reconciled into idempotent command receipts. A
-worker completion names the exact job revision it executed; a newer pause,
-delete, file edit, or other intent makes that completion conflict.
+revision. One API request's changed rows commit as one revision-checked
+Hiqlite transaction before success is returned; a failed commit restores the
+exact replicated projection. URL admission has one narrower asynchronous
+transition: its already-durable `Fetching` row may resolve once to queued or
+failed under the same revision check. A worker completion names the exact job
+revision it executed; a newer pause, delete, file edit, or other intent makes
+that completion conflict.
+
+The elected authority schedules and projects state but performs no local
+download or post-processing. A coordinator's configured executor capacity is
+available whenever it is a worker; while elected, work goes to another node so
+every mutating attempt has the same durable lease and private-generation path.
 
 A lease token is exact, not merely “owned by this node”:
 
@@ -73,11 +82,13 @@ The first start of the new control plane is a stopped-cluster conversion:
 
 1. Back up the legacy queue and history inputs under the node-local control
    directory.
-2. Hash the source and transactionally import job/file IDs, job intent, and
-   counters.
+2. Hash the queue plus retained shared-history evidence and transactionally
+   import job/file IDs, job intent, and counters. History remains in its
+   existing shared JSONL location and is included in the migration backup.
 3. Commit the source fingerprint and target `cluster_id`.
-4. A retry with the same source resumes idempotently. A different source or
-   cluster identity is rejected.
+4. Concurrent retries for the same cluster resolve idempotently. After the
+   marker commits, later queue/history changes do not create another migration;
+   a different `cluster_id` is rejected.
 
 Do not run file-election and replicated-control binaries against the same
 state tree concurrently. Rollback means stopping the new cluster and restoring
@@ -125,13 +136,15 @@ worker writes to a fence-specific private directory and seals:
 
 - the partial job state and exact article offsets/lengths/CRCs;
 - payload hashes and byte counts;
+- a hash of the exact sealed `job.json`;
 - job incarnation, owner node, fence, and result identity.
 
 Accepted ranges are durable control rows. Restart or reassignment reuses them;
 only missing ranges return to NNTP. When all ranges exist, one exact assembly
-lease reads the accepted manifests, validates every article CRC and offset,
-writes one private output, checks the final CRC, and returns one sealed result.
-No range worker renames the public file.
+lease reads the accepted manifests, requires the exact non-overlapping range
+set and continuous byte coverage, validates every article CRC and offset,
+writes one private output, checks an advertised whole-file CRC when present,
+and returns one sealed result. No range worker renames the public file.
 
 ## Post-processing and publication
 
@@ -147,7 +160,8 @@ The authority accepts a result only when:
 - the exact lease token is live;
 - job incarnation and expected revision still match;
 - the immutable generation stays within the cluster namespace;
-- every manifest path is safe and every length/hash matches.
+- every manifest path is safe and every length/hash matches;
+- the hashed `job.json` exactly matches the completion request.
 
 The publication receipt is committed before selection. Selection copies the
 verified generation to a temporary sibling, fsyncs it, preserves any prior
@@ -155,6 +169,13 @@ directory under a uniquely named `.superseded-*` sibling, then atomically
 renames the new directory. The result marker makes retries idempotent. PP
 history uses the publication receipt timestamp, so a lost response retries the
 same logical row rather than inventing a second completion.
+
+The durable job carries `*Cluster:result-ref`, and history's `final_dir` points
+at that immutable generation. The familiar completed-directory path is a
+recoverable publication alias for compatibility, not the result identity.
+Cluster scripts receive job-incarnation, lease/resource/fence/revision, and
+exact script-receipt environment variables. Lease expiry cancels the owned
+subprocess future immediately; the process wrapper kills children on drop.
 
 Superseded directories are deliberately recoverable; inspect and remove them
 only after confirming the selected output. In-progress `.building-*` and
@@ -198,6 +219,9 @@ Before enabling, normally verify:
 - NTP/clock monitoring (leases use durable expiry plus local conservative
   deadlines; wildly wrong clocks remain operationally harmful);
 - sufficient temporary capacity for private PP copies and range generations.
+- at least one eligible non-authority executor whenever queued work should
+  advance (a one-voter/one-process control-only cluster preserves the queue but
+  intentionally does not execute unfenced local work).
 
 These checks are advice, not an activation receipt.
 

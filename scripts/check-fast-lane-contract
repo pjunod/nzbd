@@ -16,6 +16,10 @@ for workflow in ci.yml lint.yml coverage.yml; do
   fi
 done
 
-grep -A16 '^  pull_request:' .github/workflows/bittorrent-fuzz.yml | grep -Fq 'ready_for_review'
-grep -Fq "github.event.pull_request.draft == false" .github/workflows/bittorrent-fuzz.yml
+if grep -Eq '^  pull_request:' .github/workflows/bittorrent-fuzz.yml; then
+  echo "BitTorrent fuzz must not run for pull requests" >&2
+  exit 1
+fi
+grep -Fq 'workflow_dispatch:' .github/workflows/bittorrent-fuzz.yml
+grep -Fq 'schedule:' .github/workflows/bittorrent-fuzz.yml
 test "$(grep -c "github.event.pull_request.draft == false" .github/workflows/supply-chain.yml)" -eq 3

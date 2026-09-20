@@ -400,7 +400,7 @@ secret_file = "/etc/nzbd/cluster.secret"  # same secret on every node
 # secret = "inline-secret"                # alternative to secret_file
 coordinator = true          # eligible for leader election
 priority = 10               # lower = preferred leader
-download = true             # takes download-job leases
+download = true             # takes leases while this node is a worker
 max_download_jobs = 2
 post_process = true         # PP executor (anti-affinity prefers idle nodes)
 pp_slots = 1
@@ -433,6 +433,10 @@ api_addr = "10.0.0.13:8820"
 An empty `control_peers` list is a supported single-voter configuration. A
 production HA cluster normally uses a fixed odd roster of at least three.
 Membership changes are stopped-cluster operations.
+
+The elected authority never consumes its own download or PP capacity. Keep at
+least one other eligible executor online when work must advance; a coordinator
+becomes an executor again automatically after it is no longer authority.
 
 Settings → **Dev · Usenet cluster** exposes the enable switch and common
 fields. Its met/unmet/unknown requirements are advisory only. The form never

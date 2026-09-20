@@ -711,10 +711,10 @@ async fn distributed_download_via_any_node_with_budgets() {
     assert_eq!(got, files[0].1);
     assert!(ns.total_hits() > 0);
 
-    // Connection budget: account cap 4 split across leader + 1 downloading
-    // node = 2 concurrent connections max (±0 — the gauge is exact).
+    // The non-executing authority consumes no share, so the only worker may
+    // use the full account cap of four.
     assert!(
-        ns.max_concurrent_connections() <= 2,
+        ns.max_concurrent_connections() <= 4,
         "budget exceeded: {} concurrent connections",
         ns.max_concurrent_connections()
     );
@@ -1126,13 +1126,14 @@ async fn single_node_cluster_restart_keeps_the_queue() {
     .await;
 
     add_job(&a.url, "solo", post.nzb.as_bytes()).await;
-    wait_for("completion", 30, || {
-        get_json(&a.url, "/api/v1/jobs")["jobs"][0]["status"] == "completed"
+    wait_for("queue committed", 15, || {
+        get_json(&a.url, "/api/v1/jobs")["jobs"][0]["name"] == "solo"
     })
     .await;
     assert_eq!(
-        std::fs::read(tmp.path().join("complete/solo/s.bin")).unwrap(),
-        data
+        ns.total_hits(),
+        0,
+        "authority must not execute unfenced work"
     );
     a.kill().await;
 
@@ -1144,7 +1145,7 @@ async fn single_node_cluster_restart_keeps_the_queue() {
     .await;
     wait_for("queue recovered", 15, || {
         let v = get_json(&a2.url, "/api/v1/jobs");
-        v["jobs"][0]["status"] == "completed" && v["jobs"][0]["name"] == "solo"
+        v["jobs"][0]["name"] == "solo"
     })
     .await;
     a2.kill().await;
@@ -1203,14 +1204,29 @@ async fn pp_runs_on_idle_node_via_anti_affinity() {
     );
     let ns = NservBuilder::new().with_post(&post).start().await.unwrap();
 
-    // a: leader + the only downloader, NOT a PP node.
-    // c: cannot download, PP executor — the anti-affinity target.
+    // a: authority only. b: downloader. c: PP executor — the
+    // anti-affinity target.
     let a = start_node(
         tmp.path(),
         "a",
         NodeOpts {
             coordinator: true,
             priority: 0,
+            download: false,
+            max_download_jobs: 0,
+            post_process: false,
+            min_free_disk_bytes: 0,
+        },
+        ns.port(),
+        4,
+    )
+    .await;
+    let b = start_node(
+        tmp.path(),
+        "b",
+        NodeOpts {
+            coordinator: false,
+            priority: 9,
             download: true,
             max_download_jobs: 2,
             post_process: false,
@@ -1240,16 +1256,16 @@ async fn pp_runs_on_idle_node_via_anti_affinity() {
         get_json(&a.url, "/api/v1/cluster")["is_leader"].as_bool() == Some(true)
     })
     .await;
-    wait_for("both nodes registered", 15, || {
+    wait_for("all nodes registered", 15, || {
         get_json(&a.url, "/api/v1/cluster")["nodes"]
             .as_array()
-            .is_some_and(|n| n.len() == 2)
+            .is_some_and(|n| n.len() == 3)
     })
     .await;
 
     add_job(&a.url, "pardl", post.nzb.as_bytes()).await;
 
-    // Download completes on a (c can't download); PP is assigned to c,
+    // Download completes on b (c can't download); PP is assigned to c,
     // executes there, and the stamped job comes back and is RETIRED to
     // history by the leader sweep. Node a has NO PP manager
     // (post_process=false), so history appearing at all proves remote
@@ -1285,5 +1301,6 @@ async fn pp_runs_on_idle_node_via_anti_affinity() {
     assert!(hist.contains("\"pardl\""), "history: {hist}");
 
     a.kill().await;
+    b.kill().await;
     c.kill().await;
 }

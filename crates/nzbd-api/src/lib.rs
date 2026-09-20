@@ -1614,6 +1614,7 @@ fn event_json(ev: &nzbd_engine::Event) -> (&'static str, serde_json::Value) {
             json!({"job": job.0, "name": name, "status": status, "health": health}),
         ),
         E::JobDeleted { job } => ("job_deleted", json!({"job": job.0})),
+        E::UrlFetchResolved { job } => ("url_fetch_resolved", json!({"job": job.0})),
         E::FileFinished {
             job,
             file,

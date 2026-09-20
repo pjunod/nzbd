@@ -245,6 +245,13 @@ pub(crate) enum QueueCommand {
         budgets: HashMap<ServerId, u16>,
         reply: oneshot::Sender<(u64, HashMap<ServerId, u16>)>,
     },
+    /// Enable or park ordinary Usenet selection without restarting. Cluster
+    /// nodes use this at role transitions so the elected authority remains a
+    /// projection/scheduler and never executes unfenced local work.
+    SetDownloadEnabled {
+        enabled: bool,
+        reply: oneshot::Sender<()>,
+    },
     /// Become the queue authority: load the shared snapshot (local jobs
     /// win on conflict — the executor copy is fresher), fold all journals,
     /// enable persistence. Unsupported durable rows refuse the transition
@@ -252,9 +259,8 @@ pub(crate) enum QueueCommand {
     AdoptAuthority {
         reply: oneshot::Sender<Result<(), nzbd_state::StateError>>,
     },
-    /// Merge the replicated control projection after ordinary authority
-    /// recovery. Locally active copies remain until exact lease
-    /// reconciliation decides their fate.
+    /// Replace the queue projection from replicated control. Local-only rows
+    /// must not survive takeover or rollback after a failed quorum commit.
     AdoptReplicatedAuthority {
         jobs: Vec<Job>,
         reply: oneshot::Sender<()>,
@@ -1214,6 +1220,7 @@ impl Owner {
                     tracing::info!(job = job.0, "url fetch complete; queued");
                     self.save_snapshot();
                     self.publish_now();
+                    self.emit(Event::UrlFetchResolved { job });
                     self.bump_epoch();
                 }
                 let _ = reply.send(ok);
@@ -1236,6 +1243,7 @@ impl Owner {
                         status: JobStatus::Failed,
                         health: 0,
                     });
+                    self.emit(Event::UrlFetchResolved { job });
                     self.bump_epoch();
                 }
                 let _ = reply.send(());
@@ -1665,6 +1673,12 @@ impl Owner {
                 let applied = self.publish_conn_budgets();
                 let _ = reply.send((self.budget_generation, applied));
             }
+            QueueCommand::SetDownloadEnabled { enabled, reply } => {
+                self.download_enabled = enabled;
+                self.bump_epoch();
+                self.publish_now();
+                let _ = reply.send(());
+            }
             QueueCommand::SetServerConnectionCaps { caps, reply } => {
                 // Clamp to what was actually spawned at boot: there are
                 // `max_connections` tasks per server and no more, so a
@@ -1695,12 +1709,25 @@ impl Owner {
                 let _ = reply.send(result);
             }
             QueueCommand::AdoptReplicatedAuthority { jobs, reply } => {
-                for job in jobs {
-                    if self.state.job(job.id).is_none() {
-                        self.import_job(job, true, false);
-                    }
-                }
+                self.state.jobs = jobs;
+                self.state.pending_admissions.clear();
+                self.state.next_job_id = self
+                    .state
+                    .jobs
+                    .iter()
+                    .map(|job| job.id.0)
+                    .max()
+                    .unwrap_or(0);
+                self.state.next_file_id = self
+                    .state
+                    .jobs
+                    .iter()
+                    .flat_map(|job| job.files.iter().map(|file| file.id.0))
+                    .max()
+                    .unwrap_or(0);
                 self.state.recompute_all_totals();
+                self.dirty = true;
+                self.save_snapshot();
                 self.publish_now();
                 self.bump_epoch();
                 let _ = reply.send(());

@@ -30,6 +30,8 @@ pub struct LeaseState {
     pub control_revision: u64,
     /// Conservative process-local deadline. Failed HTTP calls never move it.
     pub deadline: Instant,
+    /// Revokes owned PP subprocesses immediately when authority is lost.
+    pub cancel: CancellationToken,
     /// PP leases only: the pipeline finished locally; the stamped job is
     /// ready to hand to the leader.
     pub pp_ready: bool,
@@ -100,6 +102,9 @@ async fn worker_task(
         if v.is_me {
             // We are the leader: granted leases dissolve into local jobs
             // (adopt_authority kept them); the scheduler takes over.
+            for state in active.lock().unwrap().values() {
+                state.cancel.cancel();
+            }
             active.lock().unwrap().clear();
         } else if let Some(url) = v.leader_url().map(|s| s.to_string()) {
             heartbeat_and_cancel(
@@ -207,6 +212,7 @@ async fn heartbeat_and_cancel(
             for lease_id in resp.cancel {
                 let st = active.lock().unwrap().remove(&lease_id);
                 if let Some(st) = st {
+                    st.cancel.cancel();
                     tracing::info!(job = st.job.0, %lease_id, "lease cancelled by leader");
                     let _ = engine.remove_job_silent(st.job).await;
                 }
@@ -284,6 +290,12 @@ async fn report_completions(
             };
             job
         };
+        if lease.kind == LeaseKind::Segment && job.status != JobStatus::Completed {
+            reject_remote_grant(cfg, client, leader_url, &lease_id, &lease.token).await;
+            active.lock().unwrap().remove(&lease_id);
+            let _ = engine.remove_job_silent(job_id).await;
+            continue;
+        }
         let sealed = match seal_generation(cfg, dest_dir, &job, &lease).await {
             Ok(sealed) => sealed,
             Err(error) => {
@@ -340,7 +352,14 @@ async fn poll_for_work(
     let (dl_held, pp_held) = {
         let a = active.lock().unwrap();
         (
-            a.values().filter(|s| s.kind == LeaseKind::Download).count() as u32,
+            a.values()
+                .filter(|s| {
+                    matches!(
+                        s.kind,
+                        LeaseKind::Download | LeaseKind::Segment | LeaseKind::Assemble
+                    )
+                })
+                .count() as u32,
             a.values().filter(|s| s.kind == LeaseKind::Post).count() as u32,
         )
     };
@@ -408,6 +427,7 @@ async fn poll_for_work(
                             job_revision: grant.job_revision,
                             control_revision: grant.control_revision,
                             deadline: conservative_deadline(cfg),
+                            cancel: CancellationToken::new(),
                             pp_ready: false,
                             ready_job: None,
                         },
@@ -470,6 +490,7 @@ async fn poll_for_work(
                             job_revision: grant.job_revision,
                             control_revision: grant.control_revision,
                             deadline: conservative_deadline(cfg),
+                            cancel: CancellationToken::new(),
                             pp_ready: false,
                             ready_job: None,
                         },
@@ -509,6 +530,7 @@ async fn poll_for_work(
                             job_revision: grant.job_revision,
                             control_revision: grant.control_revision,
                             deadline: conservative_deadline(cfg),
+                            cancel: CancellationToken::new(),
                             pp_ready: false,
                             ready_job: None,
                         },
@@ -535,6 +557,7 @@ async fn poll_for_work(
                         job_revision: grant.job_revision,
                         control_revision: grant.control_revision,
                         deadline: conservative_deadline(cfg),
+                        cancel: CancellationToken::new(),
                         pp_ready: false,
                         ready_job: None,
                     },
@@ -678,6 +701,14 @@ fn run_pp_lease(
             tag: lease_id.clone(),
             publish_history: false,
             script_receipt: Some(script_receipt),
+            extra_env: vec![
+                ("NZBCLUSTER_JOB_INCARNATION".into(), initial.job_incarnation.clone()),
+                ("NZBCLUSTER_LEASE_ID".into(), lease_id.clone()),
+                ("NZBCLUSTER_LEASE_RESOURCE".into(), initial.token.resource.clone()),
+                ("NZBCLUSTER_LEASE_FENCE".into(), initial.token.fence.to_string()),
+                ("NZBCLUSTER_LEASE_REVISION".into(), initial.token.revision.to_string()),
+            ],
+            script_receipt_prefix: Some(format!("script:{}:", initial.job_incarnation)),
             commit_ok: Arc::new({
                 let active = active.clone();
                 let lease_id = lease_id.clone();
@@ -690,7 +721,12 @@ fn run_pp_lease(
                 }
             }),
         };
-        match process_job_ctx(&engine, &setup.post, &setup.history, &dest_dir, job_id, &ctx).await {
+        let pp_cancel = initial.cancel.clone();
+        let result = tokio::select! {
+            _ = pp_cancel.cancelled() => Err(nzbd_post::PostError::Subprocess("PP lease authority expired".into())),
+            result = process_job_ctx(&engine, &setup.post, &setup.history, &dest_dir, job_id, &ctx) => result,
+        };
+        match result {
             Ok(outcome) => {
                 tracing::info!(job = job_id.0, lease = %lease_id, outcome = outcome.as_str(), "pp lease finished");
                 if let Some(st) = active.lock().unwrap().get_mut(&lease_id) {
@@ -800,6 +836,7 @@ struct GenerationManifest {
     owner_node_id: String,
     fence: u64,
     result_id: String,
+    job_sha256: String,
     files: Vec<GenerationFile>,
     total_bytes: u64,
     sealed_at_unix_ms: i64,
@@ -890,9 +927,17 @@ async fn seal_generation(
             ));
         }
         files.sort_by(|left, right| left.path.cmp(&right.path));
-        let identity =
-            serde_json::to_vec(&(job.id.0, &lease.job_incarnation, lease.token.fence, &files))
-                .map_err(|error| format!("encode generation identity: {error}"))?;
+        let job_bytes = serde_json::to_vec_pretty(&job)
+            .map_err(|error| format!("encode generation job: {error}"))?;
+        let job_sha256 = format!("{:x}", Sha256::digest(&job_bytes));
+        let identity = serde_json::to_vec(&(
+            job.id.0,
+            &lease.job_incarnation,
+            lease.token.fence,
+            &job_sha256,
+            &files,
+        ))
+        .map_err(|error| format!("encode generation identity: {error}"))?;
         let result_id = format!("sha256:{:x}", Sha256::digest(identity));
         let manifest = GenerationManifest {
             job_id: job.id.0,
@@ -900,6 +945,7 @@ async fn seal_generation(
             owner_node_id: lease.token.owner_node_id,
             fence: lease.token.fence,
             result_id: result_id.clone(),
+            job_sha256,
             files,
             total_bytes: total,
             sealed_at_unix_ms: std::time::SystemTime::now()
@@ -909,6 +955,14 @@ async fn seal_generation(
                 .try_into()
                 .unwrap_or(i64::MAX),
         };
+        let job_tmp = building.join("job.json.tmp");
+        std::fs::write(&job_tmp, &job_bytes)
+            .map_err(|error| format!("write generation job: {error}"))?;
+        std::fs::File::open(&job_tmp)
+            .and_then(|file| file.sync_all())
+            .map_err(|error| format!("flush generation job: {error}"))?;
+        std::fs::rename(&job_tmp, building.join("job.json"))
+            .map_err(|error| format!("seal generation job: {error}"))?;
         let manifest_tmp = building.join("manifest.json.tmp");
         let manifest_bytes = serde_json::to_vec_pretty(&manifest)
             .map_err(|error| format!("encode generation manifest: {error}"))?;
@@ -919,18 +973,9 @@ async fn seal_generation(
             .map_err(|error| format!("flush generation manifest: {error}"))?;
         std::fs::rename(&manifest_tmp, building.join("manifest.json"))
             .map_err(|error| format!("seal generation manifest: {error}"))?;
-        let job_tmp = building.join("job.json.tmp");
-        std::fs::write(
-            &job_tmp,
-            serde_json::to_vec_pretty(&job)
-                .map_err(|error| format!("encode generation job: {error}"))?,
-        )
-        .map_err(|error| format!("write generation job: {error}"))?;
-        std::fs::File::open(&job_tmp)
-            .and_then(|file| file.sync_all())
-            .map_err(|error| format!("flush generation job: {error}"))?;
-        std::fs::rename(&job_tmp, building.join("job.json"))
-            .map_err(|error| format!("seal generation job: {error}"))?;
+        std::fs::File::open(&building)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|error| format!("flush sealed generation directory: {error}"))?;
         match std::fs::rename(&building, &final_dir) {
             Ok(()) => {}
             Err(error) if final_dir.join("manifest.json").exists() => {
@@ -940,6 +985,9 @@ async fn seal_generation(
             }
             Err(error) => return Err(format!("publish sealed generation directory: {error}")),
         }
+        std::fs::File::open(&root)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|error| format!("flush generation parent: {error}"))?;
         Ok(SealedGeneration {
             result_id,
             path: final_dir,
@@ -1005,6 +1053,9 @@ fn copy_generation_tree(
             .and_then(|file| file.sync_all())
             .map_err(|error| format!("flush generation file {}: {error}", to.display()))?;
     }
+    std::fs::File::open(target)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| format!("flush generation directory {}: {error}", target.display()))?;
     Ok(())
 }
 
@@ -1030,6 +1081,7 @@ async fn expire_local_leases(engine: &EngineHandle, active: &ActiveLeases) {
             .collect()
     };
     for (lease_id, state) in expired {
+        state.cancel.cancel();
         tracing::warn!(job = state.job.0, %lease_id, "local lease deadline expired; cancelling work");
         let _ = engine.remove_job_silent(state.job).await;
     }
@@ -1182,6 +1234,43 @@ mod tests {
         assert_eq!(progress.stages[0].stage, PostStage::ParVerify);
         assert!(progress.stages[0].ms.is_none());
 
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn suspended_pp_lease_past_deadline_revokes_its_subprocess_owner() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = Engine::spawn(EngineConfig::single_node(
+            Vec::new(),
+            tmp.path().join("state"),
+            tmp.path().join("dest"),
+            Tuning::default(),
+            None,
+        ))
+        .await
+        .unwrap();
+        let cancel = CancellationToken::new();
+        let active: ActiveLeases = Default::default();
+        active.lock().unwrap().insert(
+            "expired".into(),
+            LeaseState {
+                job: JobId(77),
+                kind: LeaseKind::Post,
+                token: test_token(),
+                job_incarnation: "job-incarnation".into(),
+                job_revision: 1,
+                control_revision: 1,
+                deadline: Instant::now() - std::time::Duration::from_millis(1),
+                cancel: cancel.clone(),
+                pp_ready: false,
+                ready_job: None,
+            },
+        );
+
+        expire_local_leases(&engine, &active).await;
+
+        assert!(active.lock().unwrap().is_empty());
+        assert!(cancel.is_cancelled());
         engine.shutdown().await;
     }
 

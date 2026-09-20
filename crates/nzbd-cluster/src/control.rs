@@ -173,6 +173,17 @@ pub struct LeaseToken {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DurableLease {
+    pub token: LeaseToken,
+    pub job_id: u64,
+    pub job_incarnation: String,
+    pub owner_node_id: String,
+    pub kind: String,
+    pub scope_json: String,
+    pub job_revision: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LeaseClaim {
     Acquired(LeaseToken),
     Held {
@@ -195,6 +206,22 @@ pub enum ScriptReceiptOutcome {
     AlreadyDone,
     Ambiguous,
     Conflict,
+}
+
+#[derive(Clone, Debug)]
+pub struct PublicationReceipt {
+    pub resource: String,
+    pub owner_node_id: String,
+    pub owner_incarnation: String,
+    pub fence: u64,
+    pub lease_revision: u64,
+    pub lease_expiry_ms: i64,
+    pub expected_job_revision: u64,
+    pub result_id: String,
+    pub result_ref: String,
+    pub result_job_json: String,
+    pub accepted_at_ms: i64,
+    pub kind: String,
 }
 
 impl ControlStore {
@@ -251,12 +278,18 @@ impl ControlStore {
         tokio::time::timeout(Duration::from_secs(20), client.wait_until_healthy_db())
             .await
             .map_err(|_| "replicated control quorum did not become healthy".to_owned())?;
-        for statement in CONTROL_SCHEMA {
-            client
-                .execute(*statement, params!())
-                .await
-                .map_err(|error| format!("install control schema: {error}"))?;
-        }
+        client
+            .txn(
+                CONTROL_SCHEMA
+                    .iter()
+                    .map(|statement| ((*statement).to_owned(), params!()))
+                    .collect::<Vec<(String, hiqlite::Params)>>(),
+            )
+            .await
+            .map_err(|error| format!("install control schema transaction: {error}"))?
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("install control schema statement: {error}"))?;
         Ok(Self { client })
     }
 
@@ -271,6 +304,21 @@ impl ControlStore {
         tokio::time::timeout(Duration::from_secs(2), self.client.is_healthy_db())
             .await
             .is_ok_and(|result| result.is_ok())
+    }
+
+    pub async fn migration_identity(&self) -> Result<Option<(String, String)>, String> {
+        let rows = self
+            .client
+            .query_consistent_map::<MigrationRow, _>(
+                "SELECT cluster_id,source_fingerprint FROM cluster_meta LIMIT 1",
+                params!(),
+            )
+            .await
+            .map_err(|error| format!("read control migration identity: {error}"))?;
+        Ok(rows
+            .into_iter()
+            .next()
+            .map(|row| (row.cluster_id, row.source_fingerprint)))
     }
 
     /// Import the stopped legacy queue exactly once. The caller owns making a
@@ -290,7 +338,14 @@ impl ControlStore {
             .await
             .map_err(|error| format!("read control migration: {error}"))?;
         if let Some(row) = existing.into_iter().next() {
-            if row.cluster_id == cluster_id && row.source_fingerprint == fingerprint {
+            if row.cluster_id == cluster_id {
+                if row.source_fingerprint != fingerprint {
+                    tracing::debug!(
+                        imported = %row.source_fingerprint,
+                        current = %fingerprint,
+                        "legacy source changed after its one-time control migration"
+                    );
+                }
                 return Ok(false);
             }
             return Err(format!(
@@ -327,14 +382,38 @@ impl ControlStore {
                 .into(),
             params!(cluster_id, fingerprint, now),
         ));
-        self.client
-            .txn(statements)
-            .await
-            .map_err(|error| format!("commit legacy control migration: {error}"))?
-            .into_iter()
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| format!("legacy control migration statement: {error}"))?;
-        Ok(true)
+        let committed = self.client.txn(statements).await;
+        match committed {
+            Ok(results) => {
+                results
+                    .into_iter()
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|error| format!("legacy control migration statement: {error}"))?;
+                Ok(true)
+            }
+            Err(error) => {
+                // Concurrent voter startup may race the initial read. Treat
+                // the winner's identical fingerprint as the same idempotent
+                // migration, never as a startup failure.
+                let rows = self
+                    .client
+                    .query_consistent_map::<MigrationRow, _>(
+                        "SELECT cluster_id,source_fingerprint FROM cluster_meta LIMIT 1",
+                        params!(),
+                    )
+                    .await
+                    .map_err(|read| format!("migration raced ({error}); reread failed: {read}"))?;
+                if rows
+                    .into_iter()
+                    .next()
+                    .is_some_and(|row| row.cluster_id == cluster_id)
+                {
+                    Ok(false)
+                } else {
+                    Err(format!("commit legacy control migration: {error}"))
+                }
+            }
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -484,6 +563,23 @@ impl ControlStore {
         rows.into_iter().next().map(TryInto::try_into).transpose()
     }
 
+    pub async fn current_lease_record(
+        &self,
+        resource: &str,
+    ) -> Result<Option<DurableLease>, String> {
+        let rows = self
+            .client
+            .query_consistent_map::<DurableLeaseRow, _>(
+                "SELECT resource,job_id,job_incarnation,owner_node_id,owner_incarnation,
+                        kind,scope_json,fence,revision,job_revision,expires_at_ms
+                   FROM work_leases WHERE resource=$1 AND terminal=0",
+                params!(resource),
+            )
+            .await
+            .map_err(|error| format!("read durable lease record: {error}"))?;
+        rows.into_iter().next().map(TryInto::try_into).transpose()
+    }
+
     pub async fn seed_job(
         &self,
         job_id: u64,
@@ -609,6 +705,149 @@ impl ControlStore {
             }
         }
         Err("replicated job reconciliation remained conflicted".into())
+    }
+
+    /// Atomically commit every queue row changed by one externally visible
+    /// API request. Existing rows use the same revision-checked receipt
+    /// trigger as other control mutations; new rows are inserted in the same
+    /// replicated transaction. Any stale row aborts the entire request.
+    pub async fn commit_job_delta(
+        &self,
+        changes: &[(u64, Option<nzbd_types::Job>)],
+    ) -> Result<(), String> {
+        if changes.is_empty() {
+            return Ok(());
+        }
+        let now = unix_ms()?;
+        let mut statements: Vec<(String, hiqlite::Params)> = Vec::new();
+        for (job_id, desired_job) in changes {
+            let rows = self
+                .client
+                .query_consistent_map::<ControlJobStateRow, _>(
+                    "SELECT incarnation,revision,intent_json,deleted FROM control_jobs WHERE job_id=$1",
+                    params!(i64_value("job id", *job_id)?),
+                )
+                .await
+                .map_err(|error| format!("read replicated job before request commit: {error}"))?;
+            let desired = desired_job
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()
+                .map_err(|error| format!("encode replicated request row: {error}"))?;
+            match rows.into_iter().next() {
+                None => {
+                    let intent = desired.as_deref().ok_or_else(|| {
+                        format!("request attempted to delete unknown job {job_id}")
+                    })?;
+                    let incarnation = format!("job-{:x}", Sha256::digest(intent.as_bytes()));
+                    statements.push((
+                        "INSERT INTO control_jobs
+                         (job_id,incarnation,revision,intent_json,updated_at_ms)
+                         VALUES($1,$2,1,$3,$4)"
+                            .into(),
+                        params!(i64_value("job id", *job_id)?, incarnation, intent, now),
+                    ));
+                }
+                Some(row) => {
+                    let deleted = desired.is_none();
+                    let next = desired.as_deref().unwrap_or(&row.intent_json);
+                    if row.deleted == deleted && (deleted || next == row.intent_json) {
+                        continue;
+                    }
+                    let expected = u64::try_from(row.revision)
+                        .map_err(|error| format!("invalid job revision: {error}"))?;
+                    let next_revision = expected
+                        .checked_add(1)
+                        .ok_or_else(|| "job revision exhausted".to_owned())?;
+                    let command_id = format!(
+                        "request:{:x}",
+                        Sha256::digest(format!("{job_id}:{expected}:{deleted}:{next}").as_bytes())
+                    );
+                    let envelope = serde_json::json!({
+                        "command": {"op": if deleted { "delete" } else { "replace_intent" }, "job_id": job_id},
+                        "next_intent": next,
+                        "deleted": deleted,
+                    })
+                    .to_string();
+                    statements.push((
+                        "INSERT INTO command_receipts
+                         (command_id,job_id,expected_revision,applied_revision,command_json,applied_at_ms)
+                         VALUES($1,$2,$3,$4,$5,$6)"
+                            .into(),
+                        params!(
+                            command_id,
+                            i64_value("job id", *job_id)?,
+                            i64_value("expected revision", expected)?,
+                            i64_value("applied revision", next_revision)?,
+                            envelope,
+                            now
+                        ),
+                    ));
+                }
+            }
+        }
+        if statements.is_empty() {
+            return Ok(());
+        }
+        self.client
+            .txn(statements)
+            .await
+            .map_err(|error| format!("commit replicated request delta: {error}"))?
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("replicated request statement: {error}"))?;
+        Ok(())
+    }
+
+    /// Commit the sole asynchronous queue mutation: resolving an already
+    /// durable URL-fetch placeholder. The prior control row must still be
+    /// `Fetching`, so this cannot overwrite an unrelated operator command.
+    pub async fn commit_url_resolution(&self, job: &nzbd_types::Job) -> Result<(), String> {
+        let rows = self
+            .client
+            .query_consistent_map::<ControlJobStateRow, _>(
+                "SELECT incarnation,revision,intent_json,deleted FROM control_jobs WHERE job_id=$1",
+                params!(i64_value("job id", job.id.0.into())?),
+            )
+            .await
+            .map_err(|error| format!("read URL placeholder: {error}"))?;
+        let row = rows
+            .into_iter()
+            .next()
+            .ok_or_else(|| "URL placeholder is not durable".to_owned())?;
+        let prior: nzbd_types::Job = serde_json::from_str(&row.intent_json)
+            .map_err(|error| format!("decode URL placeholder: {error}"))?;
+        if row.deleted
+            || prior.status != nzbd_types::JobStatus::Fetching
+            || job.status == nzbd_types::JobStatus::Fetching
+            || prior.id != job.id
+            || prior.params.iter().find(|(key, _)| key == "*URL")
+                != job.params.iter().find(|(key, _)| key == "*URL")
+        {
+            return Err("URL resolution no longer matches its durable placeholder".into());
+        }
+        let expected = u64::try_from(row.revision)
+            .map_err(|error| format!("invalid URL placeholder revision: {error}"))?;
+        let next = serde_json::to_string(job)
+            .map_err(|error| format!("encode URL resolution: {error}"))?;
+        let command_id = format!(
+            "url-resolution:{:x}",
+            Sha256::digest(format!("{}:{expected}:{next}", job.id.0).as_bytes())
+        );
+        match self
+            .apply_command(
+                &command_id,
+                job.id.0.into(),
+                expected,
+                r#"{"op":"url_resolution"}"#,
+                &next,
+                false,
+            )
+            .await?
+        {
+            MutationOutcome::Applied { .. } | MutationOutcome::Duplicate { .. } => Ok(()),
+            MutationOutcome::Conflict => Err("URL resolution lost a revision race".into()),
+        }
     }
 
     pub async fn apply_command(
@@ -875,6 +1114,26 @@ impl ControlStore {
         Ok(rows.into_iter().next().map(|row| row.accepted_at_ms))
     }
 
+    pub async fn publication_record(
+        &self,
+        receipt_id: &str,
+    ) -> Result<Option<PublicationReceipt>, String> {
+        let rows = self
+            .client
+            .query_consistent_map::<PublicationReceiptRow, _>(
+                "SELECT p.resource,p.owner_node_id,p.owner_incarnation,p.fence,
+                        p.lease_revision,p.lease_expiry_ms,p.expected_job_revision,
+                        p.result_id,p.result_ref,p.result_job_json,p.accepted_at_ms,l.kind
+                   FROM publication_receipts p
+                   JOIN work_leases l ON l.resource=p.resource
+                  WHERE p.receipt_id=$1",
+                params!(receipt_id),
+            )
+            .await
+            .map_err(|error| format!("read publication receipt: {error}"))?;
+        rows.into_iter().next().map(TryInto::try_into).transpose()
+    }
+
     pub async fn published_results(
         &self,
     ) -> Result<Vec<(String, String, nzbd_types::Job, u64, i64, String)>, String> {
@@ -930,6 +1189,60 @@ struct LeaseRow {
     expires_at_unix_ms: i64,
 }
 
+struct DurableLeaseRow {
+    resource: String,
+    job_id: i64,
+    job_incarnation: String,
+    owner_node_id: String,
+    owner_incarnation: String,
+    kind: String,
+    scope_json: String,
+    fence: i64,
+    revision: i64,
+    job_revision: i64,
+    expires_at_ms: i64,
+}
+
+impl From<&mut Row<'_>> for DurableLeaseRow {
+    fn from(row: &mut Row<'_>) -> Self {
+        Self {
+            resource: row.get("resource"),
+            job_id: row.get("job_id"),
+            job_incarnation: row.get("job_incarnation"),
+            owner_node_id: row.get("owner_node_id"),
+            owner_incarnation: row.get("owner_incarnation"),
+            kind: row.get("kind"),
+            scope_json: row.get("scope_json"),
+            fence: row.get("fence"),
+            revision: row.get("revision"),
+            job_revision: row.get("job_revision"),
+            expires_at_ms: row.get("expires_at_ms"),
+        }
+    }
+}
+
+impl TryFrom<DurableLeaseRow> for DurableLease {
+    type Error = String;
+    fn try_from(row: DurableLeaseRow) -> Result<Self, Self::Error> {
+        Ok(Self {
+            token: LeaseToken {
+                resource: row.resource,
+                owner_node_id: row.owner_node_id.clone(),
+                owner_incarnation: row.owner_incarnation,
+                fence: u64::try_from(row.fence).map_err(|error| error.to_string())?,
+                revision: u64::try_from(row.revision).map_err(|error| error.to_string())?,
+                expires_at_unix_ms: row.expires_at_ms,
+            },
+            job_id: u64::try_from(row.job_id).map_err(|error| error.to_string())?,
+            job_incarnation: row.job_incarnation,
+            owner_node_id: row.owner_node_id,
+            kind: row.kind,
+            scope_json: row.scope_json,
+            job_revision: u64::try_from(row.job_revision).map_err(|error| error.to_string())?,
+        })
+    }
+}
+
 impl From<&mut Row<'_>> for LeaseRow {
     fn from(row: &mut Row<'_>) -> Self {
         Self {
@@ -970,6 +1283,58 @@ struct PublishedResultRow {
     fence: i64,
     accepted_at_ms: i64,
     kind: String,
+}
+struct PublicationReceiptRow {
+    resource: String,
+    owner_node_id: String,
+    owner_incarnation: String,
+    fence: i64,
+    lease_revision: i64,
+    lease_expiry_ms: i64,
+    expected_job_revision: i64,
+    result_id: String,
+    result_ref: String,
+    result_job_json: String,
+    accepted_at_ms: i64,
+    kind: String,
+}
+impl From<&mut Row<'_>> for PublicationReceiptRow {
+    fn from(row: &mut Row<'_>) -> Self {
+        Self {
+            resource: row.get("resource"),
+            owner_node_id: row.get("owner_node_id"),
+            owner_incarnation: row.get("owner_incarnation"),
+            fence: row.get("fence"),
+            lease_revision: row.get("lease_revision"),
+            lease_expiry_ms: row.get("lease_expiry_ms"),
+            expected_job_revision: row.get("expected_job_revision"),
+            result_id: row.get("result_id"),
+            result_ref: row.get("result_ref"),
+            result_job_json: row.get("result_job_json"),
+            accepted_at_ms: row.get("accepted_at_ms"),
+            kind: row.get("kind"),
+        }
+    }
+}
+impl TryFrom<PublicationReceiptRow> for PublicationReceipt {
+    type Error = String;
+    fn try_from(row: PublicationReceiptRow) -> Result<Self, Self::Error> {
+        Ok(Self {
+            resource: row.resource,
+            owner_node_id: row.owner_node_id,
+            owner_incarnation: row.owner_incarnation,
+            fence: u64::try_from(row.fence).map_err(|error| error.to_string())?,
+            lease_revision: u64::try_from(row.lease_revision).map_err(|error| error.to_string())?,
+            lease_expiry_ms: row.lease_expiry_ms,
+            expected_job_revision: u64::try_from(row.expected_job_revision)
+                .map_err(|error| error.to_string())?,
+            result_id: row.result_id,
+            result_ref: row.result_ref,
+            result_job_json: row.result_job_json,
+            accepted_at_ms: row.accepted_at_ms,
+            kind: row.kind,
+        })
+    }
 }
 impl From<&mut Row<'_>> for PublishedResultRow {
     fn from(row: &mut Row<'_>) -> Self {

@@ -215,6 +215,10 @@ pub struct PpCtx {
     /// result receipt is accepted by the authority.
     pub publish_history: bool,
     pub script_receipt: Option<ScriptReceiptHook>,
+    /// Cluster execution identity exposed to operator scripts.
+    pub extra_env: Vec<(String, String)>,
+    /// Prefix used to derive the exact per-script durable receipt id.
+    pub script_receipt_prefix: Option<String>,
 }
 
 impl Default for PpCtx {
@@ -224,6 +228,8 @@ impl Default for PpCtx {
             commit_ok: Arc::new(|| true),
             publish_history: true,
             script_receipt: None,
+            extra_env: Vec::new(),
+            script_receipt_prefix: None,
         }
     }
 }
@@ -1566,12 +1572,22 @@ async fn process_job_ctx_from(
             let host = ScriptHost {
                 timeout: cfg.script_timeout,
             };
-            let env = script_env(&job, &dir, par_ok, par_did_repair, unpack_ok, unpacked_any);
+            let base_env = script_env(&job, &dir, par_ok, par_did_repair, unpack_ok, unpacked_any);
             for script in scripts {
                 let script_name = script
                     .file_name()
                     .map(|name| name.to_string_lossy().into_owned())
                     .unwrap_or_else(|| script.to_string_lossy().into_owned());
+                let mut env = base_env.clone();
+                env.extend(ctx.extra_env.clone());
+                if let Some(prefix) = &ctx.script_receipt_prefix {
+                    use sha2::{Digest, Sha256};
+                    let script_key = format!("{:x}", Sha256::digest(script_name.as_bytes()));
+                    env.push((
+                        "NZBCLUSTER_SCRIPT_RECEIPT".into(),
+                        format!("{prefix}{script_key}"),
+                    ));
+                }
                 if let Some(receipt) = &ctx.script_receipt {
                     match receipt(ScriptReceiptAction::Begin {
                         script: script_name.clone(),
