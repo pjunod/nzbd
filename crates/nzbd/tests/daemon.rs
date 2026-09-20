@@ -17,6 +17,19 @@ fn http(addr: &str, method: &str, path: &str, body: &[u8]) -> (u16, String) {
         .unwrap_or_else(|| panic!("http {method} {path} against {addr} failed"))
 }
 
+fn http_nzb(addr: &str, path: &str, body: &[u8]) -> (u16, String) {
+    request(
+        addr,
+        "POST",
+        path,
+        body,
+        "application/x-nzb",
+        None,
+        Duration::from_secs(10),
+    )
+    .unwrap_or_else(|| panic!("NZB upload to {path} against {addr} failed"))
+}
+
 /// A daemon mid-restart legitimately RESETs in-flight connections while
 /// its listener bounces — this poller must treat any socket error as "not
 /// yet", not panic (it flaked exactly that way: connect landed on the
@@ -61,7 +74,7 @@ fn probe(addr: &str, path: &str) -> Option<(u16, String)> {
 /// A probe under a caller-chosen bound, so a poller can shrink the last
 /// attempt to whatever is left of its own budget.
 fn probe_within(addr: &str, path: &str, budget: Duration) -> Option<(u16, String)> {
-    request(addr, "GET", path, b"", None, budget)
+    request(addr, "GET", path, b"", "application/json", None, budget)
 }
 
 /// Bound on a single readiness probe (connect and read alike).
@@ -297,7 +310,15 @@ fn try_http(
     body: &[u8],
     basic: Option<&str>,
 ) -> Option<(u16, String)> {
-    request(addr, method, path, body, basic, Duration::from_secs(10))
+    request(
+        addr,
+        method,
+        path,
+        body,
+        "application/json",
+        basic,
+        Duration::from_secs(10),
+    )
 }
 
 /// Time left before `deadline`, or `None` once it is gone. A socket timeout
@@ -350,6 +371,7 @@ fn request(
     method: &str,
     path: &str,
     body: &[u8],
+    content_type: &str,
     basic: Option<&str>,
     timeout: Duration,
 ) -> Option<(u16, String)> {
@@ -366,7 +388,7 @@ fn request(
         })
         .unwrap_or_default();
     let req = format!(
-        "{method} {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Length: {}\r\nContent-Type: application/json\r\n{auth}Connection: close\r\n\r\n",
+        "{method} {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Length: {}\r\nContent-Type: {content_type}\r\n{auth}Connection: close\r\n\r\n",
         body.len()
     );
     write_all_by(&mut sock, req.as_bytes(), deadline)?;
@@ -1048,13 +1070,8 @@ scripts_dir = "{scripts}"
     wait_healthy(&daemon, &api_addr, Duration::from_secs(15))
         .unwrap_or_else(|cause| panic!("{cause}"));
 
-    let (code, _) = http(
-        &api_addr,
-        "POST",
-        "/api/v1/jobs?name=ppjob",
-        post.nzb.as_bytes(),
-    );
-    assert_eq!(code, 201);
+    let (code, body) = http_nzb(&api_addr, "/api/v1/jobs?name=ppjob", post.nzb.as_bytes());
+    assert_eq!(code, 201, "{body}");
 
     // Wait for the download to finish and PP to reach the sleeping script.
     let start = Instant::now();
@@ -1807,9 +1824,8 @@ bind = "{api_addr}"
     wait_healthy(&daemon, &api_addr, Duration::from_secs(15))
         .unwrap_or_else(|cause| panic!("{cause}"));
 
-    let (code, body) = http(
+    let (code, body) = http_nzb(
         &api_addr,
-        "POST",
         "/api/v1/jobs?name=park%20me&category=tv&paused=true",
         post.nzb.as_bytes(),
     );

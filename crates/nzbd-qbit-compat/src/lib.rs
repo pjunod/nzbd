@@ -378,7 +378,7 @@ async fn torrent_info(
             "name": job.name,
             "size": torrent.selected_bytes,
             "progress": progress.clamp(0.0, 1.0),
-            "eta": if summary.rate_bps > 0 { summary.remaining_bytes / summary.rate_bps } else { 8640000 },
+            "eta": summary.remaining_bytes.checked_div(summary.rate_bps).unwrap_or(8640000),
             "state": qbit_state(torrent.phase, summary.useful_peers, summary.upload_rate_bps),
             "category": job.category.unwrap_or_default(),
             "save_path": save_path,

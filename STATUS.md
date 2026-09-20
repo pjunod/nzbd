@@ -1,9 +1,9 @@
 # nzbd — Project Status
 
-## Settings save repair — 2026-09-20
+## Settings save and CI repair — 2026-09-20
 
-**Status:** ready to merge; adversarial review addressed and fast lane green.
-Merge is blocked by the required full-suite check; exception decision pending.
+**Status:** implementation complete; adversarial review approved and local
+checks green. The PR below records the required CI result and merge state.
 **PR:** [#224](https://github.com/pjunod/nzbd/pull/224).
 
 - Fixed the API response so default BitTorrent values are present when the
@@ -22,14 +22,25 @@ Merge is blocked by the required full-suite check; exception decision pending.
 - No new release gate or automatic restart is introduced. The Dev-tab
   preference is recorded for feature work; this PR repairs existing behavior.
 - Main requires the full `unit + e2e` check. Branch protection stays intact
-  unless the user explicitly authorizes an exception. The PR's automatic run
-  fails the same three daemon tests as the preceding main run:
+  without a bypass. The initial PR run failed the same three daemon tests as
+  the preceding main run:
   `delete_parks_the_job_and_requeue_brings_it_back`,
   `permission_denied_state_dir_suggests_the_fix`, and
   `restart_completes_while_post_processing_runs`.
   Evidence: [PR job](https://github.com/pjunod/nzbd/actions/runs/35479476603/job/105994545460)
   and [main run](https://github.com/pjunod/nzbd/actions/runs/35476537458).
-  These remain assigned to the user's separate full-suite repair process.
+  Repairs now included in this PR: raw NZB test uploads use
+  `application/x-nzb`; history-directory errors retain the path and permission
+  repair hint. The failing assertions remain in place.
+- Replaced manual ETA division with `checked_div` to satisfy the current
+  Clippy lint while retaining the zero-rate fallback.
+- The repair batch received adversarial approval with no findings. Final
+  local checks passed: 20 daemon integration tests, 22 binary unit tests, the
+  settings regression, UI harnesses (525 DOM assertions), formatting, and
+  workspace Clippy. GitHub runs the required full workspace suite before merge.
+- The pre-existing RustSec check separately reports `RUSTSEC-2026-0285` in
+  rustls 0.23.42. Dependency remediation is outside this test-repair batch; no
+  advisory exception or suppression was added.
 
 The explicit ledger of what this project intends to do and whether it is
 done. **Update this file in every feature commit.** Derived from the
