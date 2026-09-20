@@ -34,9 +34,19 @@ fn ui_renderer_obeys_the_rendering_laws() {
     let ui = manifest.join("../nzbd-api/ui/index.html");
     assert!(ui.exists(), "embedded UI missing at {}", ui.display());
 
+    // Drive every rendered setting using the actual server schema, then
+    // deserialize the submitted payload. A stale alias in one unrelated
+    // field must not silently break every Save changes click.
+    let mut cfg = nzbd_config::Config::default();
+    cfg.post.failure_action = "park".into();
+    let mut model = serde_json::to_value(&cfg).unwrap();
+    model["torrent"] = serde_json::to_value(&cfg.torrent).unwrap();
+    let submitted = tempfile::NamedTempFile::new().unwrap();
     let out = Command::new("node")
         .arg(&harness)
         .arg(&ui)
+        .env("NZBD_UI_CONFIG", model.to_string())
+        .env("NZBD_UI_SAVED_CONFIG_PATH", submitted.path())
         .output()
         .expect("run node harness");
     assert!(
@@ -44,5 +54,13 @@ fn ui_renderer_obeys_the_rendering_laws() {
         "UI DOM harness failed:\n--- stdout ---\n{}\n--- stderr ---\n{}",
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr),
+    );
+    let saved: nzbd_config::Config =
+        serde_json::from_slice(&std::fs::read(submitted.path()).unwrap())
+            .expect("the complete settings form must submit a valid Config");
+    cfg.torrent.enabled = true;
+    assert_eq!(
+        saved, cfg,
+        "enabling BitTorrent must preserve all other settings"
     );
 }
