@@ -3080,7 +3080,7 @@ impl Owner {
             guards_ms = guards_ms.saturating_add(t.elapsed().as_millis() as u64);
         }
         let mut volumes_ms = 0u64;
-        if self.guard_tick % 30 == 0 {
+        if self.guard_tick.is_multiple_of(30) {
             let t = Instant::now();
             self.volumes.save_if_dirty();
             volumes_ms = t.elapsed().as_millis() as u64;

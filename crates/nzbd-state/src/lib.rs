@@ -1121,7 +1121,7 @@ mod tests {
             message_id: format!("part{n}of9999.deadbeefcafebabe{n:08x}@news.example.org").into(),
             number: n,
             size: 750_000,
-            state: if n % 3 == 0 {
+            state: if n.is_multiple_of(3) {
                 SegmentState::Done {
                     offset: n as u64 * 750_000,
                     len: 750_000,
@@ -1136,7 +1136,7 @@ mod tests {
             subject: format!("a file {fid}"),
             filename: format!("linux-{fid:04}.r{:02}", fid % 100),
             filename_confirmed: true,
-            is_par2: fid % 7 == 0,
+            is_par2: fid.is_multiple_of(7),
             paused: false,
             groups: vec!["alt.binaries.example".into()],
             date: Some(1_753_000_000),
