@@ -66,6 +66,39 @@ fn shipped_compose_files_mount_the_config_writable() {
     }
 }
 
+/// Every dev service that uses the checkout-only image must declare how to
+/// build it.
+///
+/// Regression (2026-09-19): the DNS-SD companion referenced `nzbd:dev` but
+/// only the main service had a `build:` entry. Compose resolves images before
+/// startup dependencies, so a clean host tried to pull `nzbd:dev` from a
+/// registry while building that same tag for the main service and failed with
+/// `pull access denied for nzbd`.
+#[test]
+fn dev_discovery_builds_the_local_image() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let path = root.join("dev/docker-compose.yml");
+    let text =
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    let discovery = text
+        .split_once("\n  nzbd-discovery:\n")
+        .map(|(_, service)| service)
+        .expect("dev compose defines nzbd-discovery");
+    let discovery = discovery
+        .lines()
+        .take_while(|line| line.trim().is_empty() || line.starts_with("    "))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(
+        discovery
+            .lines()
+            .any(|line| line.trim_start().starts_with("build:")),
+        "dev nzbd-discovery uses the local nzbd:dev image, so it must carry a \
+         build definition; otherwise Compose tries to pull that tag from a registry"
+    );
+}
+
 /// The image must name its data volume, or boot-time config recovery is
 /// blind.
 ///
