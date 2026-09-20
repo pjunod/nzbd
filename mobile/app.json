@@ -38,6 +38,7 @@
       "predictiveBackGestureEnabled": false
     },
     "plugins": [
+      "./plugins/withIosSceneLifecycle",
       "expo-document-picker",
       [
         "expo-secure-store",
