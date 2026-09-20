@@ -4169,7 +4169,7 @@ async function loadSettings(force) {
   if (!r.ok) {
     $("cfg-meta").textContent = r.status === 401
       ? "authentication required" : "settings unavailable (" + r.status + ")";
-    return;
+    return false;
   }
   const c = await r.json();
   cfgInfo = c; cfgModel = c.config; cfgLoaded = true; cfgDirty = false;
@@ -4187,6 +4187,7 @@ async function loadSettings(force) {
     $("cfg-form").querySelectorAll("input,select,button").forEach(el => { el.disabled = true; });
   }
   $("cfg-msg").textContent = ""; $("cfg-msg").className = "";
+  return true;
 }
 
 async function saveSettings(body, contentType) {
@@ -4206,29 +4207,41 @@ async function saveSettings(body, contentType) {
 }
 
 $("cfg-save").onclick = async () => {
-  const res = await saveSettings(JSON.stringify(collectSettingsForm()), "application/json");
+  let body;
+  try {
+    body = JSON.stringify(collectSettingsForm());
+  } catch (e) {
+    $("cfg-msg").className = "err";
+    $("cfg-msg").textContent = "Could not read settings: " + e.message;
+    return;
+  }
+  const res = await saveSettings(body, "application/json");
   if (!res) return;
+  const reloaded = await loadSettings(true).catch(() => false);
   const msg = $("cfg-msg");
   // A connection count raised above the sockets that exist is saved but
   // not in force. Saying "applied immediately" and leaving it there would
   // be the settings page telling a comfortable lie.
   const notes = res.connection_notes || [];
-  msg.className = notes.length ? "warn" : "ok";
+  msg.className = notes.length || !reloaded ? "warn" : "ok";
   msg.textContent = (res.applied_live.length
     ? "saved — applied immediately: " + res.applied_live.join(", ")
-    : "saved") + (notes.length ? " · " + notes.join("; ") : "");
+    : "saved") + (notes.length ? " · " + notes.join("; ") : "") +
+    (reloaded ? "" : " · could not reload settings; refresh the page");
   showRestartBanner(res.restart_required);
   cfgDirty = false; $("cfg-save").disabled = true;
-  await loadSettings(true);
   if (res.applied_live.length) refreshAll();
 };
 $("cfg-discard").onclick = () => loadSettings(true);
 $("adv-save").onclick = async () => {
   const res = await saveSettings($("adv-toml").value, "text/plain");
   if (!res) return;
-  $("cfg-msg").className = "ok"; $("cfg-msg").textContent = "TOML saved";
+  const reloaded = await loadSettings(true).catch(() => false);
+  $("cfg-msg").className = reloaded ? "ok" : "warn";
+  $("cfg-msg").textContent = "TOML saved" +
+    (reloaded ? "" : " · could not reload settings; refresh the page");
   showRestartBanner(res.restart_required);
-  await loadSettings(true);
+  cfgDirty = false; $("cfg-save").disabled = true;
 };
 // A download named nzbd.toml is a file people put back. When the text
 // still carries SECRET_MASK it is NOT that file, and shipping it under

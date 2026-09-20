@@ -2232,13 +2232,18 @@ async fn get_config(State(st): State<ApiState>) -> Response {
         let cur = h.current.lock().unwrap();
         nzbd_config::mask_secrets(&cur)
     };
+    // Config omits a default torrent section to keep existing TOML files
+    // unchanged. The form needs the complete section (including defaults)
+    // to render valid values and collect edits when first enabling it.
+    let mut config = json!(masked);
+    config["torrent"] = json!(masked.torrent);
     let pending: Vec<&str> = h.pending_restart.lock().unwrap().iter().copied().collect();
     match nzbd_config::to_toml(&masked) {
         Ok(toml) => Json(json!({
             "path": h.config_path.as_ref().map(|p| p.display().to_string()),
             "writable": h.writable,
             "toml": toml,
-            "config": masked,
+            "config": config,
             "mask": nzbd_config::SECRET_MASK,
             "pending_restart": pending,
         }))
@@ -3852,6 +3857,69 @@ mod tests {
             assert!(row["name"].is_string(), "each row is named: {row}");
             assert!(row["rate_bps"].is_number(), "…and carries a rate: {row}");
         }
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn settings_can_enable_default_torrent_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = test_engine(&tmp).await;
+        let path = tmp.path().join("nzbd.toml");
+        let mut cfg = nzbd_config::Config::default();
+        cfg.paths.main_dir = tmp.path().join("data");
+        let initial = nzbd_config::to_toml(&cfg).unwrap();
+        assert!(!initial.contains("[torrent]"));
+        std::fs::write(&path, initial).unwrap();
+        let app = router_with(ApiState {
+            engine: engine.clone(),
+            torrent: None,
+            history: None,
+            log: None,
+            setup: Some(Arc::new(SetupHandle::for_running(
+                Some(path.clone()),
+                "127.0.0.1:0".into(),
+                cfg.clone(),
+            ))),
+            clients: None,
+            shutdown: None,
+            pp_stats: None,
+            pp_manager: None,
+            events: None,
+        });
+        let get = || {
+            axum::http::Request::get("/api/v1/config")
+                .body(axum::body::Body::empty())
+                .unwrap()
+        };
+        let response = app.clone().oneshot(get()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut settings = body_json(response).await;
+        assert_eq!(settings["config"]["torrent"], json!(cfg.torrent));
+        assert!(!settings["toml"].as_str().unwrap().contains("[torrent]"));
+
+        settings["config"]["torrent"]["enabled"] = json!(true);
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::put("/api/v1/config")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(settings["config"].to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let saved = body_json(response).await;
+        assert!(saved["restart_required"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("torrent")));
+        let persisted =
+            nzbd_config::Config::from_toml(&std::fs::read_to_string(path).unwrap()).unwrap();
+        cfg.torrent.enabled = true;
+        assert_eq!(persisted, cfg);
+        let reloaded = body_json(app.oneshot(get()).await.unwrap()).await;
+        assert_eq!(reloaded["config"]["torrent"], json!(cfg.torrent));
         engine.shutdown().await;
     }
 
