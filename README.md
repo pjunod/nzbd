@@ -147,7 +147,7 @@ config), [`kubernetes/`](examples/kubernetes/) (full manifest set) and
 
 Three GitHub Actions workflows gate every push/PR — **Tests** (unit +
 engine e2e + multi-node cluster tests + the whole-daemon test, plus an
-MSRV 1.85 check), **Lint** (`cargo fmt --check`, `clippy -D warnings`),
+MSRV 1.95 check), **Lint** (`cargo fmt --check`, `clippy -D warnings`),
 and **Coverage** (`cargo llvm-cov`, self-hosted badges). Coverage runs every
 workspace test target even after a failure, then fails the job before reports
 or badges can be published unless the whole instrumented suite passed. It also

@@ -16,6 +16,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tokio::sync::watch;
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
@@ -23,6 +24,12 @@ use tokio_util::task::TaskTracker;
 pub struct LeaseState {
     pub job: JobId,
     pub kind: LeaseKind,
+    pub token: crate::control::LeaseToken,
+    pub job_incarnation: String,
+    pub job_revision: u64,
+    pub control_revision: u64,
+    /// Conservative process-local deadline. Failed HTTP calls never move it.
+    pub deadline: Instant,
     /// PP leases only: the pipeline finished locally; the stamped job is
     /// ready to hand to the leader.
     pub pp_ready: bool,
@@ -41,12 +48,23 @@ pub fn spawn_worker(
     active: ActiveLeases,
     pp: Option<PpSetup>,
     dest_dir: PathBuf,
+    owner_incarnation: String,
     cancel: CancellationToken,
     tracker: &TaskTracker,
 ) {
     let t2 = tracker.clone();
     tracker.spawn(worker_task(
-        cfg, servers, engine, view, client, active, pp, dest_dir, cancel, t2,
+        cfg,
+        servers,
+        engine,
+        view,
+        client,
+        active,
+        pp,
+        dest_dir,
+        owner_incarnation,
+        cancel,
+        t2,
     ));
 }
 
@@ -60,6 +78,7 @@ async fn worker_task(
     active: ActiveLeases,
     pp: Option<PpSetup>,
     dest_dir: PathBuf,
+    owner_incarnation: String,
     cancel: CancellationToken,
     tracker: TaskTracker,
 ) {
@@ -69,15 +88,26 @@ async fn worker_task(
         }
         let v = view.borrow().clone();
 
+        expire_local_leases(&engine, &active).await;
+
         if v.is_me {
             // We are the leader: granted leases dissolve into local jobs
             // (adopt_authority kept them); the scheduler takes over.
             active.lock().unwrap().clear();
         } else if let Some(url) = v.leader_url().map(|s| s.to_string()) {
             heartbeat_and_cancel(&cfg, &servers, &engine, &client, &active, &url).await;
-            report_completions(&cfg, &engine, &client, &active, &url).await;
+            report_completions(&cfg, &engine, &client, &active, &url, &dest_dir).await;
             poll_for_work(
-                &cfg, &servers, &engine, &client, &active, &pp, &dest_dir, &tracker, &url,
+                &cfg,
+                &servers,
+                &engine,
+                &client,
+                &active,
+                &pp,
+                &dest_dir,
+                &tracker,
+                &url,
+                &owner_incarnation,
             )
             .await;
         }
@@ -120,6 +150,7 @@ async fn heartbeat_and_cancel(
         .iter()
         .map(|(id, st)| LeaseProgress {
             lease_id: id.clone(),
+            token: st.token.clone(),
             job: st.job,
             stats: progress_of(engine, st.job),
         })
@@ -137,6 +168,23 @@ async fn heartbeat_and_cancel(
     {
         Ok(resp) => {
             let post_fetch_budgeted = resp.post_fetch_budgeted;
+            let renewed_by_resource: HashMap<_, _> = resp
+                .renewed
+                .into_iter()
+                .map(|token| (token.resource.clone(), token))
+                .collect();
+            {
+                let mut leases = active.lock().unwrap();
+                for (lease_id, state) in leases.iter_mut() {
+                    if let Some(next) = renewed_by_resource.get(&state.token.resource) {
+                        state.token = next.clone();
+                        state.deadline = conservative_deadline(cfg);
+                    }
+                    if let Some(revision) = resp.controls.get(lease_id) {
+                        state.control_revision = *revision;
+                    }
+                }
+            }
             for lease_id in resp.cancel {
                 let st = active.lock().unwrap().remove(&lease_id);
                 if let Some(st) = st {
@@ -171,9 +219,10 @@ async fn report_completions(
     client: &ClusterClient,
     active: &ActiveLeases,
     leader_url: &str,
+    dest_dir: &std::path::Path,
 ) {
     let snapshot = engine.snapshot();
-    let finished: Vec<(String, JobId)> = active
+    let finished: Vec<(String, LeaseState)> = active
         .lock()
         .unwrap()
         .iter()
@@ -184,17 +233,35 @@ async fn report_completions(
             // A PP job arrives already Completed — only hand it back once
             // the pipeline stamped it.
             LeaseKind::Post => st.pp_ready,
+            LeaseKind::Segment | LeaseKind::Assemble => false,
         })
-        .map(|(id, st)| (id.clone(), st.job))
+        .map(|(id, st)| (id.clone(), st.clone()))
         .collect();
 
-    for (lease_id, job_id) in finished {
+    for (lease_id, lease) in finished {
+        let job_id = lease.job;
         let Ok(Some(job)) = engine.export_job(job_id).await else {
             continue;
         };
+        let sealed = match seal_generation(cfg, dest_dir, &job, &lease).await {
+            Ok(sealed) => sealed,
+            Err(error) => {
+                tracing::warn!(job = job_id.0, %error, "completion generation could not be sealed");
+                continue;
+            }
+        };
+        let receipt_id = format!(
+            "complete:{}:{}:{}",
+            lease.token.resource, lease.token.fence, sealed.result_id
+        );
         let req = CompleteRequest {
             node: cfg.node_name.clone(),
             lease_id: lease_id.clone(),
+            token: lease.token.clone(),
+            expected_job_revision: lease.job_revision,
+            result_id: sealed.result_id,
+            result_ref: sealed.path.to_string_lossy().into_owned(),
+            receipt_id,
             job,
         };
         match client
@@ -225,6 +292,7 @@ async fn poll_for_work(
     dest_dir: &std::path::Path,
     tracker: &TaskTracker,
     leader_url: &str,
+    owner_incarnation: &str,
 ) {
     let disk_low = engine.snapshot().disk_low;
     let (dl_held, pp_held) = {
@@ -249,6 +317,7 @@ async fn poll_for_work(
     }
     let req = PollRequest {
         node: cfg.node_name.clone(),
+        owner_incarnation: owner_incarnation.to_owned(),
         free_download_slots: free_dl,
         free_pp_slots: free_pp,
     };
@@ -265,7 +334,7 @@ async fn poll_for_work(
     for grant in resp.grants {
         let job_id = grant.job.id;
         if engine.snapshot().disk_low {
-            reject_remote_grant(cfg, client, leader_url, &grant.lease_id).await;
+            reject_remote_grant(cfg, client, leader_url, &grant.lease_id, &grant.token).await;
             continue;
         }
         match grant.kind {
@@ -276,7 +345,8 @@ async fn poll_for_work(
                 if engine.import_job(grant.job, true, false).await.is_ok() {
                     if engine.snapshot().disk_low {
                         let _ = engine.remove_job_silent(job_id).await;
-                        reject_remote_grant(cfg, client, leader_url, &grant.lease_id).await;
+                        reject_remote_grant(cfg, client, leader_url, &grant.lease_id, &grant.token)
+                            .await;
                         continue;
                     }
                     active.lock().unwrap().insert(
@@ -284,6 +354,11 @@ async fn poll_for_work(
                         LeaseState {
                             job: job_id,
                             kind: LeaseKind::Download,
+                            token: grant.token,
+                            job_incarnation: grant.job_incarnation,
+                            job_revision: grant.job_revision,
+                            control_revision: grant.control_revision,
+                            deadline: conservative_deadline(cfg),
                             pp_ready: false,
                         },
                     );
@@ -309,7 +384,8 @@ async fn poll_for_work(
                 if engine.import_job(grant.job, false, false).await.is_ok() {
                     if engine.snapshot().disk_low {
                         let _ = engine.remove_job_silent(job_id).await;
-                        reject_remote_grant(cfg, client, leader_url, &grant.lease_id).await;
+                        reject_remote_grant(cfg, client, leader_url, &grant.lease_id, &grant.token)
+                            .await;
                         continue;
                     }
                     active.lock().unwrap().insert(
@@ -317,6 +393,11 @@ async fn poll_for_work(
                         LeaseState {
                             job: job_id,
                             kind: LeaseKind::Post,
+                            token: grant.token.clone(),
+                            job_incarnation: grant.job_incarnation,
+                            job_revision: grant.job_revision,
+                            control_revision: grant.control_revision,
+                            deadline: conservative_deadline(cfg),
                             pp_ready: false,
                         },
                     );
@@ -334,6 +415,10 @@ async fn poll_for_work(
                     );
                 }
             }
+            LeaseKind::Segment | LeaseKind::Assemble => {
+                tracing::warn!(job = job_id.0, lease = %grant.lease_id, "range grant received by a whole-job-only executor");
+                reject_remote_grant(cfg, client, leader_url, &grant.lease_id, &grant.token).await;
+            }
         }
     }
 }
@@ -343,10 +428,12 @@ async fn reject_remote_grant(
     client: &ClusterClient,
     leader_url: &str,
     lease_id: &str,
+    token: &crate::control::LeaseToken,
 ) {
     let req = RejectRequest {
         node: cfg.node_name.clone(),
         lease_id: lease_id.to_string(),
+        token: token.clone(),
     };
     match client
         .post_json::<_, RejectResponse>(leader_url, "/cluster/v1/work/reject", &req)
@@ -381,12 +468,16 @@ fn run_pp_lease(
     leader_url: String,
 ) {
     tracker.spawn(async move {
+        let Some(initial) = active.lock().unwrap().get(&lease_id).cloned() else {
+            return;
+        };
         if engine.snapshot().disk_low {
             active.lock().unwrap().remove(&lease_id);
             let _ = engine.remove_job_silent(job_id).await;
             let req = RejectRequest {
                 node,
                 lease_id: lease_id.clone(),
+                token: initial.token,
             };
             let _ = client
                 .post_json::<_, RejectResponse>(
@@ -402,7 +493,13 @@ fn run_pp_lease(
             commit_ok: Arc::new({
                 let active = active.clone();
                 let lease_id = lease_id.clone();
-                move || active.lock().unwrap().contains_key(&lease_id)
+                move || {
+                    active
+                        .lock()
+                        .unwrap()
+                        .get(&lease_id)
+                        .is_some_and(|state| state.deadline > Instant::now())
+                }
             }),
         };
         match process_job_ctx(&engine, &setup.post, &setup.history, &dest_dir, job_id, &ctx).await {
@@ -421,6 +518,232 @@ fn run_pp_lease(
             }
         }
     });
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct GenerationManifest {
+    job_id: u32,
+    job_incarnation: String,
+    fence: u64,
+    result_id: String,
+    files: Vec<GenerationFile>,
+    total_bytes: u64,
+    sealed_at_unix_ms: i64,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct GenerationFile {
+    path: String,
+    bytes: u64,
+    sha256: String,
+}
+
+struct SealedGeneration {
+    result_id: String,
+    path: PathBuf,
+}
+
+async fn seal_generation(
+    cfg: &ClusterConfig,
+    dest_dir: &std::path::Path,
+    job: &nzbd_types::Job,
+    lease: &LeaseState,
+) -> Result<SealedGeneration, String> {
+    let cfg = cfg.clone();
+    let dest_dir = dest_dir.to_path_buf();
+    let job = job.clone();
+    let lease = lease.clone();
+    tokio::task::spawn_blocking(move || {
+        let root = cfg
+            .shared_dir
+            .join(".nzbd-cluster/generations")
+            .join(format!("job-{}", job.id.0));
+        let final_dir = root.join(format!("fence-{}", lease.token.fence));
+        let manifest_path = final_dir.join("manifest.json");
+        if manifest_path.exists() {
+            let manifest: GenerationManifest = serde_json::from_slice(
+                &std::fs::read(&manifest_path)
+                    .map_err(|error| format!("read sealed manifest: {error}"))?,
+            )
+            .map_err(|error| format!("decode sealed manifest: {error}"))?;
+            return Ok(SealedGeneration {
+                result_id: manifest.result_id,
+                path: final_dir,
+            });
+        }
+
+        std::fs::create_dir_all(&root)
+            .map_err(|error| format!("create generation root: {error}"))?;
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let building = root.join(format!(
+            ".building-{}-{}-{nonce}",
+            cfg.node_name,
+            std::process::id()
+        ));
+        std::fs::create_dir(&building)
+            .map_err(|error| format!("create private generation: {error}"))?;
+        let files_root = building.join("files");
+        std::fs::create_dir(&files_root)
+            .map_err(|error| format!("create private generation files: {error}"))?;
+
+        let source = dest_dir.join(nzbd_engine::queue::job_dir_name(&job));
+        let copy_limit = job
+            .totals
+            .size
+            .saturating_mul(2)
+            .saturating_add(64 * 1024 * 1024);
+        let mut files = Vec::new();
+        let mut total = 0u64;
+        if source.exists() {
+            copy_generation_tree(
+                &source,
+                &files_root,
+                std::path::Path::new(""),
+                copy_limit,
+                &mut total,
+                &mut files,
+            )?;
+        } else if !matches!(job.status, JobStatus::Failed | JobStatus::Deleted) {
+            return Err(format!(
+                "completed output directory {} is missing",
+                source.display()
+            ));
+        }
+        files.sort_by(|left, right| left.path.cmp(&right.path));
+        let identity =
+            serde_json::to_vec(&(job.id.0, &lease.job_incarnation, lease.token.fence, &files))
+                .map_err(|error| format!("encode generation identity: {error}"))?;
+        use sha2::{Digest, Sha256};
+        let result_id = format!("sha256:{:x}", Sha256::digest(identity));
+        let manifest = GenerationManifest {
+            job_id: job.id.0,
+            job_incarnation: lease.job_incarnation,
+            fence: lease.token.fence,
+            result_id: result_id.clone(),
+            files,
+            total_bytes: total,
+            sealed_at_unix_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis()
+                .try_into()
+                .unwrap_or(i64::MAX),
+        };
+        let manifest_tmp = building.join("manifest.json.tmp");
+        let manifest_bytes = serde_json::to_vec_pretty(&manifest)
+            .map_err(|error| format!("encode generation manifest: {error}"))?;
+        std::fs::write(&manifest_tmp, manifest_bytes)
+            .map_err(|error| format!("write generation manifest: {error}"))?;
+        std::fs::File::open(&manifest_tmp)
+            .and_then(|file| file.sync_all())
+            .map_err(|error| format!("flush generation manifest: {error}"))?;
+        std::fs::rename(&manifest_tmp, building.join("manifest.json"))
+            .map_err(|error| format!("seal generation manifest: {error}"))?;
+        match std::fs::rename(&building, &final_dir) {
+            Ok(()) => {}
+            Err(error) if final_dir.join("manifest.json").exists() => {
+                std::fs::remove_dir_all(&building).map_err(|cleanup| {
+                    format!("generation race cleanup failed after {error}: {cleanup}")
+                })?;
+            }
+            Err(error) => return Err(format!("publish sealed generation directory: {error}")),
+        }
+        Ok(SealedGeneration {
+            result_id,
+            path: final_dir,
+        })
+    })
+    .await
+    .map_err(|error| format!("generation sealing task failed: {error}"))?
+}
+
+fn copy_generation_tree(
+    source: &std::path::Path,
+    target: &std::path::Path,
+    relative: &std::path::Path,
+    limit: u64,
+    total: &mut u64,
+    files: &mut Vec<GenerationFile>,
+) -> Result<(), String> {
+    for entry in std::fs::read_dir(source)
+        .map_err(|error| format!("read generation source {}: {error}", source.display()))?
+    {
+        let entry = entry.map_err(|error| format!("read generation entry: {error}"))?;
+        let name = entry.file_name();
+        if name.to_string_lossy().starts_with(".pp.") {
+            continue;
+        }
+        let from = entry.path();
+        let rel = relative.join(&name);
+        let to = target.join(&name);
+        let metadata = std::fs::symlink_metadata(&from)
+            .map_err(|error| format!("stat generation input {}: {error}", from.display()))?;
+        if metadata.file_type().is_symlink() {
+            return Err(format!("generation input {} is a symlink", from.display()));
+        }
+        if metadata.is_dir() {
+            std::fs::create_dir(&to).map_err(|error| {
+                format!("create generation directory {}: {error}", to.display())
+            })?;
+            copy_generation_tree(&from, &to, &rel, limit, total, files)?;
+            continue;
+        }
+        if !metadata.is_file() {
+            continue;
+        }
+        *total = total
+            .checked_add(metadata.len())
+            .ok_or_else(|| "generation byte accounting overflowed".to_owned())?;
+        if *total > limit {
+            return Err(format!(
+                "generation copy exceeds bounded allowance of {limit} bytes"
+            ));
+        }
+        std::fs::copy(&from, &to)
+            .map_err(|error| format!("copy generation input {}: {error}", from.display()))?;
+        let bytes = std::fs::read(&to)
+            .map_err(|error| format!("hash generation file {}: {error}", to.display()))?;
+        use sha2::{Digest, Sha256};
+        files.push(GenerationFile {
+            path: rel.to_string_lossy().into_owned(),
+            bytes: metadata.len(),
+            sha256: format!("{:x}", Sha256::digest(bytes)),
+        });
+        std::fs::File::open(&to)
+            .and_then(|file| file.sync_all())
+            .map_err(|error| format!("flush generation file {}: {error}", to.display()))?;
+    }
+    Ok(())
+}
+
+fn conservative_deadline(cfg: &ClusterConfig) -> Instant {
+    Instant::now()
+        + cfg.worker_ttl.saturating_sub(
+            cfg.lease_interval
+                .max(std::time::Duration::from_millis(100)),
+        )
+}
+
+async fn expire_local_leases(engine: &EngineHandle, active: &ActiveLeases) {
+    let expired: Vec<_> = {
+        let now = Instant::now();
+        let mut leases = active.lock().unwrap();
+        let ids: Vec<_> = leases
+            .iter()
+            .filter(|(_, state)| state.deadline <= now)
+            .map(|(id, _)| id.clone())
+            .collect();
+        ids.into_iter()
+            .filter_map(|id| leases.remove(&id).map(|state| (id, state)))
+            .collect()
+    };
+    for (lease_id, state) in expired {
+        tracing::warn!(job = state.job.0, %lease_id, "local lease deadline expired; cancelling work");
+        let _ = engine.remove_job_silent(state.job).await;
+    }
 }
 
 async fn apply_budgets(
@@ -461,6 +784,17 @@ mod tests {
     use nzbd_types::{CertLevel, DupeInfo, Job, JobKind, JobTotals, PostStage, ServerId, TlsMode};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    fn test_token() -> crate::control::LeaseToken {
+        crate::control::LeaseToken {
+            resource: "transition-lease".into(),
+            owner_node_id: "worker".into(),
+            owner_incarnation: "test-incarnation".into(),
+            fence: 1,
+            revision: 1,
+            expires_at_unix_ms: i64::MAX,
+        }
+    }
+
     #[derive(Clone)]
     struct DelayedLeader {
         poll_seen: Arc<tokio::sync::Semaphore>,
@@ -475,6 +809,11 @@ mod tests {
         Json(PollResponse {
             grants: vec![Grant {
                 lease_id: "transition-lease".into(),
+                token: test_token(),
+                job_incarnation: "test-job".into(),
+                job_revision: 1,
+                control_revision: 1,
+                scope: serde_json::json!({"whole_job": true}),
                 epoch: 1,
                 kind: LeaseKind::Download,
                 job: state.job,
@@ -609,6 +948,7 @@ mod tests {
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
         let cfg = ClusterConfig {
+            cluster_id: "test".into(),
             node_name: "worker".into(),
             shared_dir: tmp.path().to_path_buf(),
             advertise_url: "http://worker.invalid".into(),
@@ -622,6 +962,13 @@ mod tests {
             lease_interval: std::time::Duration::from_secs(1),
             takeover_after: std::time::Duration::from_secs(2),
             worker_ttl: std::time::Duration::from_secs(3),
+            control_dir: tmp.path().join("control"),
+            control_node_id: 1,
+            control_raft_bind: "127.0.0.1:38112".into(),
+            control_api_bind: "127.0.0.1:38212".into(),
+            control_peers: Vec::new(),
+            download_weight: 1,
+            pp_weight: 1,
             disk_guard_roots: Vec::new(),
             torrent_payload_roots: Vec::new(),
         };
@@ -640,6 +987,7 @@ mod tests {
             &dest,
             &tracker,
             &leader_url,
+            "test-incarnation",
         );
         let transition = async {
             let _ = state.poll_seen.acquire().await.unwrap();

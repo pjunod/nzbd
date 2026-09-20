@@ -106,6 +106,7 @@ async fn start_node_with_auth(
     let url = format!("127.0.0.1:{port}");
 
     let cfg = ClusterConfig {
+        cluster_id: "e2e".into(),
         node_name: name.to_string(),
         shared_dir: shared.to_path_buf(),
         advertise_url: format!("http://{url}"),
@@ -119,6 +120,13 @@ async fn start_node_with_auth(
         lease_interval: Duration::from_millis(150),
         takeover_after: Duration::from_millis(900),
         worker_ttl: Duration::from_millis(1800),
+        control_dir: shared.join(format!("control-{name}")),
+        control_node_id: 1,
+        control_raft_bind: "127.0.0.1:38120".into(),
+        control_api_bind: "127.0.0.1:38220".into(),
+        control_peers: Vec::new(),
+        download_weight: 1,
+        pp_weight: 1,
         disk_guard_roots: vec![nzbd_engine::volumes::DiskGuardRoot {
             label: "downloads".into(),
             path: shared.join("complete"),

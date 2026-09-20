@@ -7,6 +7,7 @@
 //! windows during a race are converged in one round and made harmless by
 //! epoch fencing on every state write.
 
+use crate::control::{ControlStore, LeaseClaim, LeaseToken};
 use crate::layout::SharedLayout;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
@@ -40,6 +41,7 @@ impl LeaderView {
 
 #[derive(Debug, Clone)]
 pub struct ElectionCfg {
+    pub cluster_id: String,
     pub node: String,
     pub api_url: String,
     pub eligible: bool,
@@ -57,6 +59,125 @@ pub fn spawn_election(
     let (tx, rx) = watch::channel(LeaderView::default());
     tracker.spawn(election_task(layout, cfg, tx, cancel));
     rx
+}
+
+/// Start election with a replicated lease as the authority boundary. The
+/// shared `leader.json` is retained only as a discovery projection for
+/// worker-only nodes; winning or rewriting it grants no authority.
+pub fn spawn_replicated_election(
+    layout: SharedLayout,
+    cfg: ElectionCfg,
+    control: ControlStore,
+    owner_incarnation: String,
+    cancel: CancellationToken,
+    tracker: &TaskTracker,
+) -> watch::Receiver<LeaderView> {
+    let (tx, rx) = watch::channel(LeaderView::default());
+    tracker.spawn(replicated_election_task(
+        layout,
+        cfg,
+        control,
+        owner_incarnation,
+        tx,
+        cancel,
+    ));
+    rx
+}
+
+async fn replicated_election_task(
+    layout: SharedLayout,
+    cfg: ElectionCfg,
+    control: ControlStore,
+    owner_incarnation: String,
+    tx: watch::Sender<LeaderView>,
+    cancel: CancellationToken,
+) {
+    let resource = "cluster/leader";
+    let mut token: Option<LeaseToken> = None;
+    let mut seq = 0u64;
+    loop {
+        if cancel.is_cancelled() {
+            break;
+        }
+        if let Some(current) = token.take() {
+            match control.renew(&current, cfg.takeover_after).await {
+                Ok(Some(renewed)) => {
+                    seq = seq.saturating_add(1);
+                    let record = LeaderRecord {
+                        epoch: renewed.fence,
+                        node: cfg.node.clone(),
+                        api_url: cfg.api_url.clone(),
+                        seq,
+                    };
+                    if let Err(error) = layout.write_json(&layout.leader_file(), &record) {
+                        tracing::warn!(%error, "leader discovery projection write failed");
+                    }
+                    publish(&tx, Some(record), true);
+                    token = Some(renewed);
+                }
+                Ok(None) => {
+                    tracing::warn!("replicated leader lease was rejected; demoting");
+                    publish(&tx, projected_leader(&layout, None), false);
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "replicated leader renewal failed; demoting");
+                    publish(&tx, projected_leader(&layout, None), false);
+                }
+            }
+        } else if cfg.eligible {
+            match control
+                .acquire(
+                    resource,
+                    &cfg.cluster_id,
+                    1,
+                    "cluster-leader",
+                    &cfg.node,
+                    &owner_incarnation,
+                    "leader",
+                    "{}",
+                    1,
+                    cfg.takeover_after,
+                )
+                .await
+            {
+                Ok(LeaseClaim::Acquired(acquired)) => {
+                    seq = 1;
+                    let record = LeaderRecord {
+                        epoch: acquired.fence,
+                        node: cfg.node.clone(),
+                        api_url: cfg.api_url.clone(),
+                        seq,
+                    };
+                    if let Err(error) = layout.write_json(&layout.leader_file(), &record) {
+                        tracing::warn!(%error, "leader discovery projection write failed");
+                    }
+                    tracing::info!(epoch = acquired.fence, "took replicated office");
+                    publish(&tx, Some(record), true);
+                    token = Some(acquired);
+                }
+                Ok(LeaseClaim::Held { fence, .. }) => {
+                    publish(&tx, projected_leader(&layout, Some(fence)), false);
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "replicated leader claim failed");
+                    publish(&tx, projected_leader(&layout, None), false);
+                }
+            }
+        }
+        sleep_or_cancel(&cancel, cfg.lease_interval).await;
+    }
+    if let Some(token) = token {
+        let _ = control.release(&token).await;
+    }
+}
+
+fn projected_leader(layout: &SharedLayout, fence: Option<u64>) -> Option<LeaderRecord> {
+    let record = SharedLayout::read_json::<LeaderRecord>(&layout.leader_file())?;
+    if fence.is_none_or(|expected| expected == record.epoch) {
+        Some(record)
+    } else {
+        None
+    }
 }
 
 async fn election_task(
@@ -270,6 +391,7 @@ mod tests {
 
     fn cfg(node: &str, priority: u32) -> ElectionCfg {
         ElectionCfg {
+            cluster_id: "test".into(),
             node: node.into(),
             api_url: format!("http://{node}.test"),
             eligible: true,

@@ -866,6 +866,14 @@ impl EngineHandle {
             .map_err(EngineError::State)
     }
 
+    pub async fn adopt_replicated_authority(
+        &self,
+        jobs: Vec<nzbd_types::Job>,
+    ) -> Result<(), EngineError> {
+        self.roundtrip_unit(|reply| QueueCommand::AdoptReplicatedAuthority { jobs, reply })
+            .await
+    }
+
     /// Crash-only demotion: keep only `keep` (leases still executing),
     /// stop authority persistence.
     pub async fn retain_jobs(&self, keep: Vec<JobId>) -> Result<(), EngineError> {

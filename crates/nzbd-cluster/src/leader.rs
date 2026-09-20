@@ -3,6 +3,7 @@
 //! partitioning. Active only while this node's election view says `is_me`;
 //! handlers reject otherwise (workers re-resolve the leader and retry).
 
+use crate::control::{ControlStore, LeaseClaim, LeaseToken, MutationOutcome};
 use crate::election::LeaderView;
 use crate::http::secret_matches;
 use crate::proto::*;
@@ -28,6 +29,9 @@ struct LeaseInfo {
     job: JobId,
     node: String,
     kind: LeaseKind,
+    token: LeaseToken,
+    job_revision: u64,
+    control_revision: u64,
     last_hb: Instant,
 }
 
@@ -37,8 +41,9 @@ pub struct LeaderShared {
     pub cfg: ClusterConfig,
     pub servers: Vec<ServerDef>,
     pub view: watch::Receiver<LeaderView>,
+    pub control: Option<ControlStore>,
+    pub owner_incarnation: String,
     leases: Mutex<HashMap<String, LeaseInfo>>,
-    lease_counter: std::sync::atomic::AtomicU64,
     /// Node liveness by observed seq progression: name → (seq, last change).
     node_seen: Mutex<HashMap<String, (u64, Instant)>>,
 }
@@ -50,6 +55,8 @@ impl LeaderShared {
         cfg: ClusterConfig,
         servers: Vec<ServerDef>,
         view: watch::Receiver<LeaderView>,
+        control: Option<ControlStore>,
+        owner_incarnation: String,
     ) -> Arc<LeaderShared> {
         Arc::new(LeaderShared {
             engine,
@@ -57,8 +64,9 @@ impl LeaderShared {
             cfg,
             servers,
             view,
+            control,
+            owner_incarnation,
             leases: Mutex::new(HashMap::new()),
-            lease_counter: std::sync::atomic::AtomicU64::new(0),
             node_seen: Mutex::new(HashMap::new()),
         })
     }
@@ -69,13 +77,6 @@ impl LeaderShared {
 
     fn epoch(&self) -> u64 {
         self.view.borrow().epoch()
-    }
-
-    fn next_lease_id(&self) -> String {
-        let n = self
-            .lease_counter
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        format!("L{}-{}", self.epoch(), n)
     }
 
     /// Every remote executor that may currently use provider connections,
@@ -134,6 +135,92 @@ impl LeaderShared {
             self.servers.iter().map(|s| (s.id, 0u16)).collect()
         };
         let _ = self.engine.set_server_budgets(by_id).await;
+    }
+
+    async fn grant_job(
+        &self,
+        node: &str,
+        owner_incarnation: &str,
+        kind: LeaseKind,
+        job: nzbd_types::Job,
+        scope: serde_json::Value,
+    ) -> Option<Grant> {
+        use sha2::{Digest, Sha256};
+
+        let control = self.control.as_ref()?;
+        let intent_json = serde_json::to_string(&job).ok()?;
+        let proposed_incarnation = format!("job-{:x}", Sha256::digest(intent_json.as_bytes()));
+        if let Err(error) = control
+            .seed_job(job.id.0.into(), &proposed_incarnation, &intent_json)
+            .await
+        {
+            tracing::warn!(job = job.id.0, %error, "could not seed replicated job");
+            return None;
+        }
+        let (job_incarnation, job_revision) = match control.job_identity(job.id.0.into()).await {
+            Ok(Some(identity)) => identity,
+            Ok(None) => return None,
+            Err(error) => {
+                tracing::warn!(job = job.id.0, %error, "could not read replicated job identity");
+                return None;
+            }
+        };
+        let kind_name = match kind {
+            LeaseKind::Download => "download",
+            LeaseKind::Post => "post",
+            LeaseKind::Segment => "segment",
+            LeaseKind::Assemble => "assemble",
+        };
+        let resource = format!("work/job/{}/{kind_name}", job.id.0);
+        let scope_json = serde_json::to_string(&scope).ok()?;
+        let token = match control
+            .acquire(
+                &resource,
+                &self.cfg.cluster_id,
+                job.id.0.into(),
+                &job_incarnation,
+                node,
+                owner_incarnation,
+                kind_name,
+                &scope_json,
+                job_revision,
+                self.cfg.worker_ttl,
+            )
+            .await
+        {
+            Ok(LeaseClaim::Acquired(token)) => token,
+            Ok(LeaseClaim::Held { .. }) => return None,
+            Err(error) => {
+                tracing::warn!(job = job.id.0, %error, "replicated work lease acquire failed");
+                return None;
+            }
+        };
+        let lease_id = format!("{}@{}", token.resource, token.fence);
+        self.leases.lock().unwrap().insert(
+            lease_id.clone(),
+            LeaseInfo {
+                job: job.id,
+                node: node.to_owned(),
+                kind,
+                token: token.clone(),
+                job_revision,
+                control_revision: job_revision,
+                last_hb: Instant::now(),
+            },
+        );
+        Some(Grant {
+            lease_id,
+            token,
+            job_incarnation,
+            job_revision,
+            control_revision: job_revision,
+            scope,
+            epoch: self.epoch(),
+            kind,
+            job,
+            server_budgets: self.budgets_for_node(node),
+            post_fetch_budgeted: true,
+        })
     }
 
     /// Live nodes (seq progressed within 3 lease intervals), self excluded.
@@ -262,28 +349,19 @@ async fn work_poll(
         let Ok(Some(job)) = s.engine.export_job(job_id).await else {
             continue;
         };
-        let lease_id = s.next_lease_id();
-        s.leases.lock().unwrap().insert(
-            lease_id.clone(),
-            LeaseInfo {
-                job: job_id,
-                node: req.node.clone(),
-                kind: LeaseKind::Download,
-                last_hb: Instant::now(),
-            },
-        );
-        tracing::info!(job = job_id.0, node = %req.node, %lease_id, "download lease granted");
-        // Budgets AFTER inserting the lease: the divisor must count the
-        // node this grant goes to, or the first grant hands out the whole
-        // account cap until a heartbeat corrects it.
-        grants.push(Grant {
-            lease_id,
-            epoch: s.epoch(),
-            kind: LeaseKind::Download,
-            job,
-            server_budgets: s.budgets_for_node(&req.node),
-            post_fetch_budgeted: true,
-        });
+        if let Some(grant) = s
+            .grant_job(
+                &req.node,
+                &req.owner_incarnation,
+                LeaseKind::Download,
+                job,
+                serde_json::json!({"whole_job": true}),
+            )
+            .await
+        {
+            tracing::info!(job = job_id.0, node = %req.node, lease = %grant.lease_id, "download lease granted");
+            grants.push(grant);
+        }
     }
 
     // PP grants (C2): completed jobs the scheduler assigned to this node
@@ -310,29 +388,20 @@ async fn work_poll(
         let Ok(Some(job)) = s.engine.export_job(job_id).await else {
             continue;
         };
-        let lease_id = s.next_lease_id();
-        s.leases.lock().unwrap().insert(
-            lease_id.clone(),
-            LeaseInfo {
-                job: job_id,
-                node: req.node.clone(),
-                kind: LeaseKind::Post,
-                last_hb: Instant::now(),
-            },
-        );
-        tracing::info!(job = job_id.0, node = %req.node, %lease_id, "pp lease granted");
-        pp_granted += 1;
-        grants.push(Grant {
-            lease_id,
-            epoch: s.epoch(),
-            kind: LeaseKind::Post,
-            job,
-            // The divisor already includes this PP executor. It may not use
-            // the allowance for ordinary files; the engine's explicit
-            // delayed-PAR lane enforces that separate authorization.
-            server_budgets: s.budgets_for_node(&req.node),
-            post_fetch_budgeted: true,
-        });
+        if let Some(grant) = s
+            .grant_job(
+                &req.node,
+                &req.owner_incarnation,
+                LeaseKind::Post,
+                job,
+                serde_json::json!({"whole_job": true}),
+            )
+            .await
+        {
+            tracing::info!(job = job_id.0, node = %req.node, lease = %grant.lease_id, "pp lease granted");
+            pp_granted += 1;
+            grants.push(grant);
+        }
     }
 
     if !grants.is_empty() {
@@ -352,13 +421,22 @@ async fn work_reject(
     if !s.is_leader() {
         return not_leader();
     }
-    let released = {
-        let mut leases = s.leases.lock().unwrap();
-        leases
-            .get(&req.lease_id)
-            .is_some_and(|lease| lease.node == req.node)
-            .then(|| leases.remove(&req.lease_id))
-            .flatten()
+    let candidate = s.leases.lock().unwrap().get(&req.lease_id).cloned();
+    let release_ok = if let Some(lease) = &candidate {
+        if lease.node != req.node || lease.token != req.token {
+            false
+        } else if let Some(control) = &s.control {
+            control.release(&req.token).await.unwrap_or(false)
+        } else {
+            true
+        }
+    } else {
+        false
+    };
+    let released = if release_ok {
+        s.leases.lock().unwrap().remove(&req.lease_id)
+    } else {
+        None
     };
     if let Some(lease) = released {
         tracing::info!(
@@ -388,65 +466,53 @@ async fn work_heartbeat(
     }
 
     let mut cancel = Vec::new();
-    let mut adopted = Vec::new();
+    let mut renewed = Vec::new();
+    let mut controls = HashMap::new();
     let snap = s.engine.snapshot();
-    {
-        let mut leases = s.leases.lock().unwrap();
-        for lp in &req.leases {
-            match leases.get_mut(&lp.lease_id) {
-                Some(info) if info.node == req.node => {
-                    info.last_hb = Instant::now();
-                    if !snap.jobs.iter().any(|j| j.id == lp.job) {
-                        cancel.push(lp.lease_id.clone()); // job deleted
-                        leases.remove(&lp.lease_id);
-                    }
-                }
-                Some(_) => cancel.push(lp.lease_id.clone()), // someone else's id?!
-                None => {
-                    // Adoption (CLUSTERING.md §6.2): new leader, live worker.
-                    // A running download lease is adoptable while the job is
-                    // non-terminal; a running PP lease while the job is
-                    // Completed with PP still pending.
-                    let job = snap.jobs.iter().find(|j| j.id == lp.job);
-                    let unassigned_or_mine = |j: &nzbd_engine::JobSummary| {
-                        j.assigned_node.is_none()
-                            || j.assigned_node.as_deref() == Some(req.node.as_str())
-                    };
-                    let kind = job.and_then(|j| {
-                        if !unassigned_or_mine(j) || leases.values().any(|l| l.job == lp.job) {
-                            None
-                        } else if matches!(j.status, JobStatus::Completed) && !j.pp_done {
-                            Some(LeaseKind::Post)
-                        } else if !matches!(
-                            j.status,
-                            JobStatus::Completed | JobStatus::Failed | JobStatus::Deleted
-                        ) {
-                            Some(LeaseKind::Download)
-                        } else {
-                            None
-                        }
-                    });
-                    if let Some(kind) = kind {
-                        leases.insert(
-                            lp.lease_id.clone(),
-                            LeaseInfo {
-                                job: lp.job,
-                                node: req.node.clone(),
-                                kind,
-                                last_hb: Instant::now(),
-                            },
-                        );
-                        adopted.push(lp.job);
-                        tracing::info!(job = lp.job.0, node = %req.node, lease = %lp.lease_id, ?kind, "lease adopted");
-                    } else {
-                        cancel.push(lp.lease_id.clone());
+    for lp in &req.leases {
+        let candidate = s.leases.lock().unwrap().get(&lp.lease_id).cloned();
+        let Some(info) = candidate else {
+            // A new leader may rebuild this process-local projection only from
+            // the exact live replicated token, never from the worker's claim.
+            let stored = match &s.control {
+                Some(control) => control
+                    .current_lease(&lp.token.resource)
+                    .await
+                    .ok()
+                    .flatten(),
+                None => None,
+            };
+            if stored.as_ref() != Some(&lp.token) {
+                cancel.push(lp.lease_id.clone());
+            }
+            continue;
+        };
+        if info.node != req.node
+            || info.job != lp.job
+            || info.token != lp.token
+            || !snap.jobs.iter().any(|job| job.id == lp.job)
+        {
+            cancel.push(lp.lease_id.clone());
+            continue;
+        }
+        let next = match &s.control {
+            Some(control) => control.renew(&lp.token, s.cfg.worker_ttl).await,
+            None => Ok(None),
+        };
+        match next {
+            Ok(Some(next)) => {
+                let mut leases = s.leases.lock().unwrap();
+                if let Some(current) = leases.get_mut(&lp.lease_id) {
+                    if current.token == lp.token {
+                        current.token = next.clone();
+                        current.last_hb = Instant::now();
+                        controls.insert(lp.lease_id.clone(), current.control_revision);
+                        renewed.push(next);
                     }
                 }
             }
+            Ok(None) | Err(_) => cancel.push(lp.lease_id.clone()),
         }
-    }
-    for job in adopted {
-        let _ = s.engine.set_delegated(job, Some(req.node.clone())).await;
     }
     for lp in &req.leases {
         if !cancel.contains(&lp.lease_id) {
@@ -455,6 +521,8 @@ async fn work_heartbeat(
     }
     Json(HeartbeatResponse {
         cancel,
+        renewed,
+        controls,
         server_budgets: Some(s.budgets_for_node(&req.node)),
         post_fetch_budgeted: true,
     })
@@ -473,34 +541,68 @@ async fn work_complete(
         return not_leader();
     }
     let job_id = req.job.id;
-    let known = {
-        let mut leases = s.leases.lock().unwrap();
-        match leases.get(&req.lease_id) {
-            Some(info) if info.node == req.node && info.job == job_id => {
-                leases.remove(&req.lease_id);
-                true
-            }
-            _ => {
-                // Accept anyway if the job is assigned to this node — the
-                // lease may have been reclaimed a moment ago; a completed
-                // job is a completed job.
-                s.engine.snapshot().jobs.iter().any(|j| {
-                    j.id == job_id && j.assigned_node.as_deref() == Some(req.node.as_str())
-                })
-            }
-        }
-    };
-    if !known {
+    let candidate = s.leases.lock().unwrap().get(&req.lease_id).cloned();
+    let Some(info) = candidate else {
         return (
             StatusCode::CONFLICT,
             Json(serde_json::json!({"error": "unknown lease"})),
         )
             .into_response();
+    };
+    if info.node != req.node
+        || info.job != job_id
+        || info.token != req.token
+        || info.job_revision != req.expected_job_revision
+    {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"error": "stale lease token or job revision"})),
+        )
+            .into_response();
+    }
+    let outcome = match &s.control {
+        Some(control) => {
+            control
+                .publish_result(
+                    &req.receipt_id,
+                    &req.token,
+                    req.expected_job_revision,
+                    &req.result_id,
+                    &req.result_ref,
+                )
+                .await
+        }
+        None => Err("replicated control unavailable".into()),
+    };
+    match outcome {
+        Ok(MutationOutcome::Applied { .. } | MutationOutcome::Duplicate { .. }) => {}
+        Ok(MutationOutcome::Conflict) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({"error": "publication fence rejected"})),
+            )
+                .into_response();
+        }
+        Err(error) => {
+            tracing::warn!(job = job_id.0, %error, "durable completion outcome unknown");
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({"error": "completion outcome unknown"})),
+            )
+                .into_response();
+        }
     }
     tracing::info!(job = job_id.0, node = %req.node, "job completed remotely");
-    let _ = s.engine.import_job(req.job, false, true).await;
+    if let Err(error) = s.engine.import_job(req.job, false, true).await {
+        tracing::error!(job = job_id.0, %error, "durable result accepted but local projection failed");
+    }
+    s.leases.lock().unwrap().remove(&req.lease_id);
     s.apply_local_budgets().await;
-    Json(CompleteResponse { ok: true }).into_response()
+    Json(CompleteResponse {
+        ok: true,
+        durable_receipt: Some(req.receipt_id),
+    })
+    .into_response()
 }
 
 // ---------------------------------------------------------------------------
@@ -532,8 +634,29 @@ pub fn spawn_leader_task(
                 // without restarting the daemon or forcing an election flap.
                 match shared.engine.adopt_authority().await {
                     Ok(()) => {
-                        authority_ready = true;
-                        tracing::info!(epoch = shared.epoch(), "leader task active");
+                        let replicated = match &shared.control {
+                            Some(control) => control.load_jobs().await,
+                            None => Err("replicated control unavailable".into()),
+                        };
+                        match replicated {
+                            Ok(rows) => {
+                                let jobs = rows.into_iter().map(|(job, _, _)| job).collect();
+                                match shared.engine.adopt_replicated_authority(jobs).await {
+                                    Ok(()) => {
+                                        authority_ready = true;
+                                        tracing::info!(epoch = shared.epoch(), "leader task active");
+                                    }
+                                    Err(error) => {
+                                        authority_ready = false;
+                                        tracing::error!(%error, "replicated queue projection failed");
+                                    }
+                                }
+                            }
+                            Err(error) => {
+                                authority_ready = false;
+                                tracing::error!(%error, "replicated queue authority unavailable");
+                            }
+                        }
                     }
                     Err(error) => {
                         authority_ready = false;
@@ -636,37 +759,51 @@ async fn schedule(s: &Arc<LeaderShared>) {
         let mut pp = HashMap::new();
         for l in leases.values() {
             match l.kind {
-                LeaseKind::Download => *dl.entry(l.node.clone()).or_insert(0) += 1,
+                LeaseKind::Download | LeaseKind::Segment | LeaseKind::Assemble => {
+                    *dl.entry(l.node.clone()).or_insert(0) += 1
+                }
                 LeaseKind::Post => *pp.entry(l.node.clone()).or_insert(0) += 1,
             }
         }
         (dl, pp)
     };
 
-    // Free download slots per worker (our lease count is fresher than the
-    // registry's self-reported load).
-    let mut free: Vec<(String, u32)> = workers
+    // Assigned-but-not-polled jobs count as load. Otherwise a slow poller can
+    // accumulate the whole queue before its first lease exists.
+    let mut download_targets: Vec<(String, u32, u32, u32, bool)> = workers
         .iter()
         .filter(|w| w.download && w.max_download_jobs > 0 && worker_admits_new_work(w))
         .map(|w| {
             let held = leases_by_node.get(&w.name).copied().unwrap_or(0);
-            (w.name.clone(), w.max_download_jobs.saturating_sub(held))
+            let backlog = snap
+                .jobs
+                .iter()
+                .filter(|job| job.assigned_node.as_deref() == Some(w.name.as_str()))
+                .count() as u32;
+            (
+                w.name.clone(),
+                w.max_download_jobs.saturating_sub(backlog.max(held)),
+                backlog.max(held),
+                w.download_weight.max(1),
+                false,
+            )
         })
-        .filter(|(_, f)| *f > 0)
         .collect();
-    free.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
 
     let self_active = snap
         .jobs
         .iter()
         .filter(|j| j.assigned_node.is_none() && matches!(j.status, JobStatus::Downloading))
         .count() as u32;
-    let self_capacity = if s.cfg.download && !snap.disk_low {
-        s.cfg.max_download_jobs.saturating_sub(self_active)
-    } else {
-        0
-    };
-    let mut self_free = self_capacity;
+    if s.cfg.download && !snap.disk_low {
+        download_targets.push((
+            s.cfg.node_name.clone(),
+            s.cfg.max_download_jobs.saturating_sub(self_active),
+            self_active,
+            s.cfg.download_weight.max(1),
+            true,
+        ));
+    }
 
     // Assign untouched queued jobs: keep local while we have capacity,
     // then spread to the freest workers. Jobs with local progress stay
@@ -675,17 +812,21 @@ async fn schedule(s: &Arc<LeaderShared>) {
         if job.assigned_node.is_some() || !matches!(job.status, JobStatus::Queued) {
             continue;
         }
-        if self_free > 0 {
-            self_free -= 1; // stays local: the engine schedules it itself
-            continue;
-        }
-        let Some(slot) = free.iter_mut().find(|(_, f)| *f > 0) else {
+        download_targets.sort_by(|left, right| {
+            (u64::from(left.2) * u64::from(right.3))
+                .cmp(&(u64::from(right.2) * u64::from(left.3)))
+                .then(left.0.cmp(&right.0))
+        });
+        let Some(slot) = download_targets.iter_mut().find(|target| target.1 > 0) else {
             break; // everyone is saturated
         };
         slot.1 -= 1;
+        slot.2 += 1;
         let node = slot.0.clone();
-        tracing::info!(job = job.id.0, %node, "delegating job");
-        let _ = s.engine.set_delegated(job.id, Some(node)).await;
+        if !slot.4 {
+            tracing::info!(job = job.id.0, %node, "delegating job by weighted load");
+            let _ = s.engine.set_delegated(job.id, Some(node)).await;
+        }
     }
 
     // ---- PP assignment (C2, CLUSTERING.md §13) ----------------------------
@@ -693,7 +834,8 @@ async fn schedule(s: &Arc<LeaderShared>) {
     // repair / unpack — prefer idle PP-capable nodes so the same box never
     // runs both when the cluster has spare hands.
     let leased_jobs: HashSet<JobId> = s.leases.lock().unwrap().values().map(|l| l.job).collect();
-    let mut pp_targets: Vec<(String, u32, bool)> = Vec::new(); // (node, free_pp, downloading)
+    // (node, free_pp, downloading, assigned, weight)
+    let mut pp_targets: Vec<(String, u32, bool, u32, u32)> = Vec::new();
     for w in workers
         .iter()
         .filter(|w| w.post_process && w.pp_slots > 0 && worker_admits_new_work(w))
@@ -704,28 +846,49 @@ async fn schedule(s: &Arc<LeaderShared>) {
         if free > 0 {
             let downloading =
                 leases_by_node.get(&w.name).copied().unwrap_or(0) > 0 || w.active_download_jobs > 0;
-            pp_targets.push((w.name.clone(), free, downloading));
+            pp_targets.push((
+                w.name.clone(),
+                free,
+                downloading,
+                pp_held,
+                w.pp_weight.max(1),
+            ));
         }
     }
     if s.cfg.post_process && s.cfg.pp_slots > 0 && !snap.disk_low {
         let held = assigned_pp_backlog(&snap, &s.cfg.node_name, &leased_jobs);
         let free = s.cfg.pp_slots.saturating_sub(held);
         if free > 0 {
-            pp_targets.push((s.cfg.node_name.clone(), free, self_active > 0));
+            pp_targets.push((
+                s.cfg.node_name.clone(),
+                free,
+                self_active > 0,
+                held,
+                s.cfg.pp_weight.max(1),
+            ));
         }
     }
-    // Idle nodes first, then most free slots, then name for determinism.
-    pp_targets.sort_by(|a, b| a.2.cmp(&b.2).then(b.1.cmp(&a.1)).then(a.0.cmp(&b.0)));
+    // Idle nodes first, then lowest assigned/weight, then stable name.
+    pp_targets.sort_by(|left, right| {
+        left.2
+            .cmp(&right.2)
+            .then(
+                (u64::from(left.3) * u64::from(right.4))
+                    .cmp(&(u64::from(right.3) * u64::from(left.4))),
+            )
+            .then(left.0.cmp(&right.0))
+    });
 
     for job in snap.jobs.iter() {
         if !matches!(job.status, JobStatus::Completed) || job.pp_done || job.assigned_node.is_some()
         {
             continue;
         }
-        let Some(slot) = pp_targets.iter_mut().find(|(_, f, _)| *f > 0) else {
+        let Some(slot) = pp_targets.iter_mut().find(|target| target.1 > 0) else {
             break;
         };
         slot.1 -= 1;
+        slot.3 += 1;
         let node = slot.0.clone();
         tracing::info!(job = job.id.0, %node, "assigning post-processing");
         let _ = s.engine.set_delegated(job.id, Some(node)).await;
@@ -757,6 +920,17 @@ mod tests {
     use axum::extract::State;
     use nzbd_engine::{Engine, EngineConfig, Tuning};
     use nzbd_types::{CertLevel, DupeInfo, Job, JobKind, JobTotals, ServerDef, ServerId, TlsMode};
+
+    fn test_token(resource: &str) -> LeaseToken {
+        LeaseToken {
+            resource: resource.into(),
+            owner_node_id: "worker".into(),
+            owner_incarnation: "test-incarnation".into(),
+            fence: 1,
+            revision: 1,
+            expires_at_unix_ms: i64::MAX,
+        }
+    }
 
     #[test]
     fn legacy_worker_without_disk_guard_capability_is_excluded() {
@@ -823,6 +997,7 @@ mod tests {
             is_me: true,
         });
         let cfg = ClusterConfig {
+            cluster_id: "test".into(),
             node_name: "leader".into(),
             shared_dir: tmp.path().to_path_buf(),
             advertise_url: "http://leader.invalid".into(),
@@ -836,10 +1011,25 @@ mod tests {
             lease_interval: std::time::Duration::from_secs(1),
             takeover_after: std::time::Duration::from_secs(2),
             worker_ttl: std::time::Duration::from_secs(3),
+            control_dir: tmp.path().join("control"),
+            control_node_id: 1,
+            control_raft_bind: "127.0.0.1:38110".into(),
+            control_api_bind: "127.0.0.1:38210".into(),
+            control_peers: Vec::new(),
+            download_weight: 1,
+            pp_weight: 1,
             disk_guard_roots: Vec::new(),
             torrent_payload_roots: Vec::new(),
         };
-        let shared = LeaderShared::new(engine.clone(), layout, cfg, vec![provider, scarce], view);
+        let shared = LeaderShared::new(
+            engine.clone(),
+            layout,
+            cfg,
+            vec![provider, scarce],
+            view,
+            None,
+            "test-incarnation".into(),
+        );
         for (lease, node) in [("pp-a", "worker-a"), ("pp-b", "worker-b")] {
             shared.leases.lock().unwrap().insert(
                 lease.into(),
@@ -847,6 +1037,9 @@ mod tests {
                     job: JobId(if node == "worker-a" { 1 } else { 2 }),
                     node: node.into(),
                     kind: LeaseKind::Post,
+                    token: test_token(lease),
+                    job_revision: 1,
+                    control_revision: 1,
                     last_hb: Instant::now(),
                 },
             );
@@ -914,6 +1107,7 @@ mod tests {
             is_me: true,
         });
         let cfg = ClusterConfig {
+            cluster_id: "test".into(),
             node_name: "leader".into(),
             shared_dir: tmp.path().to_path_buf(),
             advertise_url: "http://leader.invalid".into(),
@@ -927,16 +1121,34 @@ mod tests {
             lease_interval: std::time::Duration::from_secs(1),
             takeover_after: std::time::Duration::from_secs(2),
             worker_ttl: std::time::Duration::from_secs(3),
+            control_dir: tmp.path().join("control"),
+            control_node_id: 1,
+            control_raft_bind: "127.0.0.1:38111".into(),
+            control_api_bind: "127.0.0.1:38211".into(),
+            control_peers: Vec::new(),
+            download_weight: 1,
+            pp_weight: 1,
             disk_guard_roots: Vec::new(),
             torrent_payload_roots: Vec::new(),
         };
-        let shared = LeaderShared::new(engine.clone(), layout, cfg, Vec::new(), view);
+        let shared = LeaderShared::new(
+            engine.clone(),
+            layout,
+            cfg,
+            Vec::new(),
+            view,
+            None,
+            "test-incarnation".into(),
+        );
         shared.leases.lock().unwrap().insert(
             "transition-lease".into(),
             LeaseInfo {
                 job: JobId(91),
                 node: "worker".into(),
                 kind: LeaseKind::Download,
+                token: test_token("transition-lease"),
+                job_revision: 1,
+                control_revision: 1,
                 last_hb: Instant::now(),
             },
         );
@@ -948,6 +1160,7 @@ mod tests {
             Json(RejectRequest {
                 node: "worker".into(),
                 lease_id: "transition-lease".into(),
+                token: test_token("transition-lease"),
             }),
         )
         .await;

@@ -252,6 +252,13 @@ pub(crate) enum QueueCommand {
     AdoptAuthority {
         reply: oneshot::Sender<Result<(), nzbd_state::StateError>>,
     },
+    /// Merge the replicated control projection after ordinary authority
+    /// recovery. Locally active copies remain until exact lease
+    /// reconciliation decides their fate.
+    AdoptReplicatedAuthority {
+        jobs: Vec<Job>,
+        reply: oneshot::Sender<()>,
+    },
     /// Crash-only demotion: drop authority persistence and every job not
     /// in `keep` (the leases this node still executes).
     RetainJobs {
@@ -1679,6 +1686,17 @@ impl Owner {
             QueueCommand::AdoptAuthority { reply } => {
                 let result = self.adopt_authority();
                 let _ = reply.send(result);
+            }
+            QueueCommand::AdoptReplicatedAuthority { jobs, reply } => {
+                for job in jobs {
+                    if self.state.job(job.id).is_none() {
+                        self.import_job(job, true, false);
+                    }
+                }
+                self.state.recompute_all_totals();
+                self.publish_now();
+                self.bump_epoch();
+                let _ = reply.send(());
             }
             QueueCommand::SetJobStatus { job, status, reply } => {
                 let ok = match self.state.job_mut(job) {

@@ -27,7 +27,7 @@ jobs:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.85"
+          toolchain: "1.95"
       - uses: Swatinem/rust-cache@v2
         with:
           key: reviewed-dependency-exceptions
@@ -46,7 +46,7 @@ jobs:
       # revision so the supply-chain gate cannot change underneath a run.
       - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25
         with:
-          rust-version: "1.85"
+          rust-version: "1.95"
           command: check bans licenses sources
           arguments: --all-features --locked
 
@@ -58,6 +58,6 @@ jobs:
       - uses: actions/checkout@v5
       - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25
         with:
-          rust-version: "1.85"
+          rust-version: "1.95"
           command: check advisories
           arguments: --all-features --locked

@@ -7,6 +7,7 @@
 //! Phase C1 distributes whole-job downloads; PP leases (C2) reuse the same
 //! protocol when phase 2 lands.
 
+pub mod control;
 pub mod election;
 pub mod http;
 pub mod layout;
@@ -18,7 +19,8 @@ pub mod worker;
 
 use axum::routing::get;
 use axum::{middleware, Json, Router};
-use election::{persist_guard, spawn_election, ElectionCfg, LeaderView};
+use control::ControlStore;
+use election::{persist_guard, spawn_election, spawn_replicated_election, ElectionCfg, LeaderView};
 use http::ClusterClient;
 use layout::SharedLayout;
 use leader::{spawn_leader_task, LeaderShared};
@@ -39,10 +41,13 @@ pub enum ClusterError {
     Io(#[from] std::io::Error),
     #[error("engine: {0}")]
     Engine(#[from] nzbd_engine::EngineError),
+    #[error("replicated control: {0}")]
+    Control(String),
 }
 
 #[derive(Debug, Clone)]
 pub struct ClusterConfig {
+    pub cluster_id: String,
     pub node_name: String,
     pub shared_dir: PathBuf,
     /// How peers reach this node's API (scheme + host + port).
@@ -58,10 +63,24 @@ pub struct ClusterConfig {
     pub lease_interval: Duration,
     pub takeover_after: Duration,
     pub worker_ttl: Duration,
+    pub control_dir: PathBuf,
+    pub control_node_id: u64,
+    pub control_raft_bind: String,
+    pub control_api_bind: String,
+    pub control_peers: Vec<ControlPeer>,
+    pub download_weight: u32,
+    pub pp_weight: u32,
     /// Every configured write root on this node, used by the engine's
     /// enforcing low-disk guard.
     pub disk_guard_roots: Vec<nzbd_engine::volumes::DiskGuardRoot>,
     pub torrent_payload_roots: Vec<PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ControlPeer {
+    pub id: u64,
+    pub raft_addr: String,
+    pub api_addr: String,
 }
 
 /// Post-processing wiring for a cluster node (C2): the PP pipeline config
@@ -80,6 +99,7 @@ pub struct ClusterRuntime {
     client: ClusterClient,
     pp: Option<PpSetup>,
     pp_manager: Option<nzbd_post::manager::PostManagerHandle>,
+    control: Option<ControlStore>,
     cancel: CancellationToken,
     tracker: TaskTracker,
 }
@@ -109,19 +129,48 @@ impl ClusterRuntime {
         let cancel = CancellationToken::new();
         let tracker = TaskTracker::new();
 
-        let view = spawn_election(
-            layout.clone(),
-            ElectionCfg {
-                node: cfg.node_name.clone(),
-                api_url: cfg.advertise_url.clone(),
-                eligible: cfg.coordinator,
-                priority: cfg.priority,
-                lease_interval: cfg.lease_interval,
-                takeover_after: cfg.takeover_after,
-            },
-            cancel.clone(),
-            &tracker,
+        let owner_incarnation = format!(
+            "{}-{}-{}",
+            cfg.node_name,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
         );
+        let control = if cfg.coordinator {
+            let store = ControlStore::start(&cfg)
+                .await
+                .map_err(ClusterError::Control)?;
+            migrate_legacy_control(&store, &layout, &cfg)
+                .await
+                .map_err(ClusterError::Control)?;
+            Some(store)
+        } else {
+            None
+        };
+
+        let election_cfg = ElectionCfg {
+            cluster_id: cfg.cluster_id.clone(),
+            node: cfg.node_name.clone(),
+            api_url: cfg.advertise_url.clone(),
+            eligible: cfg.coordinator,
+            priority: cfg.priority,
+            lease_interval: cfg.lease_interval,
+            takeover_after: cfg.takeover_after,
+        };
+        let view = if let Some(store) = control.clone() {
+            spawn_replicated_election(
+                layout.clone(),
+                election_cfg,
+                store,
+                owner_incarnation.clone(),
+                cancel.clone(),
+                &tracker,
+            )
+        } else {
+            spawn_election(layout.clone(), election_cfg, cancel.clone(), &tracker)
+        };
 
         let guard = persist_guard(layout.clone(), view.clone(), cfg.node_name.clone());
         let engine = Engine::spawn(EngineConfig {
@@ -155,6 +204,8 @@ impl ClusterRuntime {
             cfg.clone(),
             servers.clone(),
             view.clone(),
+            control.clone(),
+            owner_incarnation.clone(),
         );
         spawn_leader_task(leader_shared.clone(), cancel.clone(), &tracker);
         registry::spawn_registry(
@@ -175,6 +226,7 @@ impl ClusterRuntime {
             active.clone(),
             pp.clone(),
             dest_dir.clone(),
+            owner_incarnation.clone(),
             cancel.clone(),
             &tracker,
         );
@@ -260,6 +312,7 @@ impl ClusterRuntime {
             client,
             pp,
             pp_manager,
+            control,
             cancel,
             tracker,
         })
@@ -376,7 +429,83 @@ impl ClusterRuntime {
         self.cancel.cancel();
         self.tracker.wait().await;
         self.engine.shutdown().await;
+        if let Some(control) = &self.control {
+            if let Err(error) = control.shutdown().await {
+                tracing::warn!(%error, "replicated control shutdown did not complete cleanly");
+            }
+        }
     }
+}
+
+async fn migrate_legacy_control(
+    control: &ControlStore,
+    layout: &SharedLayout,
+    cfg: &ClusterConfig,
+) -> Result<(), String> {
+    use sha2::{Digest, Sha256};
+
+    let queue_path = layout.state_dir().join("queue.json");
+    let bytes = match std::fs::read(&queue_path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(error) => return Err(format!("read legacy queue for migration: {error}")),
+    };
+    let fingerprint = format!("sha256:{:x}", Sha256::digest(&bytes));
+    let snapshot = if bytes.is_empty() {
+        nzbd_state::QueueSnapshotDoc::default()
+    } else {
+        serde_json::from_slice(&bytes)
+            .map_err(|error| format!("decode legacy queue for migration: {error}"))?
+    };
+
+    let backup = cfg
+        .control_dir
+        .join("migration-backup")
+        .join(fingerprint.trim_start_matches("sha256:"));
+    std::fs::create_dir_all(&backup)
+        .map_err(|error| format!("create migration backup: {error}"))?;
+    if !bytes.is_empty() {
+        let target = backup.join("queue.json");
+        if !target.exists() {
+            std::fs::copy(&queue_path, &target)
+                .map_err(|error| format!("backup legacy queue: {error}"))?;
+        }
+    }
+    copy_tree_if_present(&layout.history_dir(), &backup.join("history"))?;
+
+    if control
+        .migrate_legacy_snapshot(&cfg.cluster_id, &fingerprint, &snapshot)
+        .await?
+    {
+        tracing::info!(%fingerprint, backup = %backup.display(), "legacy cluster control migrated");
+    }
+    Ok(())
+}
+
+fn copy_tree_if_present(source: &std::path::Path, target: &std::path::Path) -> Result<(), String> {
+    if !source.exists() {
+        return Ok(());
+    }
+    std::fs::create_dir_all(target)
+        .map_err(|error| format!("create history backup {}: {error}", target.display()))?;
+    for entry in std::fs::read_dir(source)
+        .map_err(|error| format!("read history backup source {}: {error}", source.display()))?
+    {
+        let entry = entry.map_err(|error| format!("read history backup entry: {error}"))?;
+        let from = entry.path();
+        let to = target.join(entry.file_name());
+        if entry
+            .file_type()
+            .map_err(|error| format!("read history backup file type: {error}"))?
+            .is_dir()
+        {
+            copy_tree_if_present(&from, &to)?;
+        } else if !to.exists() {
+            std::fs::copy(&from, &to)
+                .map_err(|error| format!("copy history backup {}: {error}", from.display()))?;
+        }
+    }
+    Ok(())
 }
 
 fn leader_local_pp_admits(

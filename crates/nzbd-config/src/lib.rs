@@ -260,6 +260,8 @@ impl Default for PostSection {
 #[serde(deny_unknown_fields, default)]
 pub struct ClusterConfig {
     pub enabled: bool,
+    /// Stable identity shared by every node in this cluster.
+    pub cluster_id: String,
     /// Unique, stable node name (journal fencing suffix, registry key).
     pub node_name: String,
     /// The shared work volume mount (Gluster).
@@ -280,12 +282,33 @@ pub struct ClusterConfig {
     pub lease_interval_secs: u64,
     pub takeover_after_secs: u64,
     pub worker_ttl_secs: u64,
+    /// Local durable Raft state. This must not be on the shared payload mount.
+    pub control_dir: Option<PathBuf>,
+    /// Stable Hiqlite voter id. Every configured peer list must contain it.
+    pub control_node_id: u64,
+    pub control_raft_bind: String,
+    pub control_api_bind: String,
+    /// Explicit fixed voter roster. Empty means a single voter using the local
+    /// bind addresses; online membership changes are deliberately unsupported.
+    pub control_peers: Vec<ClusterControlPeer>,
+    /// Positive scheduler weights. Capacity is divided by assigned/weight.
+    pub download_weight: u32,
+    pub pp_weight: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ClusterControlPeer {
+    pub id: u64,
+    pub raft_addr: String,
+    pub api_addr: String,
 }
 
 impl Default for ClusterConfig {
     fn default() -> Self {
         ClusterConfig {
             enabled: false,
+            cluster_id: "default".into(),
             node_name: String::new(),
             shared_dir: None,
             advertise_url: String::new(),
@@ -300,6 +323,13 @@ impl Default for ClusterConfig {
             lease_interval_secs: 5,
             takeover_after_secs: 20,
             worker_ttl_secs: 30,
+            control_dir: None,
+            control_node_id: 1,
+            control_raft_bind: "127.0.0.1:8810".into(),
+            control_api_bind: "127.0.0.1:8820".into(),
+            control_peers: Vec::new(),
+            download_weight: 1,
+            pp_weight: 1,
         }
     }
 }
@@ -769,6 +799,9 @@ impl Config {
             )));
         }
         if self.cluster.enabled {
+            if self.cluster.cluster_id.trim().is_empty() {
+                return Err(ConfigError::Invalid("[cluster] requires cluster_id".into()));
+            }
             if self.cluster.node_name.trim().is_empty() {
                 return Err(ConfigError::Invalid("[cluster] requires node_name".into()));
             }
@@ -784,6 +817,36 @@ impl Config {
                 return Err(ConfigError::Invalid(
                     "[cluster] requires secret or secret_file".into(),
                 ));
+            }
+            if self.cluster.control_node_id == 0 {
+                return Err(ConfigError::Invalid(
+                    "[cluster] control_node_id must be greater than zero".into(),
+                ));
+            }
+            if self.cluster.download_weight == 0 || self.cluster.pp_weight == 0 {
+                return Err(ConfigError::Invalid(
+                    "[cluster] download_weight and pp_weight must be greater than zero".into(),
+                ));
+            }
+            if !self.cluster.control_peers.is_empty() {
+                let mut ids = std::collections::HashSet::new();
+                for peer in &self.cluster.control_peers {
+                    if peer.id == 0
+                        || peer.raft_addr.trim().is_empty()
+                        || peer.api_addr.trim().is_empty()
+                        || !ids.insert(peer.id)
+                    {
+                        return Err(ConfigError::Invalid(
+                            "[cluster] control_peers require unique positive ids and both addresses"
+                                .into(),
+                        ));
+                    }
+                }
+                if !ids.contains(&self.cluster.control_node_id) {
+                    return Err(ConfigError::Invalid(
+                        "[cluster] control_peers must contain control_node_id".into(),
+                    ));
+                }
             }
         }
         self.validate_torrent()?;

@@ -21,9 +21,9 @@ a claimed verification of a newer Forgejo tip or the deployed fleet.
 | Current source comparison | Complete | Coordination, publication, transport recovery, PP ownership, provider budgets, and CI inspected at the revisions above |
 | Documentation and finite implementation plan | Complete | Existing claims reconciled; recommended dependency/migration decision and P0–P5 acceptance recorded in the linked plan |
 | P0 — delivery lane | Implemented; not yet reviewed or tested | Draft PRs allocate no validation jobs; readiness starts the affected lane; full suites remain explicit |
-| P1 — transactional control authority | Not started | Reuse the maintained plurx coordination dependency and narrow contracts |
-| P2 — worker lifetime and publication | Not started | Exact leases, bounded calls, isolated outputs, durable completion |
-| P3 — weighted placement and account budgets | Not started | Capacity-based placement and acknowledged budget transfer |
+| P1 — transactional control authority | Implemented; compile-checked; not reviewed or tested | Pinned plurx Hiqlite/WAL, Rust 1.95 floor / 1.97.1 pin, fixed voter config, exact durable leases, receipts, and resumable one-time queue migration |
+| P2 — worker lifetime and publication | Implemented; compile-checked; not reviewed or tested | Bounded RPCs, independent worker deadlines, revision/token propagation, sealed private generations, and fenced idempotent publication |
+| P3 — weighted placement and account budgets | In progress | Weighted backlog-aware placement is implemented; acknowledged shrink-before-expand transfer remains |
 | P4 — segment distribution | Not started | Explicit ranges, isolated attempts, one assembler |
 | P5 — operator surface and final acceptance | Not started | Advisory requirements, live diagnostics, finite failure scenarios |
 | One adversarial review | Not requested | Request only when the implementation PR is ready to merge |

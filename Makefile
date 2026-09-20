@@ -13,7 +13,7 @@ RUSTUP_PATH_PREFIX ?= $(if $(shell command -v $(RUSTUP)),$(dir $(shell command -
 # The daemon binary package (cargo -p nzbd).
 DAEMON  := nzbd
 # Minimum supported Rust (keep in sync with Cargo.toml rust-version).
-MSRV    := 1.85
+MSRV    := 1.95
 FUZZ_TOOLCHAIN ?= nightly-2026-08-01
 FUZZ_TARGET ?=
 FUZZ_RUNS ?= 20000
@@ -134,7 +134,7 @@ lint: ## Clippy across all targets with warnings denied (CI gate)
 	$(CARGO) clippy --workspace --all-targets -- -D warnings
 
 .PHONY: msrv
-msrv: ## Type-check on the minimum supported Rust (1.85)
+msrv: ## Type-check on the minimum supported Rust (1.95)
 	$(RUSTUP) run $(MSRV) $(CARGO) check --workspace --all-targets
 
 .PHONY: coverage

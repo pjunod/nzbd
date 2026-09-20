@@ -23,6 +23,8 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+hiqlite = { workspace = true }
+sha2 = { workspace = true }
 
 [dev-dependencies]
 nzbd-nserv = { workspace = true }

@@ -4,11 +4,17 @@
 use crate::proto::SECRET_HEADER;
 use axum::body::Body;
 use http_body_util::BodyExt;
+use hyper::body::Body as _;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client as HyperClient;
 use hyper_util::rt::TokioExecutor;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
+use std::time::Duration;
+
+const WORK_RPC_TOTAL_TIMEOUT: Duration = Duration::from_secs(10);
+const WORK_RPC_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+const WORK_RPC_MAX_BODY: usize = 1024 * 1024;
 
 #[derive(Clone)]
 pub struct ClusterClient {
@@ -18,8 +24,10 @@ pub struct ClusterClient {
 
 impl ClusterClient {
     pub fn new(secret: String) -> ClusterClient {
+        let mut connector = HttpConnector::new();
+        connector.set_connect_timeout(Some(WORK_RPC_CONNECT_TIMEOUT));
         ClusterClient {
-            inner: HyperClient::builder(TokioExecutor::new()).build_http(),
+            inner: HyperClient::builder(TokioExecutor::new()).build(connector),
             secret,
         }
     }
@@ -39,25 +47,41 @@ impl ClusterClient {
             .header(SECRET_HEADER, &self.secret)
             .body(Body::from(body))
             .map_err(|e| e.to_string())?;
-        let resp = self
-            .inner
-            .request(request)
-            .await
-            .map_err(|e| format!("request: {e}"))?;
-        let status = resp.status();
-        let bytes = resp
-            .into_body()
-            .collect()
-            .await
-            .map_err(|e| format!("body: {e}"))?
-            .to_bytes();
-        if !status.is_success() {
-            return Err(format!(
-                "{status}: {}",
-                String::from_utf8_lossy(&bytes[..bytes.len().min(200)])
-            ));
-        }
-        serde_json::from_slice(&bytes).map_err(|e| format!("decode: {e}"))
+        tokio::time::timeout(WORK_RPC_TOTAL_TIMEOUT, async {
+            let mut resp = self
+                .inner
+                .request(request)
+                .await
+                .map_err(|e| format!("request: {e}"))?;
+            let status = resp.status();
+            if resp
+                .body()
+                .size_hint()
+                .upper()
+                .is_some_and(|size| size > WORK_RPC_MAX_BODY as u64)
+            {
+                return Err("response body exceeds 1 MiB limit".into());
+            }
+            let mut bytes = Vec::new();
+            while let Some(frame) = resp.body_mut().frame().await {
+                let frame = frame.map_err(|e| format!("body: {e}"))?;
+                if let Some(data) = frame.data_ref() {
+                    if bytes.len().saturating_add(data.len()) > WORK_RPC_MAX_BODY {
+                        return Err("response body exceeds 1 MiB limit".into());
+                    }
+                    bytes.extend_from_slice(data);
+                }
+            }
+            if !status.is_success() {
+                return Err(format!(
+                    "{status}: {}",
+                    String::from_utf8_lossy(&bytes[..bytes.len().min(200)])
+                ));
+            }
+            serde_json::from_slice(&bytes).map_err(|e| format!("decode: {e}"))
+        })
+        .await
+        .map_err(|_| "work RPC total deadline exceeded".to_owned())?
     }
 
     /// Forward an arbitrary request to the leader (streaming both ways).
