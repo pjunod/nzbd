@@ -724,7 +724,10 @@ impl Owner {
 
         if persist {
             if let Some(doc) = snap_store.load()? {
-                state = QueueState::from_runtime_doc(doc)?;
+                // Single-node startup restores torrent records before the
+                // daemon associates their paused backend handles. Cluster
+                // takeover retains its separate unsupported-protocol guard.
+                state = QueueState::from_doc(doc);
             }
 
             // Legacy phase-1 global journal: fold once, then retire it.
@@ -1361,7 +1364,11 @@ impl Owner {
                             && j.torrent.is_some() =>
                     {
                         j.status = JobStatus::Queued;
-                        j.torrent.as_mut().unwrap().control_intent = TorrentControlIntent::Running;
+                        let torrent = j.torrent.as_mut().unwrap();
+                        torrent.control_intent = TorrentControlIntent::Running;
+                        if torrent.ready_at_unix.is_none() {
+                            torrent.phase = nzbd_types::TorrentPhase::Queued;
+                        }
                         true
                     }
                     _ => false,
@@ -3630,7 +3637,11 @@ impl Owner {
     }
 
     fn publish_now(&mut self) {
-        let rate = self.shared.load().download_rate_bps;
+        let rate = self
+            .server_wire_ema
+            .values()
+            .map(|e| e.max(0.0) as u64)
+            .sum();
         self.publish_snapshot(rate);
     }
 
@@ -3738,6 +3749,20 @@ impl Owner {
                     retried_articles: 0,
                     stages: j.stages.clone(),
                 };
+                if let Some(torrent) = &j.torrent {
+                    summary.size_bytes = torrent.selected_bytes;
+                    summary.downloaded_bytes = torrent.downloaded_bytes.min(torrent.selected_bytes);
+                    summary.remaining_bytes = torrent
+                        .selected_bytes
+                        .saturating_sub(summary.downloaded_bytes);
+                    summary.files_total =
+                        torrent.files.iter().filter(|file| file.selected).count() as u32;
+                    summary.files_done = torrent
+                        .files
+                        .iter()
+                        .filter(|file| file.selected && file.downloaded_bytes >= file.length)
+                        .count() as u32;
+                }
                 // Delegated jobs progress remotely; overlay heartbeat stats.
                 if let Some(m) = self.mirror.get(&j.id) {
                     summary.done_articles = m.done_articles;
@@ -3787,7 +3812,11 @@ impl Owner {
                         last_at: std::time::Instant::now(),
                         ema_bps: 0.0,
                     });
-                summary.rate_bps = if summary.status == JobStatus::Downloading {
+                summary.rate_bps = if summary.kind == JobKind::Torrent {
+                    self.torrent_progress
+                        .get(&summary.id)
+                        .map_or(0, |progress| progress.download_bps)
+                } else if summary.status == JobStatus::Downloading {
                     // Local jobs: wire-fed EMA — the SAME bytes the header
                     // meter counts, attributed per job, so the row rate and
                     // the header rate can never structurally disagree
@@ -3819,6 +3848,11 @@ impl Owner {
         // would drop remote delayed-PAR bytes because those files are only
         // unpaused on the PP executor.
         let remaining_bytes = jobs.iter().map(|job| job.remaining_bytes).sum();
+        let torrent_rate: u64 = jobs
+            .iter()
+            .filter(|job| job.kind == JobKind::Torrent)
+            .map(|job| job.rate_bps)
+            .sum();
         let now_block = Instant::now();
         let mut blocked_servers: Vec<u32> = self
             .blocked
@@ -3875,6 +3909,9 @@ impl Owner {
                     self.servers.iter().map(|s| s.id.0).collect();
                 ids.extend(self.volumes.doc().servers.keys().copied());
                 ids.extend(self.server_wire_ema.keys().copied());
+                if jobs.iter().any(|job| job.kind == JobKind::Torrent) {
+                    ids.insert(crate::volumes::TORRENT_SOURCE_ID.0);
+                }
                 let mut v: Vec<crate::snapshot::ServerVolume> = ids
                     .into_iter()
                     .map(|id| {
@@ -3889,11 +3926,14 @@ impl Owner {
                                 .map(|w| w.day_bytes)
                                 .unwrap_or(0),
                             month_bytes: w.as_ref().map(|w| w.month_bytes).unwrap_or(0),
-                            rate_bps: self
-                                .server_wire_ema
-                                .get(&id)
-                                .map(|e| e.max(0.0) as u64)
-                                .unwrap_or(0),
+                            rate_bps: if id == crate::volumes::TORRENT_SOURCE_ID.0 {
+                                torrent_rate
+                            } else {
+                                self.server_wire_ema
+                                    .get(&id)
+                                    .map(|e| e.max(0.0) as u64)
+                                    .unwrap_or(0)
+                            },
                         }
                     })
                     .collect();
@@ -3902,7 +3942,7 @@ impl Owner {
             },
             speed_limit_bps: self.state.speed_limit_bps,
             max_active_downloads: self.state.max_active_downloads,
-            download_rate_bps: rate,
+            download_rate_bps: rate.saturating_add(torrent_rate),
             session_downloaded_bytes: self.meter.total(),
             remaining_bytes,
             jobs,
@@ -4213,6 +4253,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn torrent_snapshot_reports_payload_progress_and_live_rates() {
+        let (_tmp, mut owner, _adapter) = control_test_owner();
+        let mut job = control_torrent_job();
+        job.status = JobStatus::Downloading;
+        let id = job.id;
+        let torrent = job.torrent.as_mut().unwrap();
+        torrent.total_bytes = 8192;
+        torrent.selected_bytes = 4096;
+        torrent.downloaded_bytes = 1024;
+        torrent.files = vec![
+            nzbd_types::TorrentFileRecord {
+                path: "first.iso".into(),
+                length: 1024,
+                selected: true,
+                downloaded_bytes: 1024,
+            },
+            nzbd_types::TorrentFileRecord {
+                path: "second.iso".into(),
+                length: 3072,
+                selected: true,
+                downloaded_bytes: 0,
+            },
+            nzbd_types::TorrentFileRecord {
+                path: "unselected.iso".into(),
+                length: 4096,
+                selected: false,
+                downloaded_bytes: 0,
+            },
+        ];
+        owner.state.jobs.push(job);
+        owner.torrent_progress.insert(
+            id,
+            crate::backend::TransferProgress {
+                download_bps: 512,
+                upload_bps: 128,
+                useful_peers: 3,
+                ..Default::default()
+            },
+        );
+        owner.server_wire_ema.insert(1, 256.0);
+        owner.publish_now();
+        owner.publish_now(); // Structural publications must not add the torrent rate twice.
+        let snapshot = owner.shared.load();
+        let row = &snapshot.jobs[0];
+        assert_eq!(
+            (row.size_bytes, row.downloaded_bytes, row.remaining_bytes),
+            (4096, 1024, 3072)
+        );
+        assert_eq!((row.files_total, row.files_done), (2, 1));
+        assert_eq!(
+            (row.rate_bps, row.upload_rate_bps, row.useful_peers),
+            (512, 128, 3)
+        );
+        assert_eq!(snapshot.remaining_bytes, 3072);
+        assert_eq!(snapshot.download_rate_bps, 768);
+        assert_eq!(
+            snapshot
+                .server_volumes
+                .iter()
+                .map(|v| v.rate_bps)
+                .sum::<u64>(),
+            768
+        );
+    }
+
+    #[tokio::test]
     async fn torrent_control_is_persisted_before_fifo_delivery_and_is_idempotent() {
         let (tmp, mut owner, mut adapter) = control_test_owner();
         owner.state.jobs.push(control_torrent_job());
@@ -4245,6 +4351,9 @@ mod tests {
                 .is_err()
         );
 
+        let paused = owner.state.jobs[0].torrent.as_mut().unwrap();
+        paused.phase = nzbd_types::TorrentPhase::PausedDownload;
+        paused.last_activity_unix = Some(1);
         let (reply, rx) = oneshot::channel();
         owner.on_command(QueueCommand::Resume {
             job: JobId(1),

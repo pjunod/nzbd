@@ -131,6 +131,24 @@ impl QueueState {
             if matches!(job.status, JobStatus::Downloading) {
                 job.status = JobStatus::Queued;
             }
+            // Backend handles are restored paused. A previous process's
+            // activity timestamp must not make the scheduler reject the
+            // first start needed to discover peers again.
+            if let Some(torrent) = &mut job.torrent {
+                if job.status == JobStatus::Queued
+                    && torrent.control_intent == nzbd_types::TorrentControlIntent::Running
+                    && torrent.ready_at_unix.is_none()
+                    && torrent.removal_intent.is_none()
+                    && matches!(
+                        torrent.phase,
+                        nzbd_types::TorrentPhase::Downloading
+                            | nzbd_types::TorrentPhase::Checking
+                            | nzbd_types::TorrentPhase::PausedDownload
+                    )
+                {
+                    torrent.phase = nzbd_types::TorrentPhase::Queued;
+                }
+            }
         }
         state.repair_names_and_directories();
         state
