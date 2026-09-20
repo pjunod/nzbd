@@ -51,4 +51,5 @@ This page records the isolated fix for the dev Compose build failure reported on
 | 2026-09-19 | Shared the build definition and added the regression contract | Source inspection complete; tests intentionally deferred until after review |
 | 2026-09-19 | Completed the single adversarial merge-readiness review | No actionable P0–P3 correctness, compatibility, test, documentation, or side-effect findings |
 | 2026-09-19 | Ran the single fast-lane qualification pass | Workspace formatting, six shipped-config tests, Compose schema resolution, and both-service build ownership are green |
-| 2026-09-19 | Remediated a required CI failure disclosed after review | RUSTSEC-2026-0285 affects base-branch `rustls 0.23.42`; the narrow lockfile update selects patched `0.23.45` and its matching crypto dependencies |
+| 2026-09-19 | Remediated a required CI failure disclosed after review | RUSTSEC-2026-0285 affects base-branch `rustls 0.23.42`; the product and isolated fuzz lockfiles now select patched `0.23.45` and matching crypto dependencies |
+| 2026-09-19 | Batched a required lint remediation exposed by the security rerun | Replaced a manual nonzero division guard in qBittorrent ETA projection with equivalent `checked_div`; this is unrelated to the Compose fix and preserves the zero-rate sentinel |
