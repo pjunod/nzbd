@@ -20,7 +20,7 @@ a claimed verification of a newer Forgejo tip or the deployed fleet.
 |---|---|---|
 | Current source comparison | Complete | Coordination, publication, transport recovery, PP ownership, provider budgets, and CI inspected at the revisions above |
 | Documentation and finite implementation plan | Complete | Existing claims reconciled; recommended dependency/migration decision and P0–P5 acceptance recorded in the linked plan |
-| P0 — delivery lane | Implemented; reviewed; not yet tested | Draft PRs allocate no validation jobs; readiness starts the affected lane; full suites remain explicit; unrelated BitTorrent fuzzing no longer runs on PR events |
+| P0 — delivery lane | Implemented; reviewed; not yet tested | Draft PRs allocate no validation jobs; readiness starts the affected lane; full suites remain explicit; unrelated BitTorrent M0/fuzz matrices no longer run on PR events |
 | P1 — transactional control authority | Implemented; reviewed; compile-checked; not yet tested | Pinned plurx Hiqlite/WAL, atomic schema install, request-atomic queue deltas with rollback, exact projection takeover, durable full lease reconstruction, and idempotent migration startup |
 | P2 — worker lifetime and publication | Implemented; reviewed; compile-checked; not yet tested | Bounded RPCs/deadlines; immediate PP cancellation; exact lost-response receipts; job-bound, fsynced immutable generations; immutable result references and idempotent history |
 | P3 — weighted placement and account budgets | Implemented; reviewed; compile-checked; not yet tested | Weighted remote-only execution plus persisted generation handoff; only active pool tasks acknowledge at batch boundaries; startup is fail-closed and uncertain sockets remain reserved |

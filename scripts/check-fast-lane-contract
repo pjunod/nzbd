@@ -20,6 +20,10 @@ if grep -Eq '^  pull_request:' .github/workflows/bittorrent-fuzz.yml; then
   echo "BitTorrent fuzz must not run for pull requests" >&2
   exit 1
 fi
+if grep -Eq '^  pull_request:' .github/workflows/bittorrent-m0.yml; then
+  echo "BitTorrent M0 matrix must not run for pull requests" >&2
+  exit 1
+fi
 grep -Fq 'workflow_dispatch:' .github/workflows/bittorrent-fuzz.yml
 grep -Fq 'schedule:' .github/workflows/bittorrent-fuzz.yml
 test "$(grep -c "github.event.pull_request.draft == false" .github/workflows/supply-chain.yml)" -eq 3
