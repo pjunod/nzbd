@@ -1750,8 +1750,8 @@ const models = (jobs) => jobs.map((j, i) => T.rowModel(j, { idx: i, count: jobs.
     const form = doc.getElementById("cfg-form");
     const save = doc.getElementById("cfg-save");
     const msg = doc.getElementById("cfg-msg");
-    const config = {
-      paths: {}, queue: {}, post: {}, history: {}, server: [], category: [],
+    const config = process.env.NZBD_UI_CONFIG ? JSON.parse(process.env.NZBD_UI_CONFIG) : {
+      paths: {}, queue: {}, post: { failure_action: "park" }, history: {}, server: [], category: [],
       torrent: { enabled: false, listen_port: 6881, pex: true },
     };
     let stored = config, submitted, rejectSave = false, reloadFailure = null;
@@ -1774,14 +1774,47 @@ const models = (jobs) => jobs.map((j, i) => T.rowModel(j, { idx: i, count: jobs.
     await vm.runInContext("loadSettings(true)", sandbox);
     ok(form.innerHTML.includes('data-path="torrent.listen_port" data-type="num" value="6881"'),
       "the BitTorrent form renders the API's default listen port");
-    const enable = { dataset: { path: "torrent.enabled", type: "check" }, checked: true };
+    // Read controls from the renderer's markup instead of supplying a lone
+    // checkbox: previously that stub missed an obsolete field elsewhere in
+    // the form, which made the real PUT fail with a duplicate-field error.
+    const unescape = text => text.replace(/&(amp|quot|#39|lt|gt);/g,
+      (_, entity) => ({ amp: "&", quot: '"', "#39": "'", lt: "<", gt: ">" })[entity]);
+    const controls = [...form.innerHTML.matchAll(/<input\b[^>]*>|<select\b[^>]*>[\s\S]*?<\/select>/g)]
+      .filter(([markup]) => markup.includes('data-path="'))
+      .map(([markup]) => {
+        const tag = markup.match(/^<[^>]+>/)[0];
+        const attr = name => unescape((tag.match(new RegExp(`${name}="([^"]*)"`)) || ["", ""])[1]);
+        const options = [...markup.matchAll(/<option value="([^"]*)"([^>]*)>/g)];
+        const selected = options.find(option => /\bselected\b/.test(option[2])) || options[0];
+        return {
+          dataset: { path: attr("data-path"), type: attr("data-type") },
+          value: selected ? unescape(selected[1]) : attr("value"),
+          checked: /\bchecked\b/.test(tag),
+        };
+      });
+    if (process.env.NZBD_UI_CONFIG) {
+      for (const control of controls) {
+        const value = control.dataset.path.split(".").reduce((obj, key) => obj?.[key], config);
+        ok(value !== undefined, `rendered setting ${control.dataset.path} exists in the API config`);
+      }
+    }
+    const enable = controls.find(control => control.dataset.path === "torrent.enabled");
+    const failure = controls.find(control => control.dataset.path === "post.failure_action");
+    ok(!!failure, "the form uses the canonical failure_action field");
+    eq(failure?.value, config.post.failure_action, "the form shows the configured failure policy");
+    enable.checked = true;
     const originalQuery = form.querySelectorAll;
-    form.querySelectorAll = sel => sel === "[data-path]" ? [enable] : [];
+    const edited = process.env.NZBD_UI_CONFIG ? controls : controls.filter(control =>
+      control.dataset.path === "torrent.enabled" || control.dataset.path.startsWith("post."));
+    form.querySelectorAll = sel => sel === "[data-path]" ? edited : [];
     form.oninput();
     eq(save.disabled, false, "editing enables Save changes");
     await save.onclick();
     eq(JSON.parse(submitted).torrent.enabled, true, "Save changes submits BitTorrent enabled");
     eq(JSON.parse(submitted).torrent.listen_port, 6881, "save preserves the default listen port");
+    eq(JSON.parse(submitted).post.failure_action, config.post.failure_action, "save preserves the configured failure policy");
+    ok(!("health_action" in JSON.parse(submitted).post), "save does not add the legacy alias");
+    if (process.env.NZBD_UI_SAVED_CONFIG_PATH) fs.writeFileSync(process.env.NZBD_UI_SAVED_CONFIG_PATH, submitted);
     eq(msg.textContent, "saved", "save confirmation survives the settings reload");
     eq(doc.getElementById("restart-banner").hidden, false, "enabling BitTorrent requests a restart");
     eq(save.disabled, true, "a successful save clears the dirty state");

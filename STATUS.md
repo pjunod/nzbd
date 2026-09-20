@@ -1,5 +1,29 @@
 # nzbd — Project Status
 
+## Settings form schema repair — 2026-09-20
+
+**Status:** adversarial review approved; final local fast lane passed.
+**PR:** [#226](https://github.com/pjunod/nzbd/pull/226) records required CI and merge.
+
+Deploying PR #224 to nuc3 removed the missing BitTorrent defaults error, but
+live browser verification exposed another blocker: the form submitted the old
+`post.health_action` alias alongside `post.failure_action`. The server rejected
+the entire save as a duplicate field.
+
+- The form now uses `failure_action`, displays the saved failure policy, and
+  describes its current behavior. Existing configuration aliases remain valid.
+- The DOM regression now collects all rendered settings from an actual Config
+  fixture. Rust deserializes that submitted payload and verifies that enabling
+  BitTorrent preserves every other setting, including the supported `Pause` failure-policy spelling.
+- Follow-up work uses an independent clone on `codex/fix-settings-field-contract`.
+- Adversarial review caught case-insensitive and legacy failure-policy values
+  being reset by the select. Selects now preserve unlisted configured values
+  unless explicitly changed; the round-trip fixture covers this edge case.
+- Final fast lane passed: formatting, UI boot, UI DOM (529 assertions), and
+  the Rust full-form round-trip regression. Required PR checks run in GitHub.
+- Deployment completion is verified through an actual browser save followed
+  by restart; operational progress is recorded in the task status page.
+
 ## Settings save and CI repair — 2026-09-20
 
 **Status:** implementation complete; adversarial review approved and local
