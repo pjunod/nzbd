@@ -38,7 +38,7 @@ fn ui_renderer_obeys_the_rendering_laws() {
     // deserialize the submitted payload. A stale alias in one unrelated
     // field must not silently break every Save changes click.
     let mut cfg = nzbd_config::Config::default();
-    cfg.post.failure_action = "park".into();
+    cfg.post.failure_action = "Pause".into();
     let mut model = serde_json::to_value(&cfg).unwrap();
     model["torrent"] = serde_json::to_value(&cfg.torrent).unwrap();
     let submitted = tempfile::NamedTempFile::new().unwrap();

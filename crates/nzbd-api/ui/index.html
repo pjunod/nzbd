@@ -3985,7 +3985,11 @@ function fieldControl(path, label, type, opts, help) {
     return `<label class="chk"><input type="checkbox" id="${id}" data-path="${path}" data-type="check" ${v ? "checked" : ""}> ${esc(label)}${help ? " " + hint : ""}</label>`;
   if (type === "select") {
     // opts entries may be "value" or [value, label] for readable choices.
-    const os = opts.map(o => {
+    // Preserve operator-written aliases and values newer than this UI.
+    // An unrelated save must not replace them with the first option.
+    const choices = v != null && !opts.some(o => (Array.isArray(o) ? o[0] : o) === v)
+      ? [[v, `${v} (configured)`], ...opts] : opts;
+    const os = choices.map(o => {
       const [val, lab] = Array.isArray(o) ? o : [o, o];
       return `<option value="${esc(val)}" ${val === v ? "selected" : ""}>${esc(lab)}</option>`;
     }).join("");

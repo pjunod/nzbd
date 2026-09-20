@@ -13,8 +13,11 @@ the entire save as a duplicate field.
   describes its current behavior. Existing configuration aliases remain valid.
 - The DOM regression now collects all rendered settings from an actual Config
   fixture. Rust deserializes that submitted payload and verifies that enabling
-  BitTorrent preserves every other setting, including the `park` failure policy.
+  BitTorrent preserves every other setting, including the supported `Pause` failure-policy spelling.
 - Follow-up work uses an independent clone on `codex/fix-settings-field-contract`.
+- Adversarial review caught case-insensitive and legacy failure-policy values
+  being reset by the select. Selects now preserve unlisted configured values
+  unless explicitly changed; the round-trip fixture covers this edge case.
 - Completion requires adversarial review, the fast lane, required PR checks,
   deployment, and an actual browser save followed by restart verification.
 

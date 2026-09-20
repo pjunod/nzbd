@@ -1801,7 +1801,7 @@ const models = (jobs) => jobs.map((j, i) => T.rowModel(j, { idx: i, count: jobs.
     const enable = controls.find(control => control.dataset.path === "torrent.enabled");
     const failure = controls.find(control => control.dataset.path === "post.failure_action");
     ok(!!failure, "the form uses the canonical failure_action field");
-    eq(failure?.value, "park", "the form shows the configured failure policy");
+    eq(failure?.value, config.post.failure_action, "the form shows the configured failure policy");
     enable.checked = true;
     const originalQuery = form.querySelectorAll;
     const edited = process.env.NZBD_UI_CONFIG ? controls : controls.filter(control =>
@@ -1812,7 +1812,7 @@ const models = (jobs) => jobs.map((j, i) => T.rowModel(j, { idx: i, count: jobs.
     await save.onclick();
     eq(JSON.parse(submitted).torrent.enabled, true, "Save changes submits BitTorrent enabled");
     eq(JSON.parse(submitted).torrent.listen_port, 6881, "save preserves the default listen port");
-    eq(JSON.parse(submitted).post.failure_action, "park", "save preserves the configured failure policy");
+    eq(JSON.parse(submitted).post.failure_action, config.post.failure_action, "save preserves the configured failure policy");
     ok(!("health_action" in JSON.parse(submitted).post), "save does not add the legacy alias");
     if (process.env.NZBD_UI_SAVED_CONFIG_PATH) fs.writeFileSync(process.env.NZBD_UI_SAVED_CONFIG_PATH, submitted);
     eq(msg.textContent, "saved", "save confirmation survives the settings reload");
