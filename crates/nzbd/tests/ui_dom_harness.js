@@ -1754,7 +1754,7 @@ const models = (jobs) => jobs.map((j, i) => T.rowModel(j, { idx: i, count: jobs.
       paths: {}, queue: {}, post: {}, history: {}, server: [], category: [],
       torrent: { enabled: false, listen_port: 6881, pex: true },
     };
-    let stored = config, submitted, rejectSave = false;
+    let stored = config, submitted, rejectSave = false, reloadFailure = null;
     routes.set("/api/v1/config", (_url, init) => {
       if (init && init.method === "PUT") {
         submitted = init.body;
@@ -1764,6 +1764,8 @@ const models = (jobs) => jobs.map((j, i) => T.rowModel(j, { idx: i, count: jobs.
           applied_live: [], restart_required: ["torrent"], connection_notes: [],
         } };
       }
+      if (reloadFailure === "network") throw new Error("network unavailable");
+      if (reloadFailure === "http") return { status: 503, body: {} };
       return { status: 200, body: {
         config: stored, path: "/tmp/nzbd.toml", writable: true,
         toml: "[torrent]\nenabled = true", pending_restart: stored.torrent.enabled ? ["torrent"] : [],
@@ -1803,6 +1805,22 @@ const models = (jobs) => jobs.map((j, i) => T.rowModel(j, { idx: i, count: jobs.
     rejectSave = false;
     await doc.getElementById("adv-save").onclick();
     eq(msg.textContent, "TOML saved", "advanced save confirmation survives reload");
+
+    for (const failure of ["network", "http"]) {
+      reloadFailure = failure;
+      for (const id of ["cfg-save", "adv-save"]) {
+        form.oninput();
+        doc.getElementById("restart-banner").hidden = true;
+        await doc.getElementById(id).onclick();
+        const prefix = id === "cfg-save" ? "saved" : "TOML saved";
+        eq(msg.textContent, prefix + " · could not reload settings; refresh the page",
+          `${id}: a ${failure} reload failure preserves success and explains recovery`);
+        eq(msg.className, "warn", `${id}: a ${failure} reload failure is advisory`);
+        eq(doc.getElementById("restart-banner").hidden, false,
+          `${id}: a ${failure} reload failure preserves restart advice`);
+        eq(save.disabled, true, `${id}: a ${failure} reload failure clears the dirty state`);
+      }
+    }
     form.querySelectorAll = originalQuery;
     routes.clear();
   }

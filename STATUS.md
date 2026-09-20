@@ -2,7 +2,9 @@
 
 ## Settings save repair — 2026-09-20
 
-**Status:** implementation ready; adversarial review and final fast lane pending.
+**Status:** ready to merge; adversarial review addressed and fast lane green.
+Merge is blocked by the required full-suite check; exception decision pending.
+**PR:** [#224](https://github.com/pjunod/nzbd/pull/224).
 
 - Fixed the API response so default BitTorrent values are present when the
   settings form first enables the feature; the compact TOML format is retained.
@@ -11,9 +13,23 @@
 - Regression coverage checks persistence, restart advice, save feedback, and
   retryable validation failures.
 - Work is isolated in an agent-owned clone on `codex/settings-save-repair`.
-- Final fast lane: formatting, UI boot, UI DOM, and the targeted API settings
-  persistence regression. Full-suite failures are tracked separately.
-- No new release gate or automatic restart is introduced.
+- Final fast lane passed: `cargo fmt --all --check`, UI boot, UI DOM
+  (525 assertions), and `settings_can_enable_default_torrent_config`
+  (one targeted API test). No further full-suite runs were started locally.
+- Adversarial review found a lost-success-message edge case when the reload
+  request fails after saving. Both editors now retain confirmation and restart
+  advice; network and HTTP failures have regression coverage.
+- No new release gate or automatic restart is introduced. The Dev-tab
+  preference is recorded for feature work; this PR repairs existing behavior.
+- Main requires the full `unit + e2e` check. Branch protection stays intact
+  unless the user explicitly authorizes an exception. The PR's automatic run
+  fails the same three daemon tests as the preceding main run:
+  `delete_parks_the_job_and_requeue_brings_it_back`,
+  `permission_denied_state_dir_suggests_the_fix`, and
+  `restart_completes_while_post_processing_runs`.
+  Evidence: [PR job](https://github.com/pjunod/nzbd/actions/runs/35479476603/job/105994545460)
+  and [main run](https://github.com/pjunod/nzbd/actions/runs/35476537458).
+  These remain assigned to the user's separate full-suite repair process.
 
 The explicit ledger of what this project intends to do and whether it is
 done. **Update this file in every feature commit.** Derived from the
