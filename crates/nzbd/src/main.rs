@@ -425,10 +425,14 @@ fn open_history(
     retention: nzbd_state::history::Retention,
 ) -> anyhow_lite::Result<Arc<nzbd_state::history::HistoryDb>> {
     for dir in [local_dir, jsonl_dir] {
-        std::fs::create_dir_all(dir).map_err(|e| {
+        std::fs::create_dir_all(dir).map_err(|source| {
             anyhow_lite::Error::msg(format!(
-                "history db: create directory {}: {e}",
-                dir.display()
+                "history db: {}",
+                with_fs_hint(nzbd_state::StateError::Io {
+                    op: "create directory",
+                    path: dir.to_path_buf(),
+                    source,
+                })
             ))
         })?;
     }
@@ -1641,7 +1645,7 @@ mod tests {
         };
         let message = err.to_string();
         assert!(
-            message.contains("history db: create directory"),
+            message.contains("history db:") && message.contains("create directory"),
             "{message}"
         );
         assert!(message.contains(&local.display().to_string()), "{message}");

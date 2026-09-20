@@ -1,5 +1,71 @@
 # nzbd — Project Status
 
+## Settings form schema repair — 2026-09-20
+
+**Status:** adversarial review approved; final local fast lane passed.
+**PR:** [#226](https://github.com/pjunod/nzbd/pull/226) records required CI and merge.
+
+Deploying PR #224 to nuc3 removed the missing BitTorrent defaults error, but
+live browser verification exposed another blocker: the form submitted the old
+`post.health_action` alias alongside `post.failure_action`. The server rejected
+the entire save as a duplicate field.
+
+- The form now uses `failure_action`, displays the saved failure policy, and
+  describes its current behavior. Existing configuration aliases remain valid.
+- The DOM regression now collects all rendered settings from an actual Config
+  fixture. Rust deserializes that submitted payload and verifies that enabling
+  BitTorrent preserves every other setting, including the supported `Pause` failure-policy spelling.
+- Follow-up work uses an independent clone on `codex/fix-settings-field-contract`.
+- Adversarial review caught case-insensitive and legacy failure-policy values
+  being reset by the select. Selects now preserve unlisted configured values
+  unless explicitly changed; the round-trip fixture covers this edge case.
+- Final fast lane passed: formatting, UI boot, UI DOM (529 assertions), and
+  the Rust full-form round-trip regression. Required PR checks run in GitHub.
+- Deployment completion is verified through an actual browser save followed
+  by restart; operational progress is recorded in the task status page.
+
+## Settings save and CI repair — 2026-09-20
+
+**Status:** implementation complete; adversarial review approved and local
+checks green. The PR below records the required CI result and merge state.
+**PR:** [#224](https://github.com/pjunod/nzbd/pull/224).
+
+- Fixed the API response so default BitTorrent values are present when the
+  settings form first enables the feature; the compact TOML format is retained.
+- Save confirmations remain visible after reload; form collection failures
+  produce an error instead of an unhandled rejection.
+- Regression coverage checks persistence, restart advice, save feedback, and
+  retryable validation failures.
+- Work is isolated in an agent-owned clone on `codex/settings-save-repair`.
+- Final fast lane passed: `cargo fmt --all --check`, UI boot, UI DOM
+  (525 assertions), and `settings_can_enable_default_torrent_config`
+  (one targeted API test). No further full-suite runs were started locally.
+- Adversarial review found a lost-success-message edge case when the reload
+  request fails after saving. Both editors now retain confirmation and restart
+  advice; network and HTTP failures have regression coverage.
+- No new release gate or automatic restart is introduced. The Dev-tab
+  preference is recorded for feature work; this PR repairs existing behavior.
+- Main requires the full `unit + e2e` check. Branch protection stays intact
+  without a bypass. The initial PR run failed the same three daemon tests as
+  the preceding main run:
+  `delete_parks_the_job_and_requeue_brings_it_back`,
+  `permission_denied_state_dir_suggests_the_fix`, and
+  `restart_completes_while_post_processing_runs`.
+  Evidence: [PR job](https://github.com/pjunod/nzbd/actions/runs/35479476603/job/105994545460)
+  and [main run](https://github.com/pjunod/nzbd/actions/runs/35476537458).
+  Repairs now included in this PR: raw NZB test uploads use
+  `application/x-nzb`; history-directory errors retain the path and permission
+  repair hint. The failing assertions remain in place.
+- Replaced manual ETA division with `checked_div` to satisfy the current
+  Clippy lint while retaining the zero-rate fallback.
+- The repair batch received adversarial approval with no findings. Final
+  local checks passed: 20 daemon integration tests, 22 binary unit tests, the
+  settings regression, UI harnesses (525 DOM assertions), formatting, and
+  workspace Clippy. GitHub runs the required full workspace suite before merge.
+- The pre-existing RustSec check separately reports `RUSTSEC-2026-0285` in
+  rustls 0.23.42. Dependency remediation is outside this test-repair batch; no
+  advisory exception or suppression was added.
+
 The explicit ledger of what this project intends to do and whether it is
 done. **Update this file in every feature commit.** Derived from the
 roadmaps in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) §16 and
