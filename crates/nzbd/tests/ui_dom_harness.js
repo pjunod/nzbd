@@ -141,6 +141,7 @@ function wrapChild(tag, id, cls) {
 // default is a dead daemon, which is what the boot path should survive.
 const routes = new Map();
 const seen = [];
+const scheduledTimeouts = [];
 async function routeFetch(url, init) {
   seen.push({
     url,
@@ -182,7 +183,12 @@ const sandbox = {
     close() { this.readyState = 2; }
   },
   setInterval: () => 0, clearInterval() {},
-  setTimeout: () => 0, clearTimeout() {},
+  setTimeout: (_fn, delay) => { scheduledTimeouts.push(delay); return scheduledTimeouts.length; },
+  clearTimeout() {},
+  AbortController: class {
+    constructor() { this.signal = { aborted: false }; }
+    abort() { this.signal.aborted = true; }
+  },
   confirm: () => true, alert() {},
   URL: { createObjectURL: () => "blob:x", revokeObjectURL() {} },
   Blob: class {}, Date, Math, JSON, Promise, Number, String, Array, Object, Set, Map,
@@ -1168,12 +1174,20 @@ const models = (jobs) => jobs.map((j, i) => T.rowModel(j, { idx: i, count: jobs.
   eq(T.torrentRequest("   "), null, "an empty source never reaches the daemon");
 
   routes.set("/api/v1/jobs", { status: 201, body: { id: 41, info_hash: "abc" } });
+  scheduledTimeouts.length = 0;
   await T.addTorrentUri("magnet:?xt=urn:btih:abc", { category: "tv", priority: 50, paused: true });
   let add = seen.find(r => r.url === "/api/v1/jobs" && r.method === "POST");
   ok(add, "a magnet submits to the native jobs endpoint");
   eq(add.headers["content-type"], "application/json", "a magnet is typed JSON");
   eq(JSON.parse(add.body).source.type, "magnet", "the JSON names the source kind");
   eq(JSON.parse(add.body).category, "tv", "the JSON carries add options");
+  eq(scheduledTimeouts.includes(45000), false,
+    "magnet admission is not aborted after a hidden durable reservation can exist");
+
+  scheduledTimeouts.length = 0;
+  await T.addTorrentUri("https://tracker.example/file.torrent", {});
+  ok(scheduledTimeouts.includes(45000),
+    "server-bounded remote metainfo fetches retain a client response deadline");
 
   seen.length = 0;
   const bytes = new Uint8Array([100, 3, 102, 111, 111, 51, 98, 97, 114, 101]).buffer;
