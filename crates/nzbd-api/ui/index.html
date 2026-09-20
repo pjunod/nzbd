@@ -479,9 +479,25 @@ try {
   .chk-inline { display: inline-flex; align-items: center; gap: 5px; font-size: 12px;
                 color: var(--ink2); }
   .chk-inline input { accent-color: var(--accent); }
-  #addnzb-msg { font-size: 12px; color: var(--muted); }
-  #addnzb-msg.ok { color: var(--ok); }
-  #addnzb-msg.bad { color: var(--bad); }
+  #addnzb-msg, #addtorrent-msg { font-size: 12px; color: var(--muted); }
+  #addnzb-msg.ok, #addtorrent-msg.ok { color: var(--ok); }
+  #addnzb-msg.bad, #addtorrent-msg.bad { color: var(--bad); }
+  .torrent-add-panel { flex: 1 0 100%; display: flex; align-items: end; gap: 8px;
+    box-sizing: border-box; padding: 10px; border: 1px solid var(--line); border-radius: 8px;
+    background: color-mix(in srgb, var(--panel) 84%, var(--bg)); }
+  .torrent-add-panel[hidden] { display: none; }
+  .torrent-add-panel label { display: flex; flex: 1; min-width: 220px;
+    flex-direction: column; gap: 4px; color: var(--muted); font-size: 11.5px; }
+  .torrent-add-panel input[type=text] { width: 100%; box-sizing: border-box; background: var(--bg);
+    color: var(--ink); border: 1px solid var(--line); border-radius: 7px;
+    padding: 6px 8px; font: inherit; font-size: 13px; }
+  .torrent-add-panel select { box-sizing: border-box; background: var(--bg); color: var(--ink);
+    border: 1px solid var(--line); border-radius: 7px; padding: 6px 8px; font: inherit;
+    font-size: 13px; }
+  .torrent-add-panel .torrent-category { flex: 0 1 150px; min-width: 110px; }
+  .torrent-add-panel .torrent-priority { flex: 0 1 115px; min-width: 100px; }
+  .torrent-add-panel .torrent-paused { flex: 0 0 auto; align-self: center;
+    min-width: 0; flex-direction: row; align-items: center; color: var(--ink2); }
   .cfg-add { margin: 2px 0 8px; }
   #restart-banner { display: flex; align-items: center; gap: 12px; margin-top: 12px;
     padding: 9px 12px; border-radius: 8px; font-size: 12.5px; font-weight: 550;
@@ -783,6 +799,10 @@ try {
     th, td { padding-left: 6px; padding-right: 6px; }
     .controls { gap: 6px; }
     .controls label { font-size: 11px; }
+    .torrent-add-panel { align-items: stretch; flex-direction: column; }
+    .torrent-add-panel label, .torrent-add-panel .torrent-category,
+    .torrent-add-panel .torrent-priority { min-width: 0; flex-basis: auto; }
+    .torrent-add-panel .torrent-paused { align-self: flex-start; }
     #setup { margin: 10px auto; }
     #setup .row { flex-wrap: wrap; }
     #setup .row label { flex-basis: 100%; }
@@ -898,6 +918,10 @@ try {
     <button id="btn-addnzb" title="Upload .nzb files straight into the queue.">+ add nzb</button>
     <input type="file" id="nzb-file" accept=".nzb,application/x-nzb" multiple hidden>
     <span id="addnzb-msg"></span>
+    <button id="btn-addtorrent" title="Add a magnet, .torrent URL, or .torrent file."
+      aria-controls="torrent-add-form" aria-expanded="false">+ add torrent</button>
+    <input type="file" id="torrent-file" accept=".torrent,application/x-bittorrent" multiple hidden>
+    <span id="addtorrent-msg" role="status" aria-live="polite"></span>
     <label title="How many jobs download at the same time. The connections are split evenly between them — this does not add throughput, it spreads the same throughput over more jobs. 1 gives the whole pipe to the top job until it finishes.">Downloads at once
       <input type="number" id="active" min="1" max="100" step="1" style="width: 62px">
       <button class="small" id="btn-active">set</button></label>
@@ -943,6 +967,25 @@ try {
       </div>
     </details>
     <label class="conn dim" id="conn" title="Establishing the live event stream to the daemon.">○ connecting…</label>
+    <form class="torrent-add-panel" id="torrent-add-form" aria-label="Add BitTorrent download" hidden>
+      <label>Magnet or .torrent URL
+        <input type="text" id="torrent-uri" placeholder="magnet:?xt=urn:btih:… or https://…/file.torrent" autocomplete="off" spellcheck="false">
+      </label>
+      <label class="torrent-category">Category
+        <input type="text" id="torrent-category" placeholder="movies, tv…" autocomplete="off">
+      </label>
+      <label class="torrent-priority">Priority
+        <select id="torrent-priority">
+          <option value="-100">Very low</option><option value="-50">Low</option>
+          <option value="0" selected>Normal</option><option value="50">High</option>
+          <option value="100">Very high</option><option value="900">Force</option>
+        </select>
+      </label>
+      <label class="torrent-paused"><input type="checkbox" id="torrent-paused"> Add paused</label>
+      <button type="submit" id="btn-torrent-uri">Add</button>
+      <button type="button" id="btn-torrent-file">Choose .torrent</button>
+      <button type="button" class="small" id="btn-torrent-cancel">Cancel</button>
+    </form>
   </div>
 
   <nav class="tabs">
@@ -3349,12 +3392,17 @@ async function refreshJobDetail() {
 const POST_TIMEOUT_MS = 20000;
 async function post(url, init) {
   let r;
+  const hasCustomTimeout = init && Object.prototype.hasOwnProperty.call(init, "timeoutMs");
+  const timeoutMs = hasCustomTimeout ? init.timeoutMs : POST_TIMEOUT_MS;
+  const options = Object.assign(
+    { method: "POST", headers: CLIENT_HDRS },
+    init || {});
+  delete options.timeoutMs;
   const ctrl = typeof AbortController !== "undefined" ? new AbortController() : null;
-  const timer = ctrl ? setTimeout(() => ctrl.abort(), POST_TIMEOUT_MS) : null;
+  if (ctrl) options.signal = ctrl.signal;
+  const timer = ctrl && timeoutMs != null ? setTimeout(() => ctrl.abort(), timeoutMs) : null;
   try {
-    r = await jfetch(url, Object.assign(
-      { method: "POST", headers: CLIENT_HDRS, signal: ctrl ? ctrl.signal : undefined },
-      init || {}));
+    r = await jfetch(url, options);
   } catch (e) {
     const msg = String(e && e.message ? e.message : e);
     return { ok: false, error: /abort/i.test(msg) ? "the daemon never answered" : msg };
@@ -3679,6 +3727,155 @@ $("nzb-file").onchange = async () => {
   }
   $("nzb-file").value = "";
   refreshAll();
+};
+
+// ---- add BitTorrent sources ----------------------------------------------
+// The native endpoint deliberately uses one route for all protocols. Content
+// type selects raw metainfo; typed JSON distinguishes magnets from fetched
+// .torrent URLs. Keep that distinction here instead of guessing server-side.
+function torrentOptions(raw) {
+  const source = raw || {};
+  const category = String(source.category || "").trim();
+  const parsedPriority = Number(source.priority == null ? 0 : source.priority);
+  return {
+    category: category || undefined,
+    priority: Number.isFinite(parsedPriority) ? Math.trunc(parsedPriority) : 0,
+    paused: source.paused === true || source.paused === "true",
+  };
+}
+function torrentFormOptions() {
+  return torrentOptions({
+    category: $("torrent-category").value,
+    priority: $("torrent-priority").value,
+    paused: $("torrent-paused").checked,
+  });
+}
+function torrentRequest(raw, rawOptions) {
+  const uri = String(raw || "").trim();
+  if (!uri) return null;
+  const options = torrentOptions(rawOptions);
+  return {
+    source: { type: /^magnet:\?/i.test(uri) ? "magnet" : "torrent_url", uri },
+    category: options.category,
+    priority: options.priority,
+    paused: options.paused,
+  };
+}
+function torrentQuery(rawOptions) {
+  const options = torrentOptions(rawOptions);
+  const fields = [
+    "priority=" + encodeURIComponent(options.priority),
+    "paused=" + encodeURIComponent(options.paused),
+  ];
+  if (options.category) fields.push("category=" + encodeURIComponent(options.category));
+  return "?" + fields.join("&");
+}
+function showTorrentAdd(open) {
+  const panel = $("torrent-add-form");
+  const wasOpen = !panel.hidden;
+  const nextOpen = open == null ? panel.hidden : open;
+  panel.hidden = !nextOpen;
+  $("btn-addtorrent").classList.toggle("active", nextOpen);
+  $("btn-addtorrent").setAttribute("aria-expanded", String(nextOpen));
+  if (nextOpen) $("torrent-uri").focus();
+  else if (wasOpen) $("btn-addtorrent").focus();
+}
+function torrentMessage(text, cls) {
+  const msg = $("addtorrent-msg");
+  msg.className = cls || "";
+  msg.textContent = text || "";
+}
+let torrentAdding = false;
+function setTorrentBusy(busy) {
+  torrentAdding = busy;
+  for (const id of ["torrent-uri", "torrent-category", "torrent-priority", "torrent-paused",
+                    "btn-torrent-uri", "btn-torrent-file", "btn-torrent-cancel"])
+    $(id).disabled = busy;
+  $("btn-torrent-uri").textContent = busy ? "Adding…" : "Add";
+}
+async function addTorrentUri(raw, rawOptions) {
+  const request = torrentRequest(raw, rawOptions || torrentFormOptions());
+  if (!request) {
+    torrentMessage("✗ paste a magnet link or .torrent URL", "bad");
+    return false;
+  }
+  if (torrentAdding) return false;
+  setTorrentBusy(true);
+  torrentMessage("adding source…", "");
+  let res;
+  try {
+    res = await post("/api/v1/jobs", {
+      headers: { "content-type": "application/json", ...CLIENT_HDRS },
+      body: JSON.stringify(request),
+      // Magnet resolution has no atomic backend timeout/cleanup contract:
+      // aborting here can report failure after the durable reservation exists.
+      // Remote .torrent fetches are server-bounded at 30 s, so 45 s still
+      // protects that path from a dead connection without racing its limit.
+      timeoutMs: request.source.type === "magnet" ? null : 45000,
+    });
+  } finally {
+    setTorrentBusy(false);
+  }
+  if (!res.ok) {
+    torrentMessage("✗ " + res.error, "bad");
+    return false;
+  }
+  $("torrent-uri").value = "";
+  torrentMessage(res.body && res.body.created === false
+    ? "✓ already in queue as job #" + res.body.id
+    : "✓ torrent added as job #" + res.body.id, "ok");
+  refreshAll();
+  return true;
+}
+async function addTorrentFiles(files, rawOptions) {
+  if (torrentAdding) return { added: 0, failed: 0 };
+  const options = torrentOptions(rawOptions || torrentFormOptions());
+  setTorrentBusy(true);
+  let added = 0, failed = 0, lastError = "";
+  try {
+    for (const f of files || []) {
+      torrentMessage("uploading " + f.name + "…", "");
+      let bytes;
+      try { bytes = await f.arrayBuffer(); }
+      catch (e) {
+        failed++;
+        lastError = f.name + ": " + e;
+        torrentMessage("✗ " + lastError, "bad");
+        continue;
+      }
+      const res = await post("/api/v1/jobs" + torrentQuery(options), {
+        headers: { "content-type": "application/x-bittorrent", ...CLIENT_HDRS },
+        body: bytes,
+        timeoutMs: 45000,
+      });
+      if (res.ok) added++;
+      else {
+        failed++;
+        lastError = f.name + ": " + res.error;
+        torrentMessage("✗ " + lastError, "bad");
+      }
+    }
+  } finally {
+    setTorrentBusy(false);
+  }
+  if (!failed && added) torrentMessage("✓ added " + added + " torrent" + (added === 1 ? "" : "s"), "ok");
+  else if (failed) torrentMessage(
+    "✗ " + failed + " failed" + (added ? "; " + added + " added" : "") +
+      (lastError ? " — " + lastError : ""),
+    "bad");
+  if (added) refreshAll();
+  return { added, failed };
+}
+$("btn-addtorrent").onclick = () => showTorrentAdd();
+$("btn-torrent-cancel").onclick = () => showTorrentAdd(false);
+$("btn-torrent-file").onclick = () => $("torrent-file").click();
+$("torrent-add-form").onsubmit = (event) => {
+  event.preventDefault();
+  addTorrentUri($("torrent-uri").value);
+};
+$("torrent-file").onchange = async () => {
+  await addTorrentFiles([...($("torrent-file").files || [])]);
+  $("torrent-file").value = "";
 };
 
 // ---- tabs ---------------------------------------------------------------
@@ -4567,6 +4764,8 @@ if (typeof __nzbd_test_enable !== "undefined") {
     clientLabel, clientChipModels, UA_MAX,
     pageSlice, setPage, setPageSize, renderPager, PAGE_SIZES, PAGE_SIZE_DEFAULT,
     pageState: () => ({ page, pageSize }),
+    torrentOptions, torrentRequest, torrentQuery, showTorrentAdd, setTorrentBusy,
+    addTorrentUri, addTorrentFiles,
     hideAppForSetup, SETUP_KEEP, showConfigDurability, advDownloadFile,
     setOpenJob: (id) => { openJob = id; },
     setActiveTab: (t) => { activeTab = t; },
