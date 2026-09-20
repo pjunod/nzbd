@@ -1368,6 +1368,7 @@ impl Owner {
                         torrent.control_intent = TorrentControlIntent::Running;
                         if torrent.ready_at_unix.is_none() {
                             torrent.phase = nzbd_types::TorrentPhase::Queued;
+                            torrent.last_activity_unix = Some(unix_now());
                         }
                         true
                     }

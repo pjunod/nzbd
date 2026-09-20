@@ -1,6 +1,6 @@
 # BitTorrent build status — single-node release candidate
 
-**Status:** runtime repair under adversarial review · **Updated:** 2026-09-20
+**Status:** runtime repair reviewed; qualification and merge tracked in PR #231 · **Updated:** 2026-09-20
 
 Companion to [BITTORRENT_PROPOSAL.md](BITTORRENT_PROPOSAL.md), which owns the
 architecture and acceptance contract. This page records execution progress for
@@ -9,7 +9,7 @@ not authorize production use by itself.
 
 ## Runtime repair — Ubuntu transfer incident on nuc3
 
-**Status:** implementation complete; adversarial review underway · **Base:**
+**Status:** implementation and review fixes complete · **Base:**
 `main` `c77edbc` · **Updated:** 2026-09-20
 
 [PR #231](https://github.com/pjunod/nzbd/pull/231) replaces the emergency uncommitted fixes with reviewed
@@ -22,9 +22,18 @@ changes will be reconciled after merge without overwriting other work.
 | Release DHT request dispatch | implemented | Reviewer verifies all four bounded request queues execute without debug assertions |
 | Queue progress and rate display | implemented | Torrent bytes, selected files, rates, and aggregate totals agree |
 | Startup and resume | implemented | Saved torrents restart; old activity timestamps cannot prevent discovery |
-| Adversarial review | underway | One review after implementation; findings addressed before qualification |
-| Fast-lane qualification | pending | Required current-head `Main promotion gate` and focused torrent regressions pass |
-| Merge and cleanup | pending | One merged PR; temporary clones, patches, and obsolete diagnostic images removed |
+| Adversarial review | addressed | Fixed stalled-retry slot monopoly and missing CI dependency/type scope |
+| Fast-lane qualification | [live checks](https://github.com/pjunod/nzbd/pull/231/checks) | Current-head `Main promotion gate` includes focused torrent regressions |
+| Merge and cleanup | [live PR status](https://github.com/pjunod/nzbd/pull/231) | PR description records qualification and cleanup completion |
+
+The Ubuntu ISO finished on nuc3: 6,482,409,472 bytes verified, phase `seeding`,
+with no reported error. The adversarial review ran without tests. Its P1
+finding is addressed by ranking expired automatic torrent retries behind fresh
+work in both torrent and NNTP scheduling; retries still use spare capacity.
+Startup and explicit resume receive a fresh discovery interval. A deterministic
+regression covers repeated yield/resume cycles and shared NNTP ordering. The P2
+finding is addressed by selecting torrent qualification for dependency, toolchain,
+durable type, state, daemon, configuration, and scope-script changes.
 
 ### Decisions and validation boundaries
 

@@ -141,12 +141,14 @@ impl QueueState {
                     && torrent.removal_intent.is_none()
                     && matches!(
                         torrent.phase,
-                        nzbd_types::TorrentPhase::Downloading
+                        nzbd_types::TorrentPhase::Queued
+                            | nzbd_types::TorrentPhase::Downloading
                             | nzbd_types::TorrentPhase::Checking
                             | nzbd_types::TorrentPhase::PausedDownload
                     )
                 {
                     torrent.phase = nzbd_types::TorrentPhase::Queued;
+                    torrent.last_activity_unix = Some(unix_now());
                 }
             }
         }
@@ -1108,7 +1110,7 @@ pub fn next_for_server(
         .collect();
     // Stable sort: equal priorities keep their queue-vec order, which is
     // user-controlled (move top/up/down/bottom) and persisted.
-    order.sort_by_key(|j| std::cmp::Reverse(j.priority));
+    order.sort_by_key(|j| scheduling_priority(j, ctx.now_unix));
 
     // The active set: the highest-priority jobs with work, at most
     // `max_active_downloads` of them. Priority decides WHO downloads;
@@ -1205,6 +1207,19 @@ pub fn has_leased(job: &Job) -> bool {
     })
 }
 
+/// An automatic retry of an idle torrent may use spare capacity, but cannot
+/// preempt fresh work and renew its discovery grace indefinitely. Startup
+/// and explicit user resume refresh the clock before entering this queue.
+fn scheduling_priority(job: &Job, now_unix: i64) -> (bool, std::cmp::Reverse<i32>) {
+    let stalled_retry = job.torrent.as_ref().is_some_and(|torrent| {
+        torrent.phase == nzbd_types::TorrentPhase::Queued
+            && torrent.last_activity_unix.is_some_and(|last| {
+                now_unix.saturating_sub(last) >= crate::backend::STALLED_SLOT_YIELD_SECS
+            })
+    });
+    (stalled_retry, std::cmp::Reverse(job.priority))
+}
+
 /// The jobs that may download right now, highest priority first. Shares
 /// its filter and ordering with [`next_for_server`] so the set the
 /// scheduler feeds and the set the status labels reflect cannot drift.
@@ -1233,7 +1248,7 @@ pub(crate) fn active_set_with_recovery(
         .filter(|j| job_schedulable(j, state.download_paused || soft_hold))
         .filter(|j| has_backend_work(j, now_unix, post_fetch_files.get(&j.id)))
         .collect();
-    order.sort_by_key(|j| std::cmp::Reverse(j.priority));
+    order.sort_by_key(|j| scheduling_priority(j, now_unix));
     order.truncate(clamp_active_downloads(state.max_active_downloads) as usize);
     order.iter().map(|j| j.id).collect()
 }
@@ -1972,6 +1987,75 @@ mod tests {
             .to_string();
         assert!(error.contains("no production torrent backend"));
         assert!(error.contains("queue was left unchanged"));
+    }
+
+    #[test]
+    fn stalled_torrent_retries_cannot_preempt_fresh_work_after_scheduler_yield() {
+        use crate::backend::{BackendFact, StopReason, STALLED_SLOT_YIELD_SECS};
+        use nzbd_types::TorrentPhase;
+
+        let mut now = 1_800_000_000;
+        let mut queue = QueueState::default();
+        let stalled = admit_fake_torrent(&mut queue, 100, TorrentPhase::Downloading, Some(now));
+        let healthy = admit_fake_torrent(&mut queue, 0, TorrentPhase::Downloading, Some(now));
+        let none = HashMap::new();
+
+        for _ in 0..3 {
+            now += STALLED_SLOT_YIELD_SECS;
+            queue
+                .job_mut(healthy)
+                .unwrap()
+                .torrent
+                .as_mut()
+                .unwrap()
+                .last_activity_unix = Some(now);
+            assert_eq!(active_set(&queue, &none, false, now), vec![healthy]);
+            crate::torrent_runtime::reconcile_fact(
+                queue.job_mut(stalled).unwrap(),
+                BackendFact::Stopped {
+                    job: stalled,
+                    reason: StopReason::SchedulerYield,
+                },
+                None,
+                now,
+                std::path::Path::new("/unused"),
+            );
+            assert_eq!(active_set(&queue, &none, false, now + 1), vec![healthy]);
+
+            // The retry is allowed when capacity becomes available.
+            queue.job_mut(healthy).unwrap().status = JobStatus::Paused;
+            assert_eq!(active_set(&queue, &none, false, now + 1), vec![stalled]);
+            crate::torrent_runtime::reconcile_fact(
+                queue.job_mut(stalled).unwrap(),
+                BackendFact::Resumed { job: stalled },
+                None,
+                now,
+                std::path::Path::new("/unused"),
+            );
+            queue.job_mut(healthy).unwrap().status = JobStatus::Downloading;
+        }
+
+        // NNTP leases must use the same ordering as torrent starts.
+        now += STALLED_SLOT_YIELD_SECS;
+        queue
+            .job_mut(stalled)
+            .unwrap()
+            .torrent
+            .as_mut()
+            .unwrap()
+            .phase = TorrentPhase::Queued;
+        queue.job_mut(healthy).unwrap().status = JobStatus::Paused;
+        let usenet = queue.admit_nzb("usenet".into(), &sample_nzb(&[("u.bin", 2)]), None, 0, true);
+        assert_eq!(active_set(&queue, &none, false, now), vec![usenet]);
+        // grant() uses a fixed earlier clock; keep the retry expired there too.
+        queue
+            .job_mut(stalled)
+            .unwrap()
+            .torrent
+            .as_mut()
+            .unwrap()
+            .last_activity_unix = Some(1);
+        assert_eq!(grant(&mut queue, &[server(1, 0)], 1), vec![usenet]);
     }
 
     #[test]

@@ -26,7 +26,7 @@ for path in "${changed[@]}"; do
       ;;
   esac
   case "$path" in
-    crates/nzbd-engine/*|crates/nzbd-torrent/*|crates/nzbd-api/src/torrent_admission.rs|contrib/rqbit/*|Makefile|scripts/check-rqbit-maintained-patch-series.sh|.github/workflows/main-fast-lane.yml)
+    Cargo.toml|Cargo.lock|rust-toolchain.toml|crates/nzbd/*|crates/nzbd-config/*|crates/nzbd-types/*|crates/nzbd-state/*|crates/nzbd-engine/*|crates/nzbd-torrent/*|crates/nzbd-api/src/torrent_admission.rs|contrib/rqbit/*|Makefile|scripts/ci-scope|scripts/check-fast-lane-contract|scripts/check-rqbit-maintained-patch-series.sh|.github/workflows/main-fast-lane.yml)
       torrent=true
       ;;
   esac
