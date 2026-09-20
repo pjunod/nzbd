@@ -1,6 +1,6 @@
 # BitTorrent build status — single-node release candidate
 
-**Status:** runtime repair in review preparation · **Updated:** 2026-09-20
+**Status:** runtime repair under adversarial review · **Updated:** 2026-09-20
 
 Companion to [BITTORRENT_PROPOSAL.md](BITTORRENT_PROPOSAL.md), which owns the
 architecture and acceptance contract. This page records execution progress for
@@ -9,10 +9,10 @@ not authorize production use by itself.
 
 ## Runtime repair — Ubuntu transfer incident on nuc3
 
-**Status:** implementation complete; adversarial review pending · **Base:**
+**Status:** implementation complete; adversarial review underway · **Base:**
 `main` `c77edbc` · **Updated:** 2026-09-20
 
-This consolidated PR replaces the emergency uncommitted fixes with reviewed
+[PR #231](https://github.com/pjunod/nzbd/pull/231) replaces the emergency uncommitted fixes with reviewed
 commits. Work for the PR happens in an independent disposable clone. The
 previous incident investigation changed local and nuc3 checkouts; those exact
 changes will be reconciled after merge without overwriting other work.
@@ -22,7 +22,7 @@ changes will be reconciled after merge without overwriting other work.
 | Release DHT request dispatch | implemented | Reviewer verifies all four bounded request queues execute without debug assertions |
 | Queue progress and rate display | implemented | Torrent bytes, selected files, rates, and aggregate totals agree |
 | Startup and resume | implemented | Saved torrents restart; old activity timestamps cannot prevent discovery |
-| Adversarial review | pending | One review after implementation; findings addressed before qualification |
+| Adversarial review | underway | One review after implementation; findings addressed before qualification |
 | Fast-lane qualification | pending | Required current-head `Main promotion gate` and focused torrent regressions pass |
 | Merge and cleanup | pending | One merged PR; temporary clones, patches, and obsolete diagnostic images removed |
 
@@ -44,9 +44,8 @@ changes will be reconciled after merge without overwriting other work.
    already has a Developer enablement section with advisory readiness; this
    repair does not introduce an additional enablement prerequisite or move
    nzbd configuration into Plurx.
-5. **Repository ownership.** The configured Forgejo token can access
-   `pjunod/ansible` and `noirr/plurx`, but no nzbd repository exists there.
-   The established GitHub repository remains authoritative.
+5. **GitHub only.** Per the 2026-09-20 clarification, repository and PR work
+   use `pjunod/nzbd` on GitHub. Forgejo is outside this task.
 
 ## Earlier implementation evidence
 
