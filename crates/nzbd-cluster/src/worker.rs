@@ -97,7 +97,7 @@ async fn worker_task(
         }
         let v = view.borrow().clone();
 
-        expire_local_leases(&engine, &active).await;
+        expire_local_leases(&engine, &servers, &active, &budget_receipt).await;
 
         if v.is_me {
             // We are the leader: granted leases dissolve into local jobs
@@ -117,7 +117,7 @@ async fn worker_task(
                 &url,
             )
             .await;
-            report_completions(&cfg, &engine, &client, &active, &url, &dest_dir).await;
+            report_completions(&cfg, &engine, &client, &active, &pp, &url, &dest_dir).await;
             poll_for_work(
                 &cfg,
                 &servers,
@@ -257,6 +257,7 @@ async fn report_completions(
     engine: &EngineHandle,
     client: &ClusterClient,
     active: &ActiveLeases,
+    pp: &Option<PpSetup>,
     leader_url: &str,
     dest_dir: &std::path::Path,
 ) {
@@ -322,6 +323,24 @@ async fn report_completions(
             .await
         {
             Ok(resp) if resp.ok => {
+                if lease.kind == LeaseKind::Post && !resp.history_recorded_by_authority {
+                    let history_result = match (pp, resp.accepted_at_unix_ms) {
+                        (Some(setup), Some(accepted_at_ms)) => {
+                            record_published_pp_history(
+                                setup.history.clone(),
+                                &req.job,
+                                &req.result_ref,
+                                accepted_at_ms,
+                            )
+                            .await
+                        }
+                        _ => Err("durable PP history target or timestamp unavailable".into()),
+                    };
+                    if let Err(error) = history_result {
+                        tracing::warn!(job = job_id.0, %error, "PP completion awaits durable history");
+                        continue;
+                    }
+                }
                 tracing::info!(job = job_id.0, %lease_id, "completion handed to leader");
                 active.lock().unwrap().remove(&lease_id);
                 let _ = engine.remove_job_silent(job_id).await;
@@ -332,6 +351,52 @@ async fn report_completions(
             }
         }
     }
+}
+
+async fn record_published_pp_history(
+    history: Arc<nzbd_state::history::HistoryDb>,
+    job: &nzbd_types::Job,
+    result_ref: &str,
+    accepted_at_ms: i64,
+) -> Result<(), String> {
+    let status = job
+        .params
+        .iter()
+        .find(|(key, _)| key == nzbd_types::PP_DONE_PARAM)
+        .map(|(_, value)| value.clone())
+        .unwrap_or_else(|| "SUCCESS".into());
+    let entry = nzbd_state::HistoryEntry {
+        job: job.id,
+        name: job.name.clone(),
+        category: job.category.clone(),
+        final_dir: Some(result_ref.to_owned()),
+        status,
+        size: job.totals.size,
+        health: nzbd_types::Health::calc(&job.totals).0,
+        params: job
+            .params
+            .iter()
+            .filter(|(key, _)| !key.starts_with('*'))
+            .cloned()
+            .collect(),
+        dupe_key: job.dupe.key.clone(),
+        dupe_score: job.dupe.score,
+        completed_at_unix: accepted_at_ms / 1000,
+        hidden: false,
+        first_seen_at_unix: None,
+        last_seen_at_unix: None,
+        seen_count: 0,
+        removed_at_unix: None,
+        picked_up_by: None,
+        record: Some(nzbd_state::JobRecord::from_job(job)),
+        stages: job.stages.clone(),
+        seq: 0,
+    };
+    tokio::task::spawn_blocking(move || history.record_seq(&entry))
+        .await
+        .map_err(|error| format!("join durable history write: {error}"))?
+        .map(|_| ())
+        .map_err(|error| format!("write durable PP history: {error}"))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1067,7 +1132,12 @@ fn conservative_deadline(cfg: &ClusterConfig) -> Instant {
         )
 }
 
-async fn expire_local_leases(engine: &EngineHandle, active: &ActiveLeases) {
+async fn expire_local_leases(
+    engine: &EngineHandle,
+    servers: &[ServerDef],
+    active: &ActiveLeases,
+    budget_receipt: &BudgetReceipt,
+) {
     let expired: Vec<_> = {
         let now = Instant::now();
         let mut leases = active.lock().unwrap();
@@ -1080,10 +1150,20 @@ async fn expire_local_leases(engine: &EngineHandle, active: &ActiveLeases) {
             .filter_map(|id| leases.remove(&id).map(|state| (id, state)))
             .collect()
     };
+    let had_expired = !expired.is_empty();
     for (lease_id, state) in expired {
         state.cancel.cancel();
         tracing::warn!(job = state.job.0, %lease_id, "local lease deadline expired; cancelling work");
         let _ = engine.remove_job_silent(state.job).await;
+    }
+    if had_expired && active.lock().unwrap().is_empty() {
+        let generation = budget_receipt
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|receipt| receipt.cluster_generation)
+            .unwrap_or_default();
+        apply_budgets(engine, servers, &HashMap::new(), generation, budget_receipt).await;
     }
 }
 
@@ -1267,7 +1347,7 @@ mod tests {
             },
         );
 
-        expire_local_leases(&engine, &active).await;
+        expire_local_leases(&engine, &[], &active, &Arc::new(Mutex::new(None))).await;
 
         assert!(active.lock().unwrap().is_empty());
         assert!(cancel.is_cancelled());

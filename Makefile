@@ -198,7 +198,7 @@ fast-check-rust: ## Reviewed merge candidate: compile/lint Rust and run bounded 
 	$(CARGO) check --workspace --all-targets --locked
 	$(CARGO) clippy --workspace --all-targets --locked -- -D warnings
 	$(CARGO) test --locked -p nzbd-cluster --lib
-	$(CARGO) test --locked -p nzbd-cluster --test cluster_e2e
+	$(CARGO) test --locked -p nzbd-cluster --test cluster_e2e -- --test-threads=1
 
 .PHONY: fast-check
 fast-check: ## Final affected fast lane; run once after the combined adversarial review

@@ -125,6 +125,17 @@ async fn replicated_election_task(
                 }
             }
         } else if cfg.eligible {
+            // Preserve the configured coordinator preference at the
+            // replicated authority boundary. Without this stagger, fixed
+            // voters cold-starting together race their first SQL lease and
+            // a lower-priority standby can take office arbitrarily.
+            let step = cfg.lease_interval * 3;
+            let jitter_ms = hash_jitter(&cfg.node) % cfg.lease_interval.as_millis().max(1) as u64;
+            let stagger = step * cfg.priority.min(16) + Duration::from_millis(jitter_ms);
+            sleep_or_cancel(&cancel, stagger).await;
+            if cancel.is_cancelled() {
+                break;
+            }
             match control
                 .acquire(
                     resource,

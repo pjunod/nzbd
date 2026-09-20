@@ -1,6 +1,6 @@
 # Cluster completion — progress and remaining work
 
-**Updated:** 2026-09-19 · **State:** adversarial findings addressed; final validation rerun pending ·
+**Updated:** 2026-09-19 · **State:** repair candidate complete; final affected-lane rerun pending ·
 **Branch:** `codex/clustering-completion` · **PR:** [#227](https://github.com/pjunod/nzbd/pull/227)
 
 Companion to [CLUSTERING.md](CLUSTERING.md) (the existing implementation) and
@@ -20,14 +20,14 @@ a claimed verification of a newer Forgejo tip or the deployed fleet.
 |---|---|---|
 | Current source comparison | Complete | Coordination, publication, transport recovery, PP ownership, provider budgets, and CI inspected at the revisions above |
 | Documentation and finite implementation plan | Complete | Existing claims reconciled; recommended dependency/migration decision and P0–P5 acceptance recorded in the linked plan |
-| P0 — delivery lane | Implemented; reviewed; not yet tested | Draft PRs allocate no validation jobs; readiness starts the affected lane; full suites remain explicit; unrelated BitTorrent M0/fuzz matrices no longer run on PR events |
-| P1 — transactional control authority | Implemented; reviewed; compile-checked; not yet tested | Pinned plurx Hiqlite/WAL, atomic schema install, request-atomic queue deltas with rollback, exact projection takeover, durable full lease reconstruction, and idempotent migration startup |
-| P2 — worker lifetime and publication | Implemented; reviewed; compile-checked; not yet tested | Bounded RPCs/deadlines; immediate PP cancellation; exact lost-response receipts; job-bound, fsynced immutable generations; immutable result references and idempotent history |
-| P3 — weighted placement and account budgets | Implemented; reviewed; compile-checked; not yet tested | Weighted remote-only execution plus persisted generation handoff; only active pool tasks acknowledge at batch boundaries; startup is fail-closed and uncertain sockets remain reserved |
-| P4 — segment distribution | Implemented; reviewed; compile-checked; not yet tested | Fixed explicit article ranges; failed ranges cannot publish; exact range-set/byte coverage and CRC validation; one exact assembly lease |
-| P5 — operator surface and final acceptance | Implemented; reviewed; compile-checked; not yet tested | Cached diagnostics, unrestricted Settings → Dev enable controls with advisory evidence, updated behavior/config docs, bounded acceptance harnesses, and vendored RustSec inventory |
+| P0 — delivery lane | Implemented; reviewed; targeted validation green | Draft PRs allocate no validation jobs; readiness starts the affected lane; full suites remain explicit; unrelated BitTorrent M0/fuzz matrices no longer run on PR events |
+| P1 — transactional control authority | Implemented; reviewed; targeted validation green | Pinned plurx Hiqlite/WAL, atomic schema install, request-atomic queue deltas with rollback, quorum-backed health, adoption-before-write ordering, durable lease reconstruction, and idempotent migration startup |
+| P2 — worker lifetime and publication | Implemented; reviewed; targeted validation green | Bounded RPCs/deadlines; immediate PP cancellation; lost-renewal resynchronization inside one fence; exact completion receipts; job-bound, fsynced immutable generations; receipt-timestamped history |
+| P3 — weighted placement and account budgets | Implemented; reviewed; targeted validation green | Weighted remote-only execution plus persisted generation handoff; only active pool tasks acknowledge at batch boundaries; dead-holder capacity remains reserved through bounded lease expiry |
+| P4 — segment distribution | Implemented; reviewed; targeted validation green | Fixed explicit article ranges; failed ranges cannot publish; exact range-set/byte coverage and CRC validation; one exact assembly lease |
+| P5 — operator surface and final acceptance | Implemented; reviewed; targeted validation green | Cached diagnostics, pre-extraction peer authentication, unrestricted Settings → Dev enable controls with advisory evidence, updated docs, bounded serial acceptance harnesses, and vendored RustSec inventory |
 | One adversarial review | Complete; findings addressed | Independent combined-change review found authority, failover, publication, budget, range, acceptance, audit, and CI gaps; all actionable findings were implemented before validation |
-| Fast lane | Repair rerun pending | Validation exposed an unintended Hiqlite S3/XML feature edge, a cargo-audit/deny exception mismatch, one historical review-label contract, and compiler-upgrade Clippy lints. The S3 edge was removed rather than waived, the exact existing exception set is shared by both advisory tools, the review record stays countable, and the lints use semantics-preserving replacements or a typed constructor bundle. Require the repaired candidate's affected lane to pass. |
+| Fast lane | Affected repair cases green; combined rerun pending | The first combined run exposed dependency/CI contracts plus auth ordering, quorum health, adoption ordering, restart identity, lost-renewal failover, dead-holder capacity, and PP-history defects. Each affected clustering regression now passes in isolation. The complete bounded E2E target runs serially to isolate its multi-process voters before merge. |
 | PR / merge / deployment | PR #227 open and ready; not merged; not deployed | Next: satisfy the repaired candidate's required checks and merge. Deployment remains a separate operation. |
 
 ## Implementation decisions
@@ -54,6 +54,12 @@ a claimed verification of a newer Forgejo tip or the deployed fleet.
   configured capacity returns automatically when that node is a worker.
 - The familiar completed directory is a compatibility alias. Durable history
   and `*Cluster:result-ref` expose the immutable selected generation.
+- API writes wait for completed authority adoption; this is a transactional
+  correctness boundary, not a feature gate. Cluster enablement remains wholly
+  operator-controlled.
+- Provider capacity held by an unreachable process is released only after all
+  its durable work leases expire and its process-local deadline has drained
+  connections. Missing a heartbeat alone never reallocates sockets.
 
 ## Bounded acceptance inventory
 
@@ -69,9 +75,11 @@ worker/leader death scenarios exercise reassign/adopt behavior.
 ## Compile evidence
 
 `cargo check --workspace --all-targets` is green after the adversarial fixes.
-This is static development evidence, not the final fast lane. Per the delivery
-contract, no test target has run yet; the tests run once at the final
-merge-candidate stage.
+The seven clustering scenarios that failed or timed out in the first remote
+candidate were rerun individually after repair and are green: peer auth,
+three-voter quorum loss, snapshot-repair adoption, queue restart, leader death,
+worker death, and remote PP/history. This is affected repair evidence; the
+combined remote fast lane remains the required merge result.
 
 ## Working rules
 

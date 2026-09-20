@@ -9,8 +9,9 @@ use crate::http::secret_matches;
 use crate::proto::*;
 use crate::registry::read_nodes;
 use crate::{ClusterConfig, SharedLayout};
-use axum::extract::State;
+use axum::extract::{Request, State};
 use axum::http::{HeaderMap, StatusCode};
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -19,6 +20,7 @@ use nzbd_types::{JobId, JobStatus, ServerDef};
 use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
 use tokio::sync::watch;
@@ -65,6 +67,7 @@ pub struct LeaderShared {
     /// commits. The engine is speculative until replicated control accepts
     /// the exact request-local delta.
     pub(crate) mutation_serial: tokio::sync::Mutex<()>,
+    authority_ready: AtomicBool,
 }
 
 pub(crate) struct LeaderDurability {
@@ -111,7 +114,12 @@ impl LeaderShared {
             node_seen: Mutex::new(HashMap::new()),
             budgets: Mutex::new(BudgetHandoff::default()),
             mutation_serial: tokio::sync::Mutex::new(()),
+            authority_ready: AtomicBool::new(false),
         })
+    }
+
+    pub(crate) fn authority_ready(&self) -> bool {
+        self.authority_ready.load(Ordering::Acquire)
     }
 
     pub(crate) async fn engine_projection(&self) -> Result<HashMap<u64, nzbd_types::Job>, String> {
@@ -400,6 +408,31 @@ impl LeaderShared {
         self.persist_budget_state().await;
     }
 
+    /// A holder that stopped acknowledging a shrink keeps its capacity
+    /// reserved until all of its durable work leases have expired. Workers
+    /// independently drain connections at that same bounded deadline, so the
+    /// expired holder can then be removed without oversubscribing a provider.
+    fn retire_expired_budget_holder(&self, node: &str) {
+        if self
+            .leases
+            .lock()
+            .unwrap()
+            .values()
+            .any(|lease| lease.node == node)
+        {
+            return;
+        }
+        let mut state = self.budgets.lock().unwrap();
+        state.grants.remove(node);
+        state.commands.remove(node);
+        state.awaiting_shrink.remove(node);
+        if state.pending_target.is_some() && state.awaiting_shrink.is_empty() {
+            state.generation = state.generation.saturating_add(1);
+            state.grants = state.pending_target.take().unwrap();
+            state.commands = state.grants.clone();
+        }
+    }
+
     async fn grant_job(
         &self,
         node: &str,
@@ -523,7 +556,26 @@ pub fn router(shared: Arc<LeaderShared>) -> Router {
         .route("/cluster/v1/work/complete", post(work_complete))
         .route("/cluster/v1/work/reject", post(work_reject))
         .route("/cluster/v1/work/script-receipt", post(work_script_receipt))
+        // Authenticate the peer namespace before extractors parse a request
+        // body. Otherwise an unauthenticated malformed request can reveal
+        // schema details through a 4xx extractor response.
+        .route_layer(middleware::from_fn_with_state(
+            shared.clone(),
+            require_cluster_secret,
+        ))
         .with_state(shared)
+}
+
+async fn require_cluster_secret(
+    State(shared): State<Arc<LeaderShared>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    if authed(&shared, request.headers()) {
+        next.run(request).await
+    } else {
+        denied()
+    }
 }
 
 async fn work_script_receipt(
@@ -577,6 +629,20 @@ fn authed(shared: &LeaderShared, headers: &HeaderMap) -> bool {
 
 fn worker_admits_new_work(worker: &NodeRecord) -> bool {
     worker.disk_guard_capable && !worker.disk_low
+}
+
+/// A heartbeat may carry a predecessor token when the prior leader committed
+/// a renewal but died before its response reached the worker. Only the
+/// durable token is renewed; ownership and the fencing generation must still
+/// match exactly, and a worker can never move a token backwards or across a
+/// takeover.
+fn heartbeat_token_can_advance(provided: &LeaseToken, durable: &LeaseToken) -> bool {
+    provided.resource == durable.resource
+        && provided.owner_node_id == durable.owner_node_id
+        && provided.owner_incarnation == durable.owner_incarnation
+        && provided.fence == durable.fence
+        && provided.revision <= durable.revision
+        && provided.expires_at_unix_ms <= durable.expires_at_unix_ms
 }
 
 fn not_leader() -> Response {
@@ -942,7 +1008,7 @@ async fn work_heartbeat(
                     continue;
                 }
             };
-            if stored.token != lp.token
+            if !heartbeat_token_can_advance(&lp.token, &stored.token)
                 || stored.owner_node_id != req.node
                 || stored.job_id != u64::from(lp.job.0)
                 || stored_kind != lp.kind
@@ -969,7 +1035,7 @@ async fn work_heartbeat(
         };
         if info.node != req.node
             || info.job != lp.job
-            || info.token != lp.token
+            || !heartbeat_token_can_advance(&lp.token, &info.token)
             || !snap.jobs.iter().any(|job| job.id == lp.job)
         {
             cancel.push(lp.lease_id.clone());
@@ -992,14 +1058,14 @@ async fn work_heartbeat(
             continue;
         }
         let next = match &s.control {
-            Some(control) => control.renew(&lp.token, s.cfg.worker_ttl).await,
+            Some(control) => control.renew(&info.token, s.cfg.worker_ttl).await,
             None => Ok(None),
         };
         match next {
             Ok(Some(next)) => {
                 let mut leases = s.leases.lock().unwrap();
                 if let Some(current) = leases.get_mut(&lp.lease_id) {
-                    if current.token == lp.token {
+                    if current.token == info.token {
                         current.token = next.clone();
                         current.last_hb = Instant::now();
                         controls.insert(lp.lease_id.clone(), current.control_revision);
@@ -1189,6 +1255,28 @@ async fn work_complete(
                 .into_response();
         }
     }
+    let accepted_at_ms = match durable_receipt
+        .as_ref()
+        .map(|receipt| receipt.accepted_at_ms)
+    {
+        Some(value) => value,
+        None => match &s.control {
+            Some(control) => control
+                .publication_accepted_at(&req.receipt_id)
+                .await
+                .ok()
+                .flatten()
+                .unwrap_or_default(),
+            None => 0,
+        },
+    };
+    if accepted_at_ms <= 0 {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "durable completion timestamp unavailable"})),
+        )
+            .into_response();
+    }
     if info.kind == LeaseKind::Segment {
         tracing::info!(job = job_id.0, node = %req.node, resource = %req.token.resource, "article range committed");
         s.leases.lock().unwrap().remove(&req.lease_id);
@@ -1196,6 +1284,8 @@ async fn work_complete(
         return Json(CompleteResponse {
             ok: true,
             durable_receipt: Some(req.receipt_id),
+            accepted_at_unix_ms: Some(accepted_at_ms),
+            history_recorded_by_authority: false,
         })
         .into_response();
     }
@@ -1242,17 +1332,9 @@ async fn work_complete(
         }
         published_job.dir_name = original_dir;
     }
+    let history_recorded_by_authority = info.kind == LeaseKind::Post && s.history.is_some();
     if info.kind == LeaseKind::Post {
-        let accepted_at = match &s.control {
-            Some(control) => control
-                .publication_accepted_at(&req.receipt_id)
-                .await
-                .ok()
-                .flatten()
-                .unwrap_or_default(),
-            None => 0,
-        };
-        if let Err(error) = record_pp_history(&s, &published_job, accepted_at).await {
+        if let Err(error) = record_pp_history(&s, &published_job, accepted_at_ms).await {
             tracing::warn!(job = job_id.0, %error, "published PP result awaits durable history");
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -1273,6 +1355,8 @@ async fn work_complete(
     Json(CompleteResponse {
         ok: true,
         durable_receipt: Some(req.receipt_id),
+        accepted_at_unix_ms: Some(accepted_at_ms),
+        history_recorded_by_authority,
     })
     .into_response()
 }
@@ -1566,6 +1650,7 @@ pub fn spawn_leader_task(
             if is_leader && !was_leader {
                 // Taking office: discard leases inherited from the old view.
                 // New leases arrive via worker heartbeats or fresh grants.
+                shared.authority_ready.store(false, Ordering::Release);
                 shared.leases.lock().unwrap().clear();
                 shared.restore_budget_state().await;
             }
@@ -1591,6 +1676,9 @@ pub fn spawn_leader_task(
                                         match recover_selected_publications(&shared).await {
                                             Ok(()) => {
                                                 authority_ready = true;
+                                                shared
+                                                    .authority_ready
+                                                    .store(true, Ordering::Release);
                                                 tracing::info!(epoch = shared.epoch(), "leader task active");
                                             }
                                             Err(error) => {
@@ -1622,6 +1710,7 @@ pub fn spawn_leader_task(
                 }
             } else if !is_leader {
                 authority_ready = false;
+                shared.authority_ready.store(false, Ordering::Release);
             }
             was_leader = is_leader;
 
@@ -1747,6 +1836,7 @@ async fn sweep_expired(s: &Arc<LeaderShared>) {
         // job re-enters scheduling (locally or re-delegated).
         let _ = s.engine.fold_job_journals(info.job).await;
         let _ = s.engine.set_delegated(info.job, None).await;
+        s.retire_expired_budget_holder(&info.node);
     }
     s.apply_local_budgets().await;
 }

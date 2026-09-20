@@ -511,6 +511,15 @@ async fn commit_control_mutation(
         return next.run(request).await;
     }
     let _serial = shared.mutation_serial.lock().await;
+    if !shared.authority_ready() {
+        return (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": "queue authority is still being adopted; retry"
+            })),
+        )
+            .into_response();
+    }
     let healthy = match &shared.control {
         Some(control) => control.is_healthy().await,
         None => false,

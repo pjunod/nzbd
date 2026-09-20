@@ -58,6 +58,11 @@ failed under the same revision check. A worker completion names the exact job
 revision it executed; a newer pause, delete, file edit, or other intent makes
 that completion conflict.
 
+Election and queue adoption are distinct steps. The native mutation API
+returns a retryable `503` while an elected process is still adopting the
+replicated projection, so a successful write cannot be erased by the tail of
+takeover recovery.
+
 The elected authority schedules and projects state but performs no local
 download or post-processing. A coordinator's configured executor capacity is
 available whenever it is a worker; while elected, work goes to another node so
@@ -70,9 +75,12 @@ resource + owner node + owner process incarnation + fence + lease revision + exp
 ```
 
 Acquire, renew, release, and publication compare every field. Renewal returns a
-successor token. Replaying an earlier token cannot revive authority. Workers
-also keep a conservative monotonic deadline; failed or hung HTTP never extends
-it. Cluster JSON bodies are capped at 1 MiB and ordinary control calls have a
+successor token. Replaying an earlier token cannot release or publish. A
+heartbeat may resynchronize only to a newer durable token with the same
+resource, owner process, and fence; this covers a committed renewal whose
+response was lost with the old leader without crossing a takeover. Workers also
+keep a conservative monotonic deadline; failed or hung HTTP never extends it.
+Cluster JSON bodies are capped at 1 MiB and ordinary control calls have a
 3-second connect / 10-second total deadline. Streaming API proxy traffic keeps
 its separate streaming behavior.
 
@@ -117,7 +125,10 @@ NNTP connection task acknowledges only after reaching a batch boundary; a task
 above the new allowance closes its socket before acknowledging. The leader
 withholds increases until every old holder confirms the shrink. A stopped or
 unreachable holder therefore leaves capacity conservatively reserved and the
-diagnostic snapshot reports it as `uncertain_reserved_capacity`.
+diagnostic snapshot reports it as `uncertain_reserved_capacity` until all of
+that holder's durable work leases expire. At the same bounded deadline the
+worker independently drains its local connection budgets; only then may the
+leader retire the dead holder and reassign the capacity.
 
 Desired, commanded, acknowledged, and pending transfer state is replicated so
 a leader change does not forget an uncertain socket. Zero-connection shares are
@@ -170,6 +181,11 @@ renames the new directory. The result marker makes retries idempotent. PP
 history uses the publication receipt timestamp, so a lost response retries the
 same logical row rather than inventing a second completion.
 
+When the authority has a history index it records that logical row directly.
+Otherwise the PP executor records it only after the authority returns the
+durable receipt timestamp; a lost response leaves the lease active and the
+retry reuses the same receipt and history key.
+
 The durable job carries `*Cluster:result-ref`, and history's `final_dir` points
 at that immutable generation. The familiar completed-directory path is a
 recoverable publication alias for compatibility, not the result identity.
@@ -185,7 +201,8 @@ private attempt directories are never selected as results.
 
 Every node serves the native API and NZBGet-compatible shim. A non-leader
 proxies client traffic to the discovered authority. Peer endpoints under
-`/cluster/v1/*` use the independent cluster secret.
+`/cluster/v1/*` use the independent cluster secret, checked before JSON/body
+extraction so malformed unauthenticated requests cannot expose peer schemas.
 
 Authenticated `GET /api/v1/cluster` serves a two-second background snapshot,
 so an unavailable shared mount does not turn the HTTP request into an
@@ -235,7 +252,7 @@ These checks are advice, not an activation receipt.
 | Pause/delete races completion | Reconciled job revision wins; stale result changes no queue/history state |
 | Worker dies during a range | Accepted ranges remain; incomplete range alone is retried |
 | PP attempts overlap | Each has private bytes; only the accepted fence is selected |
-| Budget holder disappears | Its uncertain sockets remain reserved; other nodes do not receive that capacity |
+| Budget holder disappears | Its uncertain sockets remain reserved through durable lease expiry; the worker drains locally at its deadline, then capacity can move |
 | Shared volume stalls | Control and cached diagnostics stay bounded; payload publication reports incomplete |
 
 ## Limits

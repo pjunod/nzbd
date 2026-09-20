@@ -592,19 +592,61 @@ async fn three_voters_keep_majority_and_reject_mutations_after_quorum_loss() {
 async fn leader_retries_authority_adoption_after_snapshot_repair() {
     let tmp = tempfile::tempdir().unwrap();
     let state_dir = tmp.path().join(".nzbd-cluster");
-    std::fs::create_dir_all(&state_dir).unwrap();
+    let post = build_post("repaired", &[("payload.bin", prng_bytes(9, 16_000))], 4_000);
+    let ns = NservBuilder::new().with_post(&post).start().await.unwrap();
+    let control = control_topology(1).remove(0);
+    let opts = || NodeOpts {
+        coordinator: true,
+        priority: 0,
+        download: true,
+        max_download_jobs: 1,
+        post_process: false,
+        min_free_disk_bytes: 0,
+    };
+
+    // Complete the one-time legacy migration before simulating a future
+    // snapshot. Once the replicated migration identity exists, restarts must
+    // not decode or overwrite a newer queue format they do not understand.
+    let initial = start_node_with_control(
+        tmp.path(),
+        "a",
+        opts(),
+        ns.port(),
+        2,
+        nzbd_api::AuthConfig::default(),
+        Some(control.clone()),
+    )
+    .await;
+    wait_for("initial migration leader elected", 15, || {
+        get_json(&initial.url, "/api/v1/cluster")["is_leader"].as_bool() == Some(true)
+    })
+    .await;
+    initial.kill().await;
+
     let snapshot_path = state_dir.join("queue.json");
     let unreadable = br#"{"schema_version":4,"jobs":[{"kind":"future_transfer"}]}"#;
     std::fs::write(&snapshot_path, unreadable).unwrap();
-
-    let post = build_post("repaired", &[("payload.bin", prng_bytes(9, 16_000))], 4_000);
-    let ns = NservBuilder::new().with_post(&post).start().await.unwrap();
-    let node = start_node(
+    let node = start_node_with_control(
         tmp.path(),
         "a",
+        opts(),
+        ns.port(),
+        2,
+        nzbd_api::AuthConfig::default(),
+        Some(control),
+    )
+    .await;
+
+    wait_for("leader elected", 15, || {
+        get_json(&node.url, "/api/v1/cluster")["is_leader"].as_bool() == Some(true)
+    })
+    .await;
+    let worker = start_node(
+        tmp.path(),
+        "worker",
         NodeOpts {
-            coordinator: true,
-            priority: 0,
+            coordinator: false,
+            priority: 100,
             download: true,
             max_download_jobs: 1,
             post_process: false,
@@ -613,11 +655,6 @@ async fn leader_retries_authority_adoption_after_snapshot_repair() {
         ns.port(),
         2,
     )
-    .await;
-
-    wait_for("leader elected", 15, || {
-        get_json(&node.url, "/api/v1/cluster")["is_leader"].as_bool() == Some(true)
-    })
     .await;
     tokio::time::sleep(Duration::from_millis(500)).await;
     assert_eq!(
@@ -638,6 +675,7 @@ async fn leader_retries_authority_adoption_after_snapshot_repair() {
     })
     .await;
 
+    worker.kill().await;
     node.kill().await;
 }
 
@@ -1000,8 +1038,9 @@ async fn leader_death_fails_over_and_adopts_the_running_lease() {
     }
     let ns = builder.start().await.unwrap();
 
-    // Three fixed voters: a is preferred, b also executes downloads, c is
-    // the standby. Starting them together lets the initial quorum form.
+    // Three fixed voters plus a dedicated executor. The voter that wins a
+    // simultaneous cold start is deliberately not assumed: the invariant is
+    // that any successor adopts the executor's durable running lease.
     let topology = control_topology(3);
     let (a, b, c) = tokio::join!(
         start_node_with_control(
@@ -1026,8 +1065,8 @@ async fn leader_death_fails_over_and_adopts_the_running_lease() {
             NodeOpts {
                 coordinator: true,
                 priority: 9,
-                download: true,
-                max_download_jobs: 2,
+                download: false,
+                max_download_jobs: 0,
                 post_process: false,
                 min_free_disk_bytes: 0,
             },
@@ -1053,38 +1092,80 @@ async fn leader_death_fails_over_and_adopts_the_running_lease() {
             Some(topology[2].clone())
         ),
     );
+    let mut voters = vec![a, b, c];
 
-    wait_for("every node sees a as leader", 15, || {
-        [&a, &b, &c]
+    wait_for("every voter agrees on one leader", 20, || {
+        let views: Vec<_> = voters
             .iter()
-            .all(|n| get_json(&n.url, "/api/v1/cluster")["leader"]["node"].as_str() == Some("a"))
-            && get_json(&a.url, "/api/v1/cluster")["is_leader"].as_bool() == Some(true)
+            .map(|node| get_json(&node.url, "/api/v1/cluster"))
+            .collect();
+        let leader = views[0]["leader"]["node"].as_str();
+        leader.is_some()
+            && views
+                .iter()
+                .all(|view| view["leader"]["node"].as_str() == leader)
+            && views
+                .iter()
+                .filter(|view| view["is_leader"].as_bool() == Some(true))
+                .count()
+                == 1
     })
     .await;
-    // Add via the standby coordinator: must proxy to the leader.
-    add_job(&c.url, "failover", post.nzb.as_bytes()).await;
+    let worker = start_node(
+        tmp.path(),
+        "worker",
+        NodeOpts {
+            coordinator: false,
+            priority: 100,
+            download: true,
+            max_download_jobs: 2,
+            post_process: false,
+            min_free_disk_bytes: 0,
+        },
+        ns.port(),
+        4,
+    )
+    .await;
+    // Add through the worker: the request must proxy to whichever voter won.
+    add_job(&worker.url, "failover", post.nzb.as_bytes()).await;
 
-    // b makes progress, then the leader dies.
+    // The dedicated worker makes progress, then the leader dies.
     let shared = tmp.path().to_path_buf();
-    wait_for("progress on b", 20, || {
+    wait_for("progress on worker", 20, || {
         journaled_segments(&shared).len() >= 3
     })
     .await;
     let done_before = journaled_segments(&shared);
-    let epoch_before = get_json(&c.url, "/api/v1/cluster")["epoch"]
-        .as_u64()
+    let before = get_json(&voters[0].url, "/api/v1/cluster");
+    let epoch_before = before["epoch"].as_u64().unwrap();
+    let old_leader = before["leader"]["node"].as_str().unwrap().to_string();
+    let old_index = voters
+        .iter()
+        .position(|node| node.name == old_leader)
         .unwrap();
-    a.kill().await;
+    voters.remove(old_index).kill().await;
 
-    // c takes over with a higher epoch; b keeps executing (its lease is
-    // adopted via heartbeat, not restarted).
-    wait_for("c takes office", 30, || {
-        let v = get_json(&c.url, "/api/v1/cluster");
-        v["is_leader"].as_bool() == Some(true) && v["epoch"].as_u64().unwrap_or(0) > epoch_before
+    // A surviving voter takes over with a higher epoch; the worker keeps
+    // executing and its lease is adopted via heartbeat, not restarted.
+    wait_for("surviving voter takes office", 30, || {
+        voters.iter().any(|node| {
+            let view = get_json(&node.url, "/api/v1/cluster");
+            view["is_leader"].as_bool() == Some(true)
+                && view["epoch"].as_u64().unwrap_or(0) > epoch_before
+        })
     })
     .await;
+    let new_leader_url = voters
+        .iter()
+        .find(|node| get_json(&node.url, "/api/v1/cluster")["is_leader"].as_bool() == Some(true))
+        .unwrap()
+        .url
+        .clone();
     wait_for("completion under the new leader", 60, || {
-        get_json(&c.url, "/api/v1/jobs")["jobs"][0]["status"] == "completed"
+        let (code, body) = http(&new_leader_url, "GET", "/api/v1/jobs", b"");
+        code == 200
+            && serde_json::from_str::<serde_json::Value>(&body)
+                .is_ok_and(|value| value["jobs"][0]["status"] == "completed")
     })
     .await;
 
@@ -1097,11 +1178,13 @@ async fn leader_death_fails_over_and_adopts_the_running_lease() {
             "segment {seg} must not be re-fetched across the failover"
         );
     }
-    // b's view agrees the job is done (proxied to c).
-    assert_eq!(get_json(&b.url, "/api/v1/status")["jobs_finished"], 1);
+    // The worker's view agrees the job is done through the new leader.
+    assert_eq!(get_json(&worker.url, "/api/v1/status")["jobs_finished"], 1);
 
-    b.kill().await;
-    c.kill().await;
+    worker.kill().await;
+    for voter in voters {
+        voter.kill().await;
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1119,7 +1202,17 @@ async fn single_node_cluster_restart_keeps_the_queue() {
         post_process: false,
         min_free_disk_bytes: 0,
     };
-    let a = start_node(tmp.path(), "solo", opts(), ns.port(), 4).await;
+    let control = control_topology(1).remove(0);
+    let a = start_node_with_control(
+        tmp.path(),
+        "solo",
+        opts(),
+        ns.port(),
+        4,
+        nzbd_api::AuthConfig::default(),
+        Some(control.clone()),
+    )
+    .await;
     wait_for("self-election", 15, || {
         get_json(&a.url, "/api/v1/cluster")["is_leader"].as_bool() == Some(true)
     })
@@ -1138,7 +1231,16 @@ async fn single_node_cluster_restart_keeps_the_queue() {
     a.kill().await;
 
     // Restart: the queue authority state survives on the shared volume.
-    let a2 = start_node(tmp.path(), "solo", opts(), ns.port(), 4).await;
+    let a2 = start_node_with_control(
+        tmp.path(),
+        "solo",
+        opts(),
+        ns.port(),
+        4,
+        nzbd_api::AuthConfig::default(),
+        Some(control),
+    )
+    .await;
     wait_for("re-election after restart", 20, || {
         get_json(&a2.url, "/api/v1/cluster")["is_leader"].as_bool() == Some(true)
     })

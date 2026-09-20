@@ -131,6 +131,12 @@ pub struct CompleteRequest {
 pub struct CompleteResponse {
     pub ok: bool,
     pub durable_receipt: Option<String>,
+    /// Replicated receipt time used as the one authoritative history key.
+    #[serde(default)]
+    pub accepted_at_unix_ms: Option<i64>,
+    /// True when the authority already durably wrote the logical history row.
+    #[serde(default)]
+    pub history_recorded_by_authority: bool,
 }
 
 /// A worker's local guard changed after it advertised capacity but before it

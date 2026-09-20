@@ -301,7 +301,11 @@ impl ControlStore {
     }
 
     pub async fn is_healthy(&self) -> bool {
-        tokio::time::timeout(Duration::from_secs(2), self.client.is_healthy_db())
+        // A local server/leader observation is not enough to authorize a
+        // mutation: a minority can retain a stale leader view after losing
+        // its peers. Force a linearizable quorum round trip so callers fail
+        // closed until a majority has acknowledged the current term.
+        tokio::time::timeout(Duration::from_secs(2), self.client.db_quorum_watermark())
             .await
             .is_ok_and(|result| result.is_ok())
     }
