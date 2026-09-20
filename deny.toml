@@ -18,10 +18,6 @@ unmaintained = "workspace"
 ignore = [
     "RUSTSEC-2026-0194",
     "RUSTSEC-2026-0195",
-    # rcgen compiles time without its parsing feature. The vulnerable RFC 2822
-    # parser is therefore absent, while the fixed time 0.3.47 requires Rust
-    # 1.88 and nzbd's tested MSRV remains 1.85.
-    "RUSTSEC-2026-0009",
 ]
 
 [licenses]

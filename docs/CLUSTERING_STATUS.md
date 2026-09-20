@@ -1,7 +1,7 @@
 # Cluster completion — progress and remaining work
 
-**Updated:** 2026-09-19 · **State:** adversarial findings addressed; final validation pending ·
-**Branch:** `codex/clustering-completion`
+**Updated:** 2026-09-19 · **State:** adversarial findings addressed; final validation rerun pending ·
+**Branch:** `codex/clustering-completion` · **PR:** [#227](https://github.com/pjunod/nzbd/pull/227)
 
 Companion to [CLUSTERING.md](CLUSTERING.md) (the existing implementation) and
 [CLUSTERING_COMPLETION_PLAN.md](CLUSTERING_COMPLETION_PLAN.md) (the finite
@@ -27,8 +27,8 @@ a claimed verification of a newer Forgejo tip or the deployed fleet.
 | P4 — segment distribution | Implemented; reviewed; compile-checked; not yet tested | Fixed explicit article ranges; failed ranges cannot publish; exact range-set/byte coverage and CRC validation; one exact assembly lease |
 | P5 — operator surface and final acceptance | Implemented; reviewed; compile-checked; not yet tested | Cached diagnostics, unrestricted Settings → Dev enable controls with advisory evidence, updated behavior/config docs, bounded acceptance harnesses, and vendored RustSec inventory |
 | One adversarial review | Complete; findings addressed | Independent combined-change review found authority, failover, publication, budget, range, acceptance, audit, and CI gaps; all actionable findings were implemented before validation |
-| Fast lane | Not run | Run after review findings are addressed |
-| PR / merge / deployment | None | Next: commit review fixes, run the one final fast lane, open/ready the combined PR, satisfy required checks, and merge; deployment remains separate |
+| Fast lane | First merge-candidate run started; rerun pending | The first run exposed an unintended Hiqlite S3/XML feature edge and a cargo-audit/deny exception mismatch. The S3 edge is removed rather than waived; the exact existing exception set is shared by both advisory tools. Push the repaired candidate and require its affected lane to pass. |
+| PR / merge / deployment | PR #227 open and ready; not merged; not deployed | Next: satisfy the repaired candidate's required checks and merge. Deployment remains a separate operation. |
 
 ## Implementation decisions
 
@@ -45,6 +45,10 @@ a claimed verification of a newer Forgejo tip or the deployed fleet.
   `done` becomes a visible `unknown-not-replayed` result and a script failure.
 - The maintained Hiqlite/WAL source is pinned to the inspected plurx revision;
   nzbd's Rust floor is 1.95 and the repository toolchain is 1.97.1.
+- nzbd adds one dependency-surface correction to the pinned Hiqlite copy:
+  `cryptr/s3` follows Hiqlite's `s3` feature instead of compiling for the
+  SQLite-only cluster build. This removes the unrelated S3/XML advisory path
+  without expanding the repository's exact reviewed exception set.
 - The authority does not execute downloads or PP locally. This is the bounded
   way to make every output-producing path use one lease/generation contract;
   configured capacity returns automatically when that node is a worker.

@@ -1,7 +1,7 @@
 # Vendored Hiqlite 0.14.0
 
 This directory is the crates.io `hiqlite` 0.14.0 package, licensed under
-Apache-2.0. Plurx carries fifteen compatibility patches for clustered
+Apache-2.0. This copy carries sixteen compatibility patches for clustered
 deployments:
 
 - `NodeConfig` selects the local node by `Node::id` and rejects duplicate ids.
@@ -129,8 +129,13 @@ deployments:
   additionally logs each applied entry's index and payload to stderr, which
   is how a contaminating entry is identified down to its SQL. Production
   binaries compile none of it.
+- Cryptr's S3 transport is activated by Hiqlite's `s3` feature instead of by
+  the unconditional dependency declaration. S3 and backup builds retain the
+  same feature through Hiqlite's existing `backup`/`s3` relationship, while
+  SQLite-only consumers such as nzbd do not compile the unrelated XML object
+  storage client or inherit its advisory surface.
 
-Remove this vendor when an upstream Hiqlite release contains all fifteen patches
+Remove this vendor when an upstream Hiqlite release contains all sixteen patches
 and Plurx has upgraded to it. Until then, the sparse-roster regression in
 `crates/plurx-core/src/cluster/migration.rs` keeps the first patch load-bearing,
 and the snapshot RPC error-boundary plus queue-saturated reset tests above keep
