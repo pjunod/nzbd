@@ -1,45 +1,6 @@
 name: rqbit contribution patches
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - contrib/rqbit/*.patch
-      - contrib/rqbit/*.md
-      - contrib/rqbit/maintained-series.txt
-      - contrib/rqbit/*.sha256
-      - contrib/rqbit/vendor/**
-      - scripts/check-rqbit-maintained-patch-series.sh
-      - scripts/check-rqbit-authoritative-restore-patch.sh
-      - scripts/check-rqbit-discovery-health-patch.sh
-      - scripts/check-rqbit-tracker-request-budget-patch.sh
-      - scripts/check-rqbit-session-peer-budget-patch.sh
-      - scripts/check-rqbit-pending-handshake-budget.sh
-      - scripts/check-rqbit-known-peer-budget-patch.sh
-      - scripts/check-rqbit-metadata-size-limit-patch.sh
-      - scripts/check-rqbit-file-sizing-error-patch.sh
-      - scripts/check-rqbit-peer-response-budget-patch.sh
-      - scripts/check-rqbit-discovery-pressure-patch.sh
-      - .github/workflows/rqbit-patches.yml
-  pull_request:
-    paths:
-      - contrib/rqbit/*.patch
-      - contrib/rqbit/*.md
-      - contrib/rqbit/maintained-series.txt
-      - contrib/rqbit/*.sha256
-      - contrib/rqbit/vendor/**
-      - scripts/check-rqbit-maintained-patch-series.sh
-      - scripts/check-rqbit-authoritative-restore-patch.sh
-      - scripts/check-rqbit-discovery-health-patch.sh
-      - scripts/check-rqbit-tracker-request-budget-patch.sh
-      - scripts/check-rqbit-session-peer-budget-patch.sh
-      - scripts/check-rqbit-pending-handshake-budget.sh
-      - scripts/check-rqbit-known-peer-budget-patch.sh
-      - scripts/check-rqbit-metadata-size-limit-patch.sh
-      - scripts/check-rqbit-file-sizing-error-patch.sh
-      - scripts/check-rqbit-peer-response-budget-patch.sh
-      - scripts/check-rqbit-discovery-pressure-patch.sh
-      - .github/workflows/rqbit-patches.yml
   schedule:
     # Surface upstream-main drift even when nzbd has not changed.
     - cron: "29 7 * * 1"

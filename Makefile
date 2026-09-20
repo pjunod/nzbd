@@ -200,11 +200,19 @@ fast-check-rust: ## Reviewed merge candidate: compile/lint Rust and run bounded 
 	$(CARGO) test --locked -p nzbd-cluster --lib
 	$(CARGO) test --locked -p nzbd-cluster --test cluster_e2e -- --test-threads=1
 
+.PHONY: fast-check-torrent
+fast-check-torrent: ## Reviewed torrent changes: bounded transfer, recovery, and release-dispatch checks
+	$(CARGO) test --locked -p nzbd-engine --lib torrent_
+	$(CARGO) test --locked -p nzbd-engine --test e2e single_node_startup_restores_torrent_rows_before_backend_attachment -- --exact
+	$(CARGO) test --locked -p nzbd-engine --test e2e cluster_authority_adoption_refuses_dormant_torrent_rows_without_rewrite -- --exact
+	RQBIT_SERIES_DISPATCH_ONLY=1 scripts/check-rqbit-maintained-patch-series.sh
+
 .PHONY: fast-check
 fast-check: ## Final affected fast lane; run once after the combined adversarial review
 	scripts/check-fast-lane-contract
 	$(MAKE) ui-test
 	$(MAKE) fast-check-rust
+	$(MAKE) fast-check-torrent
 	@echo "OK - merge-candidate fast lane passed"
 
 .PHONY: gate
