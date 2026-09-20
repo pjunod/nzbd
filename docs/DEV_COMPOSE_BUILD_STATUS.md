@@ -1,6 +1,6 @@
 # Dev Compose build status — local image ownership
 
-**Status:** reviewed and fast-lane green, merge pending · **Branch:**
+**Status:** local fast lane green, required CI remediation pending · **Branch:**
 `codex/fix-dev-compose-build` · **Updated:** 2026-09-19
 
 Companion to [STATUS.md](../STATUS.md), which owns the project-wide ledger.
@@ -16,6 +16,7 @@ This page records the isolated fix for the dev Compose build failure reported on
 | Regression contract | implemented | A source-level test rejects an image-only dev discovery service |
 | Adversarial review | complete | No actionable P0–P3 findings |
 | Fast-lane qualification | complete | Formatting, six config tests, Compose validation, and build-ownership assertion pass |
+| Required CI | remediation pending | RustSec disclosed RUSTSEC-2026-0285 after review; lockfile now selects patched `rustls 0.23.45` |
 | Merge | pending | Reviewed, green head lands on `main` |
 
 ## Working rules — one review and one qualification pass
@@ -50,3 +51,4 @@ This page records the isolated fix for the dev Compose build failure reported on
 | 2026-09-19 | Shared the build definition and added the regression contract | Source inspection complete; tests intentionally deferred until after review |
 | 2026-09-19 | Completed the single adversarial merge-readiness review | No actionable P0–P3 correctness, compatibility, test, documentation, or side-effect findings |
 | 2026-09-19 | Ran the single fast-lane qualification pass | Workspace formatting, six shipped-config tests, Compose schema resolution, and both-service build ownership are green |
+| 2026-09-19 | Remediated a required CI failure disclosed after review | RUSTSEC-2026-0285 affects base-branch `rustls 0.23.42`; the narrow lockfile update selects patched `0.23.45` and its matching crypto dependencies |
