@@ -6,7 +6,7 @@ readonly series_file="$repository_root/contrib/rqbit/maintained-series.txt"
 readonly checksum_file="$repository_root/contrib/rqbit/upstream-v8.1.1.sha256"
 readonly vendor_dir="$repository_root/contrib/rqbit/vendor"
 readonly upstream_url="https://github.com/ikatson/rqbit/archive/refs/tags/v8.1.1.tar.gz"
-readonly expected_series=$'0001-allow-persistence-without-auto-restore.patch\n0005-bound-tracker-requests.patch\n0007-bound-session-peers.patch\n0009-bound-pending-incoming-handshakes.patch\n0010-bound-known-peer-records.patch\n0012-bound-peer-response-backlog.patch\n0014-bound-discovery-pressure.patch\n0016-limit-peer-metadata-before-allocation.patch\n0018-propagate-file-sizing-errors.patch\n0019-disable-peer-exchange.patch'
+readonly expected_series=$'0001-allow-persistence-without-auto-restore.patch\n0005-bound-tracker-requests.patch\n0007-bound-session-peers.patch\n0009-bound-pending-incoming-handshakes.patch\n0010-bound-known-peer-records.patch\n0012-bound-peer-response-backlog.patch\n0014-bound-discovery-pressure.patch\n0016-limit-peer-metadata-before-allocation.patch\n0018-propagate-file-sizing-errors.patch\n0019-disable-peer-exchange.patch\n0020-expose-test-only-dht-bootstrap.patch'
 readonly expected_vendor_entries=$'LICENSE\nREADME.md\ncrates'
 
 if [[ "$(<"$series_file")" != "$expected_series" ]]; then
@@ -95,6 +95,17 @@ if ! diff -u "$source_dir/LICENSE" "$vendor_dir/LICENSE" \
   exit 1
 fi
 
+if ! grep -Fq 'pub fn new_with_opts_for_test(' \
+  "$source_dir/crates/librqbit/src/session.rs"; then
+  echo "maintained rqbit test-only DHT bootstrap hook was not discovered" >&2
+  exit 1
+fi
+if ! grep -Fq 'pub struct InvalidResolvedMagnetMetadataError;' \
+  "$source_dir/crates/librqbit/src/session.rs"; then
+  echo "maintained rqbit invalid resolved-metadata marker was not discovered" >&2
+  exit 1
+fi
+
 if [[ "${RQBIT_SERIES_DERIVE_ONLY:-0}" == "1" ]]; then
   echo "rqbit maintained patch series: checksum, ordered apply, and vendor drift checks passed"
   exit 0
@@ -174,4 +185,4 @@ fi
   cargo check --workspace --exclude rqbit-desktop
 )
 
-echo "rqbit maintained patch series: ten revert-sensitive contracts passed"
+echo "rqbit maintained patch series: eleven revert-sensitive contracts passed"

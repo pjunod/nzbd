@@ -39,6 +39,7 @@ postgres = ["sqlx", "home"]
 async-bt = ["async-backtrace"]
 watch = ["notify"]
 disable-upload = []
+test-support = []
 
 [dependencies]
 # sqlx and home are pinned so that we can compile on older Rusts

@@ -7,6 +7,15 @@ architecture and acceptance contract. This page records execution progress for
 the consolidated implementation branch. It is not an operator guide and does
 not authorize production use by itself.
 
+## Magnet DHT correction — active 2026-09-20
+
+Trackerless public magnet discovery is being corrected in a separate isolated
+clone and batched pull request. The live implementation, review, and test
+record is [BITTORRENT_MAGNET_DHT_STATUS.md](BITTORRENT_MAGNET_DHT_STATUS.md).
+That record is authoritative for this follow-up: no earlier workflow or public
+Ubuntu transfer proves the new list-only DHT resolution, private-result
+rejection, timeout cancellation, or durable pending cleanup contracts.
+
 ## Runtime repair — Ubuntu transfer incident on nuc3
 
 **Status:** implementation and review fixes complete · **Base:**

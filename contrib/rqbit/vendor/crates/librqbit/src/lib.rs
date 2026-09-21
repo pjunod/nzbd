@@ -80,8 +80,8 @@ pub use create_torrent_file::{create_torrent, CreateTorrentOptions};
 pub use dht;
 pub use peer_connection::PeerConnectionOptions;
 pub use session::{
-    AddTorrent, AddTorrentOptions, AddTorrentResponse, ListOnlyResponse, Session, SessionOptions,
-    SessionPersistenceConfig, SUPPORTED_SCHEMES,
+    AddTorrent, AddTorrentOptions, AddTorrentResponse, InvalidResolvedMagnetMetadataError,
+    ListOnlyResponse, Session, SessionOptions, SessionPersistenceConfig, SUPPORTED_SCHEMES,
 };
 pub use spawn_utils::spawn as librqbit_spawn;
 pub use torrent_state::{

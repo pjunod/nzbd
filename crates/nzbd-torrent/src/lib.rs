@@ -73,6 +73,9 @@ pub const PEER_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 pub const PEER_READ_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Interval between idle peer keepalive messages.
 pub const PEER_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(120);
+/// End-to-end deadline for resolving magnet metadata from DHT, trackers, or
+/// explicitly supplied peers.
+pub const MAGNET_METADATA_TIMEOUT: Duration = Duration::from_secs(120);
 /// Maximum display-safe engine error length from proposal §10.3.
 pub const DISPLAY_SAFE_ERROR_MAX_BYTES: usize = 2 * 1024;
 
@@ -121,10 +124,18 @@ pub enum TorrentError {
     )]
     ProxyWithDht,
     #[error(
-        "magnet metadata cannot be resolved while DHT is enabled because torrent privacy is unknown until the metadata arrives"
+        "This magnet has no usable peer source while DHT is disabled. Enable DHT without a SOCKS proxy, or use a tracker-bearing magnet or .torrent file."
     )]
-    MagnetWithDht,
-    #[error("private torrent metainfo cannot be admitted while DHT is enabled")]
+    MagnetDiscoveryUnavailable,
+    #[error(
+        "Magnet metadata could not be resolved within 120 seconds. Check peer availability and DHT or tracker connectivity, then retry."
+    )]
+    MagnetMetadataTimeout,
+    #[error("Resolved magnet metadata is invalid. Use a valid magnet or a trusted .torrent file.")]
+    InvalidResolvedMagnetMetadata,
+    #[error(
+        "This torrent is private and cannot be added while DHT is enabled. Disable DHT and use the private tracker's .torrent file."
+    )]
     PrivateMetainfoWithDht,
     #[error(
         "SOCKS proxy cannot be used with UDP trackers because librqbit 8.1.1 sends UDP announces outside the proxy"
@@ -632,36 +643,72 @@ pub struct TorrentSession {
     dht_enabled: bool,
     output_root: PathBuf,
     proxy_enabled: bool,
+    magnet_metadata_timeout: Duration,
+}
+
+struct ResolvedMagnet {
+    torrent_bytes: bytes::Bytes,
+    seen_peers: Vec<SocketAddr>,
 }
 
 impl TorrentSession {
     /// Resolve magnet metadata in list-only mode. No managed torrent or
     /// payload storage exists when this returns.
     pub async fn resolve_magnet_metadata(&self, magnet: String) -> Result<Vec<u8>, TorrentError> {
-        let magnet = validate_magnet_contract(&magnet, self.proxy_enabled)?;
-        if self.dht_enabled {
-            return Err(TorrentError::MagnetWithDht);
-        }
-        let resolved = self
-            .inner
-            .add_torrent(
-                AddTorrent::from_url(magnet),
-                Some(magnet_resolution_options(Vec::new())),
-            )
-            .await
-            .map_err(engine_error)?;
-        let AddTorrentResponse::ListOnly(resolved) = resolved else {
-            return Err(TorrentError::MissingResolvedMagnet);
-        };
-        validate_metainfo_contract(resolved.torrent_bytes.as_ref(), self.proxy_enabled)?;
-        validate_existing_filesystem_paths(resolved.torrent_bytes.as_ref(), &self.output_root)?;
+        let resolved = self.resolve_validated_magnet(magnet, Vec::new()).await?;
         Ok(resolved.torrent_bytes.to_vec())
+    }
+
+    /// Validate resolved metainfo against the payload root selected by the
+    /// durable queue owner. This must run before admission is committed.
+    pub fn validate_metainfo_filesystem(
+        bytes: &[u8],
+        output_root: &Path,
+    ) -> Result<(), TorrentError> {
+        validate_existing_filesystem_paths(bytes, output_root)
+    }
+
+    /// Reject a magnet that cannot reach any implemented discovery source.
+    /// Higher layers call this before creating a durable reservation.
+    pub fn validate_magnet_discovery(&self, magnet: &str) -> Result<(), TorrentError> {
+        let magnet = validate_magnet_contract(magnet, self.proxy_enabled)?;
+        validate_magnet_discovery_available(&magnet, self.dht_enabled, false)
     }
     pub async fn start(
         output_root: PathBuf,
         config: TorrentSessionConfig,
     ) -> Result<Self, TorrentError> {
-        validate_listen_port_range(config.listen_port_range.as_ref())?;
+        Self::start_internal(output_root, config, None).await
+    }
+
+    /// Start a DHT session against only the supplied bootstrap nodes.
+    /// Available solely to deterministic downstream test builds.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub async fn start_with_dht_bootstrap_for_test(
+        output_root: PathBuf,
+        config: TorrentSessionConfig,
+        dht_bootstrap_addrs: Vec<SocketAddr>,
+    ) -> Result<Self, TorrentError> {
+        Self::start_internal(output_root, config, Some(dht_bootstrap_addrs)).await
+    }
+
+    async fn start_internal(
+        output_root: PathBuf,
+        config: TorrentSessionConfig,
+        test_dht_bootstrap_addrs: Option<Vec<SocketAddr>>,
+    ) -> Result<Self, TorrentError> {
+        if test_dht_bootstrap_addrs.is_some() {
+            if config
+                .listen_port_range
+                .as_ref()
+                .is_some_and(|range| range.start == 0 || range.start >= range.end)
+            {
+                return Err(TorrentError::InvalidListenPortRange);
+            }
+        } else {
+            validate_listen_port_range(config.listen_port_range.as_ref())?;
+        }
         install_process_crypto_provider()?;
         let proxy_enabled = config.proxy.is_some();
         if proxy_enabled && config.dht {
@@ -686,15 +733,37 @@ impl TorrentSession {
             config.max_known_peers_total,
             config.metainfo_max_bytes,
         );
-        let inner = Session::new_with_opts(output_root.clone(), options)
-            .await
-            .map_err(engine_error)?;
+        #[cfg(any(test, feature = "test-support"))]
+        let inner = match test_dht_bootstrap_addrs {
+            Some(addresses) => {
+                Session::new_with_opts_for_test(output_root.clone(), options, addresses).await
+            }
+            None => Session::new_with_opts(output_root.clone(), options).await,
+        }
+        .map_err(engine_error)?;
+        #[cfg(not(any(test, feature = "test-support")))]
+        let inner = {
+            debug_assert!(test_dht_bootstrap_addrs.is_none());
+            Session::new_with_opts(output_root.clone(), options)
+                .await
+                .map_err(engine_error)?
+        };
         Ok(Self {
             inner,
             dht_enabled: config.dht,
             output_root,
             proxy_enabled,
+            magnet_metadata_timeout: MAGNET_METADATA_TIMEOUT,
         })
+    }
+
+    /// Override the metadata deadline solely in downstream deterministic
+    /// tests. Production sessions always use [`MAGNET_METADATA_TIMEOUT`].
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn with_magnet_metadata_timeout_for_test(mut self, timeout: Duration) -> Self {
+        self.magnet_metadata_timeout = timeout;
+        self
     }
 
     pub fn tcp_listen_port(&self) -> Option<u16> {
@@ -751,6 +820,7 @@ impl TorrentSession {
             dht_enabled: false,
             output_root,
             proxy_enabled: false,
+            magnet_metadata_timeout: MAGNET_METADATA_TIMEOUT,
         })
     }
 
@@ -791,36 +861,72 @@ impl TorrentSession {
         mut config: TorrentAddConfig,
     ) -> Result<TorrentHandle, TorrentError> {
         normalize_initial_peers(&mut config.initial_peers)?;
-        let magnet = validate_magnet_contract(&magnet, self.proxy_enabled)?;
-        // A magnet does not reveal the private bit until BEP 9 metadata has
-        // already been fetched. Stable rqbit has no per-add DHT suppression,
-        // so a DHT-enabled session would query for the hash before nzbd could
-        // learn that the torrent is private. Fail closed before calling the
-        // engine; tracker/explicit-peer resolution remains available in a
-        // DHT-disabled session.
-        if self.dht_enabled {
-            return Err(TorrentError::MagnetWithDht);
-        }
         let resolved = self
-            .inner
-            .add_torrent(
-                AddTorrent::from_url(magnet),
-                Some(magnet_resolution_options(config.initial_peers.clone())),
-            )
+            .resolve_validated_magnet(magnet, config.initial_peers.clone())
+            .await?;
+        let output_root = config.output_root.as_deref().unwrap_or(&self.output_root);
+        validate_existing_filesystem_paths(resolved.torrent_bytes.as_ref(), output_root)?;
+        extend_with_resolved_peers(&mut config.initial_peers, resolved.seen_peers);
+        self.add_validated_metainfo(resolved.torrent_bytes, config)
             .await
-            .map_err(engine_error)?;
+    }
+
+    async fn resolve_validated_magnet(
+        &self,
+        magnet: String,
+        initial_peers: Vec<SocketAddr>,
+    ) -> Result<ResolvedMagnet, TorrentError> {
+        self.resolve_validated_magnet_with_timeout(
+            magnet,
+            initial_peers,
+            self.magnet_metadata_timeout,
+        )
+        .await
+    }
+
+    async fn resolve_validated_magnet_with_timeout(
+        &self,
+        magnet: String,
+        initial_peers: Vec<SocketAddr>,
+        timeout: Duration,
+    ) -> Result<ResolvedMagnet, TorrentError> {
+        let magnet = validate_magnet_contract(&magnet, self.proxy_enabled)?;
+        validate_magnet_discovery_available(&magnet, self.dht_enabled, !initial_peers.is_empty())?;
+        let resolved = tokio::time::timeout(
+            timeout,
+            self.inner.add_torrent(
+                AddTorrent::from_url(magnet),
+                Some(magnet_resolution_options(initial_peers)),
+            ),
+        )
+        .await
+        .map_err(|_| TorrentError::MagnetMetadataTimeout)?
+        .map_err(|error| {
+            if error
+                .downcast_ref::<librqbit::InvalidResolvedMagnetMetadataError>()
+                .is_some()
+            {
+                TorrentError::InvalidResolvedMagnetMetadata
+            } else {
+                engine_error(error)
+            }
+        })?;
         let AddTorrentResponse::ListOnly(resolved) = resolved else {
             return Err(TorrentError::MissingResolvedMagnet);
         };
 
-        // rqbit's list-only path resolves BEP 9 metadata but returns before it
-        // constructs storage or manages the torrent. Re-run every nzbd-owned
-        // metainfo invariant here, then admit only the validated bytes.
-        validate_metainfo_contract(resolved.torrent_bytes.as_ref(), self.proxy_enabled)?;
-        validate_existing_filesystem_paths(resolved.torrent_bytes.as_ref(), &self.output_root)?;
-        extend_with_resolved_peers(&mut config.initial_peers, resolved.seen_peers);
-        self.add_validated_metainfo(resolved.torrent_bytes, config)
-            .await
+        // The list-only result has a verified v1 info hash but is not yet a
+        // managed torrent. Apply every nzbd admission rule, including the
+        // private+DHT policy, before storage or peer handoff can exist.
+        validate_metainfo_admission(
+            resolved.torrent_bytes.as_ref(),
+            self.proxy_enabled,
+            self.dht_enabled,
+        )?;
+        Ok(ResolvedMagnet {
+            torrent_bytes: resolved.torrent_bytes,
+            seen_peers: resolved.seen_peers,
+        })
     }
 
     async fn add_validated_metainfo(
@@ -1327,13 +1433,15 @@ fn valid_initial_peer(peer: SocketAddr) -> bool {
         && *address != std::net::Ipv4Addr::BROADCAST
 }
 
+#[cfg(any(test, feature = "fuzzing"))]
 fn validate_metainfo_contract(bytes: &[u8], proxy_enabled: bool) -> Result<bool, TorrentError> {
-    validate_metainfo_contract_with_limit(bytes, proxy_enabled, DEFAULT_MAX_METAINFO_BYTES)
+    validate_metainfo_contract_with_limit(bytes, proxy_enabled, false, DEFAULT_MAX_METAINFO_BYTES)
 }
 
 fn validate_metainfo_contract_with_limit(
     bytes: &[u8],
     proxy_enabled: bool,
+    dht_enabled: bool,
     max_metainfo_bytes: usize,
 ) -> Result<bool, TorrentError> {
     validate_metainfo_size_with_limit(bytes.len(), max_metainfo_bytes)?;
@@ -1342,6 +1450,9 @@ fn validate_metainfo_contract_with_limit(
         librqbit::torrent_from_bytes::<librqbit::ByteBuf<'_>>(bytes).map_err(engine_error)?;
     validate_metainfo_geometry(&metainfo.info)?;
     validate_metainfo_paths(&metainfo.info)?;
+    if metainfo.info.private && dht_enabled {
+        return Err(TorrentError::PrivateMetainfoWithDht);
+    }
     let mut trackers = HashSet::new();
     for tracker in metainfo.iter_announce() {
         let tracker = AsRef::<[u8]>::as_ref(tracker);
@@ -1407,7 +1518,12 @@ fn validate_metainfo_admission(
     proxy_enabled: bool,
     dht_enabled: bool,
 ) -> Result<(), TorrentError> {
-    let private = validate_metainfo_contract(bytes, proxy_enabled)?;
+    let private = validate_metainfo_contract_with_limit(
+        bytes,
+        proxy_enabled,
+        dht_enabled,
+        DEFAULT_MAX_METAINFO_BYTES,
+    )?;
     validate_private_discovery(private, dht_enabled)
 }
 
@@ -2062,6 +2178,28 @@ fn validate_magnet_contract(magnet: &str, proxy_enabled: bool) -> Result<String,
         .clear()
         .extend_pairs(normalized_pairs);
     Ok(normalized.into())
+}
+
+fn validate_magnet_discovery_available(
+    magnet: &str,
+    dht_enabled: bool,
+    has_initial_peers: bool,
+) -> Result<(), TorrentError> {
+    if dht_enabled || has_initial_peers || magnet_has_supported_tracker(magnet) {
+        return Ok(());
+    }
+    Err(TorrentError::MagnetDiscoveryUnavailable)
+}
+
+fn magnet_has_supported_tracker(magnet: &str) -> bool {
+    // This runs only after `validate_magnet_contract`, which has already
+    // rejected malformed and unsupported tracker URLs. Count exactly the
+    // non-empty `tr` values that rqbit's parser hands to tracker discovery;
+    // ignored parameters such as `x.pe` are deliberately not peer sources.
+    url::Url::parse(magnet).is_ok_and(|url| {
+        url.query_pairs()
+            .any(|(key, tracker)| key == "tr" && !tracker.is_empty())
+    })
 }
 
 fn valid_btih(hash: &[u8]) -> bool {

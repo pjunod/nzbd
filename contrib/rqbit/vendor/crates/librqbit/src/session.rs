@@ -68,6 +68,19 @@ pub const SUPPORTED_SCHEMES: [&str; 3] = ["http:", "https:", "magnet:"];
 
 pub type TorrentId = usize;
 
+/// Marker attached to errors produced after a peer supplied hash-valid but
+/// structurally unusable magnet metadata.
+#[derive(Debug)]
+pub struct InvalidResolvedMagnetMetadataError;
+
+impl std::fmt::Display for InvalidResolvedMagnetMetadataError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("resolved magnet metadata is structurally invalid")
+    }
+}
+
+impl std::error::Error for InvalidResolvedMagnetMetadataError {}
+
 struct ParsedTorrentFile {
     info: TorrentMetaV1Owned,
     info_bytes: Bytes,
@@ -545,7 +558,37 @@ impl Session {
     #[inline(never)]
     pub fn new_with_opts(
         default_output_folder: PathBuf,
+        opts: SessionOptions,
+    ) -> BoxFuture<'static, anyhow::Result<Arc<Self>>> {
+        Self::new_with_opts_and_dht_bootstrap(default_output_folder, opts, None)
+    }
+
+    /// Construct a session with deterministic DHT bootstrap nodes for
+    /// downstream loopback tests. This is deliberately absent unless the
+    /// `test-support` feature is enabled.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn new_with_opts_for_test(
+        default_output_folder: PathBuf,
+        opts: SessionOptions,
+        dht_bootstrap_addrs: Vec<SocketAddr>,
+    ) -> BoxFuture<'static, anyhow::Result<Arc<Self>>> {
+        Self::new_with_opts_and_dht_bootstrap(
+            default_output_folder,
+            opts,
+            Some(
+                dht_bootstrap_addrs
+                    .into_iter()
+                    .map(|address| address.to_string())
+                    .collect(),
+            ),
+        )
+    }
+
+    fn new_with_opts_and_dht_bootstrap(
+        default_output_folder: PathBuf,
         mut opts: SessionOptions,
+        dht_bootstrap_addrs: Option<Vec<String>>,
     ) -> BoxFuture<'static, anyhow::Result<Arc<Self>>> {
         async move {
             let peer_id = opts
@@ -574,6 +617,7 @@ impl Session {
             } else {
                 let dht = if opts.disable_dht_persistence {
                     DhtBuilder::with_config(DhtConfig {
+                        bootstrap_addrs: dht_bootstrap_addrs,
                         cancellation_token: Some(token.child_token()),
                         ..Default::default()
                     })
@@ -1515,7 +1559,8 @@ impl Session {
                         info,
                         torrent_file_from_info_bytes(&info_bytes, trackers)?,
                         info_bytes.0,
-                    )?,
+                    )
+                    .context(InvalidResolvedMagnetMetadataError)?,
                     peer_rx: rx,
                     seen_peers: {
                         let seen = seen.into_iter().collect_vec();

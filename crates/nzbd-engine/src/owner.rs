@@ -84,7 +84,7 @@ pub(crate) enum QueueCommand {
     },
     CancelTorrentAdmission {
         job: JobId,
-        reply: oneshot::Sender<bool>,
+        reply: oneshot::Sender<Result<bool, nzbd_state::StateError>>,
     },
     AddParsed {
         name: String,
@@ -1090,13 +1090,31 @@ impl Owner {
                 let _ = reply.send(result);
             }
             QueueCommand::CancelTorrentAdmission { job, reply } => {
+                let before = self.state.pending_admissions.clone();
                 let removed = self.state.cancel_torrent_admission(job);
-                if removed {
-                    self.save_snapshot();
-                    let _ = self.pending_sources.remove(job);
-                    self.publish_now();
-                }
-                let _ = reply.send(removed);
+                let result = if !removed {
+                    Ok(false)
+                } else {
+                    match self.save_snapshot_result() {
+                        Ok(true) => {
+                            self.publish_now();
+                            self.pending_sources.remove(job).map(|()| true)
+                        }
+                        Ok(false) => {
+                            self.state.pending_admissions = before;
+                            Err(nzbd_state::StateError::Corrupt(
+                                "torrent admission cancellation requires durable queue ownership"
+                                    .into(),
+                            ))
+                        }
+                        Err(error) => {
+                            self.state.pending_admissions = before;
+                            self.on_snapshot_save_error(&error);
+                            Err(error)
+                        }
+                    }
+                };
+                let _ = reply.send(result);
             }
             QueueCommand::AddParsed {
                 name,
@@ -4001,29 +4019,39 @@ impl Owner {
     }
 
     fn save_snapshot(&mut self) -> bool {
+        match self.save_snapshot_result() {
+            Ok(saved) => saved,
+            Err(error) => {
+                self.on_snapshot_save_error(&error);
+                false
+            }
+        }
+    }
+
+    fn on_snapshot_save_error(&mut self, error: &nzbd_state::StateError) {
+        tracing::error!(
+            error = %error,
+            "snapshot save failed (fenced or io); demoting persistence until re-adopted"
+        );
+        if matches!(error, nzbd_state::StateError::Corrupt(_)) {
+            self.persist = false;
+        }
+    }
+
+    fn save_snapshot_result(&mut self) -> Result<bool, nzbd_state::StateError> {
         if !self.persist {
             self.dirty = false;
-            return false;
+            return Ok(false);
         }
         let doc = self.state.to_doc();
         let write_started = Instant::now();
-        let result = match &self.persist_guard {
+        let bytes = match &self.persist_guard {
             Some(g) => {
                 let g = g.clone();
                 self.snap_store.save_guarded(&doc, &move || g())
             }
             None => self.snap_store.save(&doc),
-        };
-        let bytes = match result {
-            Ok(b) => b,
-            Err(e) => {
-                tracing::error!(error = %e, "snapshot save failed (fenced or io); demoting persistence until re-adopted");
-                if matches!(e, nzbd_state::StateError::Corrupt(_)) {
-                    self.persist = false; // deposed: stop writing authority state
-                }
-                return false;
-            }
-        };
+        }?;
         // Duration and throughput, remembered for the adaptive spacing and
         // said out loud when slow — "how fast is the state volume really?"
         // must be answerable from the log, with numbers.
@@ -4069,7 +4097,7 @@ impl Owner {
         self.dirty = false;
         self.seed_checkpoints = durable_seed_checkpoints(&self.state);
         self.last_save = Instant::now();
-        true
+        Ok(true)
     }
 
     fn emit(&self, ev: Event) {

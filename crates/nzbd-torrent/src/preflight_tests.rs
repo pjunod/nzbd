@@ -1,5 +1,9 @@
 use super::*;
+use sha1::{Digest, Sha1};
+use std::net::Ipv4Addr;
 use std::panic::{catch_unwind, AssertUnwindSafe};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
 
 const REPLACEMENTS: &[u8] = &[0, b':', b'0', b'9', b'd', b'e', b'i', b'l', 0xff];
 const INSERTIONS: &[u8] = &[0, b':', b'0', b'd', b'e', b'i', b'l', 0xff];
@@ -1496,4 +1500,318 @@ fn existing_path_preflight_fails_closed_on_an_unreadable_prefix() {
 
     std::fs::set_permissions(&release, std::fs::Permissions::from_mode(0o755)).unwrap();
     assert!(denied, "test process bypassed directory permissions");
+}
+
+fn peer_handshake(info_hash: [u8; 20]) -> Vec<u8> {
+    let mut handshake = Vec::with_capacity(68);
+    handshake.push(19);
+    handshake.extend_from_slice(b"BitTorrent protocol");
+    let mut reserved = [0_u8; 8];
+    reserved[5] = 0x10;
+    handshake.extend_from_slice(&reserved);
+    handshake.extend_from_slice(&info_hash);
+    handshake.extend_from_slice(b"-NZ0001-DHTMETATEST1");
+    assert_eq!(handshake.len(), 68);
+    handshake
+}
+
+fn peer_extended_message(extension_id: u8, payload: &[u8]) -> Vec<u8> {
+    let length = u32::try_from(payload.len() + 2).unwrap();
+    let mut message = Vec::with_capacity(payload.len() + 6);
+    message.extend_from_slice(&length.to_be_bytes());
+    message.push(20);
+    message.push(extension_id);
+    message.extend_from_slice(payload);
+    message
+}
+
+async fn read_peer_message(stream: &mut TcpStream) -> Vec<u8> {
+    let mut length = [0_u8; 4];
+    stream.read_exact(&mut length).await.unwrap();
+    let mut message = vec![0_u8; u32::from_be_bytes(length) as usize];
+    stream.read_exact(&mut message).await.unwrap();
+    message
+}
+
+fn peer_metadata_extension_id(payload: &[u8]) -> Option<u8> {
+    let marker = b"11:ut_metadatai";
+    let start = payload
+        .windows(marker.len())
+        .position(|window| window == marker)?
+        + marker.len();
+    let end = payload[start..].iter().position(|byte| *byte == b'e')? + start;
+    std::str::from_utf8(&payload[start..end]).ok()?.parse().ok()
+}
+
+async fn serve_metadata_peer(listener: TcpListener, info: Vec<u8>, info_hash: [u8; 20]) {
+    let (mut stream, _) = listener.accept().await.unwrap();
+    let mut incoming_handshake = [0_u8; 68];
+    stream.read_exact(&mut incoming_handshake).await.unwrap();
+    assert_eq!(&incoming_handshake[28..48], &info_hash);
+    stream.write_all(&peer_handshake(info_hash)).await.unwrap();
+
+    let extended_handshake = format!("d1:md11:ut_metadatai1ee13:metadata_sizei{}ee", info.len());
+    stream
+        .write_all(&peer_extended_message(0, extended_handshake.as_bytes()))
+        .await
+        .unwrap();
+    let response_extension_id = tokio::time::timeout(Duration::from_secs(5), async {
+        let mut response_extension_id = None;
+        loop {
+            let request = read_peer_message(&mut stream).await;
+            if request.starts_with(&[20, 0]) {
+                response_extension_id = peer_metadata_extension_id(&request[2..]);
+            }
+            if request.starts_with(&[20, 1]) {
+                break response_extension_id
+                    .expect("client did not advertise a ut_metadata extension id");
+            }
+        }
+    })
+    .await
+    .expect("metadata request was not received");
+
+    let mut response =
+        format!("d8:msg_typei1e5:piecei0e10:total_sizei{}ee", info.len()).into_bytes();
+    response.extend_from_slice(&info);
+    stream
+        .write_all(&peer_extended_message(response_extension_id, &response))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+}
+
+fn dht_transaction_id(packet: &[u8]) -> [u8; 2] {
+    let marker = b"1:t2:";
+    let start = packet
+        .windows(marker.len())
+        .position(|window| window == marker)
+        .expect("DHT request did not contain a two-byte transaction id")
+        + marker.len();
+    [packet[start], packet[start + 1]]
+}
+
+fn compact_ipv4(address: SocketAddr) -> [u8; 6] {
+    let SocketAddr::V4(address) = address else {
+        panic!("loopback DHT fixture requires IPv4");
+    };
+    let mut compact = [0_u8; 6];
+    compact[..4].copy_from_slice(&address.ip().octets());
+    compact[4..].copy_from_slice(&address.port().to_be_bytes());
+    compact
+}
+
+fn dht_response(
+    transaction: [u8; 2],
+    node_id: [u8; 20],
+    node: SocketAddr,
+    peer: Option<SocketAddr>,
+) -> Vec<u8> {
+    let mut response = b"d1:rd2:id20:".to_vec();
+    response.extend_from_slice(&node_id);
+    if let Some(peer) = peer {
+        response.extend_from_slice(b"5:token4:test6:valuesl6:");
+        response.extend_from_slice(&compact_ipv4(peer));
+        response.extend_from_slice(b"ee");
+    } else {
+        response.extend_from_slice(b"5:nodes26:");
+        response.extend_from_slice(&node_id);
+        response.extend_from_slice(&compact_ipv4(node));
+        response.push(b'e');
+    }
+    response.extend_from_slice(b"1:t2:");
+    response.extend_from_slice(&transaction);
+    response.extend_from_slice(b"1:y1:re");
+    response
+}
+
+async fn serve_dht_node(
+    socket: UdpSocket,
+    node_id: [u8; 20],
+    expected_info_hash: [u8; 20],
+    metadata_peer: SocketAddr,
+) -> bool {
+    let node = socket.local_addr().unwrap();
+    let mut packet = [0_u8; 2048];
+    let mut saw_get_peers = false;
+    let mut saw_announce = false;
+    loop {
+        let receive_timeout = if saw_get_peers {
+            Duration::from_secs(1)
+        } else {
+            Duration::from_secs(5)
+        };
+        let received = tokio::time::timeout(receive_timeout, socket.recv_from(&mut packet)).await;
+        let Ok(Ok((length, source))) = received else {
+            break;
+        };
+        let request = &packet[..length];
+        let transaction = dht_transaction_id(request);
+        if request
+            .windows(b"13:announce_peer".len())
+            .any(|window| window == b"13:announce_peer")
+        {
+            saw_announce = true;
+            continue;
+        }
+        let peer = if request
+            .windows(b"9:get_peers".len())
+            .any(|window| window == b"9:get_peers")
+        {
+            let marker = b"9:info_hash20:";
+            let start = request
+                .windows(marker.len())
+                .position(|window| window == marker)
+                .expect("get_peers request omitted info_hash")
+                + marker.len();
+            assert_eq!(&request[start..start + 20], &expected_info_hash);
+            saw_get_peers = true;
+            Some(metadata_peer)
+        } else {
+            None
+        };
+        socket
+            .send_to(&dht_response(transaction, node_id, node, peer), source)
+            .await
+            .unwrap();
+    }
+    assert!(saw_get_peers, "DHT fixture never received get_peers");
+    saw_announce
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn trackerless_public_magnet_resolves_through_loopback_dht_without_announce() {
+    let payload = b"loopback-dht";
+    let piece_hash = Sha1::digest(payload);
+    let info = single_file_info_with_geometry(
+        b"loopback.bin",
+        payload.len() as u64,
+        payload.len() as u32,
+        &piece_hash,
+    );
+    let info_hash: [u8; 20] = Sha1::digest(&info).into();
+    let metadata_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let metadata_peer = metadata_listener.local_addr().unwrap();
+    let metadata_task = tokio::spawn(serve_metadata_peer(metadata_listener, info, info_hash));
+    let dht_socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let dht_address = dht_socket.local_addr().unwrap();
+    let dht_task = tokio::spawn(serve_dht_node(
+        dht_socket,
+        [0x42; 20],
+        info_hash,
+        metadata_peer,
+    ));
+
+    let root = tempfile::tempdir().unwrap();
+    let session = TorrentSession::start_with_dht_bootstrap_for_test(
+        root.path().to_path_buf(),
+        TorrentSessionConfig {
+            dht: true,
+            ..Default::default()
+        },
+        vec![dht_address],
+    )
+    .await
+    .unwrap();
+    let output_root = session.output_root().to_path_buf();
+    let magnet = format!(
+        "magnet:?xt=urn:btih:{}&dn=loopback",
+        info_hash
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    );
+
+    let resolved = tokio::time::timeout(
+        Duration::from_secs(10),
+        session.resolve_magnet_metadata(magnet),
+    )
+    .await
+    .expect("loopback DHT metadata resolution timed out")
+    .expect("public trackerless metadata should resolve through DHT");
+    assert_eq!(
+        inspect_metainfo(&resolved, false, true)
+            .unwrap()
+            .info_hash_v1,
+        info_hash
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    );
+    assert_eq!(session.inner.with_torrents(|torrents| torrents.count()), 0);
+    assert_eq!(std::fs::read_dir(&output_root).unwrap().count(), 0);
+    metadata_task.await.unwrap();
+    assert!(
+        !dht_task.await.unwrap(),
+        "list-only lookup announced a peer"
+    );
+
+    session.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn metadata_timeout_drops_owned_peer_work_and_releases_capacity() {
+    let payload = b"timeout-recovery";
+    let piece_hash = Sha1::digest(payload);
+    let info = single_file_info_with_geometry(
+        b"timeout.bin",
+        payload.len() as u64,
+        payload.len() as u32,
+        &piece_hash,
+    );
+    let info_hash: [u8; 20] = Sha1::digest(&info).into();
+    let magnet = format!(
+        "magnet:?xt=urn:btih:{}",
+        info_hash
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    );
+
+    let stalled_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let stalled_peer = stalled_listener.local_addr().unwrap();
+    let stalled_task = tokio::spawn(async move {
+        let (mut stream, _) = stalled_listener.accept().await.unwrap();
+        let mut handshake = [0_u8; 68];
+        stream.read_exact(&mut handshake).await.unwrap();
+        let mut byte = [0_u8; 1];
+        let closed = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut byte))
+            .await
+            .expect("timed-out resolver left its peer socket open")
+            .unwrap();
+        assert_eq!(closed, 0, "timed-out resolver kept writing to its peer");
+    });
+
+    let root = tempfile::tempdir().unwrap();
+    let session = TorrentSession::start(root.path().to_path_buf(), TorrentSessionConfig::default())
+        .await
+        .unwrap();
+    let result = session
+        .resolve_validated_magnet_with_timeout(
+            magnet.clone(),
+            vec![stalled_peer],
+            Duration::from_millis(100),
+        )
+        .await;
+    assert!(matches!(result, Err(TorrentError::MagnetMetadataTimeout)));
+    stalled_task.await.unwrap();
+
+    let working_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let working_peer = working_listener.local_addr().unwrap();
+    let working_task = tokio::spawn(serve_metadata_peer(working_listener, info, info_hash));
+    let resolved = session
+        .resolve_validated_magnet_with_timeout(magnet, vec![working_peer], Duration::from_secs(5))
+        .await
+        .expect("a second lookup should reuse capacity released by timeout");
+    assert_eq!(
+        inspect_metainfo(resolved.torrent_bytes.as_ref(), false, false)
+            .unwrap()
+            .info_hash_v1,
+        info_hash
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    );
+    working_task.await.unwrap();
+    session.stop().await;
 }

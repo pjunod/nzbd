@@ -483,6 +483,7 @@ async fn async_main(opts: Opts, cancel: CancellationToken) -> anyhow::Result<()>
     let mut sopts = SessionOptions {
         disable_auto_restore: false,
         disable_dht: opts.disable_dht,
+        disable_pex: false,
         disable_dht_persistence: opts.disable_dht_persistence,
         dht_config: None,
         // This will be overriden by "server start" below if needed.

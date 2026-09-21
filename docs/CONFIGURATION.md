@@ -58,7 +58,7 @@ source_redirects = 5
 |---|---|---|
 | `enabled` | `false` | `true` starts one torrent session after restart. Disabled mode opens no peer listener and refuses startup if live torrent records still need an owner. |
 | `listen_port` | `6881` | One explicit TCP/IPv4 port from 1–65534; ranges and ephemeral port 0 are unsupported. |
-| `dht` / `pex` | `false` / `true` | Conservative discovery defaults; DHT is incompatible with the SOCKS proxy. |
+| `dht` / `pex` | `false` / `true` | DHT finds peers for trackerless magnets but can expose an unknown magnet hash before metadata reveals private status. Private torrents require DHT off, and DHT is incompatible with the SOCKS proxy. |
 | `local_discovery` / `upnp_port_forwarding` | `false` / `false` | Avoids LAN disclosure and router mutation. Either unsupported value is rejected. |
 | `socks_proxy_*` | absent | URL must be a credential-free SOCKS5 origin. Username/password are paired; the username must be non-empty, and both fields may contain only ASCII letters, digits, `-`, `.`, `_`, or `~` (so characters such as `@` and `!` are rejected). The password is masked by Settings. |
 | peer ceilings | `80`, `400`, `1024`, `4096` | Separate live and retained per-torrent/session budgets. |
@@ -82,10 +82,16 @@ time limits stop on the first boundary reached, retaining all payload files.
 
 Before enabling, publish the configured TCP peer port only where intended,
 confirm the payload and state volumes have durable free space, and decide
-whether unlimited seeding is acceptable. DHT is public discovery, and a SOCKS
-proxy is not a VPN kill switch; proxy deployments must keep DHT off and enforce
-required routing in the host or container firewall. The Settings page presents
-these warnings but does not replace the operator's explicit `enabled` choice.
+whether unlimited seeding is acceptable. DHT is public discovery: it makes
+trackerless magnets usable, but may query their hashes before downloaded
+metadata reveals that a torrent is private. nzbd rejects that private metadata
+before admission; it cannot retract the earlier lookup. Operators requiring no
+pre-metadata public lookup must leave DHT off and use a trusted tracker-bearing
+magnet or `.torrent` file. A SOCKS proxy is not a VPN kill switch; proxy
+deployments must keep DHT off and enforce required routing in the host or
+container firewall. The Developer settings tab shows these prerequisites and
+their current form-derived state as advice; it never disables the operator's
+explicit enable control.
 
 Sonarr and Radarr can use nzbd as a qBittorrent client at the normal nzbd API
 URL. Use the existing nzbd username/password, or put `[api].token` in the

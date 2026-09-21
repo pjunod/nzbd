@@ -277,6 +277,7 @@ async fn fetch_redirect_chain(
         validate_metainfo_contract_with_limit(
             &bytes,
             engine_proxy_enabled,
+            false,
             limits.max_metainfo_bytes,
         )?;
         return Ok(bytes);

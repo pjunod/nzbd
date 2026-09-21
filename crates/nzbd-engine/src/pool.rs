@@ -467,7 +467,10 @@ mod adaptive_tests {
         cancel: CancellationToken,
     ) -> (ConnCtx, watch::Sender<u64>, watch::Sender<BudgetEnvelope>) {
         let (epoch_tx, epoch) = watch::channel(0);
-        let (budget_tx, budgets) = watch::channel(BudgetEnvelope::default());
+        let (budget_tx, budgets) = watch::channel(BudgetEnvelope {
+            generation: 0,
+            allowances: HashMap::from([(server.id, 1)]),
+        });
         (
             ConnCtx {
                 server,

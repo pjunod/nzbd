@@ -186,7 +186,8 @@ impl TorrentAdmissionService {
     ) -> Result<AdmissionResult, AdmissionError> {
         match source {
             TorrentSource::Magnet => {
-                nzbd_torrent::validate_magnet_source(&secret, self.proxy_enabled)?
+                nzbd_torrent::validate_magnet_source(&secret, self.proxy_enabled)?;
+                self.session.validate_magnet_discovery(&secret)?;
             }
             TorrentSource::Url => {
                 let url = url::Url::parse(&secret).map_err(|_| AdmissionError::Encoding)?;
@@ -200,19 +201,29 @@ impl TorrentAdmissionService {
             .engine
             .reserve_torrent_admission(source, secret.as_bytes().to_vec(), opts.clone())
             .await?;
-        let bytes = match source {
-            TorrentSource::Magnet => self.session.resolve_magnet_metadata(secret).await?,
-            TorrentSource::Url => {
-                nzbd_torrent::fetch_torrent_source(
-                    &secret,
-                    self.source_fetch_limits,
-                    self.proxy_enabled,
-                )
-                .await?
-            }
-            TorrentSource::Metainfo => return Err(AdmissionError::Encoding),
-        };
-        self.finish(Some(job), bytes, source, opts).await
+        let attempt = async {
+            let bytes = match source {
+                TorrentSource::Magnet => self.session.resolve_magnet_metadata(secret).await?,
+                TorrentSource::Url => {
+                    nzbd_torrent::fetch_torrent_source(
+                        &secret,
+                        self.source_fetch_limits,
+                        self.proxy_enabled,
+                    )
+                    .await?
+                }
+                TorrentSource::Metainfo => return Err(AdmissionError::Encoding),
+            };
+            self.finish(Some(job), bytes, source, opts).await
+        }
+        .await;
+        if attempt.is_err() {
+            // Cancellation is conditional on the reservation still being
+            // pending. If `finish` committed before a later managed-engine
+            // failure, the owner returns false and the durable job remains.
+            self.engine.cancel_torrent_admission(job).await?;
+        }
+        attempt
     }
 
     /// Reconcile queue-authorized descriptors and pending secret sidecars.
@@ -371,9 +382,21 @@ impl TorrentAdmissionService {
             .await;
             match attempt {
                 Ok(result) => restored.push(result),
-                Err(_) => tracing::warn!(
+                Err(error)
+                    if pending.source == TorrentSource::Magnet
+                        && deterministic_magnet_recovery_failure(&error) =>
+                {
+                    self.engine.cancel_torrent_admission(pending.job_id).await?;
+                    tracing::warn!(
+                        job = pending.job_id.0,
+                        error = %error,
+                        "deterministically rejected pending magnet was removed during recovery"
+                    );
+                }
+                Err(error) => tracing::warn!(
                     job = pending.job_id.0,
                     source = ?pending.source,
+                    error = %error,
                     "pending torrent admission could not be recovered; it remains durable for a later retry"
                 ),
             }
@@ -445,19 +468,6 @@ impl TorrentAdmissionService {
                     other => AdmissionError::Torrent(other),
                 }
             })?;
-        let job = match pending {
-            Some(job) => job,
-            None => {
-                self.engine
-                    .reserve_torrent_admission(TorrentSource::Metainfo, bytes.clone(), opts.clone())
-                    .await?
-            }
-        };
-        let relative = PathBuf::from(format!(
-            "torrents/sources/{}.torrent",
-            descriptor.info_hash_v1
-        ));
-        persist_descriptor(&self.state_dir.join(&relative), &bytes)?;
         // Match qBittorrent/*arr category names case-insensitively while
         // retaining the configured spelling in durable queue state.
         if let Some(requested) = opts.category.as_deref() {
@@ -509,6 +519,20 @@ impl TorrentAdmissionService {
                     .map(|(_, root)| root.clone())
             })
             .unwrap_or_else(|| self.session.output_root().to_path_buf());
+        TorrentSession::validate_metainfo_filesystem(&bytes, &payload_root)?;
+        let job = match pending {
+            Some(job) => job,
+            None => {
+                self.engine
+                    .reserve_torrent_admission(TorrentSource::Metainfo, bytes.clone(), opts.clone())
+                    .await?
+            }
+        };
+        let relative = PathBuf::from(format!(
+            "torrents/sources/{}.torrent",
+            descriptor.info_hash_v1
+        ));
+        persist_descriptor(&self.state_dir.join(&relative), &bytes)?;
         let record = TorrentRecord {
             info_hash_v1: descriptor.info_hash_v1.clone(),
             source,
@@ -1194,6 +1218,13 @@ impl TorrentAdmissionService {
                 Json(json!({"id":result.id,"info_hash":result.info_hash,"created":false})),
             )
                 .into_response(),
+            Err(AdmissionError::Torrent(
+                nzbd_torrent::TorrentError::MagnetMetadataTimeout,
+            )) => (
+                StatusCode::GATEWAY_TIMEOUT,
+                Json(json!({"error":"Magnet metadata could not be resolved within 120 seconds. Check peer availability and DHT or tracker connectivity, then retry."})),
+            )
+                .into_response(),
             Err(error) if error.is_input_error() => (
                 StatusCode::UNPROCESSABLE_ENTITY,
                 Json(json!({"error":error.to_string()})),
@@ -1212,6 +1243,24 @@ impl AdmissionError {
     fn is_input_error(&self) -> bool {
         matches!(self, Self::Encoding | Self::MetainfoTooLarge)
             || matches!(self, Self::Torrent(error) if !matches!(error, nzbd_torrent::TorrentError::Engine(_)))
+    }
+}
+
+fn deterministic_magnet_recovery_failure(error: &AdmissionError) -> bool {
+    match error {
+        AdmissionError::Torrent(
+            nzbd_torrent::TorrentError::Engine(_)
+            | nzbd_torrent::TorrentError::MagnetMetadataTimeout
+            | nzbd_torrent::TorrentError::MissingResolvedMagnet,
+        ) => false,
+        AdmissionError::Torrent(_)
+        | AdmissionError::Encoding
+        | AdmissionError::MetainfoTooLarge => true,
+        AdmissionError::Engine(_)
+        | AdmissionError::State(_)
+        | AdmissionError::Io(_)
+        | AdmissionError::MissingPending
+        | AdmissionError::MissingBackendAdapter => false,
     }
 }
 
@@ -1256,8 +1305,15 @@ mod tests {
     use http_body_util::BodyExt;
     use nzbd_engine::backend::backend_channel;
     use nzbd_engine::{Engine, EngineConfig, Tuning};
-    use nzbd_torrent::TorrentSessionConfig;
+    use nzbd_torrent::{TorrentAddConfig, TorrentSessionConfig};
+    use sha1::{Digest, Sha1};
+    use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
     use tower::ServiceExt;
+
+    const DHT_SWARM_FILE: &str = "dht-production.bin";
 
     fn metainfo(name: &[u8]) -> Vec<u8> {
         fn bytes(out: &mut Vec<u8>, value: &[u8]) {
@@ -1271,6 +1327,228 @@ mod tests {
         torrent.extend_from_slice(&[0; 20]);
         torrent.extend_from_slice(b"ee");
         torrent
+    }
+
+    fn swarm_info(payload: &[u8], private: bool) -> (Vec<u8>, [u8; 20]) {
+        fn bytes(out: &mut Vec<u8>, value: &[u8]) {
+            out.extend_from_slice(value.len().to_string().as_bytes());
+            out.push(b':');
+            out.extend_from_slice(value);
+        }
+        let mut info = vec![b'd'];
+        bytes(&mut info, b"length");
+        info.extend_from_slice(format!("i{}e", payload.len()).as_bytes());
+        bytes(&mut info, b"name");
+        bytes(&mut info, DHT_SWARM_FILE.as_bytes());
+        bytes(&mut info, b"piece length");
+        info.extend_from_slice(format!("i{}e", payload.len()).as_bytes());
+        bytes(&mut info, b"pieces");
+        bytes(&mut info, &Sha1::digest(payload));
+        if private {
+            bytes(&mut info, b"private");
+            info.extend_from_slice(b"i1e");
+        }
+        info.push(b'e');
+        let info_hash = Sha1::digest(&info).into();
+        (info, info_hash)
+    }
+
+    fn swarm_metainfo(payload: &[u8], private: bool) -> (Vec<u8>, [u8; 20]) {
+        fn bytes(out: &mut Vec<u8>, value: &[u8]) {
+            out.extend_from_slice(value.len().to_string().as_bytes());
+            out.push(b':');
+            out.extend_from_slice(value);
+        }
+        let (info, info_hash) = swarm_info(payload, private);
+        let mut torrent = vec![b'd'];
+        if private {
+            bytes(&mut torrent, b"announce");
+            bytes(&mut torrent, b"http://127.0.0.1:9/announce");
+        }
+        bytes(&mut torrent, b"info");
+        torrent.extend_from_slice(&info);
+        torrent.push(b'e');
+        (torrent, info_hash)
+    }
+
+    fn peer_handshake(info_hash: [u8; 20]) -> Vec<u8> {
+        let mut handshake = Vec::with_capacity(68);
+        handshake.push(19);
+        handshake.extend_from_slice(b"BitTorrent protocol");
+        let mut reserved = [0_u8; 8];
+        reserved[5] = 0x10;
+        handshake.extend_from_slice(&reserved);
+        handshake.extend_from_slice(&info_hash);
+        handshake.extend_from_slice(b"-NZ0001-METAPREFLT12");
+        assert_eq!(handshake.len(), 68);
+        handshake
+    }
+
+    fn extended_message(extension_id: u8, payload: &[u8]) -> Vec<u8> {
+        let length = u32::try_from(payload.len() + 2).unwrap();
+        let mut message = Vec::with_capacity(payload.len() + 6);
+        message.extend_from_slice(&length.to_be_bytes());
+        message.push(20);
+        message.push(extension_id);
+        message.extend_from_slice(payload);
+        message
+    }
+
+    async fn read_peer_message(stream: &mut TcpStream) -> Vec<u8> {
+        let mut length = [0_u8; 4];
+        stream.read_exact(&mut length).await.unwrap();
+        let mut message = vec![0_u8; u32::from_be_bytes(length) as usize];
+        stream.read_exact(&mut message).await.unwrap();
+        message
+    }
+
+    fn advertised_metadata_id(payload: &[u8]) -> Option<u8> {
+        let marker = b"11:ut_metadatai";
+        let start = payload
+            .windows(marker.len())
+            .position(|window| window == marker)?
+            + marker.len();
+        let end = payload[start..].iter().position(|byte| *byte == b'e')? + start;
+        std::str::from_utf8(&payload[start..end]).ok()?.parse().ok()
+    }
+
+    async fn metadata_peer(listener: TcpListener, info: Vec<u8>, info_hash: [u8; 20]) {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut incoming_handshake = [0_u8; 68];
+        stream.read_exact(&mut incoming_handshake).await.unwrap();
+        assert_eq!(&incoming_handshake[28..48], &info_hash);
+        stream.write_all(&peer_handshake(info_hash)).await.unwrap();
+        let handshake = format!("d1:md11:ut_metadatai1ee13:metadata_sizei{}ee", info.len());
+        stream
+            .write_all(&extended_message(0, handshake.as_bytes()))
+            .await
+            .unwrap();
+        let response_id = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let mut response_id = None;
+            loop {
+                let request = read_peer_message(&mut stream).await;
+                if request.starts_with(&[20, 0]) {
+                    response_id = advertised_metadata_id(&request[2..]);
+                }
+                if request.starts_with(&[20, 1]) {
+                    break response_id.unwrap();
+                }
+            }
+        })
+        .await
+        .unwrap();
+        let mut response =
+            format!("d8:msg_typei1e5:piecei0e10:total_sizei{}ee", info.len()).into_bytes();
+        response.extend_from_slice(&info);
+        stream
+            .write_all(&extended_message(response_id, &response))
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    }
+
+    fn dht_transaction_id(packet: &[u8]) -> [u8; 2] {
+        let marker = b"1:t2:";
+        let start = packet
+            .windows(marker.len())
+            .position(|window| window == marker)
+            .expect("DHT request did not contain a two-byte transaction id")
+            + marker.len();
+        [packet[start], packet[start + 1]]
+    }
+
+    fn compact_ipv4(address: SocketAddr) -> [u8; 6] {
+        let SocketAddr::V4(address) = address else {
+            panic!("loopback DHT fixture requires IPv4");
+        };
+        let mut compact = [0_u8; 6];
+        compact[..4].copy_from_slice(&address.ip().octets());
+        compact[4..].copy_from_slice(&address.port().to_be_bytes());
+        compact
+    }
+
+    fn dht_response(
+        transaction: [u8; 2],
+        node_id: [u8; 20],
+        node: SocketAddr,
+        peer: Option<SocketAddr>,
+    ) -> Vec<u8> {
+        let mut response = b"d1:rd2:id20:".to_vec();
+        response.extend_from_slice(&node_id);
+        if let Some(peer) = peer {
+            response.extend_from_slice(b"5:token4:test6:valuesl6:");
+            response.extend_from_slice(&compact_ipv4(peer));
+            response.extend_from_slice(b"ee");
+        } else {
+            response.extend_from_slice(b"5:nodes26:");
+            response.extend_from_slice(&node_id);
+            response.extend_from_slice(&compact_ipv4(node));
+            response.push(b'e');
+        }
+        response.extend_from_slice(b"1:t2:");
+        response.extend_from_slice(&transaction);
+        response.extend_from_slice(b"1:y1:re");
+        response
+    }
+
+    async fn dht_swarm_node(
+        socket: tokio::net::UdpSocket,
+        info_hash: [u8; 20],
+        peer: SocketAddr,
+        get_peers_count: Arc<AtomicUsize>,
+    ) {
+        let node_id = [0x24; 20];
+        let node = socket.local_addr().unwrap();
+        let mut packet = [0_u8; 2048];
+        loop {
+            let (length, source) = socket.recv_from(&mut packet).await.unwrap();
+            let request = &packet[..length];
+            let transaction = dht_transaction_id(request);
+            let discovered_peer = if request
+                .windows(b"9:get_peers".len())
+                .any(|window| window == b"9:get_peers")
+            {
+                let marker = b"9:info_hash20:";
+                let start = request
+                    .windows(marker.len())
+                    .position(|window| window == marker)
+                    .expect("get_peers request omitted info_hash")
+                    + marker.len();
+                assert_eq!(&request[start..start + 20], &info_hash);
+                get_peers_count.fetch_add(1, Ordering::SeqCst);
+                Some(peer)
+            } else {
+                None
+            };
+            socket
+                .send_to(
+                    &dht_response(transaction, node_id, node, discovered_peer),
+                    source,
+                )
+                .await
+                .unwrap();
+        }
+    }
+
+    async fn empty_dht_node(socket: tokio::net::UdpSocket, get_peers_count: Arc<AtomicUsize>) {
+        let node_id = [0x25; 20];
+        let node = socket.local_addr().unwrap();
+        let mut packet = [0_u8; 2048];
+        loop {
+            let (length, source) = socket.recv_from(&mut packet).await.unwrap();
+            let request = &packet[..length];
+            if request
+                .windows(b"9:get_peers".len())
+                .any(|window| window == b"9:get_peers")
+            {
+                get_peers_count.fetch_add(1, Ordering::SeqCst);
+            }
+            let transaction = dht_transaction_id(request);
+            socket
+                .send_to(&dht_response(transaction, node_id, node, None), source)
+                .await
+                .unwrap();
+        }
     }
 
     async fn service(tmp: &tempfile::TempDir) -> (TorrentAdmissionService, EngineHandle) {
@@ -1327,6 +1605,27 @@ mod tests {
                 error: SafeError::from_redacted("torrent control target is unavailable"),
             }
         );
+    }
+
+    #[test]
+    fn recovery_keeps_transient_magnet_failures_and_reaps_policy_failures() {
+        assert!(!deterministic_magnet_recovery_failure(
+            &AdmissionError::Torrent(nzbd_torrent::TorrentError::MagnetMetadataTimeout)
+        ));
+        assert!(!deterministic_magnet_recovery_failure(
+            &AdmissionError::Torrent(nzbd_torrent::TorrentError::Engine(
+                "peer stream exhausted".into()
+            ))
+        ));
+        assert!(deterministic_magnet_recovery_failure(
+            &AdmissionError::Torrent(nzbd_torrent::TorrentError::PrivateMetainfoWithDht)
+        ));
+        assert!(deterministic_magnet_recovery_failure(
+            &AdmissionError::Torrent(nzbd_torrent::TorrentError::MagnetDiscoveryUnavailable)
+        ));
+        assert!(deterministic_magnet_recovery_failure(
+            &AdmissionError::Torrent(nzbd_torrent::TorrentError::InvalidResolvedMagnetMetadata)
+        ));
     }
 
     #[tokio::test]
@@ -1642,6 +1941,363 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn trackerless_magnet_without_dht_is_rejected_before_reservation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (service, engine) = service(&tmp).await;
+        let request = serde_json::json!({
+            "source": {
+                "type": "magnet",
+                "uri": "magnet:?xt=urn:btih:0000000000000000000000000000000000000000&dn=offline"
+            }
+        });
+        let response = router(service)
+            .oneshot(
+                axum::http::Request::post("/api/v1/jobs")
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(request.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(body["error"]
+            .as_str()
+            .unwrap()
+            .contains("no usable peer source while DHT is disabled"));
+        let persisted = nzbd_state::SnapshotStore::open(&tmp.path().join("state"))
+            .unwrap()
+            .load()
+            .unwrap()
+            .unwrap_or_default();
+        assert!(persisted.pending_admissions.is_empty());
+        assert!(PendingSourceStore::open(&tmp.path().join("state"))
+            .unwrap()
+            .inventory()
+            .unwrap()
+            .is_empty());
+        engine.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn pending_public_magnet_recovers_through_dht_and_transfers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let payload = (0..64 * 1024)
+            .map(|index| ((index * 29 + 11) % 251) as u8)
+            .collect::<Vec<_>>();
+        let (torrent, info_hash) = swarm_metainfo(&payload, false);
+
+        let seed_root = tmp.path().join("seed");
+        std::fs::create_dir_all(&seed_root).unwrap();
+        std::fs::write(seed_root.join(DHT_SWARM_FILE), &payload).unwrap();
+        let seeder = TorrentSession::start_with_dht_bootstrap_for_test(
+            seed_root,
+            TorrentSessionConfig {
+                listen_port_range: Some(30_000..60_000),
+                ..Default::default()
+            },
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        let seed_port = seeder.tcp_listen_port().unwrap();
+        let seed = seeder
+            .add_metainfo(
+                torrent,
+                TorrentAddConfig {
+                    overwrite: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            seed.wait_until_completed(),
+        )
+        .await
+        .expect("loopback seeder hash check timed out")
+        .unwrap();
+
+        let dht_socket = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let dht_address = dht_socket.local_addr().unwrap();
+        let get_peers_count = Arc::new(AtomicUsize::new(0));
+        let dht_task = tokio::spawn(dht_swarm_node(
+            dht_socket,
+            info_hash,
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, seed_port)),
+            get_peers_count.clone(),
+        ));
+
+        let state = tmp.path().join("state");
+        let payload_root = tmp.path().join("payload");
+        let engine = Engine::spawn(EngineConfig::single_node(
+            vec![],
+            state.clone(),
+            tmp.path().join("dest"),
+            Tuning::default(),
+            None,
+        ))
+        .await
+        .unwrap();
+        let session = TorrentSession::start_with_dht_bootstrap_for_test(
+            payload_root.clone(),
+            TorrentSessionConfig {
+                dht: true,
+                ..Default::default()
+            },
+            vec![dht_address],
+        )
+        .await
+        .unwrap();
+        let service =
+            TorrentAdmissionService::new(engine.clone(), session, state.clone(), false, true);
+        let executor = service.spawn_backend_executor().unwrap();
+        let magnet = format!(
+            "magnet:?xt=urn:btih:{}&dn=production",
+            info_hash
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        );
+        let pending = engine
+            .reserve_torrent_admission(
+                TorrentSource::Magnet,
+                magnet.into_bytes(),
+                AddOpts::default(),
+            )
+            .await
+            .unwrap();
+        let recovered = service.recover().await.unwrap();
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].id, pending);
+        assert!(recovered[0].created);
+
+        let downloaded = payload_root.join(DHT_SWARM_FILE);
+        tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            loop {
+                if std::fs::read(&downloaded).is_ok_and(|bytes| bytes == payload) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("production DHT magnet transfer timed out");
+        assert!(
+            get_peers_count.load(Ordering::SeqCst) >= 2,
+            "production admission must rediscover a peer after metadata-only resolution"
+        );
+        let persisted = nzbd_state::SnapshotStore::open(&state)
+            .unwrap()
+            .load()
+            .unwrap()
+            .unwrap();
+        assert!(persisted.pending_admissions.is_empty());
+        assert_eq!(persisted.jobs.len(), 1);
+
+        service.shutdown().await;
+        seeder.stop().await;
+        dht_task.abort();
+        engine.shutdown().await;
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), executor).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn dht_resolved_private_magnet_is_rejected_and_cleans_pending_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let payload = b"private-over-public-discovery".to_vec();
+        let (info, info_hash) = swarm_info(&payload, true);
+        let peer_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let peer_address = peer_listener.local_addr().unwrap();
+        let peer_task = tokio::spawn(metadata_peer(peer_listener, info, info_hash));
+
+        let dht_socket = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let dht_address = dht_socket.local_addr().unwrap();
+        let get_peers_count = Arc::new(AtomicUsize::new(0));
+        let dht_task = tokio::spawn(dht_swarm_node(
+            dht_socket,
+            info_hash,
+            peer_address,
+            get_peers_count.clone(),
+        ));
+
+        let state = tmp.path().join("private-state");
+        let payload_root = tmp.path().join("private-payload");
+        let engine = Engine::spawn(EngineConfig::single_node(
+            vec![],
+            state.clone(),
+            tmp.path().join("private-dest"),
+            Tuning::default(),
+            None,
+        ))
+        .await
+        .unwrap();
+        let session = TorrentSession::start_with_dht_bootstrap_for_test(
+            payload_root.clone(),
+            TorrentSessionConfig {
+                dht: true,
+                ..Default::default()
+            },
+            vec![dht_address],
+        )
+        .await
+        .unwrap();
+        let service =
+            TorrentAdmissionService::new(engine.clone(), session, state.clone(), false, true);
+        let magnet = format!(
+            "magnet:?xt=urn:btih:{}",
+            info_hash
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        );
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            router(service.clone()).oneshot(
+                axum::http::Request::post("/api/v1/jobs")
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(
+                        json!({"source":{"type":"magnet","uri":magnet}}).to_string(),
+                    ))
+                    .unwrap(),
+            ),
+        )
+        .await
+        .expect("private DHT magnet admission timed out")
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(body["error"]
+            .as_str()
+            .unwrap()
+            .contains("private and cannot be added while DHT is enabled"));
+        assert!(get_peers_count.load(Ordering::SeqCst) >= 1);
+        let persisted = nzbd_state::SnapshotStore::open(&state)
+            .unwrap()
+            .load()
+            .unwrap()
+            .unwrap();
+        assert!(persisted.pending_admissions.is_empty());
+        assert!(persisted.jobs.is_empty());
+        assert!(PendingSourceStore::open(&state)
+            .unwrap()
+            .inventory()
+            .unwrap()
+            .is_empty());
+        assert_eq!(std::fs::read_dir(&payload_root).unwrap().count(), 0);
+        tokio::time::timeout(std::time::Duration::from_secs(5), peer_task)
+            .await
+            .expect("private metadata peer did not finish")
+            .unwrap();
+
+        service.shutdown().await;
+        dht_task.abort();
+        engine.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn dht_timeout_stops_lookup_cleans_explicit_admission_and_keeps_recovery_pending() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dht_socket = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let dht_address = dht_socket.local_addr().unwrap();
+        let get_peers_count = Arc::new(AtomicUsize::new(0));
+        let dht_task = tokio::spawn(empty_dht_node(dht_socket, get_peers_count.clone()));
+
+        let state = tmp.path().join("timeout-state");
+        let engine = Engine::spawn(EngineConfig::single_node(
+            vec![],
+            state.clone(),
+            tmp.path().join("timeout-dest"),
+            Tuning::default(),
+            None,
+        ))
+        .await
+        .unwrap();
+        let session = TorrentSession::start_with_dht_bootstrap_for_test(
+            tmp.path().join("timeout-payload"),
+            TorrentSessionConfig {
+                dht: true,
+                ..Default::default()
+            },
+            vec![dht_address],
+        )
+        .await
+        .unwrap()
+        .with_magnet_metadata_timeout_for_test(std::time::Duration::from_millis(300));
+        let service =
+            TorrentAdmissionService::new(engine.clone(), session, state.clone(), false, true);
+        let magnet = "magnet:?xt=urn:btih:1111111111111111111111111111111111111111";
+        let response = router(service.clone())
+            .oneshot(
+                axum::http::Request::post("/api/v1/jobs")
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(
+                        json!({"source":{"type":"magnet","uri":magnet}}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+        let snapshot = nzbd_state::SnapshotStore::open(&state)
+            .unwrap()
+            .load()
+            .unwrap()
+            .unwrap();
+        assert!(snapshot.pending_admissions.is_empty());
+        assert!(PendingSourceStore::open(&state)
+            .unwrap()
+            .inventory()
+            .unwrap()
+            .is_empty());
+        let queries_after_timeout = get_peers_count.load(Ordering::SeqCst);
+        assert!(queries_after_timeout >= 1);
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        assert_eq!(
+            get_peers_count.load(Ordering::SeqCst),
+            queries_after_timeout,
+            "dropping the timed-out resolution must stop its DHT request stream"
+        );
+
+        let pending = engine
+            .reserve_torrent_admission(
+                TorrentSource::Magnet,
+                magnet.as_bytes().to_vec(),
+                AddOpts::default(),
+            )
+            .await
+            .unwrap();
+        assert!(service.recover().await.unwrap().is_empty());
+        let snapshot = nzbd_state::SnapshotStore::open(&state)
+            .unwrap()
+            .load()
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot.pending_admissions.len(), 1);
+        assert_eq!(snapshot.pending_admissions[0].job_id, pending);
+        assert_eq!(
+            PendingSourceStore::open(&state)
+                .unwrap()
+                .inventory()
+                .unwrap(),
+            vec![pending]
+        );
+
+        service.shutdown().await;
+        dht_task.abort();
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn typed_http_source_uses_the_same_durable_admission_path() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -1702,6 +2358,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn category_root_is_validated_instead_of_the_unused_default_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (service, engine) = service(&tmp).await;
+        let category_root = tmp.path().join("category-payload");
+        std::fs::create_dir_all(&category_root).unwrap();
+        std::fs::create_dir_all(tmp.path().join("payload/category.bin")).unwrap();
+        let service = service.with_category_payload_roots(HashMap::from([(
+            "Movies".to_string(),
+            category_root.clone(),
+        )]));
+
+        let result = service
+            .admit_raw(
+                metainfo(b"category.bin"),
+                AddOpts {
+                    category: Some("movies".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("unused default-root collision must not reject category admission");
+        assert!(result.created);
+        let persisted = nzbd_state::SnapshotStore::open(&tmp.path().join("state"))
+            .unwrap()
+            .load()
+            .unwrap()
+            .unwrap();
+        assert_eq!(persisted.jobs.len(), 1);
+        assert_eq!(persisted.jobs[0].category.as_deref(), Some("Movies"));
+        assert_eq!(
+            persisted.jobs[0].torrent.as_ref().unwrap().payload_root,
+            category_root
+        );
+
+        service.shutdown().await;
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn category_root_collision_is_rejected_before_durable_commit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (service, engine) = service(&tmp).await;
+        let category_root = tmp.path().join("category-payload");
+        std::fs::create_dir_all(category_root.join("collision.bin")).unwrap();
+        let service = service
+            .with_category_payload_roots(HashMap::from([("Movies".to_string(), category_root)]));
+
+        let error = service
+            .admit_raw(
+                metainfo(b"collision.bin"),
+                AddOpts {
+                    category: Some("movies".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("category-root type collision must be rejected");
+        assert!(matches!(
+            error,
+            AdmissionError::Torrent(nzbd_torrent::TorrentError::ExistingPathType(_))
+        ));
+        let persisted = nzbd_state::SnapshotStore::open(&tmp.path().join("state"))
+            .unwrap()
+            .load()
+            .unwrap()
+            .unwrap_or_default();
+        assert!(persisted.jobs.is_empty());
+        assert!(persisted.pending_admissions.is_empty());
+
+        service.shutdown().await;
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn recover_resumes_a_durable_http_intent_and_reaps_orphans() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -1758,6 +2488,42 @@ mod tests {
             .unwrap();
         assert!(persisted.pending_admissions.is_empty());
         assert_eq!(persisted.jobs[0].id, job);
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn recover_removes_a_deterministically_unusable_pending_magnet() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (service, engine) = service(&tmp).await;
+        let state = tmp.path().join("state");
+        let job = engine
+            .reserve_torrent_admission(
+                TorrentSource::Magnet,
+                b"magnet:?xt=urn:btih:0000000000000000000000000000000000000000".to_vec(),
+                AddOpts::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            PendingSourceStore::open(&state)
+                .unwrap()
+                .inventory()
+                .unwrap(),
+            vec![job]
+        );
+
+        assert!(service.recover().await.unwrap().is_empty());
+        let persisted = nzbd_state::SnapshotStore::open(&state)
+            .unwrap()
+            .load()
+            .unwrap()
+            .unwrap();
+        assert!(persisted.pending_admissions.is_empty());
+        assert!(PendingSourceStore::open(&state)
+            .unwrap()
+            .inventory()
+            .unwrap()
+            .is_empty());
         engine.shutdown().await;
     }
 

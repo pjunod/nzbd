@@ -25,9 +25,11 @@ thiserror = { workspace = true }
 url = { workspace = true }
 
 [dev-dependencies]
+nzbd-torrent = { workspace = true, features = ["test-support"] }
 tokio = { workspace = true, features = ["test-util"] }
 tower = { version = "0.5", features = ["util"] }
 tempfile = { workspace = true }
 http-body-util = "0.1"
 nzbd-nserv = { workspace = true }
 nzbd-nzb = { workspace = true }
+sha1 = "0.10"

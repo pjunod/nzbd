@@ -589,6 +589,9 @@ async fn work_script_receipt(
     if !s.is_leader() {
         return not_leader();
     }
+    if !s.authority_ready() {
+        return authority_not_ready();
+    }
     let exact = s
         .leases
         .lock()
@@ -653,6 +656,16 @@ fn not_leader() -> Response {
         .into_response()
 }
 
+fn authority_not_ready() -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(serde_json::json!({
+            "error": "queue authority is still being adopted; retry"
+        })),
+    )
+        .into_response()
+}
+
 fn denied() -> Response {
     (
         StatusCode::UNAUTHORIZED,
@@ -685,6 +698,9 @@ async fn work_poll(
     }
     if !s.is_leader() {
         return not_leader();
+    }
+    if !s.authority_ready() {
+        return authority_not_ready();
     }
     // The registry is the leader's independent admission fact. Do not trust
     // slot counts from a poll whose node is already known to be held.
@@ -929,6 +945,9 @@ async fn work_reject(
     if !s.is_leader() {
         return not_leader();
     }
+    if !s.authority_ready() {
+        return authority_not_ready();
+    }
     let candidate = s.leases.lock().unwrap().get(&req.lease_id).cloned();
     let release_ok = if let Some(lease) = &candidate {
         if lease.node != req.node || lease.token != req.token {
@@ -971,6 +990,9 @@ async fn work_heartbeat(
     }
     if !s.is_leader() {
         return not_leader();
+    }
+    if !s.authority_ready() {
+        return authority_not_ready();
     }
 
     let (budget_generation, server_budgets) = s.budget_command(&req.node, req.budget_ack.as_ref());
@@ -1102,6 +1124,9 @@ async fn work_complete(
     }
     if !s.is_leader() {
         return not_leader();
+    }
+    if !s.authority_ready() {
+        return authority_not_ready();
     }
     let _serial = s.mutation_serial.lock().await;
     let job_id = req.job.id;
@@ -2380,6 +2405,7 @@ mod tests {
             view,
             LeaderDurability::new(None, None, "test-incarnation".into()),
         );
+        shared.authority_ready.store(true, Ordering::Release);
         shared.leases.lock().unwrap().insert(
             "transition-lease".into(),
             LeaseInfo {
