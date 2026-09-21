@@ -1433,7 +1433,7 @@ fn valid_initial_peer(peer: SocketAddr) -> bool {
         && *address != std::net::Ipv4Addr::BROADCAST
 }
 
-#[cfg(feature = "fuzzing")]
+#[cfg(any(test, feature = "fuzzing"))]
 fn validate_metainfo_contract(bytes: &[u8], proxy_enabled: bool) -> Result<bool, TorrentError> {
     validate_metainfo_contract_with_limit(bytes, proxy_enabled, false, DEFAULT_MAX_METAINFO_BYTES)
 }

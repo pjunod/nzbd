@@ -1,6 +1,6 @@
 use super::*;
 use sha1::{Digest, Sha1};
-use std::net::{Ipv4Addr, SocketAddrV4};
+use std::net::Ipv4Addr;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
