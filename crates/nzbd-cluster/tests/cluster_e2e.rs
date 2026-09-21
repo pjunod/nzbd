@@ -439,6 +439,20 @@ async fn cluster_diagnostics_route_requires_configured_user_auth() {
     )
     .await;
 
+    wait_for("authenticated diagnostics register this node", 15, || {
+        let (code, body) = http_with_headers(
+            &node.url,
+            "GET",
+            "/api/v1/cluster",
+            b"",
+            &[("Authorization", "Basic YWRtaW46c2VjcmV0")],
+        );
+        code == 200
+            && serde_json::from_str::<serde_json::Value>(&body)
+                .is_ok_and(|value| value["self"] == "auth-node")
+    })
+    .await;
+
     let (without_code, _) = http(&node.url, "GET", "/api/v1/cluster", b"");
     assert_eq!(without_code, 401);
     let (with_code, body) = http_with_headers(
