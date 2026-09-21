@@ -136,6 +136,7 @@ NZBGet configuration and prints a mapping report.
 | [docs/CLUSTERING.md](docs/CLUSTERING.md) | Cluster design (ADR-13…16), failure matrix, operations |
 | [docs/CLUSTERING_COMPLETION_PLAN.md](docs/CLUSTERING_COMPLETION_PLAN.md) | Current plurx comparison, recommended authority changes, and the finite C3 implementation/CI plan |
 | [docs/CLUSTERING_STATUS.md](docs/CLUSTERING_STATUS.md) | Cluster completion progress, review, validation, and remaining external evidence |
+| [docs/TORRENT_QUEUE_STATUS.md](docs/TORRENT_QUEUE_STATUS.md) | Torrent queue lifecycle, review, validation, and merge progress |
 | [STATUS.md](STATUS.md) | What's done, what's next, with commit evidence |
 
 Deployable examples live under [`examples/`](examples/):

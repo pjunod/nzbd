@@ -1323,6 +1323,8 @@ impl Owner {
                     {
                         j.status = JobStatus::Paused;
                         j.torrent.as_mut().unwrap().control_intent = TorrentControlIntent::Paused;
+                        j.torrent.as_mut().unwrap().stop_reason =
+                            Some(nzbd_types::TorrentStopReason::Manual);
                         true
                     }
                     _ => false,
@@ -1356,6 +1358,17 @@ impl Owner {
                 let _ = reply.send(ok);
             }
             QueueCommand::Resume { job, reply } => {
+                if self
+                    .state
+                    .job(job)
+                    .and_then(|j| j.torrent.as_ref())
+                    .is_some_and(|t| {
+                        t.ready_at_unix.is_some() && crate::torrent_runtime::seed_policy_reached(t)
+                    })
+                {
+                    let _ = reply.send(false);
+                    return;
+                }
                 let before = self.state.job(job).cloned();
                 let torrent = match self.state.job_mut(job) {
                     Some(j)
@@ -1366,6 +1379,7 @@ impl Owner {
                         j.status = JobStatus::Queued;
                         let torrent = j.torrent.as_mut().unwrap();
                         torrent.control_intent = TorrentControlIntent::Running;
+                        torrent.stop_reason = None;
                         if torrent.ready_at_unix.is_none() {
                             torrent.phase = nzbd_types::TorrentPhase::Queued;
                             torrent.last_activity_unix = Some(unix_now());
@@ -1492,6 +1506,15 @@ impl Owner {
                 let _ = reply.send(ok);
             }
             QueueCommand::SetTorrentSeedPolicy { job, policy, reply } => {
+                if policy
+                    .ratio_limit
+                    .is_some_and(|v| !v.is_finite() || v <= 0.0)
+                    || policy.time_limit_secs == Some(0)
+                {
+                    let _ = reply.send(false);
+                    return;
+                }
+                let before = self.state.job(job).cloned();
                 let ok = self.state.job_mut(job).is_some_and(|record| {
                     let Some(torrent) = record.torrent.as_mut() else {
                         return false;
@@ -1499,11 +1522,22 @@ impl Owner {
                     torrent.seed_policy = policy;
                     true
                 });
-                if ok {
-                    self.save_snapshot();
-                    self.publish_now();
-                    self.bump_epoch();
-                }
+                let ok = if ok {
+                    self.dirty = true;
+                    if self.persist && !self.save_snapshot() {
+                        if let Some(before) = before {
+                            *self.state.job_mut(job).unwrap() = before;
+                        }
+                        false
+                    } else {
+                        self.update_seed_policies(unix_now());
+                        self.publish_now();
+                        self.bump_epoch();
+                        true
+                    }
+                } else {
+                    false
+                };
                 let _ = reply.send(ok);
             }
             QueueCommand::Move { job, op, reply } => {
@@ -3368,14 +3402,14 @@ impl Owner {
                 torrent.seeding_seconds = torrent.seeding_seconds.saturating_add(elapsed);
                 changed = true;
             }
-            if crate::torrent_runtime::seed_policy_reached(torrent) {
-                reached.push(job.id);
+            if let Some(reason) = crate::torrent_runtime::seed_policy_stop_reason(torrent) {
+                reached.push((job.id, reason));
             }
         }
         self.seed_clock_unix.retain(|job, _| live.contains(job));
         self.dirty |= changed;
 
-        for job_id in reached {
+        for (job_id, reason) in reached {
             let Some(before) = self.state.job(job_id).cloned() else {
                 continue;
             };
@@ -3384,6 +3418,7 @@ impl Owner {
             };
             job.status = JobStatus::Paused;
             job.torrent.as_mut().unwrap().control_intent = TorrentControlIntent::Paused;
+            job.torrent.as_mut().unwrap().stop_reason = Some(reason);
             self.dirty = true;
             if self.persist_then_command(BackendCommand::PauseForSeedPolicy { job: job_id }) {
                 self.bump_epoch();
@@ -3715,6 +3750,11 @@ impl Owner {
                     pp_done: j.params.iter().any(|(k, _)| k == nzbd_types::PP_DONE_PARAM),
                     ready: j.ready(),
                     ready_at_unix: j.ready_at_unix(),
+                    torrent_phase: j.torrent.as_ref().map(|t| t.phase),
+                    torrent_control_intent: j.torrent.as_ref().map(|t| t.control_intent),
+                    seed_policy: j.torrent.as_ref().map(|t| t.seed_policy),
+                    seed_stop_reason: j.torrent.as_ref().and_then(|t| t.stop_reason),
+                    torrent_error: j.torrent.as_ref().and_then(|t| t.last_error.clone()),
                     uploaded_bytes: j
                         .torrent
                         .as_ref()
@@ -4238,6 +4278,7 @@ mod tests {
             removal_intent: None,
             removal_outcome: None,
             removal_confirmed_at_unix: None,
+            stop_reason: None,
             files: Vec::new(),
             total_bytes: 1,
             selected_bytes: 1,
@@ -4320,6 +4361,99 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn seed_policy_stop_survives_restart_and_requires_a_new_policy_to_resume() {
+        let (_tmp, mut owner, mut adapter) = control_test_owner();
+        let mut job = control_torrent_job();
+        job.status = JobStatus::Downloading;
+        let torrent = job.torrent.as_mut().unwrap();
+        torrent.phase = TorrentPhase::Seeding;
+        torrent.ready_at_unix = Some(100);
+        torrent.downloaded_bytes = 1;
+        owner.state.jobs.push(job);
+        let (reply, rx) = oneshot::channel();
+        owner.on_command(QueueCommand::SetTorrentSeedPolicy {
+            job: JobId(1),
+            policy: nzbd_types::SeedPolicy {
+                stop_on_complete: true,
+                ..Default::default()
+            },
+            reply,
+        });
+        assert!(rx.await.unwrap());
+        assert_eq!(
+            adapter.next_command().await,
+            Some(BackendCommand::PauseForSeedPolicy { job: JobId(1) })
+        );
+        let persisted = owner.snap_store.load().unwrap().unwrap();
+        let saved = persisted.jobs[0].torrent.as_ref().unwrap();
+        assert!(saved.seed_policy.stop_on_complete);
+        assert_eq!(
+            saved.stop_reason,
+            Some(nzbd_types::TorrentStopReason::DownloadComplete)
+        );
+        assert_eq!(saved.control_intent, TorrentControlIntent::Paused);
+        assert_eq!(
+            owner.shared.load().jobs[0].seed_stop_reason,
+            saved.stop_reason
+        );
+        let (reply, rx) = oneshot::channel();
+        owner.on_command(QueueCommand::Resume {
+            job: JobId(1),
+            reply,
+        });
+        assert!(!rx.await.unwrap());
+
+        let (reply, rx) = oneshot::channel();
+        owner.on_command(QueueCommand::SetTorrentSeedPolicy {
+            job: JobId(1),
+            policy: Default::default(),
+            reply,
+        });
+        assert!(rx.await.unwrap());
+        assert_eq!(
+            owner.state.jobs[0].status,
+            JobStatus::Paused,
+            "editing a policy must not restart a stopped seed"
+        );
+        let (reply, rx) = oneshot::channel();
+        owner.on_command(QueueCommand::Resume {
+            job: JobId(1),
+            reply,
+        });
+        assert!(rx.await.unwrap());
+        assert_eq!(
+            owner.state.jobs[0].torrent.as_ref().unwrap().stop_reason,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn seed_policy_save_failure_rolls_back_without_stopping_the_torrent() {
+        let (_tmp, mut owner, mut adapter) =
+            control_test_owner_with_persistence(true, Some(Arc::new(|| false)));
+        owner.state.jobs.push(control_torrent_job());
+        let (reply, rx) = oneshot::channel();
+        owner.on_command(QueueCommand::SetTorrentSeedPolicy {
+            job: JobId(1),
+            policy: nzbd_types::SeedPolicy {
+                stop_on_complete: true,
+                ..Default::default()
+            },
+            reply,
+        });
+        assert!(!rx.await.unwrap());
+        assert_eq!(
+            owner.state.jobs[0].torrent.as_ref().unwrap().seed_policy,
+            Default::default()
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), adapter.next_command())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
     async fn torrent_control_is_persisted_before_fifo_delivery_and_is_idempotent() {
         let (tmp, mut owner, mut adapter) = control_test_owner();
         owner.state.jobs.push(control_torrent_job());
@@ -4339,6 +4473,10 @@ mod tests {
         let torrent = persisted.jobs[0].torrent.as_ref().unwrap();
         assert_eq!(persisted.jobs[0].status, JobStatus::Paused);
         assert_eq!(torrent.control_intent, TorrentControlIntent::Paused);
+        assert_eq!(
+            torrent.stop_reason,
+            Some(nzbd_types::TorrentStopReason::Manual)
+        );
 
         let (reply, rx) = oneshot::channel();
         owner.on_command(QueueCommand::Pause {

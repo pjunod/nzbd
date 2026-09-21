@@ -394,6 +394,8 @@ pub struct PendingAdmission {
     #[serde(default)]
     pub seed_time_limit_secs: Option<u64>,
     #[serde(default)]
+    pub stop_seeding_on_complete: Option<bool>,
+    #[serde(default)]
     pub params: Vec<(String, String)>,
     #[serde(default)]
     pub client: Option<String>,
@@ -992,6 +994,7 @@ mod tests {
             paused: true,
             seed_ratio_limit: Some(1.5),
             seed_time_limit_secs: Some(3_600),
+            stop_seeding_on_complete: Some(true),
             params: vec![("source".into(), "test".into())],
             client: Some("Sonarr".into()),
         };
@@ -1029,6 +1032,7 @@ mod tests {
             removal_intent: None,
             removal_outcome: None,
             removal_confirmed_at_unix: None,
+            stop_reason: None,
             files: vec![nzbd_types::TorrentFileRecord {
                 path: "payload.bin".into(),
                 length: 42,

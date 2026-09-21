@@ -1,5 +1,12 @@
 # nzbd — Project Status
 
+## Torrent queue lifecycle — 2026-09-20
+
+**Status:** implementation complete in an independent clone; preparing review.
+See [the live work status](docs/TORRENT_QUEUE_STATUS.md) for scope, decisions,
+review findings, validation, and merge progress. Existing queue layout retained;
+seeding and completion gain distinct sections, metrics, and durable controls.
+
 ## Settings form schema repair — 2026-09-20
 
 **Status:** adversarial review approved; final local fast lane passed.

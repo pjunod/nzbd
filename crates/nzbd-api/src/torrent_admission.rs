@@ -136,6 +136,27 @@ impl TorrentAdmissionService {
         self.session.output_root()
     }
 
+    pub fn seed_defaults(&self, category: Option<&str>) -> SeedPolicy {
+        let category = category.and_then(|name| {
+            self.category_seed_policies
+                .iter()
+                .find(|(key, _)| key.eq_ignore_ascii_case(name))
+                .map(|(_, policy)| policy)
+        });
+        let mut policy = nzbd_engine::torrent_runtime::normalized_seed_policy(
+            category
+                .and_then(|p| p.ratio_limit)
+                .or(self.default_seed_policy.ratio_limit),
+            category
+                .and_then(|p| p.time_limit_secs)
+                .or(self.default_seed_policy.time_limit_secs),
+        );
+        policy.stop_on_complete = category
+            .unwrap_or(&self.default_seed_policy)
+            .stop_on_complete;
+        policy
+    }
+
     pub fn with_transfer_policy(
         mut self,
         default_seed_policy: SeedPolicy,
@@ -317,6 +338,7 @@ impl TorrentAdmissionService {
                 paused: pending.paused,
                 seed_ratio_limit: pending.seed_ratio_limit,
                 seed_time_limit_secs: pending.seed_time_limit_secs,
+                stop_seeding_on_complete: pending.stop_seeding_on_complete,
                 params: pending.params.clone(),
                 client: pending.client.clone(),
                 ..Default::default()
@@ -462,7 +484,7 @@ impl TorrentAdmissionService {
                 .find(|(name, _)| name.eq_ignore_ascii_case(category))
                 .map(|(_, policy)| policy)
         });
-        let seed_policy = nzbd_engine::torrent_runtime::normalized_seed_policy(
+        let mut seed_policy = nzbd_engine::torrent_runtime::normalized_seed_policy(
             opts.seed_ratio_limit
                 .or_else(|| category_policy.and_then(|policy| policy.ratio_limit))
                 .or(self.default_seed_policy.ratio_limit),
@@ -470,6 +492,11 @@ impl TorrentAdmissionService {
                 .or_else(|| category_policy.and_then(|policy| policy.time_limit_secs))
                 .or(self.default_seed_policy.time_limit_secs),
         );
+        seed_policy.stop_on_complete = opts.stop_seeding_on_complete.unwrap_or_else(|| {
+            category_policy
+                .unwrap_or(&self.default_seed_policy)
+                .stop_on_complete
+        });
         let payload_root = opts
             .category
             .as_ref()
@@ -492,6 +519,7 @@ impl TorrentAdmissionService {
             removal_intent: None,
             removal_outcome: None,
             removal_confirmed_at_unix: None,
+            stop_reason: None,
             files: descriptor
                 .files
                 .iter()
@@ -1048,6 +1076,8 @@ struct TypedRequest {
     #[serde(default)]
     seed_time_limit_secs: Option<u64>,
     #[serde(default)]
+    stop_seeding_on_complete: Option<bool>,
+    #[serde(default)]
     params: std::collections::BTreeMap<String, String>,
 }
 #[derive(Deserialize)]
@@ -1129,6 +1159,7 @@ impl TorrentAdmissionService {
                             paused: request.paused,
                             seed_ratio_limit: request.seed_ratio_limit,
                             seed_time_limit_secs: request.seed_time_limit_secs,
+                            stop_seeding_on_complete: request.stop_seeding_on_complete,
                             params: request.params.into_iter().collect(),
                             client,
                             ..Default::default()
@@ -1296,6 +1327,95 @@ mod tests {
                 error: SafeError::from_redacted("torrent control target is unavailable"),
             }
         );
+    }
+
+    #[tokio::test]
+    async fn native_seed_policy_edit_and_defaults_preserve_explicit_intent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (service, engine) = service(&tmp).await;
+        let service = service.with_transfer_policy(
+            SeedPolicy {
+                stop_on_complete: true,
+                ratio_limit: Some(2.0),
+                time_limit_secs: Some(3600),
+            },
+            HashMap::from([(
+                "Linux".into(),
+                SeedPolicy {
+                    stop_on_complete: false,
+                    ratio_limit: Some(0.0),
+                    time_limit_secs: None,
+                },
+            )]),
+            None,
+        );
+        assert!(service.seed_defaults(None).stop_on_complete);
+        let category = service.seed_defaults(Some("linux"));
+        assert!(!category.stop_on_complete);
+        assert_eq!(
+            category.ratio_limit, None,
+            "category zero explicitly overrides the global ratio"
+        );
+        assert_eq!(category.time_limit_secs, Some(3600));
+        let added = service
+            .admit_raw(
+                metainfo(b"policy"),
+                AddOpts {
+                    stop_seeding_on_complete: Some(false),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let original = engine
+            .export_job(added.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .torrent
+            .unwrap();
+        assert!(
+            !original.seed_policy.stop_on_complete,
+            "per-add false overrides the global stop policy"
+        );
+        let app = crate::router(engine.clone());
+        for (body, expected) in [
+            (json!({"ratio_limit": -1}), StatusCode::UNPROCESSABLE_ENTITY),
+            (
+                json!({"time_limit_secs": 0}),
+                StatusCode::UNPROCESSABLE_ENTITY,
+            ),
+            (json!({"stop_on_complete": true}), StatusCode::OK),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("PUT")
+                        .uri(format!("/api/v1/jobs/{}/torrent/seed-policy", added.id.0))
+                        .header("content-type", "application/json")
+                        .body(axum::body::Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected);
+        }
+        let job = engine.export_job(added.id).await.unwrap().unwrap();
+        assert!(job.torrent.unwrap().seed_policy.stop_on_complete);
+        assert!(
+            engine
+                .snapshot()
+                .jobs
+                .iter()
+                .find(|j| j.id == added.id)
+                .unwrap()
+                .seed_policy
+                .unwrap()
+                .stop_on_complete
+        );
+        engine.shutdown().await;
+        service.session.stop().await;
     }
 
     #[tokio::test]

@@ -49,6 +49,7 @@ max_known_peers_total = 4096
 upload_limit_kib = 0
 default_seed_ratio = 0
 default_seed_minutes = 0
+stop_seeding_on_complete = false
 metainfo_max_mib = 10
 source_redirects = 5
 ```
@@ -63,6 +64,7 @@ source_redirects = 5
 | peer ceilings | `80`, `400`, `1024`, `4096` | Separate live and retained per-torrent/session budgets. |
 | `upload_limit_kib` | `0` | Unlimited; this is the only torrent setting designed for live application. |
 | seed ratio/minutes | `0` | Unlimited globally; optional category values override these and per-add values override categories. |
+| `stop_seeding_on_complete` | `false` | Stop after the selected payload is verified. Uploading pieces during download is still allowed. Category and per-add values can override this default. |
 | `metainfo_max_mib` / `source_redirects` | `10` / `5` | Bounds hostile metadata and source fetches; metainfo accepts 1–100 MiB. |
 
 Omitting `[torrent]` is identical to its disabled defaults. `torrent_dir`
@@ -71,6 +73,12 @@ never falls back to Usenet `dest_dir`; when omitted it derives as
 `seed_minutes` follow per-add → category → global precedence. Torrent roots do
 not enter disk probes while disabled. Cluster mode and BitTorrent cannot be
 enabled together. Unknown keys fail closed.
+
+Category `stop_seeding_on_complete` is optional: omit it to inherit, or set
+`true`/`false` explicitly. Seed defaults take effect for new admissions after
+restart; they do not rewrite existing torrent policies. Use the queue's
+After download editor to change an existing torrent immediately. Ratio and
+time limits stop on the first boundary reached, retaining all payload files.
 
 Before enabling, publish the configured TCP peer port only where intended,
 confirm the payload and state volumes have durable free space, and decide

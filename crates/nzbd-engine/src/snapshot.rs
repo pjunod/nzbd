@@ -55,6 +55,11 @@ pub struct JobSummary {
     pub ratio: f64,
     pub seeding_seconds: u64,
     pub useful_peers: u32,
+    pub torrent_phase: Option<nzbd_types::TorrentPhase>,
+    pub torrent_control_intent: Option<nzbd_types::TorrentControlIntent>,
+    pub seed_policy: Option<nzbd_types::SeedPolicy>,
+    pub seed_stop_reason: Option<nzbd_types::TorrentStopReason>,
+    pub torrent_error: Option<String>,
     /// Duplicate-detection metadata (empty key = no dupe tracking).
     pub dupe_key: String,
     pub dupe_score: i32,

@@ -361,6 +361,7 @@ mod tests {
             removal_intent: None,
             removal_outcome: None,
             removal_confirmed_at_unix: None,
+            stop_reason: None,
             files: Vec::new(),
             total_bytes: 100,
             selected_bytes: 100,

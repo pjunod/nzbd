@@ -67,6 +67,7 @@ pub struct TorrentConfig {
     pub upload_limit_kib: u64,
     pub default_seed_ratio: f64,
     pub default_seed_minutes: u64,
+    pub stop_seeding_on_complete: bool,
     pub metainfo_max_mib: u32,
     pub source_redirects: u32,
 }
@@ -90,6 +91,7 @@ impl Default for TorrentConfig {
             upload_limit_kib: 0,
             default_seed_ratio: 0.0,
             default_seed_minutes: 0,
+            stop_seeding_on_complete: false,
             metainfo_max_mib: 10,
             source_redirects: 5,
         }
@@ -124,6 +126,7 @@ impl std::fmt::Debug for TorrentConfig {
             .field("max_known_peers_total", &self.max_known_peers_total)
             .field("upload_limit_kib", &self.upload_limit_kib)
             .field("default_seed_ratio", &self.default_seed_ratio)
+            .field("stop_seeding_on_complete", &self.stop_seeding_on_complete)
             .field("default_seed_minutes", &self.default_seed_minutes)
             .field("metainfo_max_mib", &self.metainfo_max_mib)
             .field("source_redirects", &self.source_redirects)
@@ -437,6 +440,7 @@ pub struct CategoryConfig {
     pub torrent_dir: Option<PathBuf>,
     pub seed_ratio: Option<f64>,
     pub seed_minutes: Option<u64>,
+    pub stop_seeding_on_complete: Option<bool>,
 }
 
 /// `[[feed]]` — an RSS/Atom indexer feed with an NZBGet-style filter.

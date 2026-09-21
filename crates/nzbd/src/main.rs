@@ -827,6 +827,7 @@ fn run(
                 category_seed_policies.insert(
                     category.name.clone(),
                     nzbd_types::SeedPolicy {
+                        stop_on_complete: category.stop_seeding_on_complete.unwrap_or(cfg.torrent.stop_seeding_on_complete),
                         ratio_limit: category.seed_ratio,
                         time_limit_secs: category.seed_minutes.map(|minutes| minutes * 60),
                     },
@@ -854,6 +855,7 @@ fn run(
             )
             .with_transfer_policy(
                 nzbd_types::SeedPolicy {
+                    stop_on_complete: cfg.torrent.stop_seeding_on_complete,
                     ratio_limit: (cfg.torrent.default_seed_ratio > 0.0)
                         .then_some(cfg.torrent.default_seed_ratio),
                     time_limit_secs: (cfg.torrent.default_seed_minutes > 0)
