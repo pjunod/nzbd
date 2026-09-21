@@ -502,7 +502,9 @@ impl EngineHandle {
         let (tx, rx) = oneshot::channel();
         self.send(QueueCommand::CancelTorrentAdmission { job, reply: tx })
             .await?;
-        rx.await.map_err(|_| EngineError::Closed)
+        rx.await
+            .map_err(|_| EngineError::Closed)?
+            .map_err(EngineError::State)
     }
     /// Parse and enqueue an NZB. Parsing happens on the caller's task so a
     /// large or hostile NZB never stalls the queue owner.
@@ -1092,5 +1094,64 @@ mod out_of_space_tests {
         assert!(is_out_of_space("Disk quota exceeded (os error 122)"));
         assert!(!is_out_of_space("Permission denied (os error 13)"));
         assert!(!is_out_of_space("connection reset by peer"));
+    }
+}
+
+#[cfg(test)]
+mod torrent_admission_persistence_tests {
+    use super::{AddOpts, Engine, EngineConfig, EngineError, Tuning};
+    use nzbd_state::torrent_sources::PendingSourceStore;
+    use nzbd_types::TorrentSource;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn cancellation_reports_snapshot_failure_and_keeps_recovery_evidence() {
+        let temp = tempfile::tempdir().unwrap();
+        let state_dir = temp.path().join("state");
+        let authority = Arc::new(AtomicBool::new(true));
+        let mut config = EngineConfig::single_node(
+            vec![],
+            state_dir.clone(),
+            temp.path().join("dest"),
+            Tuning::default(),
+            None,
+        );
+        config.persist_guard = Some({
+            let authority = authority.clone();
+            Arc::new(move || authority.load(Ordering::SeqCst))
+        });
+        let engine = Engine::spawn(config).await.unwrap();
+        let job = engine
+            .reserve_torrent_admission(
+                TorrentSource::Magnet,
+                b"magnet:?xt=urn:btih:0000000000000000000000000000000000000000".to_vec(),
+                AddOpts::default(),
+            )
+            .await
+            .unwrap();
+
+        authority.store(false, Ordering::SeqCst);
+        assert!(matches!(
+            engine.cancel_torrent_admission(job).await,
+            Err(EngineError::State(_))
+        ));
+
+        let persisted = nzbd_state::SnapshotStore::open(&state_dir)
+            .unwrap()
+            .load()
+            .unwrap()
+            .unwrap();
+        assert_eq!(persisted.pending_admissions.len(), 1);
+        assert_eq!(persisted.pending_admissions[0].job_id, job);
+        assert_eq!(
+            PendingSourceStore::open(&state_dir)
+                .unwrap()
+                .inventory()
+                .unwrap(),
+            vec![job]
+        );
+
+        engine.shutdown().await;
     }
 }
