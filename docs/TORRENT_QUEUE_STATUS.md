@@ -1,7 +1,8 @@
 # Torrent queue — implementation and merge status
 
-**Status:** combined candidate ready for adversarial review.
+**Status:** adversarial agent review in progress.
 **Updated:** 2026-09-20 · **Branch:** `codex/torrent-queue-lifecycle`.
+**PR:** [#232](https://github.com/pjunod/nzbd/pull/232) (draft).
 
 Companion to [USAGE.md](USAGE.md) (operator behavior) and
 [CONFIGURATION.md](CONFIGURATION.md) (seeding defaults). This page records
@@ -19,7 +20,7 @@ progress, decisions, review findings, and final validation for the queue work.
 - [x] Transfer work into an independent clone and restore the original
   checkout without changing its branch or existing commits.
 - [x] Make focused backend and UI/validation commits.
-- [ ] Open one draft PR for the combined review.
+- [x] Open one draft PR for the combined review.
 - [ ] Complete the adversarial agent review and address actionable findings.
 - [ ] Run final affected unit/DOM checks and required CI; fix failures.
 - [ ] Merge the green PR into main and clean temporary artifacts.
@@ -55,5 +56,7 @@ unit tests and owner policy persistence cases. Preflight runs both UI harnesses.
 
 ## Review and merge record
 
-Pending the combined candidate. Findings and their fixes will be recorded here
-before final tests. The PR link and GitHub checks will provide merge evidence.
+The independent adversarial review examines the combined diff against main.
+Findings and fixes will be recorded before tests. Required CI will run the
+Rust unit tests after the draft becomes ready; avoiding a duplicate local
+Rust run keeps validation resource use bounded.
