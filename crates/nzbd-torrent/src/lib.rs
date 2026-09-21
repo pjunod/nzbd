@@ -1433,13 +1433,15 @@ fn valid_initial_peer(peer: SocketAddr) -> bool {
         && *address != std::net::Ipv4Addr::BROADCAST
 }
 
+#[cfg(feature = "fuzzing")]
 fn validate_metainfo_contract(bytes: &[u8], proxy_enabled: bool) -> Result<bool, TorrentError> {
-    validate_metainfo_contract_with_limit(bytes, proxy_enabled, DEFAULT_MAX_METAINFO_BYTES)
+    validate_metainfo_contract_with_limit(bytes, proxy_enabled, false, DEFAULT_MAX_METAINFO_BYTES)
 }
 
 fn validate_metainfo_contract_with_limit(
     bytes: &[u8],
     proxy_enabled: bool,
+    dht_enabled: bool,
     max_metainfo_bytes: usize,
 ) -> Result<bool, TorrentError> {
     validate_metainfo_size_with_limit(bytes.len(), max_metainfo_bytes)?;
@@ -1448,6 +1450,9 @@ fn validate_metainfo_contract_with_limit(
         librqbit::torrent_from_bytes::<librqbit::ByteBuf<'_>>(bytes).map_err(engine_error)?;
     validate_metainfo_geometry(&metainfo.info)?;
     validate_metainfo_paths(&metainfo.info)?;
+    if metainfo.info.private && dht_enabled {
+        return Err(TorrentError::PrivateMetainfoWithDht);
+    }
     let mut trackers = HashSet::new();
     for tracker in metainfo.iter_announce() {
         let tracker = AsRef::<[u8]>::as_ref(tracker);
@@ -1513,7 +1518,12 @@ fn validate_metainfo_admission(
     proxy_enabled: bool,
     dht_enabled: bool,
 ) -> Result<(), TorrentError> {
-    let private = validate_metainfo_contract(bytes, proxy_enabled)?;
+    let private = validate_metainfo_contract_with_limit(
+        bytes,
+        proxy_enabled,
+        dht_enabled,
+        DEFAULT_MAX_METAINFO_BYTES,
+    )?;
     validate_private_discovery(private, dht_enabled)
 }
 

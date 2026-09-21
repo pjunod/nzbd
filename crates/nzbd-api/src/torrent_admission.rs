@@ -1309,6 +1309,8 @@ mod tests {
     use sha1::{Digest, Sha1};
     use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
     use tower::ServiceExt;
 
     const DHT_SWARM_FILE: &str = "dht-production.bin";
@@ -1327,7 +1329,7 @@ mod tests {
         torrent
     }
 
-    fn swarm_metainfo(payload: &[u8], private: bool) -> (Vec<u8>, [u8; 20]) {
+    fn swarm_info(payload: &[u8], private: bool) -> (Vec<u8>, [u8; 20]) {
         fn bytes(out: &mut Vec<u8>, value: &[u8]) {
             out.extend_from_slice(value.len().to_string().as_bytes());
             out.push(b':');
@@ -1348,6 +1350,16 @@ mod tests {
         }
         info.push(b'e');
         let info_hash = Sha1::digest(&info).into();
+        (info, info_hash)
+    }
+
+    fn swarm_metainfo(payload: &[u8], private: bool) -> (Vec<u8>, [u8; 20]) {
+        fn bytes(out: &mut Vec<u8>, value: &[u8]) {
+            out.extend_from_slice(value.len().to_string().as_bytes());
+            out.push(b':');
+            out.extend_from_slice(value);
+        }
+        let (info, info_hash) = swarm_info(payload, private);
         let mut torrent = vec![b'd'];
         if private {
             bytes(&mut torrent, b"announce");
@@ -1357,6 +1369,82 @@ mod tests {
         torrent.extend_from_slice(&info);
         torrent.push(b'e');
         (torrent, info_hash)
+    }
+
+    fn peer_handshake(info_hash: [u8; 20]) -> Vec<u8> {
+        let mut handshake = Vec::with_capacity(68);
+        handshake.push(19);
+        handshake.extend_from_slice(b"BitTorrent protocol");
+        let mut reserved = [0_u8; 8];
+        reserved[5] = 0x10;
+        handshake.extend_from_slice(&reserved);
+        handshake.extend_from_slice(&info_hash);
+        handshake.extend_from_slice(b"-NZ0001-METAPREFLT12");
+        assert_eq!(handshake.len(), 68);
+        handshake
+    }
+
+    fn extended_message(extension_id: u8, payload: &[u8]) -> Vec<u8> {
+        let length = u32::try_from(payload.len() + 2).unwrap();
+        let mut message = Vec::with_capacity(payload.len() + 6);
+        message.extend_from_slice(&length.to_be_bytes());
+        message.push(20);
+        message.push(extension_id);
+        message.extend_from_slice(payload);
+        message
+    }
+
+    async fn read_peer_message(stream: &mut TcpStream) -> Vec<u8> {
+        let mut length = [0_u8; 4];
+        stream.read_exact(&mut length).await.unwrap();
+        let mut message = vec![0_u8; u32::from_be_bytes(length) as usize];
+        stream.read_exact(&mut message).await.unwrap();
+        message
+    }
+
+    fn advertised_metadata_id(payload: &[u8]) -> Option<u8> {
+        let marker = b"11:ut_metadatai";
+        let start = payload
+            .windows(marker.len())
+            .position(|window| window == marker)?
+            + marker.len();
+        let end = payload[start..].iter().position(|byte| *byte == b'e')? + start;
+        std::str::from_utf8(&payload[start..end]).ok()?.parse().ok()
+    }
+
+    async fn metadata_peer(listener: TcpListener, info: Vec<u8>, info_hash: [u8; 20]) {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut incoming_handshake = [0_u8; 68];
+        stream.read_exact(&mut incoming_handshake).await.unwrap();
+        assert_eq!(&incoming_handshake[28..48], &info_hash);
+        stream.write_all(&peer_handshake(info_hash)).await.unwrap();
+        let handshake = format!("d1:md11:ut_metadatai1ee13:metadata_sizei{}ee", info.len());
+        stream
+            .write_all(&extended_message(0, handshake.as_bytes()))
+            .await
+            .unwrap();
+        let response_id = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let mut response_id = None;
+            loop {
+                let request = read_peer_message(&mut stream).await;
+                if request.starts_with(&[20, 0]) {
+                    response_id = advertised_metadata_id(&request[2..]);
+                }
+                if request.starts_with(&[20, 1]) {
+                    break response_id.unwrap();
+                }
+            }
+        })
+        .await
+        .unwrap();
+        let mut response =
+            format!("d8:msg_typei1e5:piecei0e10:total_sizei{}ee", info.len()).into_bytes();
+        response.extend_from_slice(&info);
+        stream
+            .write_all(&extended_message(response_id, &response))
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     }
 
     fn dht_transaction_id(packet: &[u8]) -> [u8; 2] {
@@ -2022,32 +2110,10 @@ mod tests {
     async fn dht_resolved_private_magnet_is_rejected_and_cleans_pending_state() {
         let tmp = tempfile::tempdir().unwrap();
         let payload = b"private-over-public-discovery".to_vec();
-        let (torrent, info_hash) = swarm_metainfo(&payload, true);
-        let seed_root = tmp.path().join("private-seed");
-        std::fs::create_dir_all(&seed_root).unwrap();
-        std::fs::write(seed_root.join(DHT_SWARM_FILE), &payload).unwrap();
-        let seeder = TorrentSession::start_with_dht_bootstrap_for_test(
-            seed_root,
-            TorrentSessionConfig {
-                listen_port_range: Some(30_000..60_000),
-                ..Default::default()
-            },
-            Vec::new(),
-        )
-        .await
-        .unwrap();
-        let seed_port = seeder.tcp_listen_port().unwrap();
-        let seed = seeder
-            .add_metainfo(
-                torrent,
-                TorrentAddConfig {
-                    overwrite: true,
-                    ..Default::default()
-                },
-            )
-            .await
-            .unwrap();
-        seed.wait_until_completed().await.unwrap();
+        let (info, info_hash) = swarm_info(&payload, true);
+        let peer_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let peer_address = peer_listener.local_addr().unwrap();
+        let peer_task = tokio::spawn(metadata_peer(peer_listener, info, info_hash));
 
         let dht_socket = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
             .await
@@ -2057,7 +2123,7 @@ mod tests {
         let dht_task = tokio::spawn(dht_swarm_node(
             dht_socket,
             info_hash,
-            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, seed_port)),
+            peer_address,
             get_peers_count.clone(),
         ));
 
@@ -2091,17 +2157,20 @@ mod tests {
                 .map(|byte| format!("{byte:02x}"))
                 .collect::<String>()
         );
-        let response = router(service.clone())
-            .oneshot(
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            router(service.clone()).oneshot(
                 axum::http::Request::post("/api/v1/jobs")
                     .header(CONTENT_TYPE, "application/json")
                     .body(axum::body::Body::from(
                         json!({"source":{"type":"magnet","uri":magnet}}).to_string(),
                     ))
                     .unwrap(),
-            )
-            .await
-            .unwrap();
+            ),
+        )
+        .await
+        .expect("private DHT magnet admission timed out")
+        .unwrap();
         assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
@@ -2123,9 +2192,12 @@ mod tests {
             .unwrap()
             .is_empty());
         assert_eq!(std::fs::read_dir(&payload_root).unwrap().count(), 0);
+        tokio::time::timeout(std::time::Duration::from_secs(5), peer_task)
+            .await
+            .expect("private metadata peer did not finish")
+            .unwrap();
 
         service.shutdown().await;
-        seeder.stop().await;
         dht_task.abort();
         engine.shutdown().await;
     }
@@ -2308,7 +2380,11 @@ mod tests {
             .await
             .expect("unused default-root collision must not reject category admission");
         assert!(result.created);
-        let persisted = engine.snapshot();
+        let persisted = nzbd_state::SnapshotStore::open(&tmp.path().join("state"))
+            .unwrap()
+            .load()
+            .unwrap()
+            .unwrap();
         assert_eq!(persisted.jobs.len(), 1);
         assert_eq!(persisted.jobs[0].category.as_deref(), Some("Movies"));
         assert_eq!(
@@ -2343,7 +2419,11 @@ mod tests {
             error,
             AdmissionError::Torrent(nzbd_torrent::TorrentError::ExistingPathType(_))
         ));
-        let persisted = engine.snapshot();
+        let persisted = nzbd_state::SnapshotStore::open(&tmp.path().join("state"))
+            .unwrap()
+            .load()
+            .unwrap()
+            .unwrap_or_default();
         assert!(persisted.jobs.is_empty());
         assert!(persisted.pending_admissions.is_empty());
 

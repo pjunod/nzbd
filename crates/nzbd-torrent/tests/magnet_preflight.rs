@@ -83,13 +83,13 @@ async fn http_tracker(listener: TcpListener, peer: SocketAddr, requests: Arc<Ato
         .windows(b"GET /announce?".len())
         .any(|window| window == b"GET /announce?"));
     requests.fetch_add(1, Ordering::SeqCst);
-    let mut body = b"d8:intervali60e5:peers6:".to_vec();
+    let mut body = b"d8:completei1e10:incompletei0e8:intervali60e5:peers6:".to_vec();
     body.extend_from_slice(&compact_ipv4(peer));
     body.push(b'e');
     stream
         .write_all(
             format!(
-                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                 body.len()
             )
             .as_bytes(),
@@ -273,10 +273,13 @@ async fn dht_enabled_session_rejects_private_metadata_after_resolution() {
         .await
         .expect("metadata peer did not finish")
         .expect("metadata peer failed");
-    assert!(
-        matches!(result, Err(TorrentError::PrivateMetainfoWithDht)),
-        "private metadata must be rejected after the permitted unknown-hash lookup"
-    );
+    match result {
+        Err(TorrentError::PrivateMetainfoWithDht) => {}
+        Err(other) => panic!(
+            "private metadata returned the wrong rejection after the permitted unknown-hash lookup: {other:?}"
+        ),
+        Ok(_) => panic!("private metadata was admitted after the unknown-hash lookup"),
+    }
     assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
 
     session.stop().await;
