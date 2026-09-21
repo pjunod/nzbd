@@ -787,9 +787,9 @@ async fn publish_backend_state(
     {
         let mut associations = associations.lock().await;
         for (job, association) in associations.iter_mut() {
-            if accepted_ready.contains(job) {
-                association.ready_emitted = true;
-            }
+            // Explicit missing-file recovery revokes historical readiness.
+            // Rearm completion delivery until the owner accepts a fresh Ready.
+            association.ready_emitted = accepted_ready.contains(job);
         }
     }
     let association_snapshot = associations.lock().await.clone();
@@ -1414,6 +1414,18 @@ mod tests {
                 .unwrap()
                 .stop_on_complete
         );
+        // A previously completed association must report completion again
+        // when explicit recovery has revoked the owner's ready stamp.
+        service
+            .associations
+            .lock()
+            .await
+            .get_mut(&added.id)
+            .unwrap()
+            .ready_emitted = true;
+        let (_owner, adapter) = nzbd_engine::backend::backend_channel(1, 1);
+        publish_backend_state(&adapter, &service.registry, &service.associations, &engine).await;
+        assert!(!service.associations.lock().await[&added.id].ready_emitted);
         engine.shutdown().await;
         service.session.stop().await;
     }

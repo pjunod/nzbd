@@ -1363,7 +1363,9 @@ impl Owner {
                     .job(job)
                     .and_then(|j| j.torrent.as_ref())
                     .is_some_and(|t| {
-                        t.ready_at_unix.is_some() && crate::torrent_runtime::seed_policy_reached(t)
+                        matches!(t.phase, TorrentPhase::Seeding | TorrentPhase::PausedSeed)
+                            && t.ready_at_unix.is_some()
+                            && crate::torrent_runtime::seed_policy_reached(t)
                     })
                 {
                     let _ = reply.send(false);
@@ -1380,6 +1382,12 @@ impl Owner {
                         let torrent = j.torrent.as_mut().unwrap();
                         torrent.control_intent = TorrentControlIntent::Running;
                         torrent.stop_reason = None;
+                        // Historical completion must not stop missing-file recovery
+                        // before a new Ready fact verifies the selected payload.
+                        if torrent.phase == TorrentPhase::MissingFiles {
+                            torrent.ready_at_unix = None;
+                            torrent.content_path = None;
+                        }
                         if torrent.ready_at_unix.is_none() {
                             torrent.phase = nzbd_types::TorrentPhase::Queued;
                             torrent.last_activity_unix = Some(unix_now());
@@ -3053,6 +3061,7 @@ impl Owner {
             {
                 torrent.phase = TorrentPhase::Queued;
                 torrent.last_error = None;
+                torrent.stop_reason = None;
                 job.status = JobStatus::Queued;
                 changed = true;
             }
@@ -4425,6 +4434,93 @@ mod tests {
             owner.state.jobs[0].torrent.as_ref().unwrap().stop_reason,
             None
         );
+    }
+
+    #[tokio::test]
+    async fn torrent_missing_file_recovery_is_not_blocked_by_a_completed_seed_policy() {
+        let (tmp, mut owner, mut adapter) = control_test_owner();
+        let mut job = control_torrent_job();
+        job.status = JobStatus::Paused;
+        let torrent = job.torrent.as_mut().unwrap();
+        torrent.phase = TorrentPhase::MissingFiles;
+        torrent.ready_at_unix = Some(100);
+        torrent.content_path = Some(PathBuf::from("/payload"));
+        torrent.seed_policy.stop_on_complete = true;
+        owner.state.jobs.push(job);
+        let (reply, rx) = oneshot::channel();
+        owner.on_command(QueueCommand::Resume {
+            job: JobId(1),
+            reply,
+        });
+        assert!(rx.await.unwrap());
+        owner.schedule_torrent_starts();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), adapter.next_command())
+                .await
+                .unwrap(),
+            Some(BackendCommand::Start { job: JobId(1) })
+        );
+        let torrent = owner.state.jobs[0].torrent.as_ref().unwrap();
+        assert_eq!(torrent.phase, TorrentPhase::Queued);
+        assert_eq!(torrent.ready_at_unix, None);
+        assert_eq!(torrent.content_path, None);
+        assert!(torrent.seed_policy.stop_on_complete);
+        let persisted = owner.snap_store.load().unwrap().unwrap();
+        assert_eq!(
+            persisted.jobs[0].torrent.as_ref().unwrap().ready_at_unix,
+            None
+        );
+        let payload_root = tmp.path().join("payload");
+        std::fs::create_dir_all(&payload_root).unwrap();
+        let content_path = payload_root.join("recovered.bin");
+        std::fs::write(&content_path, b"x").unwrap();
+        owner.torrent_payload_roots = vec![payload_root];
+        adapter.progress(
+            JobId(1),
+            crate::backend::TransferProgress {
+                verified_bytes: 1,
+                ..Default::default()
+            },
+        );
+        adapter
+            .structural(BackendFact::Ready {
+                job: JobId(1),
+                content_path,
+            })
+            .await
+            .unwrap();
+        owner.fold_backend_progress();
+        owner.fold_backend_structural();
+        owner.update_seed_policies(200);
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), adapter.next_command())
+                .await
+                .unwrap(),
+            Some(BackendCommand::PauseForSeedPolicy { job: JobId(1) })
+        );
+        let torrent = owner.state.jobs[0].torrent.as_ref().unwrap();
+        assert!(torrent.ready_at_unix.is_some());
+        assert_eq!(
+            torrent.stop_reason,
+            Some(nzbd_types::TorrentStopReason::DownloadComplete)
+        );
+    }
+
+    #[tokio::test]
+    async fn torrent_storage_recovery_clears_the_stop_reason() {
+        let (_tmp, mut owner, _adapter) = control_test_owner();
+        let mut job = control_torrent_job();
+        job.status = JobStatus::Paused;
+        let torrent = job.torrent.as_mut().unwrap();
+        torrent.phase = TorrentPhase::PausedDownload;
+        torrent.last_error = Some("storage full".into());
+        torrent.stop_reason = Some(nzbd_types::TorrentStopReason::StorageFull);
+        owner.state.jobs.push(job);
+        owner.release_torrents_after_storage_recovery();
+        let torrent = owner.state.jobs[0].torrent.as_ref().unwrap();
+        assert_eq!(torrent.phase, TorrentPhase::Queued);
+        assert_eq!(torrent.stop_reason, None);
+        assert_eq!(torrent.last_error, None);
     }
 
     #[tokio::test]

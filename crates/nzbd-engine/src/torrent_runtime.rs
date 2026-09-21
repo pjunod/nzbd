@@ -553,6 +553,7 @@ pub fn reconcile_fact_with_roots(
             let torrent = job.torrent.as_mut().unwrap();
             torrent.last_error = None;
             if job.status != JobStatus::Paused {
+                torrent.stop_reason = None;
                 // A newly started backend needs a fresh discovery window;
                 // the previous run's idle clock cannot immediately yield it.
                 torrent.last_activity_unix = Some(now_unix);

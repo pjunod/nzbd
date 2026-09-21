@@ -1,8 +1,9 @@
 # Torrent queue — implementation and merge status
 
-**Status:** adversarial agent review in progress.
+**Status:** adversarial review approved; local UI/format checks passed.
+Required CI and merge status: [PR #232](https://github.com/pjunod/nzbd/pull/232).
 **Updated:** 2026-09-20 · **Branch:** `codex/torrent-queue-lifecycle`.
-**PR:** [#232](https://github.com/pjunod/nzbd/pull/232) (draft).
+**PR:** [#232](https://github.com/pjunod/nzbd/pull/232) (combined candidate).
 
 Companion to [USAGE.md](USAGE.md) (operator behavior) and
 [CONFIGURATION.md](CONFIGURATION.md) (seeding defaults). This page records
@@ -21,9 +22,11 @@ progress, decisions, review findings, and final validation for the queue work.
   checkout without changing its branch or existing commits.
 - [x] Make focused backend and UI/validation commits.
 - [x] Open one draft PR for the combined review.
-- [ ] Complete the adversarial agent review and address actionable findings.
-- [ ] Run final affected unit/DOM checks and required CI; fix failures.
-- [ ] Merge the green PR into main and clean temporary artifacts.
+- [x] Complete the adversarial agent review and address actionable findings.
+- [x] Run final UI checks: boot and 599 DOM assertions; formatting/diff clean.
+- Required unit/build/mobile/CI results and merge completion are recorded by
+  [the PR checks and merge record](https://github.com/pjunod/nzbd/pull/232),
+  so this committed page does not freeze a transient CI status.
 
 ## Decisions and scope
 
@@ -48,15 +51,26 @@ compilation, and affected-package Clippy. Three unrelated connection-pool
 shutdown tests stalled and were excluded from that preliminary run. These are
 historical results, not certification of this final candidate.
 
-No tests have run after the workflow instruction. Final validation will follow
-adversarial review; draft CI is skipped by the repository's existing workflow.
+After the workflow instruction, testing was deferred until the adversarial
+review approved all fixes. Final local UI boot/DOM checks and formatting pass.
+Draft CI was skipped by the repository's existing workflow.
 The required main check is `Main promotion gate`; protection stays intact.
 The final torrent lane includes affected API/config/types/state/compatibility
 unit tests and owner policy persistence cases. Preflight runs both UI harnesses.
 
 ## Review and merge record
 
-The independent adversarial review examines the combined diff against main.
-Findings and fixes will be recorded before tests. Required CI will run the
+The independent adversarial review requested three corrections, all addressed:
+
+- Storage-paused torrents show “waiting for disk space” and the storage error;
+  automatic recovery clears their stop reason.
+- A completed seed policy no longer rejects missing-file recovery. Resuming
+  missing files invalidates historical readiness and requires fresh verification
+  before the stop-after-download policy can apply again. The adapter rearms
+  completion delivery when owner readiness is revoked.
+- The readiness advisory matches the actual peer port range, 1–65534.
+
+Focused Rust/DOM regressions cover the changes. The reviewer approved all
+corrections before final tests. Required CI runs the
 Rust unit tests after the draft becomes ready; avoiding a duplicate local
 Rust run keeps validation resource use bounded.

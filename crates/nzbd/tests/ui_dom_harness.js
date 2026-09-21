@@ -1450,6 +1450,9 @@ const models = (jobs) => jobs.map((j, i) => T.rowModel(j, { idx: i, count: jobs.
     eq(T.sectionOf({ ...seed, status: "failed" }), "waiting", "failure cannot be hidden by a ready flag");
     eq(T.sectionOf({ ...seed, torrent_phase: "checking" }), "checking", "piece verification has its own section");
     eq(T.sectionOf({ ...seed, ready: false, torrent_phase: "fetching_metadata" }), "torrent_metadata", "magnet metadata is not fetching an NZB");
+    const held = { ...seed, ready: false, status: "paused", torrent_phase: "paused_download", torrent_error: "storage full", seed_stop_reason: "storage_full" };
+    eq(T.torrentStatus(held), "waiting for disk space", "storage holds are not queued or manually paused");
+    ok(T.rowModel(held).dRest.includes("storage full"), "the row explains the storage hold");
     const stopped = { ...seed, id: 502, status: "paused", torrent_control_intent: "paused", seed_stop_reason: "manual" };
     eq(T.sectionOf(stopped), "completed", "accepted stop intent moves a ready torrent before backend acknowledgement");
     const row = T.rowModel(seed);
@@ -1958,6 +1961,10 @@ const models = (jobs) => jobs.map((j, i) => T.rowModel(j, { idx: i, count: jobs.
     ok(advice.includes("unmet"), "incompatible configuration is advisory");
     ok(advice.includes("unknown"), "unverified runtime readiness is explicit");
     ok(!advice.includes("disabled"), "readiness never disables an enable switch");
+    for (const [port, state] of [[65534, "met"], [65535, "unmet"]]) {
+      ok(T.enableAdvisory({ torrent: { listen_port: port } }).includes(`<b>${state}</b> · A peer TCP port`),
+        `port ${port} readiness matches configuration validation`);
+    }
     const generalCard = { dataset: { settingsView: "general" }, hidden: false };
     const devCard = { dataset: { settingsView: "dev" }, hidden: true };
     const queryBeforeViews = form.querySelectorAll;
