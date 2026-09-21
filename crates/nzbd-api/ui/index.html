@@ -404,6 +404,23 @@ try {
   .sec-count { margin-left: 7px; font-weight: 600; letter-spacing: normal;
     opacity: .7; }
   .sec-label { cursor: help; }
+  .sec-toggle { font: inherit; color: inherit; background: transparent; border: 0;
+    padding: 4px 0; letter-spacing: inherit; text-transform: inherit; }
+  .sec-summary { margin-left: 12px; color: var(--ink2); font-size: 12px;
+    font-weight: 400; letter-spacing: 0; text-transform: none; }
+  .jd-torrent { margin: 14px 0; }
+  .torrent-facts { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+    gap: 12px; margin: 12px 0; }
+  .torrent-facts dt { color: var(--ink2); font-size: 12px; }
+  .torrent-facts dd { margin: 3px 0 0; overflow-wrap: anywhere; }
+  .seed-fields { display: flex; flex-wrap: wrap; gap: 12px; align-items: end; margin: 12px 0; }
+  .seed-fields label { display: flex; min-width: 0; max-width: 100%; flex-direction: column; gap: 5px; color: var(--ink2); font-size: 12px; }
+  .seed-fields input, .seed-fields select { max-width: 100%; box-sizing: border-box;
+    padding: 7px; background: var(--panel2); color: var(--ink); border: 1px solid var(--line); border-radius: 5px; }
+  .seed-fields input { width: 130px; }
+  .seed-note { color: var(--ink2); font-size: 12px; }
+  #queue-body tr.job-seeding { --job-accent: var(--ok); }
+  #queue-body tr.job-checking { --job-accent: var(--warn); }
   /* Where a finished job's post-processing time went, under its status. */
   .pp-note { font-size: 10.5px; color: var(--muted); margin-top: 2px;
     font-variant-numeric: tabular-nums; }
@@ -982,6 +999,20 @@ try {
         </select>
       </label>
       <label class="torrent-paused"><input type="checkbox" id="torrent-paused"> Add paused</label>
+      <label>After download
+        <select id="torrent-seed-mode">
+          <option value="defaults">Use category / global defaults</option>
+          <option value="stop">Stop when download completes</option>
+          <option value="unlimited">Keep seeding until stopped</option>
+          <option value="limits">Stop at ratio or time limit</option>
+        </select>
+      </label>
+      <label id="torrent-seed-ratio-box" hidden>Share ratio
+        <input type="number" id="torrent-seed-ratio" min="0" step="any" placeholder="No limit">
+      </label>
+      <label id="torrent-seed-hours-box" hidden>Seeding hours
+        <input type="number" id="torrent-seed-hours" min="0" step="any" placeholder="No limit">
+      </label>
       <button type="submit" id="btn-torrent-uri">Add</button>
       <button type="button" id="btn-torrent-file">Choose .torrent</button>
       <button type="button" class="small" id="btn-torrent-cancel">Cancel</button>
@@ -998,7 +1029,7 @@ try {
   <section id="tab-queue">
     <table>
       <thead><tr><th>Job</th><th style="width:96px">Status</th><th style="width:250px">Progress</th>
-        <th class="num">Size</th><th class="num">Health</th><th style="width:190px"></th></tr></thead>
+        <th class="num">Size</th><th class="num">Health / ratio</th><th style="width:190px"></th></tr></thead>
       <tbody id="queue-body"><tr><td colspan="6" class="empty">Loading the queue…</td></tr></tbody>
     </table>
     <div class="pager" id="queue-pager" hidden>
@@ -1062,6 +1093,10 @@ try {
       <button id="btn-restart">Restart Runner</button>
     </div>
     <div id="cfg-meta" class="cfg-meta"></div>
+    <div class="controls" aria-label="Settings views">
+      <button id="cfg-general" aria-pressed="true">General</button>
+      <button id="cfg-dev" aria-pressed="false">Dev</button>
+    </div>
     <form id="cfg-form" onsubmit="return false"></form>
     <details id="cfg-advanced">
       <summary>Advanced: edit the raw nzbd.toml (feeds and voter roster live here)</summary>
@@ -1530,6 +1565,10 @@ const SECTIONS = [
     tip: "Pulling articles from your news servers." },
   { key: "fetching", label: "Fetching NZB", ordered: true,
     tip: "Retrieving the NZB from the indexer — the job has no files yet." },
+  { key: "torrent_metadata", label: "Fetching torrent metadata", ordered: true,
+    tip: "Retrieving the torrent source or metadata from peers." },
+  { key: "checking", label: "Checking torrent files",
+    tip: "Verifying selected files against torrent piece hashes." },
   { key: "post_queued", label: "Waiting to post-process",
     tip: "Downloaded, waiting for a post-processing slot. Raise [post] strategy to run more at once." },
   { key: "renaming", label: "Renaming",
@@ -1546,7 +1585,11 @@ const SECTIONS = [
     tip: "Moving the finished files to their destination." },
   { key: "scripting", label: "Running scripts",
     tip: "Running your post-processing scripts." },
-  { key: "waiting", label: "Waiting", ordered: true,
+  { key: "seeding", label: "Seeding", collapsible: true,
+    tip: "Files are ready. These torrents continue sharing outside the download-slot limit." },
+  { key: "completed", label: "Completed", collapsible: true,
+    tip: "Files are ready and seeding is stopped. Files remain on disk." },
+  { key: "waiting", label: "Waiting", ordered: true, collapsible: true,
     tip: "In the queue, in your order. These are the jobs move up / move down act on." },
 ];
 const STAGE_SECTION = {
@@ -1559,7 +1602,71 @@ const STAGE_SECTION = {
 // be levers attached to nothing.
 const ORDERED = new Set(SECTIONS.filter(s => s.ordered).map(s => s.key));
 
+const collapsedSections = new Set();
+try {
+  const saved = JSON.parse(localStorage.getItem("nzbd-collapsed-sections") || "[]");
+  if (Array.isArray(saved)) for (const key of saved)
+    if (SECTIONS.some(s => s.key === key && s.collapsible)) collapsedSections.add(key);
+} catch {}
+function toggleSection(key) {
+  if (!SECTIONS.some(s => s.key === key && s.collapsible)) return;
+  if (collapsedSections.has(key)) collapsedSections.delete(key); else collapsedSections.add(key);
+  try { localStorage.setItem("nzbd-collapsed-sections", JSON.stringify([...collapsedSections])); } catch {}
+  page = 0;
+  renderQueue();
+}
+function torrentPhase(j) {
+  if (j.kind !== "torrent") return null;
+  const phase = j.torrent_phase;
+  if (j.status === "failed") return "failed";
+  if (["missing_files", "failed", "checking"].includes(phase)) return phase;
+  const overlay = pending.status(j.id);
+  const paused = overlay ? overlay === "paused" : j.torrent_control_intent
+    ? j.torrent_control_intent === "paused" : j.status === "paused";
+  if (j.ready) return paused ? "paused_seed" : "seeding";
+  if (paused) return "paused_download";
+  if (overlay || (j.torrent_control_intent === "running" && phase === "paused_download")) return "queued";
+  return phase || (j.status === "fetching" ? "fetching_metadata" : j.status);
+}
+function torrentStatus(j) {
+  const phase = torrentPhase(j);
+  if (phase === "seeding") return j.upload_rate_bps > 0 ? "seeding" : "seeding · idle";
+  return ({ fetching_source: "fetching torrent source", fetching_metadata: "fetching metadata",
+    queued: "queued for download", checking: "checking files", downloading: "downloading",
+    paused_download: "download paused", paused_seed: "seeding stopped", missing_files: "missing files",
+    failed: "torrent error" })[phase] || "torrent state unavailable";
+}
+function seedPolicyText(policy) {
+  if (!policy) return "Seeding policy unavailable";
+  if (policy.stop_on_complete) return "Stop when download completes";
+  const limits = [];
+  if (policy.ratio_limit != null) limits.push("ratio " + Number(policy.ratio_limit).toFixed(2));
+  if (policy.time_limit_secs != null) limits.push(fmtDur(policy.time_limit_secs * 1000) + " seeding");
+  return limits.length ? "Stop at " + limits.join(" or ") + (limits.length > 1 ? " · first limit reached" : "")
+    : "Keep seeding until stopped";
+}
+function seedStopText(j) {
+  return ({ manual: "Stopped manually", download_complete: "Stopped after download",
+    ratio_limit: "Ratio limit reached", time_limit: "Seeding time limit reached",
+    storage_full: "Stopped: storage full" })[j.seed_stop_reason] || "Seeding stopped";
+}
+function seedLimitReached(j) {
+  const p = j.seed_policy;
+  return !!(j.ready && p && (p.stop_on_complete ||
+    (p.ratio_limit != null && j.ratio >= p.ratio_limit) ||
+    (p.time_limit_secs != null && j.seeding_seconds >= p.time_limit_secs)));
+}
+
 function sectionOf(j) {
+  const phase = torrentPhase(j);
+  if (phase) {
+    if (phase === "seeding") return "seeding";
+    if (phase === "paused_seed") return "completed";
+    if (phase === "checking") return "checking";
+    if (phase === "downloading") return "downloading";
+    if (["fetching_metadata", "fetching_source"].includes(phase)) return "torrent_metadata";
+    return "waiting";
+  }
   const st = j.status;
   const stage = currentPostStage(j);
   if (stage) return STAGE_SECTION[stage] || "post_queued";
@@ -1634,8 +1741,11 @@ function rowModel(j, ctx) {
   const over = pend ? pend.status(j.id) : null;  // unconfirmed pause/resume
   const busy = pend ? pend.busy(j.id) : false;   // an action is in flight
   const section = ctx.section || sectionOf(j);
-  const active = section !== "waiting";
+  const active = !["waiting", "completed"].includes(section);
   const torrent = j.kind === "torrent";
+  const phase = torrentPhase(j);
+  const seed = phase === "seeding" || phase === "paused_seed";
+  const seedPaused = phase === "paused_seed";
 
   // A URL job has no articles until its NZB arrives — "0 B of 0 B" reads as
   // broken; say what it is actually doing instead.
@@ -1697,26 +1807,29 @@ function rowModel(j, ctx) {
     sub: "#" + j.id + (torrent ? " · BITTORRENT" : " · USENET") +
          (j.category ? " · " + j.category : "") +
          (j.assigned_node ? " · on " + j.assigned_node : "") + " ",
-    st: (shownSt === "completed" && j.ready
+    st: torrent ? torrentStatus(j).toUpperCase() : (shownSt === "completed" && j.ready
       ? "ready" : (STATUS_HUMAN[shownSt] || shownSt)).toUpperCase(),
-    stCls: "st " + shownCls,
+    stCls: "st " + (torrent ? (["failed", "missing_files"].includes(phase) ? "bad" : seed ? "ok" : "dim") : shownCls),
     // Under a heading that names the stage, a pill repeating it is the
     // same word twice on one line. Only the waiting list mixes states
     // (queued sitting next to paused), so only there does the pill still
     // say something the heading did not.
-    stHidden: ctx.mixedSection === false,
-    stInlineCls: "st st-inline " + shownCls,
+    stHidden: !torrent && ctx.mixedSection === false,
+    stInlineCls: "st st-inline " + (torrent && ["failed", "missing_files"].includes(phase) ? "bad" : shownCls),
     // A post-processing job has already downloaded every byte, so its bar
     // sits at a full 100% — which in a section headed REPAIRING reads as
     // "finished" for a job that has nineteen minutes of work left. The
     // percentage is answering a question nobody is asking any more. No
     // bar; the stage and its timer carry the row.
-    barHidden: isPost,
+    barHidden: isPost || seed || ["fetching_source", "fetching_metadata", "missing_files", "failed"].includes(phase),
     pct: fetching || isPost ? "" : pct + "%",
     fill: pct + "%",
     fillCls: pct >= 100 ? "fill done" : "fill",
-    dBold: fetching ? "" : fmtBytes(done),
-    dRest: fetching ? "fetching the NZB from the indexer…" : rest.join(""),
+    dBold: seed ? "Files ready" : fetching ? "" : fmtBytes(done),
+    dRest: seed ? " · " + (seedPaused ? seedStopText(j) : "↑ " + fmtRate(j.upload_rate_bps || 0)) +
+      " · " + fmtBytes(j.uploaded_bytes || 0) + " uploaded · " + (j.useful_peers || 0) + " peers"
+      : torrent && ["failed", "missing_files"].includes(phase) ? " · " + (j.torrent_error || torrentStatus(j))
+      : fetching ? "fetching the NZB from the indexer…" : rest.join(""),
     dRetry: j.retried_articles > 0
       ? " · " + j.retried_articles + " retries" : "",
     dRetryTip: j.retried_articles > 0
@@ -1726,18 +1839,24 @@ function rowModel(j, ctx) {
     health: fetching ? "—" : (torrent ? Number(j.ratio || 0).toFixed(2) + "×" : (j.health / 10).toFixed(1) + "%"),
     healthColor: fetching || torrent ? "" : healthColor(j.health, j.critical_health),
     healthTip: fetching ? "" : (torrent ? "uploaded / selected payload bytes" : healthTip(j.health, j.critical_health)),
-    hNote: fetching ? "" : (torrent ? fmtDur((j.seeding_seconds || 0) * 1000) + " seeding" : hNote),
+    hNote: fetching ? "" : (torrent ? fmtDur((j.seeding_seconds || 0) * 1000) + " seeded" : hNote),
     hNoteCls: fetching ? "hnote" : hNoteCls,
-    hNoteTip: hNoteTip,
+    hNoteTip: torrent ? seedPolicyText(j.seed_policy) : hNoteTip,
     upDisabled: ctx.idx === 0,
     downDisabled: ctx.idx === (ctx.count || 0) - 1,
     // `movable` defaults to true so a caller that renders a row outside
     // the sectioned queue (the DOM harness, a future flat view) keeps the
     // controls it always had.
-    moveHidden: ctx.movable === false,
+    moveHidden: seed || ctx.movable === false,
     pauseHidden: fetching,
-    pauseLabel: (over || st) === "paused" ? "resume" : "pause",
-    pauseAction: (over || st) === "paused" ? "resume" : "pause",
+    pauseLabel: seed ? (seedPaused ? (seedLimitReached(j) ? "seeding options" : "start seeding") : "stop seeding")
+      : (phase === "paused_download" || (over || st) === "paused") ? "resume" : "pause",
+    pauseAction: seedPaused && seedLimitReached(j) ? "seed-options" :
+      (seedPaused || phase === "paused_download" || (over || st) === "paused" ? "resume" : "pause"),
+    deleteLabel: torrent ? "remove torrent" : "delete",
+    deleteTip: torrent ? "Remove this torrent from the queue, keeping its downloaded files." :
+      "Remove this job from the queue. One click — no dialog; you get 8 seconds to undo it.",
+    seedRule: seed ? seedPolicyText(j.seed_policy) : "",
     deleteDataHidden: !torrent,
     deleteDataLabel: armIsSet("q" + j.id) ? "sure?" : "delete data",
     // `detail` is the joined line the row shows; kept as one string for
@@ -1772,6 +1891,7 @@ function buildJobRow(d) {
   c.dBold = d.append(det, d.create("b"));
   c.dRest = d.append(det, d.create("span"));
   c.dRetry = d.append(det, d.create("span"));
+  c.seedRule = d.append(meter, d.create("div", "sub"));
 
   c.size = d.append(tr, d.create("td", "num"));
 
@@ -1823,6 +1943,7 @@ function applyRow(tr, m, d) {
   w("dBold", m.dBold, v => d.text(c.dBold, v));
   w("dRest", m.dRest, v => d.text(c.dRest, v));
   w("dRetry", m.dRetry, v => d.text(c.dRetry, v));
+  w("seedRule", m.seedRule || "", v => { d.text(c.seedRule, v); d.prop(c.seedRule, "hidden", !v); });
   w("dRetryTip", m.dRetryTip, v => d.prop(c.dRetry, "title", v));
   w("size", m.size, v => d.text(c.size, v));
   w("health", m.health, v => d.text(c.health, v));
@@ -1843,6 +1964,8 @@ function applyRow(tr, m, d) {
   w("pauseHidden", m.pauseHidden, v => d.prop(c.pause, "hidden", v));
   w("pauseLabel", m.pauseLabel, v => d.text(c.pause, v));
   w("pauseAction", m.pauseAction, v => d.data(c.pause, "action", v));
+  w("deleteLabel", m.deleteLabel, v => d.text(c.del, v));
+  w("deleteTip", m.deleteTip, v => d.prop(c.del, "title", v));
   w("deleteDataHidden", m.deleteDataHidden, v => d.prop(c.delData, "hidden", v));
   w("deleteDataLabel", m.deleteDataLabel, v => d.text(c.delData, v));
 }
@@ -1874,8 +1997,12 @@ function buildSectionRow(d) {
   const td = d.append(tr, d.create("td", "section"));
   d.attr(td, "colspan", "6");
   const c = {};
+  c.toggle = d.append(td, d.create("button", "sec-toggle"));
+  d.prop(c.toggle, "type", "button");
+  d.data(c.toggle, "action", "toggle-section");
   c.label = d.append(td, d.create("span", "sec-label"));
   c.count = d.append(td, d.create("span", "sec-count"));
+  c.summary = d.append(td, d.create("span", "sec-summary"));
   tr.__c = c;
   return tr;
 }
@@ -1884,7 +2011,12 @@ function applySectionRow(tr, m, d) {
   const c = tr.__c, w = differ(tr);
   w("label", m.label, v => d.text(c.label, v));
   w("count", m.count, v => d.text(c.count, v));
-  w("tip", m.tip || "", v => d.prop(c.label, "title", v));
+  w("collapsible", !!m.collapsible, v => { d.prop(c.toggle, "hidden", !v); d.prop(c.label, "hidden", v); });
+  w("section", m.section || "", v => d.data(c.toggle, "section", v));
+  w("toggleLabel", (m.collapsed ? "▸ " : "▾ ") + m.label, v => d.text(c.toggle, v));
+  w("expanded", !m.collapsed, v => d.attr(c.toggle, "aria-expanded", String(v)));
+  w("summary", m.summary || "", v => d.text(c.summary, v));
+  w("tip", m.tip || "", v => { d.prop(c.label, "title", v); d.prop(c.toggle, "title", v); });
 }
 KINDS.section = { build: buildSectionRow, apply: applySectionRow };
 
@@ -1907,6 +2039,61 @@ KINDS.section = { build: buildSectionRow, apply: applySectionRow };
 // The one deliberate difference is the file list, and it is a default, not
 // a structure: open in the queue, folded in history (see `filesOpen`).
 let openJob = null;
+const seedDrafts = new Map();
+const seedSaving = new Set();
+function seedDraft(j) {
+  if (seedDrafts.has(j.id)) return seedDrafts.get(j.id);
+  const p = j.seed_policy || {};
+  return { mode: p.stop_on_complete ? "stop" : p.ratio_limit != null || p.time_limit_secs != null ? "limits" : "unlimited",
+    ratio: p.ratio_limit == null ? "" : String(p.ratio_limit),
+    hours: p.time_limit_secs == null ? "" : String(p.time_limit_secs / 3600) };
+}
+function seedBody(draft) {
+  const body = { use_defaults: draft.mode === "defaults", stop_on_complete: draft.mode === "stop",
+    ratio_limit: null, time_limit_secs: null };
+  if (draft.mode === "limits") {
+    body.ratio_limit = draft.ratio.trim() ? Number(draft.ratio) : null;
+    body.time_limit_secs = draft.hours.trim() ? Math.round(Number(draft.hours) * 3600) : null;
+    if (body.ratio_limit == null && body.time_limit_secs == null)
+      throw new Error("Enter at least one limit, or choose keep seeding.");
+    if (body.ratio_limit != null && (!Number.isFinite(body.ratio_limit) || body.ratio_limit <= 0)
+        || body.time_limit_secs != null && (!Number.isSafeInteger(body.time_limit_secs) || body.time_limit_secs <= 0))
+      throw new Error("Seeding limits must be positive numbers.");
+  }
+  return body;
+}
+async function saveSeedPolicy(id) {
+  const j = store.jobs.find(j => j.id === id);
+  if (!j || j.kind !== "torrent" || seedSaving.has(id)) return;
+  let body;
+  try { body = seedBody(seedDraft(j)); }
+  catch (e) { toast({ text: e.message, kind: "error" }); return; }
+  seedSaving.add(id); renderQueue();
+  const result = await post("/api/v1/jobs/" + id + "/torrent/seed-policy", {
+    method: "PUT", headers: { ...CLIENT_HDRS, "content-type": "application/json" }, body: JSON.stringify(body),
+  });
+  seedSaving.delete(id);
+  if (result.ok) {
+    seedDrafts.delete(id);
+    const current = store.jobs.find(j => j.id === id);
+    if (current) current.seed_policy = result.body.seed_policy;
+    toast({ text: "Seeding policy saved. Stopped torrents stay stopped until you start them." });
+    refreshAll();
+  } else toast({ text: "Couldn't save seeding policy — " + result.error, kind: "error" });
+  renderQueue();
+}
+function editSeedPolicy(ev) {
+  const el = ev.target;
+  const field = el && el.dataset && el.dataset.seedField;
+  if (!["mode", "ratio", "hours"].includes(field)) return;
+  const row = el.closest("[data-job-id]");
+  const j = row && store.jobs.find(j => j.id === Number(row.dataset.jobId));
+  if (!j || seedSaving.has(j.id)) return;
+  seedDrafts.set(j.id, { ...seedDraft(j), [field]: el.value });
+  renderQueue();
+}
+document.addEventListener("input", editSeedPolicy);
+document.addEventListener("change", editSeedPolicy);
 
 function buildDetailRow(d) {
   const tr = d.create("tr", "detail-tr");
@@ -1928,6 +2115,38 @@ function buildDetailRow(d) {
   c.close = d.append(head, d.create("button", "small"));
   d.data(c.close, "action", "detail-close");
   d.text(c.close, "close");
+
+  c.torrent = d.append(wrap, d.create("section", "jd-torrent"));
+  const facts = d.append(c.torrent, d.create("dl", "torrent-facts"));
+  for (const [key, label] of [["torReady", "Files"], ["torUploaded", "Uploaded"],
+    ["torRate", "Upload speed"], ["torRatio", "Share ratio"], ["torPeers", "Useful peers"],
+    ["torTime", "Time seeding"], ["torCompleted", "Download completed"], ["torStopped", "Stop reason"]]) {
+    const box = d.append(facts, d.create("div"));
+    d.text(d.append(box, d.create("dt")), label);
+    c[key] = d.append(box, d.create("dd"));
+  }
+  c.torError = d.append(c.torrent, d.create("div", "bad"));
+  c.torPolicy = d.append(c.torrent, d.create("div", "seed-note"));
+  const fields = d.append(c.torrent, d.create("div", "seed-fields"));
+  const modeLabel = d.append(fields, d.create("label"));
+  d.text(d.append(modeLabel, d.create("span")), "After download");
+  c.seedMode = d.append(modeLabel, d.create("select"));
+  d.data(c.seedMode, "seedField", "mode");
+  for (const [value, text] of [["defaults", "Use category / global defaults"], ["stop", "Stop when download completes"],
+    ["unlimited", "Keep seeding until stopped"], ["limits", "Stop at ratio or time limit"]]) {
+    const option = d.append(c.seedMode, d.create("option"));
+    d.prop(option, "value", value); d.text(option, text);
+  }
+  for (const [key, field, label] of [["seedRatio", "ratio", "Share ratio"], ["seedHours", "hours", "Seeding hours"]]) {
+    c[key + "Box"] = d.append(fields, d.create("label"));
+    d.text(d.append(c[key + "Box"], d.create("span")), label);
+    c[key] = d.append(c[key + "Box"], d.create("input"));
+    d.prop(c[key], "type", "number"); d.prop(c[key], "min", "0"); d.prop(c[key], "step", "any");
+    d.prop(c[key], "placeholder", "No limit"); d.data(c[key], "seedField", field);
+  }
+  c.seedSave = d.append(fields, d.create("button"));
+  d.prop(c.seedSave, "type", "button"); d.data(c.seedSave, "action", "seed-save");
+  c.seedHint = d.append(c.torrent, d.create("div", "seed-note"));
 
   // The pipeline sits above the files: what happened to this job, in
   // order, is the first thing you want when you open it — the file list
@@ -1998,6 +2217,7 @@ function buildDetailRow(d) {
   for (const [label, cls] of [["File", ""], ["Size", "num"], ["Segments", "num"], ["", ""]]) {
     const th = d.append(htr, d.create("th", cls));
     d.text(th, label);
+    if (label === "Segments") c.filesUnit = th;
   }
   c.files = d.append(c.filesTable, d.create("tbody"));
   c.logs = d.append(wrap, d.create("div", "jd-logs"));
@@ -2081,10 +2301,24 @@ function detailModel(j, nowMs) {
     .filter(([k]) => k && k[0] !== "*")
     .map(([k, v]) => k + " = " + v);
   const recoverMax = recoveryMax(j);
+  const draft = seedDraft(j);
   return {
     key: "__detail", kind: "detail", id: j.id, name: j.name, scope: "queue",
     pipe: pipelineModels(j, nowMs),
-    st: statusLabel(j.status, postStage, j.ready).toUpperCase(), stCls: "st " + cls,
+    st: (torrent ? torrentStatus(j) : statusLabel(j.status, postStage, j.ready)).toUpperCase(), stCls: "st " + cls,
+    torrent,
+    torReady: j.ready && !["missing_files", "failed", "checking"].includes(torrentPhase(j)) ? "Ready · files kept" : "Not ready",
+    torUploaded: fmtBytes(j.uploaded_bytes || 0), torRate: fmtRate(j.upload_rate_bps || 0),
+    torRatio: Number(j.ratio || 0).toFixed(2), torPeers: String(j.useful_peers || 0),
+    torTime: j.seeding_seconds ? fmtDur(j.seeding_seconds * 1000) : "0s",
+    torCompleted: j.ready_at_unix ? new Date(j.ready_at_unix * 1000).toLocaleString() : "Not completed",
+    torStopped: j.seed_stop_reason ? seedStopText(j) : torrentPhase(j) === "paused_seed" ? "Reason unavailable" : "—",
+    torError: j.torrent_error || "", torPolicy: seedPolicyText(j.seed_policy),
+    seedMode: draft.mode, seedRatio: draft.ratio, seedHours: draft.hours, seedBusy: seedSaving.has(j.id),
+    seedHint: draft.mode === "limits" ? "Stop when either limit is reached. Leave a field blank for no limit. Time counts only while seeding."
+      : draft.mode === "stop" ? "Pieces may upload during downloading. Seeding stops once the download is verified complete."
+      : draft.mode === "defaults" ? "Copies the active category / global defaults to this torrent. Later default changes do not alter it."
+      : "Continue seeding until manually stopped.",
     articles: torrent ? "" : "articles " + j.done_articles + "/" + j.total_articles +
       (j.failed_articles ? " · " + j.failed_articles + " failed" : "") +
       (j.retried_articles ? " · " + j.retried_articles + " retried" : ""),
@@ -2098,7 +2332,7 @@ function detailModel(j, nowMs) {
       : "Download this job's NZB regenerated from queue state.",
     nzbHidden: false,
     closeHidden: false,
-    recoverHidden: !recoverMax,
+    recoverHidden: torrent || !recoverMax,
     recoverMax,
     meta: bits.join("  ·  "),
     metaHidden: false,
@@ -2182,6 +2416,18 @@ KINDS.activity = { build: buildActivityRow, apply: applyActivityRow };
 function applyDetail(tr, m, d) {
   d = d || dom;
   const c = tr.__c, w = differ(tr);
+  w("torrent", !!m.torrent, v => { d.prop(c.torrent, "hidden", !v); d.text(c.filesUnit, v ? "Downloaded" : "Segments"); });
+  for (const key of ["torReady", "torUploaded", "torRate", "torRatio", "torPeers", "torTime", "torCompleted", "torStopped", "torError", "torPolicy", "seedHint"])
+    w(key, m[key] || "", v => d.text(c[key], v));
+  for (const key of ["seedMode", "seedRatio", "seedHours"])
+    w(key, m[key] || "", v => { if (c[key].value !== v) d.prop(c[key], "value", v); });
+  w("seedLimits", m.seedMode === "limits", v => {
+    d.prop(c.seedRatioBox, "hidden", !v); d.prop(c.seedHoursBox, "hidden", !v);
+  });
+  w("seedBusy", !!m.seedBusy, v => {
+    for (const key of ["seedMode", "seedRatio", "seedHours", "seedSave"]) d.prop(c[key], "disabled", v);
+    d.text(c.seedSave, v ? "Saving…" : "Apply to this torrent");
+  });
   w("id", m.id, v => {
     d.text(c.id, "#" + v);
     d.data(c.close, "job", String(v));
@@ -2366,23 +2612,23 @@ function queueModels() {
   // tick cannot flash a deleted row back into view before the daemon has
   // caught up with the click.
   const jobs = pending.order(store.jobs).filter(j => !pending.hidden(j.id));
-  const p = pageSlice(jobs);
-  renderPager(p);
-  if (!jobs.length)
-    return [{
-      key: "__empty", kind: "empty", span: 6,
-      text: "No downloads in the queue. Drop one in with “+ add nzb”.",
-    }];
-  // Index the page BEFORE grouping. `move up` is a queue operation on the
-  // job's global position, and the section a row is drawn under must not
-  // change what the arrow next to it does.
-  const shown = p.shown.map((j, i) => ({ j, idx: p.start + i }));
-  const groups = new Map();
-  for (const x of shown) {
-    const k = sectionOf(x.j);
-    const g = groups.get(k);
-    if (g) g.push(x); else groups.set(k, [x]);
+  if (!jobs.length) {
+    renderPager(pageSlice([]));
+    return [{ key: "__empty", kind: "empty", span: 6,
+      text: "No downloads in the queue. Drop one in with “+ add nzb”." }];
   }
+  // Group the whole queue before paging. Collapsed groups cost no page
+  // slots; their full counts and transfer totals remain visible.
+  const groups = new Map();
+  jobs.forEach((j, idx) => {
+    const k = sectionOf(j);
+    if (!groups.has(k)) groups.set(k, []);
+    groups.get(k).push({ j, idx });
+  });
+  const expanded = SECTIONS.flatMap(sec => collapsedSections.has(sec.key) ? [] : groups.get(sec.key) || []);
+  const p = pageSlice(expanded);
+  renderPager(p);
+  const visible = new Set(p.shown.map(x => x.j.id));
   const nowMs = Date.now();
   const out = [];
   for (const sec of SECTIONS) {
@@ -2391,11 +2637,18 @@ function queueModels() {
     out.push({
       key: "sec:" + sec.key, kind: "section",
       label: sec.label, count: String(g.length), tip: sec.tip,
+      section: sec.key, collapsible: !!sec.collapsible, collapsed: collapsedSections.has(sec.key),
+      summary: sec.key === "seeding"
+        ? "↑ " + fmtRate(g.reduce((n, x) => n + (x.j.upload_rate_bps || 0), 0)) + " · " +
+          fmtBytes(g.reduce((n, x) => n + (x.j.uploaded_bytes || 0), 0)) + " uploaded"
+        : sec.collapsible ? fmtBytes(g.reduce((n, x) => n + (x.j.size_bytes || 0), 0)) +
+          (sec.key === "completed" ? " · files kept" : "") : "",
     });
     for (const x of g) {
+      if (!visible.has(x.j.id)) continue;
       out.push(rowModel(x.j, {
         idx: x.idx,
-        count: p.total,
+        count: jobs.length,
         healthAbortArmed: store.healthAbort,
         pendingOps: pending,
         // Off the download queue, position means nothing and the arrows
@@ -3532,6 +3785,7 @@ document.addEventListener("click", (ev) => {
   const el = t && t.closest ? t.closest("[data-action]") : null;
   if (!el) return;
   const action = el.dataset.action;
+  if (action === "toggle-section") { toggleSection(el.dataset.section); return; }
   const row = el.closest ? el.closest("[data-job-id]") : null;
   const id = Number(el.dataset.job || (row && row.dataset.jobId));
   const scope = row ? row.dataset.scope : "queue";
@@ -3568,6 +3822,8 @@ document.addEventListener("click", (ev) => {
     });
     return;
   }
+  if (action === "seed-options") { if (openJob !== id) toggleJob(id); return; }
+  if (action === "seed-save") { saveSeedPolicy(id); return; }
   if (action === "delete") {
     deleteJob(id, name);
     return;
@@ -3741,10 +3997,17 @@ function torrentOptions(raw) {
     category: category || undefined,
     priority: Number.isFinite(parsedPriority) ? Math.trunc(parsedPriority) : 0,
     paused: source.paused === true || source.paused === "true",
+    seed_ratio_limit: source.seed_ratio_limit,
+    seed_time_limit_secs: source.seed_time_limit_secs,
+    stop_seeding_on_complete: source.stop_seeding_on_complete,
   };
 }
 function torrentFormOptions() {
+  const body = seedBody({ mode: $("torrent-seed-mode").value || "defaults",
+    ratio: $("torrent-seed-ratio").value, hours: $("torrent-seed-hours").value });
   return torrentOptions({
+    ...(body.use_defaults ? {} : { seed_ratio_limit: body.ratio_limit || 0,
+      seed_time_limit_secs: body.time_limit_secs || 0, stop_seeding_on_complete: body.stop_on_complete }),
     category: $("torrent-category").value,
     priority: $("torrent-priority").value,
     paused: $("torrent-paused").checked,
@@ -3759,6 +4022,9 @@ function torrentRequest(raw, rawOptions) {
     category: options.category,
     priority: options.priority,
     paused: options.paused,
+    seed_ratio_limit: options.seed_ratio_limit,
+    seed_time_limit_secs: options.seed_time_limit_secs,
+    stop_seeding_on_complete: options.stop_seeding_on_complete,
   };
 }
 function torrentQuery(rawOptions) {
@@ -3768,6 +4034,8 @@ function torrentQuery(rawOptions) {
     "paused=" + encodeURIComponent(options.paused),
   ];
   if (options.category) fields.push("category=" + encodeURIComponent(options.category));
+  for (const key of ["seed_ratio_limit", "seed_time_limit_secs", "stop_seeding_on_complete"])
+    if (options[key] != null) fields.push(key + "=" + encodeURIComponent(options[key]));
   return "?" + fields.join("&");
 }
 function showTorrentAdd(open) {
@@ -3789,12 +4057,14 @@ let torrentAdding = false;
 function setTorrentBusy(busy) {
   torrentAdding = busy;
   for (const id of ["torrent-uri", "torrent-category", "torrent-priority", "torrent-paused",
-                    "btn-torrent-uri", "btn-torrent-file", "btn-torrent-cancel"])
+                    "btn-torrent-uri", "btn-torrent-file", "btn-torrent-cancel", "torrent-seed-mode", "torrent-seed-ratio", "torrent-seed-hours"])
     $(id).disabled = busy;
   $("btn-torrent-uri").textContent = busy ? "Adding…" : "Add";
 }
 async function addTorrentUri(raw, rawOptions) {
-  const request = torrentRequest(raw, rawOptions || torrentFormOptions());
+  let request;
+  try { request = torrentRequest(raw, rawOptions || torrentFormOptions()); }
+  catch (e) { torrentMessage(e.message, "bad"); return false; }
   if (!request) {
     torrentMessage("✗ paste a magnet link or .torrent URL", "bad");
     return false;
@@ -3829,7 +4099,9 @@ async function addTorrentUri(raw, rawOptions) {
 }
 async function addTorrentFiles(files, rawOptions) {
   if (torrentAdding) return { added: 0, failed: 0 };
-  const options = torrentOptions(rawOptions || torrentFormOptions());
+  let options;
+  try { options = torrentOptions(rawOptions || torrentFormOptions()); }
+  catch (e) { torrentMessage(e.message, "bad"); return { added: 0, failed: files.length }; }
   setTorrentBusy(true);
   let added = 0, failed = 0, lastError = "";
   try {
@@ -3866,6 +4138,11 @@ async function addTorrentFiles(files, rawOptions) {
   if (added) refreshAll();
   return { added, failed };
 }
+$("torrent-seed-mode").onchange = () => {
+  const show = $("torrent-seed-mode").value === "limits";
+  $("torrent-seed-ratio-box").hidden = !show;
+  $("torrent-seed-hours-box").hidden = !show;
+};
 $("btn-addtorrent").onclick = () => showTorrentAdd();
 $("btn-torrent-cancel").onclick = () => showTorrentAdd(false);
 $("btn-torrent-file").onclick = () => $("torrent-file").click();
@@ -4087,6 +4364,18 @@ function applyHb() {
 // The form edits a working copy; Save PUTs the whole object back —
 // the daemon applies what it can live and reports what needs a restart.
 let cfgModel = null, cfgInfo = null, cfgDirty = false, cfgLoaded = false;
+let settingsView = "general";
+function showSettingsView(view) {
+  settingsView = view;
+  $("cfg-form").querySelectorAll("[data-settings-view]").forEach(card => {
+    card.hidden = card.dataset.settingsView !== view;
+  });
+  $("cfg-general").setAttribute("aria-pressed", String(view === "general"));
+  $("cfg-dev").setAttribute("aria-pressed", String(view === "dev"));
+  $("cfg-advanced").hidden = view === "dev";
+}
+$("cfg-general").onclick = () => showSettingsView("general");
+$("cfg-dev").onclick = () => showSettingsView("dev");
 
 const SEL = (opts) => opts;  // readability
 const SETTINGS_SECTIONS = [
@@ -4115,11 +4404,11 @@ const SETTINGS_SECTIONS = [
     ["queue.continue_partial", "resume partials on restart", "check"],
   ]},
   { key: "torrent", title: "BitTorrent", desc: "Single-node v1 BitTorrent. Enabling starts a public peer listener after restart. The active-download limit is shared with Usenet; seeding is unlimited unless you set a ratio or time. Cluster mode, UPnP, local discovery, IPv6, uTP and v2 torrents are not supported.", fields: [
-    ["torrent.enabled", "enable BitTorrent after restart", "check"],
     ["torrent.listen_port", "peer TCP listen port", "num"],
     ["torrent.dht", "DHT discovery", "check"],
     ["torrent.pex", "peer exchange (PEX)", "check"],
     ["torrent.upload_limit_kib", "upload limit (KiB/s, 0 = unlimited)", "num"],
+    ["torrent.stop_seeding_on_complete", "stop seeding when download completes (default for new torrents)", "check"],
     ["torrent.default_seed_ratio", "default seed ratio (0 = unlimited)", "num"],
     ["torrent.default_seed_minutes", "default seed time (minutes, 0 = unlimited)", "num"],
     ["torrent.metainfo_max_mib", "maximum metainfo size (MiB)", "num"],
@@ -4166,8 +4455,11 @@ const SETTINGS_SECTIONS = [
       "NZBGet calls this KeepHistory. An entry older than this goes even if the count bound is nowhere near."],
   ]},
   { key: "categories", title: "Categories", desc: "Per-category destination and unpack overrides (what the *arrs select).", array: true },
-  { key: "dev", title: "Dev · Usenet cluster", desc: "Enable multi-node Usenet execution after restart. Requirements are advisory: nzbd reports what it can verify but never locks this switch.", fields: [
+  { key: "enable", dev: true, title: "Enable features", desc: "Switches take effect after restart. Readiness is advisory and never disables these controls. Queue sections and seeding controls are always available for torrent jobs.", fields: [
+    ["torrent.enabled", "enable BitTorrent after restart", "check"],
     ["cluster.enabled", "enable Usenet clustering after restart", "check"],
+  ]},
+  { key: "dev", dev: true, title: "Usenet cluster", desc: "Multi-node Usenet execution. Configure the voter roster in General → Advanced TOML.", fields: [
     ["cluster.cluster_id", "cluster identity", "text"],
     ["cluster.node_name", "unique node name", "text"],
     ["cluster.shared_dir", "shared payload directory", "text?"],
@@ -4188,16 +4480,27 @@ const SETTINGS_SECTIONS = [
   ]},
 ];
 
-function clusterAdvisory() {
-  const c = cfgModel.cluster || {};
+function enableAdvisory(config) {
+  const t = config.torrent || {}, c = config.cluster || {};
+  const item = (state, message) => `<li><b>${state}</b> · ${esc(message)}</li>`;
+  return `<div class="cfg-sub"><b>BitTorrent readiness</b><ul>` +
+    item(c.enabled ? "unmet" : "met", "Single-node execution: BitTorrent and cluster execution cannot run together.") +
+    item(t.socks_proxy_url && t.dht ? "unmet" : "met", "A SOCKS proxy requires DHT off because DHT traffic bypasses the proxy.") +
+    item(Number.isInteger(t.listen_port) && t.listen_port > 0 && t.listen_port <= 65535 ? "met" : "unmet", "A peer TCP port from 1 to 65535 is configured.") +
+    item("unknown", "Verify the peer port is available, firewall rules match your intent, and the payload directory is writable with sufficient free space.") +
+    `</ul><p class="desc">Based on the form values; this is not a connectivity or disk probe. Enabling starts peer networking after restart. Normal configuration and runtime validation still apply.</p></div>` + clusterAdvisory(config);
+}
+
+function clusterAdvisory(config = cfgModel) {
+  const c = config.cluster || {};
   const peers = Array.isArray(c.control_peers) ? c.control_peers : [];
   const item = (state, message) => `<li><b>${state}</b> · ${esc(message)}</li>`;
-  return `<div class="cfg-sub"><b>Safe-enable advisory</b><ul>` +
-    item(c.shared_dir ? "met" : "unmet", "A shared payload directory is configured and mounted identically on every node.") +
+  return `<div class="cfg-sub"><b>Usenet cluster readiness</b><ul>` +
+    item(c.shared_dir ? "met" : "unmet", "A shared payload directory is configured.") +
     item((c.secret || c.secret_file) ? "met" : "unmet", "Cluster RPC authentication has a secret or secret file.") +
     item(c.control_dir ? "met" : "unmet", "Replicated control state uses a node-local durable directory.") +
-    item(peers.length >= 3 ? "met" : (peers.length ? "unmet" : "unknown"), "A fixed odd voter roster of at least three nodes is configured (edit control_peers in Advanced TOML).") +
-    item("unknown", "Clock synchronization, shared-volume durability, provider account identity, and cross-node reachability require an operator check.") +
+    item(peers.length >= 3 && peers.length % 2 === 1 ? "met" : (peers.length ? "unmet" : "unknown"), "A fixed odd voter roster of at least three nodes is configured (edit control_peers in Advanced TOML).") +
+    item("unknown", "Verify identical shared-volume mounts, volume durability, clock synchronization, provider account identity, secret-file readability, and cross-node reachability.") +
     `</ul><p class="desc">These signals never prevent enabling. Invalid credentials, stale lease tokens, and transactional conflicts are still rejected when operations run.</p></div>`;
 }
 
@@ -4306,6 +4609,7 @@ function categoryCard(cIdx) {
       ${fieldControl(p("torrent_dir"), "torrent payload dir (optional)", "text?")}
       ${fieldControl(p("seed_ratio"), "torrent seed ratio (empty = global)", "num?")}
       ${fieldControl(p("seed_minutes"), "torrent seed minutes (empty = global)", "num?")}
+      ${fieldControl(p("stop_seeding_on_complete"), "stop seeding after download", "select3")}
       ${fieldControl(p("unpack"), "unpack override", "select3")}
     </div>
   </div>`;
@@ -4324,9 +4628,9 @@ function renderSettingsForm() {
     } else {
       body = `<div class="cfg-grid">` +
         sec.fields.map(([p, l, t, o, help]) => fieldControl(p, l, t, o, help)).join("") + `</div>`;
-      if (sec.key === "dev") body += clusterAdvisory();
+      if (sec.key === "enable") body += `<div id="cfg-enable-advisory">${enableAdvisory(cfgModel)}</div>`;
     }
-    return `<div class="cfg-card"><h3>${esc(sec.title)}</h3><p class="desc">${esc(sec.desc)}</p>${body}</div>`;
+    return `<div class="cfg-card" data-settings-view="${sec.dev ? "dev" : "general"}"><h3>${esc(sec.title)}</h3><p class="desc">${esc(sec.desc)}</p>${body}</div>`;
   }).join("");
   // Tri-state (inherit/yes/no) selects render as placeholders first;
   // swap them for real <select>s.
@@ -4343,7 +4647,12 @@ function renderSettingsForm() {
     }
     inp.replaceWith(sel);
   });
-  form.oninput = () => { cfgDirty = true; $("cfg-save").disabled = !cfgInfo.writable; };
+  showSettingsView(settingsView);
+  form.oninput = () => {
+    cfgDirty = true; $("cfg-save").disabled = !cfgInfo.writable;
+    try { $("cfg-enable-advisory").innerHTML = enableAdvisory(collectSettingsForm()); }
+    catch (_) { /* Save reports incomplete or invalid form values. */ }
+  };
 }
 
 function collectSettingsForm() {
@@ -4776,6 +5085,7 @@ if (typeof __nzbd_test_enable !== "undefined") {
     histModel, fileModel, statusModels, storageModels, queueModels, detailModel,
     statusName, statusLabel, healthColor, fmtBytes, fmtRate, fmtEta, fmtDur, ppSummary,
     sectionOf, currentPostStage, pipelineModels, stageElapsedMs, SECTIONS, ORDERED,
+    torrentPhase, torrentStatus, seedPolicyText, seedStopText, seedLimitReached, toggleSection, collapsedSections,
     pending, satisfied, toast, connState, pollResult,
     connFromGaps, activeWire, applyTick, applyHb, pollPass,
     startStream, ensureStream,
@@ -4798,9 +5108,10 @@ if (typeof __nzbd_test_enable !== "undefined") {
     clientLabel, clientChipModels, UA_MAX,
     pageSlice, setPage, setPageSize, renderPager, PAGE_SIZES, PAGE_SIZE_DEFAULT,
     pageState: () => ({ page, pageSize }),
+    seedDraft, seedDrafts, seedBody, saveSeedPolicy,
     torrentOptions, torrentRequest, torrentQuery, showTorrentAdd, setTorrentBusy,
     addTorrentUri, addTorrentFiles,
-    hideAppForSetup, SETUP_KEEP, showConfigDurability, advDownloadFile,
+    hideAppForSetup, SETUP_KEEP, showConfigDurability, advDownloadFile, enableAdvisory,
     setOpenJob: (id) => { openJob = id; },
     setActiveTab: (t) => { activeTab = t; },
     conn: () => store.conn,

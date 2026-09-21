@@ -1,6 +1,6 @@
 # Torrent queue — implementation and merge status
 
-**Status:** implementation complete; preparing the combined review candidate.
+**Status:** combined candidate ready for adversarial review.
 **Updated:** 2026-09-20 · **Branch:** `codex/torrent-queue-lifecycle`.
 
 Companion to [USAGE.md](USAGE.md) (operator behavior) and
@@ -18,7 +18,8 @@ progress, decisions, review findings, and final validation for the queue work.
 - [x] Add Settings → Dev enable controls with live advisory readiness.
 - [x] Transfer work into an independent clone and restore the original
   checkout without changing its branch or existing commits.
-- [ ] Make focused commits and open one draft PR.
+- [x] Make focused backend and UI/validation commits.
+- [ ] Open one draft PR for the combined review.
 - [ ] Complete the adversarial agent review and address actionable findings.
 - [ ] Run final affected unit/DOM checks and required CI; fix failures.
 - [ ] Merge the green PR into main and clean temporary artifacts.
@@ -49,6 +50,8 @@ historical results, not certification of this final candidate.
 No tests have run after the workflow instruction. Final validation will follow
 adversarial review; draft CI is skipped by the repository's existing workflow.
 The required main check is `Main promotion gate`; protection stays intact.
+The final torrent lane includes affected API/config/types/state/compatibility
+unit tests and owner policy persistence cases. Preflight runs both UI harnesses.
 
 ## Review and merge record
 

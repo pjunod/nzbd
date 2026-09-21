@@ -45,7 +45,7 @@ jobs:
           node-version: "22"
       - run: scripts/check-fast-lane-contract
       - name: Exercise the embedded application JavaScript
-        run: node crates/nzbd/tests/ui_boot_harness.js crates/nzbd-api/ui/index.html
+        run: make ui-test
       - name: Documentation-only lane
         if: needs.scope.outputs.docs_only == 'true'
         run: echo "Documentation-only diff; compiler jobs are skipped."

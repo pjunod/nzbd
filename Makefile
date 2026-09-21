@@ -203,6 +203,8 @@ fast-check-rust: ## Reviewed merge candidate: compile/lint Rust and run bounded 
 .PHONY: fast-check-torrent
 fast-check-torrent: ## Reviewed torrent changes: bounded transfer, recovery, and release-dispatch checks
 	$(CARGO) test --locked -p nzbd-engine --lib torrent_
+	$(CARGO) test --locked -p nzbd-engine --lib owner::tests::seed_policy_
+	$(CARGO) test --locked -p nzbd-api -p nzbd-config -p nzbd-types -p nzbd-state -p nzbd-qbit-compat --lib
 	$(CARGO) test --locked -p nzbd-engine --test e2e single_node_startup_restores_torrent_rows_before_backend_attachment -- --exact
 	$(CARGO) test --locked -p nzbd-engine --test e2e cluster_authority_adoption_refuses_dormant_torrent_rows_without_rewrite -- --exact
 	RQBIT_SERIES_DISPATCH_ONLY=1 scripts/check-rqbit-maintained-patch-series.sh
