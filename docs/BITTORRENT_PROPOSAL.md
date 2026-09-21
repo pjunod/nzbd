@@ -1,8 +1,8 @@
 # BitTorrent support — one queue, two transfer protocols
 
 **Status:** ADR-19 implemented for single-node v1; M2 lifecycle/policy/activation,
-M3 native surfaces, and M4 qBittorrent compatibility are implemented on the
-consolidated branch; adversarial review and fast qualification remain ·
+M3 native surfaces, and M4 qBittorrent compatibility are implemented; the
+magnet DHT amendment is locally qualified and awaits PR publication ·
 **Decision:** pin the reproducibly derived eleven-patch rqbit v8.1.1 engine;
 complete single-node M2–M5 before separately approving M6 ·
 **Written:** 2026-08-05 · **Revised:** 2026-09-20 ·
@@ -55,8 +55,9 @@ dependency, not the production gate: M1b's queue schema, scheduler boundary,
 and fake backend were useful for any embedded engine and started no peer
 session, so they proceeded independently. The historical maintained-engine
 series and its independent review accepted all eleven M0 gates. The later
-test-support patch for deterministic DHT bootstrap is pending this branch's
-derivation and final gate; it does not alter the production engine path. M2 was
+test-support patch for deterministic DHT bootstrap passed the maintained
+derivation, focused upstream suites, release DHT assertion, and upstream
+workspace check; it does not alter the production engine path. M2 was
 decomposed on 2026-08-22 and corrected after an adversarial plan review. M2a's dormant
 `[torrent]` config and fail-closed activation guard and M2b's dormant selective
 runtime ownership have since merged, but no production admission route,
