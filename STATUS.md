@@ -3,7 +3,8 @@
 ## Torrent queue lifecycle — 2026-09-20
 
 **Status:** backend and queue UI committed in an independent clone; combined
-candidate ready for adversarial review.
+candidate ready for adversarial review. The affected CI lane includes DOM
+stability and seed-policy regressions.
 See [the live work status](docs/TORRENT_QUEUE_STATUS.md) for scope, decisions,
 review findings, validation, and merge progress. Existing queue layout retained;
 seeding and completion gain distinct sections, metrics, and durable controls.

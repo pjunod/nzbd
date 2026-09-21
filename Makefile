@@ -118,8 +118,9 @@ test-strict: ## Like `test`, but a missing par2/7z is a failure, not a skip (as 
 	NZBD_REQUIRE_TOOLS=1 $(CARGO) test --workspace
 
 .PHONY: ui-test
-ui-test: ## Fast UI boot smoke test only (executes the embedded page script via node)
+ui-test: ## Embedded UI boot and stable-DOM regression harnesses
 	node crates/nzbd/tests/ui_boot_harness.js crates/nzbd-api/ui/index.html
+	node crates/nzbd/tests/ui_dom_harness.js crates/nzbd-api/ui/index.html
 
 .PHONY: fmt
 fmt: ## Format the whole workspace
