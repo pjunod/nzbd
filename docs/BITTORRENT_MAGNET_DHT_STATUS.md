@@ -1,7 +1,7 @@
 # Magnet DHT build status — implementation and verification record
 
-**Status:** local qualification complete; PR publication and merge remain ·
-**Started:** 2026-09-20 · **Qualified:** 2026-09-21 ·
+**Status:** complete; merged in [PR #233](https://github.com/pjunod/nzbd/pull/233) ·
+**Started:** 2026-09-20 · **Qualified and merged:** 2026-09-21 ·
 **Branch:** `codex/magnet-dht-discovery`
 
 Companion to [BITTORRENT_PROPOSAL.md](BITTORRENT_PROPOSAL.md) (the product
@@ -21,7 +21,7 @@ code exists; it does not imply that the final test gate has run.
 - [x] Adversarial review after the implementation is otherwise merge-ready.
 - [x] Review findings resolved in the review-fix commit.
 - [x] Focused and workspace test gates run after review fixes.
-- [ ] Pull request merged to `main`.
+- [x] Pull request merged to `main` as `5ba95d9`.
 
 ## Contract — what this change must make true
 
@@ -85,6 +85,7 @@ failure.
 | `make check` | macOS | pass | Format, Clippy, all workspace/unit/integration/doc tests, and Rust 1.95 MSRV check passed on the final local head. |
 | `make bittorrent-policy` | macOS | pass | Dependency, release-review, and reviewed-exception policies passed. |
 | Private discovery packet capture | Linux (`nynuc`) | pass | Public controls were captured before and during the private window; the private hash was absent in binary and text forms. The temporary clone and bundle were removed. |
+| PR CI and promotion gate | GitHub Actions | pass | Rust merge candidate, torrent transfer/recovery regressions, mobile compile/unit, static contracts, RustSec, dependency policy, and main promotion all passed before merge. |
 
 ## Non-goals — boundaries that remain intact
 
