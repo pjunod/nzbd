@@ -53,9 +53,11 @@ A same-day re-check of stable 8.1.1 and rqbit's unreleased 9.0 branch found
 that both original M0 blockers remained. That result changed the milestone
 dependency, not the production gate: M1b's queue schema, scheduler boundary,
 and fake backend were useful for any embedded engine and started no peer
-session, so they proceeded independently. The maintained-engine proof and its
-independent review have since accepted all eleven M0 gates. M2 was decomposed
-on 2026-08-22 and corrected after an adversarial plan review. M2a's dormant
+session, so they proceeded independently. The historical maintained-engine
+series and its independent review accepted all eleven M0 gates. The later
+test-support patch for deterministic DHT bootstrap is pending this branch's
+derivation and final gate; it does not alter the production engine path. M2 was
+decomposed on 2026-08-22 and corrected after an adversarial plan review. M2a's dormant
 `[torrent]` config and fail-closed activation guard and M2b's dormant selective
 runtime ownership have since merged, but no production admission route,
 listener, or daemon session is present merely because those slices cleared.
@@ -986,8 +988,11 @@ would make error and compatibility behavior depend on remote content.
 
 Success remains `201 {"id": <JobId>}` and may add `info_hash`. A duplicate
 live hash returns `200` with the existing id and `created: false`. Malformed or
-unsupported metainfo returns `422`; source fetch failures become a visible
-failed job only after a valid request was durably admitted.
+unsupported metainfo returns `422`; a magnet metadata deadline returns `504`
+and cancels an explicit request's still-pending reservation. Recovery keeps
+the same transient timeout intent durable for a later retry. Other source
+fetch failures become a visible failed job only after a valid request was
+durably admitted.
 
 For magnet/URL input, “durably admitted” means the protected source artifact
 and queue-owned pending intent above both exist. The source can then resume

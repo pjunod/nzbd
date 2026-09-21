@@ -1,6 +1,8 @@
 use nzbd_torrent::{TorrentAddConfig, TorrentError, TorrentSession, TorrentSessionConfig};
 use sha1::{Digest, Sha1};
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, SocketAddr};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -43,6 +45,58 @@ fn private_info() -> (Vec<u8>, [u8; 20]) {
     info.push(b'e');
     let info_hash = Sha1::digest(&info).into();
     (info, info_hash)
+}
+
+fn structurally_invalid_info() -> (Vec<u8>, [u8; 20]) {
+    let payload = b"x";
+    let mut info = vec![b'd'];
+    bencode_bytes(&mut info, b"files");
+    info.extend_from_slice(b"ld6:lengthi1e4:pathl8:file.bineee");
+    bencode_bytes(&mut info, b"length");
+    info.extend_from_slice(b"i1e");
+    bencode_bytes(&mut info, b"name");
+    bencode_bytes(&mut info, b"invalid");
+    bencode_bytes(&mut info, b"piece length");
+    info.extend_from_slice(b"i1e");
+    bencode_bytes(&mut info, b"pieces");
+    bencode_bytes(&mut info, &Sha1::digest(payload));
+    info.push(b'e');
+    let info_hash = Sha1::digest(&info).into();
+    (info, info_hash)
+}
+
+fn compact_ipv4(address: SocketAddr) -> [u8; 6] {
+    let SocketAddr::V4(address) = address else {
+        panic!("tracker fixture requires IPv4");
+    };
+    let mut compact = [0_u8; 6];
+    compact[..4].copy_from_slice(&address.ip().octets());
+    compact[4..].copy_from_slice(&address.port().to_be_bytes());
+    compact
+}
+
+async fn http_tracker(listener: TcpListener, peer: SocketAddr, requests: Arc<AtomicUsize>) {
+    let (mut stream, _) = listener.accept().await.unwrap();
+    let mut request = [0_u8; 4096];
+    let length = stream.read(&mut request).await.unwrap();
+    assert!(request[..length]
+        .windows(b"GET /announce?".len())
+        .any(|window| window == b"GET /announce?"));
+    requests.fetch_add(1, Ordering::SeqCst);
+    let mut body = b"d8:intervali60e5:peers6:".to_vec();
+    body.extend_from_slice(&compact_ipv4(peer));
+    body.push(b'e');
+    stream
+        .write_all(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    stream.write_all(&body).await.unwrap();
 }
 
 fn handshake(info_hash: [u8; 20]) -> Vec<u8> {
@@ -294,5 +348,82 @@ async fn dht_disabled_private_magnet_can_resolve_through_an_explicit_peer() {
         .expect("metadata peer did not finish")
         .expect("metadata peer failed");
     session.delete(&handle, false).await.unwrap();
+    session.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn malformed_hash_valid_metadata_has_a_deterministic_error() {
+    let (info, info_hash) = structurally_invalid_info();
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let peer = listener.local_addr().unwrap();
+    let peer_task = tokio::spawn(metadata_peer(listener, info, info_hash));
+    let root = tempfile::tempdir().unwrap();
+    let session = TorrentSession::start(root.path().to_path_buf(), TorrentSessionConfig::default())
+        .await
+        .unwrap();
+    let magnet = format!(
+        "magnet:?xt=urn:btih:{}",
+        info_hash
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    );
+
+    let result = session
+        .add_magnet(
+            magnet,
+            TorrentAddConfig {
+                initial_peers: vec![peer],
+                ..Default::default()
+            },
+        )
+        .await;
+    let error = match result {
+        Ok(_) => panic!("structurally invalid metadata was admitted"),
+        Err(error) => error,
+    };
+    assert!(matches!(error, TorrentError::InvalidResolvedMagnetMetadata));
+    peer_task.await.unwrap();
+    session.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dht_disabled_tracker_bearing_magnet_resolves_through_http_tracker() {
+    let (info, info_hash) = private_info();
+    let peer_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let peer = peer_listener.local_addr().unwrap();
+    let peer_task = tokio::spawn(metadata_peer(peer_listener, info, info_hash));
+    let tracker_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let tracker_address = tracker_listener.local_addr().unwrap();
+    let tracker_requests = Arc::new(AtomicUsize::new(0));
+    let tracker_task = tokio::spawn(http_tracker(
+        tracker_listener,
+        peer,
+        tracker_requests.clone(),
+    ));
+    let root = tempfile::tempdir().unwrap();
+    let session = TorrentSession::start(root.path().to_path_buf(), TorrentSessionConfig::default())
+        .await
+        .unwrap();
+    let magnet = format!(
+        "magnet:?xt=urn:btih:{}&tr=http%3A%2F%2F127.0.0.1%3A{}%2Fannounce",
+        info_hash
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>(),
+        tracker_address.port()
+    );
+
+    let resolved = tokio::time::timeout(
+        Duration::from_secs(10),
+        session.resolve_magnet_metadata(magnet),
+    )
+    .await
+    .expect("tracker metadata resolution timed out")
+    .expect("DHT-off tracker discovery should resolve metadata");
+    assert!(!resolved.is_empty());
+    assert_eq!(tracker_requests.load(Ordering::SeqCst), 1);
+    tracker_task.await.unwrap();
+    peer_task.await.unwrap();
     session.stop().await;
 }

@@ -131,6 +131,8 @@ pub enum TorrentError {
         "Magnet metadata could not be resolved within 120 seconds. Check peer availability and DHT or tracker connectivity, then retry."
     )]
     MagnetMetadataTimeout,
+    #[error("Resolved magnet metadata is invalid. Use a valid magnet or a trusted .torrent file.")]
+    InvalidResolvedMagnetMetadata,
     #[error(
         "This torrent is private and cannot be added while DHT is enabled. Disable DHT and use the private tracker's .torrent file."
     )]
@@ -641,6 +643,7 @@ pub struct TorrentSession {
     dht_enabled: bool,
     output_root: PathBuf,
     proxy_enabled: bool,
+    magnet_metadata_timeout: Duration,
 }
 
 struct ResolvedMagnet {
@@ -653,8 +656,16 @@ impl TorrentSession {
     /// payload storage exists when this returns.
     pub async fn resolve_magnet_metadata(&self, magnet: String) -> Result<Vec<u8>, TorrentError> {
         let resolved = self.resolve_validated_magnet(magnet, Vec::new()).await?;
-        validate_existing_filesystem_paths(resolved.torrent_bytes.as_ref(), &self.output_root)?;
         Ok(resolved.torrent_bytes.to_vec())
+    }
+
+    /// Validate resolved metainfo against the payload root selected by the
+    /// durable queue owner. This must run before admission is committed.
+    pub fn validate_metainfo_filesystem(
+        bytes: &[u8],
+        output_root: &Path,
+    ) -> Result<(), TorrentError> {
+        validate_existing_filesystem_paths(bytes, output_root)
     }
 
     /// Reject a magnet that cannot reach any implemented discovery source.
@@ -687,7 +698,17 @@ impl TorrentSession {
         config: TorrentSessionConfig,
         test_dht_bootstrap_addrs: Option<Vec<SocketAddr>>,
     ) -> Result<Self, TorrentError> {
-        validate_listen_port_range(config.listen_port_range.as_ref())?;
+        if test_dht_bootstrap_addrs.is_some() {
+            if config
+                .listen_port_range
+                .as_ref()
+                .is_some_and(|range| range.start == 0 || range.start >= range.end)
+            {
+                return Err(TorrentError::InvalidListenPortRange);
+            }
+        } else {
+            validate_listen_port_range(config.listen_port_range.as_ref())?;
+        }
         install_process_crypto_provider()?;
         let proxy_enabled = config.proxy.is_some();
         if proxy_enabled && config.dht {
@@ -732,7 +753,17 @@ impl TorrentSession {
             dht_enabled: config.dht,
             output_root,
             proxy_enabled,
+            magnet_metadata_timeout: MAGNET_METADATA_TIMEOUT,
         })
+    }
+
+    /// Override the metadata deadline solely in downstream deterministic
+    /// tests. Production sessions always use [`MAGNET_METADATA_TIMEOUT`].
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn with_magnet_metadata_timeout_for_test(mut self, timeout: Duration) -> Self {
+        self.magnet_metadata_timeout = timeout;
+        self
     }
 
     pub fn tcp_listen_port(&self) -> Option<u16> {
@@ -789,6 +820,7 @@ impl TorrentSession {
             dht_enabled: false,
             output_root,
             proxy_enabled: false,
+            magnet_metadata_timeout: MAGNET_METADATA_TIMEOUT,
         })
     }
 
@@ -844,8 +876,12 @@ impl TorrentSession {
         magnet: String,
         initial_peers: Vec<SocketAddr>,
     ) -> Result<ResolvedMagnet, TorrentError> {
-        self.resolve_validated_magnet_with_timeout(magnet, initial_peers, MAGNET_METADATA_TIMEOUT)
-            .await
+        self.resolve_validated_magnet_with_timeout(
+            magnet,
+            initial_peers,
+            self.magnet_metadata_timeout,
+        )
+        .await
     }
 
     async fn resolve_validated_magnet_with_timeout(
@@ -865,7 +901,16 @@ impl TorrentSession {
         )
         .await
         .map_err(|_| TorrentError::MagnetMetadataTimeout)?
-        .map_err(engine_error)?;
+        .map_err(|error| {
+            if error
+                .downcast_ref::<librqbit::InvalidResolvedMagnetMetadataError>()
+                .is_some()
+            {
+                TorrentError::InvalidResolvedMagnetMetadata
+            } else {
+                engine_error(error)
+            }
+        })?;
         let AddTorrentResponse::ListOnly(resolved) = resolved else {
             return Err(TorrentError::MissingResolvedMagnet);
         };

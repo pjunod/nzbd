@@ -63,9 +63,11 @@ Deployments that require forced routing must enforce it in the host or
 container network namespace and firewall.
 
 **Reviewer acceptance:** packet capture must show the expected public controls,
-no private hash through DHT/PEX/LSD, and no direct UDP path for a proxied job.
-Logs and the Settings UI must display the redacted traffic policy before a
-session starts.
+known-private metainfo is never handed to DHT/PEX/LSD, and no direct UDP path
+exists for a proxied job. An unknown magnet hash may already have crossed DHT
+before resolved metadata proves it private; that result must be rejected before
+managed admission. Logs and the Settings UI must display the redacted traffic
+policy before a session starts.
 
 ## 3. Ports
 

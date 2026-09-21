@@ -2,7 +2,7 @@
 
 **Status:** active single-node BitTorrent engine · **Upstream base:**
 rqbit v8.1.1, commit `00b97485160ff5b5aa2b379ea0815d568ec665f0` ·
-**Stable patch delta:** 3,012 lines across exactly eleven ordered patches ·
+**Stable patch delta:** exactly eleven ordered patches ·
 **Production daemon:** starts it only when `[torrent].enabled = true`
 
 Companion to
@@ -42,7 +42,7 @@ The maintained series is:
 | 8 | `0016-limit-peer-metadata-before-allocation.patch` | Enforce the adapter's 10 MiB BEP 9 ceiling before allocation or requests. |
 | 9 | `0018-propagate-file-sizing-errors.patch` | Stop initialization on the first selected-file sizing failure and preserve useful error context. |
 | 10 | `0019-disable-peer-exchange.patch` | Make the daemon's PEX setting authoritative for inbound messages and outgoing advertisement. |
-| 11 | `0020-expose-test-only-dht-bootstrap.patch` | Expose a feature-gated constructor for deterministic loopback DHT tests without adding an nzbd runtime bootstrap setting. |
+| 11 | `0020-expose-test-only-dht-bootstrap.patch` | Expose a feature-gated constructor for deterministic loopback DHT tests and a typed invalid-resolved-metadata marker without adding an nzbd runtime bootstrap setting. |
 
 The checked-in [`vendor/`](vendor/) tree is generated from those inputs. It
 contains the derived upstream `LICENSE`, `README.md`, and `crates/` tree needed
@@ -55,8 +55,8 @@ gate-9 disposition. A broad semver update is not permitted.
 
 ## 2. Why this remains rqbit, not libtorrent
 
-The stable series is 3,012 patch lines, applies cleanly to one immutable source
-archive, and has focused tests at every changed behavior boundary. It preserves
+The stable series applies cleanly to one immutable source archive and has
+focused tests at every changed behavior boundary. It preserves
 the Rust/Tokio single-binary architecture and adds no FFI or second daemon.
 That stays within ADR-19's small-maintainable-fix branch, so the heavier
 `libtorrent-rasterbar` C++/FFI and packaging fallback is not triggered.

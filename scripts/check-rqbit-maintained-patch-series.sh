@@ -100,6 +100,11 @@ if ! grep -Fq 'pub fn new_with_opts_for_test(' \
   echo "maintained rqbit test-only DHT bootstrap hook was not discovered" >&2
   exit 1
 fi
+if ! grep -Fq 'pub struct InvalidResolvedMagnetMetadataError;' \
+  "$source_dir/crates/librqbit/src/session.rs"; then
+  echo "maintained rqbit invalid resolved-metadata marker was not discovered" >&2
+  exit 1
+fi
 
 if [[ "${RQBIT_SERIES_DERIVE_ONLY:-0}" == "1" ]]; then
   echo "rqbit maintained patch series: checksum, ordered apply, and vendor drift checks passed"

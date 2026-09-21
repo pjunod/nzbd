@@ -68,6 +68,19 @@ pub const SUPPORTED_SCHEMES: [&str; 3] = ["http:", "https:", "magnet:"];
 
 pub type TorrentId = usize;
 
+/// Marker attached to errors produced after a peer supplied hash-valid but
+/// structurally unusable magnet metadata.
+#[derive(Debug)]
+pub struct InvalidResolvedMagnetMetadataError;
+
+impl std::fmt::Display for InvalidResolvedMagnetMetadataError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("resolved magnet metadata is structurally invalid")
+    }
+}
+
+impl std::error::Error for InvalidResolvedMagnetMetadataError {}
+
 struct ParsedTorrentFile {
     info: TorrentMetaV1Owned,
     info_bytes: Bytes,
@@ -1546,7 +1559,8 @@ impl Session {
                         info,
                         torrent_file_from_info_bytes(&info_bytes, trackers)?,
                         info_bytes.0,
-                    )?,
+                    )
+                    .context(InvalidResolvedMagnetMetadataError)?,
                     peer_rx: rx,
                     seen_peers: {
                         let seen = seen.into_iter().collect_vec();

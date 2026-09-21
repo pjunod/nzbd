@@ -17,8 +17,8 @@ code exists; it does not imply that the final test gate has run.
 - [x] Adapter policy and bounded metadata resolution.
 - [x] Durable admission cleanup and recovery classification.
 - [x] Developer settings enablement guidance and current-policy docs.
-- [ ] Adversarial review after the implementation is otherwise merge-ready.
-- [ ] Review findings resolved.
+- [x] Adversarial review after the implementation is otherwise merge-ready.
+- [x] Review findings resolved in the review-fix commit.
 - [ ] Focused and workspace test gates run once after review fixes.
 - [ ] Pull request merged to `main`.
 
@@ -48,6 +48,12 @@ operator's enable control.
    after `finish` commits it.
 5. **Do not use public swarms in automated tests.** Loopback fixtures keep CI
    deterministic and prevent tests from publishing real users' hashes.
+6. **Validate the selected category root before commit.** Metadata-only
+   resolution cannot know the queue-owned destination; `finish` applies the
+   filesystem preflight to the canonical selected root before persistence.
+7. **Classify hash-valid malformed metadata explicitly.** The maintained
+   engine marks structural construction failures so recovery removes them as
+   deterministic input instead of retrying them forever.
 
 ## Implementation record — committed before review
 
@@ -63,7 +69,7 @@ test command has run yet; the test code above is implementation, not evidence.
 
 | Check | Platform | Result | Evidence |
 |---|---|---|---|
-| Adversarial agent review | local | not run | Deferred until merge-ready. |
+| Adversarial agent review | local | findings resolved | Found category-root timing, malformed-metadata classification, timeout/restart proof, tracker-only discovery proof, port-race, and documentation gaps. No tests were run by the reviewer. |
 | Focused BitTorrent tests | local | not run | Runs after review fixes. |
 | `make ui-test` | local | not run | Runs after review fixes. |
 | `scripts/check-bittorrent-release-review.sh` | local | not run | Runs after review fixes. |

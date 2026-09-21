@@ -468,19 +468,6 @@ impl TorrentAdmissionService {
                     other => AdmissionError::Torrent(other),
                 }
             })?;
-        let job = match pending {
-            Some(job) => job,
-            None => {
-                self.engine
-                    .reserve_torrent_admission(TorrentSource::Metainfo, bytes.clone(), opts.clone())
-                    .await?
-            }
-        };
-        let relative = PathBuf::from(format!(
-            "torrents/sources/{}.torrent",
-            descriptor.info_hash_v1
-        ));
-        persist_descriptor(&self.state_dir.join(&relative), &bytes)?;
         // Match qBittorrent/*arr category names case-insensitively while
         // retaining the configured spelling in durable queue state.
         if let Some(requested) = opts.category.as_deref() {
@@ -532,6 +519,20 @@ impl TorrentAdmissionService {
                     .map(|(_, root)| root.clone())
             })
             .unwrap_or_else(|| self.session.output_root().to_path_buf());
+        TorrentSession::validate_metainfo_filesystem(&bytes, &payload_root)?;
+        let job = match pending {
+            Some(job) => job,
+            None => {
+                self.engine
+                    .reserve_torrent_admission(TorrentSource::Metainfo, bytes.clone(), opts.clone())
+                    .await?
+            }
+        };
+        let relative = PathBuf::from(format!(
+            "torrents/sources/{}.torrent",
+            descriptor.info_hash_v1
+        ));
+        persist_descriptor(&self.state_dir.join(&relative), &bytes)?;
         let record = TorrentRecord {
             info_hash_v1: descriptor.info_hash_v1.clone(),
             source,
@@ -1217,6 +1218,13 @@ impl TorrentAdmissionService {
                 Json(json!({"id":result.id,"info_hash":result.info_hash,"created":false})),
             )
                 .into_response(),
+            Err(AdmissionError::Torrent(
+                nzbd_torrent::TorrentError::MagnetMetadataTimeout,
+            )) => (
+                StatusCode::GATEWAY_TIMEOUT,
+                Json(json!({"error":"Magnet metadata could not be resolved within 120 seconds. Check peer availability and DHT or tracker connectivity, then retry."})),
+            )
+                .into_response(),
             Err(error) if error.is_input_error() => (
                 StatusCode::UNPROCESSABLE_ENTITY,
                 Json(json!({"error":error.to_string()})),
@@ -1299,8 +1307,7 @@ mod tests {
     use nzbd_engine::{Engine, EngineConfig, Tuning};
     use nzbd_torrent::{TorrentAddConfig, TorrentSessionConfig};
     use sha1::{Digest, Sha1};
-    use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener as StdTcpListener};
-    use std::ops::Range;
+    use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tower::ServiceExt;
 
@@ -1350,17 +1357,6 @@ mod tests {
         torrent.extend_from_slice(&info);
         torrent.push(b'e');
         (torrent, info_hash)
-    }
-
-    fn free_port_range() -> Range<u16> {
-        loop {
-            let listener = StdTcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-            let port = listener.local_addr().unwrap().port();
-            drop(listener);
-            if port < u16::MAX {
-                return port..port + 1;
-            }
-        }
     }
 
     fn dht_transaction_id(packet: &[u8]) -> [u8; 2] {
@@ -1446,6 +1442,27 @@ mod tests {
         }
     }
 
+    async fn empty_dht_node(socket: tokio::net::UdpSocket, get_peers_count: Arc<AtomicUsize>) {
+        let node_id = [0x25; 20];
+        let node = socket.local_addr().unwrap();
+        let mut packet = [0_u8; 2048];
+        loop {
+            let (length, source) = socket.recv_from(&mut packet).await.unwrap();
+            let request = &packet[..length];
+            if request
+                .windows(b"9:get_peers".len())
+                .any(|window| window == b"9:get_peers")
+            {
+                get_peers_count.fetch_add(1, Ordering::SeqCst);
+            }
+            let transaction = dht_transaction_id(request);
+            socket
+                .send_to(&dht_response(transaction, node_id, node, None), source)
+                .await
+                .unwrap();
+        }
+    }
+
     async fn service(tmp: &tempfile::TempDir) -> (TorrentAdmissionService, EngineHandle) {
         let state = tmp.path().join("state");
         let engine = Engine::spawn(EngineConfig::single_node(
@@ -1517,6 +1534,9 @@ mod tests {
         ));
         assert!(deterministic_magnet_recovery_failure(
             &AdmissionError::Torrent(nzbd_torrent::TorrentError::MagnetDiscoveryUnavailable)
+        ));
+        assert!(deterministic_magnet_recovery_failure(
+            &AdmissionError::Torrent(nzbd_torrent::TorrentError::InvalidResolvedMagnetMetadata)
         ));
     }
 
@@ -1873,7 +1893,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn trackerless_dht_magnet_rediscovery_transfers_through_production_admission() {
+    async fn pending_public_magnet_recovers_through_dht_and_transfers() {
         let tmp = tempfile::tempdir().unwrap();
         let payload = (0..64 * 1024)
             .map(|index| ((index * 29 + 11) % 251) as u8)
@@ -1883,17 +1903,17 @@ mod tests {
         let seed_root = tmp.path().join("seed");
         std::fs::create_dir_all(&seed_root).unwrap();
         std::fs::write(seed_root.join(DHT_SWARM_FILE), &payload).unwrap();
-        let seed_ports = free_port_range();
-        let seed_port = seed_ports.start;
-        let seeder = TorrentSession::start(
+        let seeder = TorrentSession::start_with_dht_bootstrap_for_test(
             seed_root,
             TorrentSessionConfig {
-                listen_port_range: Some(seed_ports),
+                listen_port_range: Some(30_000..60_000),
                 ..Default::default()
             },
+            Vec::new(),
         )
         .await
         .unwrap();
+        let seed_port = seeder.tcp_listen_port().unwrap();
         let seed = seeder
             .add_metainfo(
                 torrent,
@@ -1955,18 +1975,18 @@ mod tests {
                 .map(|byte| format!("{byte:02x}"))
                 .collect::<String>()
         );
-        let response = router(service.clone())
-            .oneshot(
-                axum::http::Request::post("/api/v1/jobs")
-                    .header(CONTENT_TYPE, "application/json")
-                    .body(axum::body::Body::from(
-                        json!({"source":{"type":"magnet","uri":magnet}}).to_string(),
-                    ))
-                    .unwrap(),
+        let pending = engine
+            .reserve_torrent_admission(
+                TorrentSource::Magnet,
+                magnet.into_bytes(),
+                AddOpts::default(),
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::CREATED);
+        let recovered = service.recover().await.unwrap();
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].id, pending);
+        assert!(recovered[0].created);
 
         let downloaded = payload_root.join(DHT_SWARM_FILE);
         tokio::time::timeout(std::time::Duration::from_secs(20), async {
@@ -2006,17 +2026,17 @@ mod tests {
         let seed_root = tmp.path().join("private-seed");
         std::fs::create_dir_all(&seed_root).unwrap();
         std::fs::write(seed_root.join(DHT_SWARM_FILE), &payload).unwrap();
-        let seed_ports = free_port_range();
-        let seed_port = seed_ports.start;
-        let seeder = TorrentSession::start(
+        let seeder = TorrentSession::start_with_dht_bootstrap_for_test(
             seed_root,
             TorrentSessionConfig {
-                listen_port_range: Some(seed_ports),
+                listen_port_range: Some(30_000..60_000),
                 ..Default::default()
             },
+            Vec::new(),
         )
         .await
         .unwrap();
+        let seed_port = seeder.tcp_listen_port().unwrap();
         let seed = seeder
             .add_metainfo(
                 torrent,
@@ -2110,6 +2130,101 @@ mod tests {
         engine.shutdown().await;
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn dht_timeout_stops_lookup_cleans_explicit_admission_and_keeps_recovery_pending() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dht_socket = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let dht_address = dht_socket.local_addr().unwrap();
+        let get_peers_count = Arc::new(AtomicUsize::new(0));
+        let dht_task = tokio::spawn(empty_dht_node(dht_socket, get_peers_count.clone()));
+
+        let state = tmp.path().join("timeout-state");
+        let engine = Engine::spawn(EngineConfig::single_node(
+            vec![],
+            state.clone(),
+            tmp.path().join("timeout-dest"),
+            Tuning::default(),
+            None,
+        ))
+        .await
+        .unwrap();
+        let session = TorrentSession::start_with_dht_bootstrap_for_test(
+            tmp.path().join("timeout-payload"),
+            TorrentSessionConfig {
+                dht: true,
+                ..Default::default()
+            },
+            vec![dht_address],
+        )
+        .await
+        .unwrap()
+        .with_magnet_metadata_timeout_for_test(std::time::Duration::from_millis(300));
+        let service =
+            TorrentAdmissionService::new(engine.clone(), session, state.clone(), false, true);
+        let magnet = "magnet:?xt=urn:btih:1111111111111111111111111111111111111111";
+        let response = router(service.clone())
+            .oneshot(
+                axum::http::Request::post("/api/v1/jobs")
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(
+                        json!({"source":{"type":"magnet","uri":magnet}}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+        let snapshot = nzbd_state::SnapshotStore::open(&state)
+            .unwrap()
+            .load()
+            .unwrap()
+            .unwrap();
+        assert!(snapshot.pending_admissions.is_empty());
+        assert!(PendingSourceStore::open(&state)
+            .unwrap()
+            .inventory()
+            .unwrap()
+            .is_empty());
+        let queries_after_timeout = get_peers_count.load(Ordering::SeqCst);
+        assert!(queries_after_timeout >= 1);
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        assert_eq!(
+            get_peers_count.load(Ordering::SeqCst),
+            queries_after_timeout,
+            "dropping the timed-out resolution must stop its DHT request stream"
+        );
+
+        let pending = engine
+            .reserve_torrent_admission(
+                TorrentSource::Magnet,
+                magnet.as_bytes().to_vec(),
+                AddOpts::default(),
+            )
+            .await
+            .unwrap();
+        assert!(service.recover().await.unwrap().is_empty());
+        let snapshot = nzbd_state::SnapshotStore::open(&state)
+            .unwrap()
+            .load()
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot.pending_admissions.len(), 1);
+        assert_eq!(snapshot.pending_admissions[0].job_id, pending);
+        assert_eq!(
+            PendingSourceStore::open(&state)
+                .unwrap()
+                .inventory()
+                .unwrap(),
+            vec![pending]
+        );
+
+        service.shutdown().await;
+        dht_task.abort();
+        engine.shutdown().await;
+    }
+
     #[tokio::test]
     async fn typed_http_source_uses_the_same_durable_admission_path() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -2167,6 +2282,72 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn category_root_is_validated_instead_of_the_unused_default_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (service, engine) = service(&tmp).await;
+        let category_root = tmp.path().join("category-payload");
+        std::fs::create_dir_all(&category_root).unwrap();
+        std::fs::create_dir_all(tmp.path().join("payload/category.bin")).unwrap();
+        let service = service.with_category_payload_roots(HashMap::from([(
+            "Movies".to_string(),
+            category_root.clone(),
+        )]));
+
+        let result = service
+            .admit_raw(
+                metainfo(b"category.bin"),
+                AddOpts {
+                    category: Some("movies".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("unused default-root collision must not reject category admission");
+        assert!(result.created);
+        let persisted = engine.snapshot();
+        assert_eq!(persisted.jobs.len(), 1);
+        assert_eq!(persisted.jobs[0].category.as_deref(), Some("Movies"));
+        assert_eq!(
+            persisted.jobs[0].torrent.as_ref().unwrap().payload_root,
+            category_root
+        );
+
+        service.shutdown().await;
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn category_root_collision_is_rejected_before_durable_commit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (service, engine) = service(&tmp).await;
+        let category_root = tmp.path().join("category-payload");
+        std::fs::create_dir_all(category_root.join("collision.bin")).unwrap();
+        let service = service
+            .with_category_payload_roots(HashMap::from([("Movies".to_string(), category_root)]));
+
+        let error = service
+            .admit_raw(
+                metainfo(b"collision.bin"),
+                AddOpts {
+                    category: Some("movies".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("category-root type collision must be rejected");
+        assert!(matches!(
+            error,
+            AdmissionError::Torrent(nzbd_torrent::TorrentError::ExistingPathType(_))
+        ));
+        let persisted = engine.snapshot();
+        assert!(persisted.jobs.is_empty());
+        assert!(persisted.pending_admissions.is_empty());
+
+        service.shutdown().await;
         engine.shutdown().await;
     }
 

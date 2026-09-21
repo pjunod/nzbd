@@ -14,6 +14,26 @@ diff --git a/crates/librqbit/src/session.rs b/crates/librqbit/src/session.rs
 index 2b24337..1af5e2d 100644
 --- a/crates/librqbit/src/session.rs
 +++ b/crates/librqbit/src/session.rs
+@@ -68,6 +68,19 @@ pub const SUPPORTED_SCHEMES: [&str; 3] = ["http:", "https:", "magnet:"];
+ 
+ pub type TorrentId = usize;
+ 
++/// Marker attached to errors produced after a peer supplied hash-valid but
++/// structurally unusable magnet metadata.
++#[derive(Debug)]
++pub struct InvalidResolvedMagnetMetadataError;
++
++impl std::fmt::Display for InvalidResolvedMagnetMetadataError {
++    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        formatter.write_str("resolved magnet metadata is structurally invalid")
++    }
++}
++
++impl std::error::Error for InvalidResolvedMagnetMetadataError {}
++
+ struct ParsedTorrentFile {
+     info: TorrentMetaV1Owned,
+     info_bytes: Bytes,
 @@ -544,8 +544,38 @@ impl Session {
      /// Create a new session with options.
      #[inline(never)]
@@ -61,3 +81,32 @@ index 2b24337..1af5e2d 100644
                          cancellation_token: Some(token.child_token()),
                          ..Default::default()
                      })
+@@ -1516,11 +1559,12 @@ impl Session {
+             } => {
+                 trace!(?info, "received result from DHT");
+                 Ok(ResolveMagnetResult {
+                     metadata: TorrentMetadata::new(
+                         info,
+                         torrent_file_from_info_bytes(&info_bytes, trackers)?,
+                         info_bytes.0,
+-                    )?,
++                    )
++                    .context(InvalidResolvedMagnetMetadataError)?,
+                     peer_rx: rx,
+                     seen_peers: {
+                         let seen = seen.into_iter().collect_vec();
+diff --git a/crates/librqbit/src/lib.rs b/crates/librqbit/src/lib.rs
+index 5411760..5162e5e 100644
+--- a/crates/librqbit/src/lib.rs
++++ b/crates/librqbit/src/lib.rs
+@@ -67,8 +67,8 @@ pub use create_torrent_file::{create_torrent, CreateTorrentOptions};
+ pub use dht;
+ pub use peer_connection::PeerConnectionOptions;
+ pub use session::{
+-    AddTorrent, AddTorrentOptions, AddTorrentResponse, ListOnlyResponse, Session, SessionOptions,
+-    SessionPersistenceConfig, SUPPORTED_SCHEMES,
++    AddTorrent, AddTorrentOptions, AddTorrentResponse, InvalidResolvedMagnetMetadataError,
++    ListOnlyResponse, Session, SessionOptions, SessionPersistenceConfig, SUPPORTED_SCHEMES,
+ };
+ pub use spawn_utils::spawn as librqbit_spawn;
+ pub use torrent_state::{
