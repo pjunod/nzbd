@@ -14,9 +14,9 @@ code exists; it does not imply that the final test gate has run.
 
 - [x] Isolated clone created from `origin/main`; the user's working checkout
   remains untouched.
-- [~] Adapter policy and bounded metadata resolution — implementation active.
-- [ ] Durable admission cleanup and recovery classification.
-- [ ] Developer settings enablement guidance and current-policy docs.
+- [x] Adapter policy and bounded metadata resolution.
+- [x] Durable admission cleanup and recovery classification.
+- [x] Developer settings enablement guidance and current-policy docs.
 - [ ] Adversarial review after the implementation is otherwise merge-ready.
 - [ ] Review findings resolved.
 - [ ] Focused and workspace test gates run once after review fixes.
@@ -48,6 +48,16 @@ operator's enable control.
    after `finish` commits it.
 5. **Do not use public swarms in automated tests.** Loopback fixtures keep CI
    deterministic and prevent tests from publishing real users' hashes.
+
+## Implementation record — committed before review
+
+| Commit | Scope | Observable contract |
+|---|---|---|
+| `e31c936` | Adapter and maintained engine | Trackerless public magnets use loopback-proven DHT lookup; list-only resolution is bounded and private results fail before managed admission. |
+| `d709fb0` | Queue owner and production admission | Explicit failures cancel only still-pending reservations durably; recovery removes deterministic failures and keeps transient failures. The native path proves peer rediscovery and payload hash. |
+
+The UI and policy-document commit follows this record. No unit or integration
+test command has run yet; the test code above is implementation, not evidence.
 
 ## Verification record — blank until the final gate runs
 

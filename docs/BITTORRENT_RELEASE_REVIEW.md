@@ -6,6 +6,12 @@ qualification remain ·
 are implemented on the consolidated branch and M5 owns final qualification ·
 **Owner:** ADR-19 in [BITTORRENT_PROPOSAL.md](BITTORRENT_PROPOSAL.md)
 
+**2026-09-20 magnet-discovery amendment:** DHT-enabled sessions now resolve
+privacy-unknown v1 magnets in list-only mode, then reject private metainfo
+before managed admission. This makes public trackerless magnets usable, but a
+hash may already have been queried publicly before the private bit is known.
+The setting remains off by default, and SOCKS plus DHT still fails closed.
+
 This is the short operations and release-review surface for nzbd's BitTorrent
 backend. It tells a reviewer what network traffic, ports, storage, seeding,
 deletion, native API, and qBittorrent-compatible behavior the implementation
@@ -43,16 +49,18 @@ discovery and UPnP remain unavailable, and cluster plus torrent is rejected.
 | HTTP(S) trackers | Allowed; secrets and queries stay redacted | Only the one validated metainfo tracker in the first release |
 | UDP trackers | Allowed only without a SOCKS proxy | Same validation rule; proxy plus UDP fails closed |
 | PEX | Enabled by default for public torrents | Disabled regardless of operator settings |
-| DHT | Disabled by default; enabling it requires the accepted pre-metadata privacy policy and complete release evidence | Disabled regardless of operator settings |
+| DHT | Disabled by default; when enabled, may query unresolved magnet hashes and can resolve trackerless public magnets | Known-private metainfo is never handed to DHT; metadata found after an unknown-hash lookup is rejected before admission |
 | Local discovery (LSD) | Disabled by default | Disabled regardless of operator settings |
 | UPnP | Unavailable | Unavailable |
 
-An unresolved magnet is privacy-unknown. Stable rqbit cannot suppress DHT for
-one add before metadata reveals the private bit, so a DHT-enabled session must
-reject magnet admission rather than risk public discovery. A proxy covers
-eligible TCP peer and HTTP(S) tracker traffic only; it is not a VPN kill
-switch or an anonymity guarantee. Deployments that require forced routing
-must enforce it in the host or container network namespace and firewall.
+An unresolved magnet is privacy-unknown. When DHT is enabled, nzbd permits the
+public lookup needed by trackerless magnets, resolves metadata in list-only
+mode, validates the requested info hash and all metainfo limits, and only then
+admits public content. A private result is rejected, but that cannot erase the
+earlier hash lookup. A proxy covers eligible TCP peer and HTTP(S) tracker
+traffic only; it is not a VPN kill switch or an anonymity guarantee.
+Deployments that require forced routing must enforce it in the host or
+container network namespace and firewall.
 
 **Reviewer acceptance:** packet capture must show the expected public controls,
 no private hash through DHT/PEX/LSD, and no direct UDP path for a proxied job.
@@ -67,9 +75,9 @@ There is no port range probe, random fallback, ephemeral port, automatic
 router mutation, or UPnP. Failure to bind the configured port is a startup
 failure for the torrent feature, not permission to choose another port.
 
-DHT remains off by default. A later DHT-enabled release must document its UDP
-socket and egress requirements explicitly; operators must never have to infer
-them from library behavior.
+DHT remains off by default. Enabling it opens UDP discovery egress and permits
+pre-metadata hash lookup; the Developer settings advisory and
+[CONFIGURATION.md](CONFIGURATION.md) state that consequence before restart.
 
 **Reviewer acceptance:** the startup summary, Settings UI, container examples,
 and firewall guidance must agree on every inbound and outbound transport. An
@@ -195,7 +203,8 @@ relying on one local host:
 
 | Evidence | Last recorded proof |
 |---|---|
-| Maintained v8.1.1 archive, exact nine-patch series, generated vendor, and focused upstream tests | [2026-08-14 maintained-rqbit workflow](https://github.com/pjunod/nzbd/actions/runs/31837867809) |
+| Historical maintained v8.1.1 archive and then-current nine-patch series | [2026-08-14 maintained-rqbit workflow](https://github.com/pjunod/nzbd/actions/runs/31837867809); this does not qualify the 2026-09-20 eleven-patch head |
+| Current eleven-patch derivation and magnet-DHT regressions | Not yet recorded; see [BITTORRENT_MAGNET_DHT_STATUS.md](BITTORRENT_MAGNET_DHT_STATUS.md) for the merge gate |
 | Native 100-torrent admission/shutdown pressure | [2026-08-09 matrix run](https://github.com/pjunod/nzbd/actions/runs/31330178035) |
 | Private DHT/LSD packet capture | [2026-08-06 capture run](https://github.com/pjunod/nzbd/actions/runs/31128106994) |
 | Cross-platform filesystem behavior | [2026-08-08 probe run](https://github.com/pjunod/nzbd/actions/runs/31240896567) and [review correction](https://github.com/pjunod/nzbd/actions/runs/31264422471) |

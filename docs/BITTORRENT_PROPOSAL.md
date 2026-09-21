@@ -3,9 +3,9 @@
 **Status:** ADR-19 implemented for single-node v1; M2 lifecycle/policy/activation,
 M3 native surfaces, and M4 qBittorrent compatibility are implemented on the
 consolidated branch; adversarial review and fast qualification remain ·
-**Decision:** pin the reproducibly derived nine-patch rqbit v8.1.1 engine;
+**Decision:** pin the reproducibly derived eleven-patch rqbit v8.1.1 engine;
 complete single-node M2–M5 before separately approving M6 ·
-**Written:** 2026-08-05 · **Revised:** 2026-09-19 ·
+**Written:** 2026-08-05 · **Revised:** 2026-09-20 ·
 **Verified against:** rqbit v8.1.1 (`00b97485160ff5b5aa2b379ea0815d568ec665f0`) ·
 **Cluster reuse baseline:** plurx `7c781e5f5e28ac8114bacb1919a463a6a18e2680` ·
 **Post-baseline cluster audit:** plurx `64e96aa71f58ebb3ec2c7b71d5c36a537b50aba6` ·
@@ -43,9 +43,11 @@ is not available through the public per-torrent stats model. The isolated
 adapter and schema groundwork remained; production session wiring stopped here
 until ADR-19 was amended with a maintained fix or a different engine. The
 2026-08-14 amendment in §4.3.3 makes that decision: nzbd derives a pinned local
-rqbit v8.1.1 vendor from the immutable release archive plus exactly nine small,
-ordered patches. This is an explicit dependency boundary, not permission to
-wire a daemon session.
+rqbit v8.1.1 vendor from the immutable release archive plus a small ordered
+patch series. The 2026-09-20 magnet amendment adds the eleventh patch: a
+feature-gated loopback-test constructor, not an operator bootstrap setting.
+This is an explicit dependency boundary, not permission to wire another
+daemon session.
 
 A same-day re-check of stable 8.1.1 and rqbit's unreleased 9.0 branch found
 that both original M0 blockers remained. That result changed the milestone
@@ -59,14 +61,21 @@ runtime ownership have since merged, but no production admission route,
 listener, or daemon session is present merely because those slices cleared.
 
 The Fable review later that day found a real proxy leak boundary and several
-plan inconsistencies. This revision rejects proxy+DHT and proxy+UDP trackers,
-rejects privacy-unknown magnets in a DHT-enabled session, disables
+plan inconsistencies. That revision rejects proxy+DHT and proxy+UDP trackers,
+originally rejected privacy-unknown magnets in a DHT-enabled session, disables
 process-global DHT persistence, completes v2/hybrid admission checks
 for metainfo, reserves schema version 3 for torrent job records, defines how a
 stalled torrent yields the shared slot, and originally split completed M1a
 schema work from then-blocked M1b routing. The §4.3.2 amendment then permitted
 that dormant routing seam while gates 7 and 8 still blocked production wiring.
 The maintained-engine amendment in §4.3.3 supersedes that gate state.
+
+The 2026-09-20 amendment supersedes only the blanket magnet rejection. DHT-on
+sessions may query an unresolved v1 hash, resolve metadata in list-only mode,
+and admit it only after full validation proves it public. A private result is
+rejected before managed storage, but the earlier public hash query cannot be
+retracted. DHT remains off by default; known-private metainfo and proxy rules
+retain their previous fail-closed boundaries.
 
 > BitTorrent publishes the client’s IP address to peers and may upload data
 > after the download completes. nzbd can provide controls and honest status;
@@ -354,7 +363,7 @@ behavior. Rebuilding those protocols would be a new project, not a feature.
 
 | Option | Complexity | Runtime dependency | Protocol maturity | Fit with nzbd | Decision |
 |---|---:|---:|---:|---:|---|
-| Embed `librqbit` | Medium | none | Good v1 feature set; nine bounded fixes close the reviewed M0 gaps | Rust, Tokio, library API, Apache-2.0, single binary | **Choose the reproducibly derived v8.1.1 patch series, subject to complete M0 evidence** |
+| Embed `librqbit` | Medium | none | Good v1 feature set; eleven bounded fixes close the reviewed M0 and deterministic-DHT-test gaps | Rust, Tokio, library API, Apache-2.0, single binary | **Choose the reproducibly derived v8.1.1 patch series, subject to complete M0 evidence** |
 | Bind `libtorrent-rasterbar` | High | C++ library/FFI | Broad and mature, including extensive BEP coverage | Adds unsafe FFI, C++ packaging, and static-build complexity | Fallback if M0 fails a blocker |
 | Delegate to Transmission/qBittorrent/rqbit daemon | Low initial, high product | second daemon | Mature according to chosen daemon | Split queue, auth, persistence, paths, logs, lifecycle, and support boundary | Reject |
 | Implement BitTorrent in nzbd | Extreme | none | Years behind mature engines on day one | Maximum control, unacceptable protocol/security burden | Reject |
@@ -393,9 +402,10 @@ M0 passes only if it proves all of the following:
    converts trackers to a hash set before truncating private torrents to one,
    so M0 must prove a one-tracker private torrent and the adapter must reject
    zero or multiple unique trackers rather than pretending a primary tracker
-   is deterministic. Because a magnet's private bit is unknown until metadata
-   arrives, magnet resolution must also avoid DHT until that metadata has been
-   validated.
+   is deterministic. A magnet's private bit is unknown until metadata arrives,
+   so a DHT-enabled lookup may expose its hash before nzbd can reject private
+   metadata. The release contract must state that limit rather than invent a
+   pre-metadata privacy oracle.
 6. File paths are either rejected safely by the library or can be validated
    before any file is created.
 7. Torrent stats expose the required public facts without reading
@@ -540,7 +550,7 @@ and [public torrent statistics](https://docs.rs/librqbit/8.1.1/librqbit/struct.T
 #### 4.3.3 Maintained-engine amendment — selected 2026-08-14
 
 This amendment supersedes the release-only conclusions in §§4.3.1–4.3.2.
-ADR-19 selects rqbit v8.1.1 plus exactly these nine stable patches:
+ADR-19 selects rqbit v8.1.1 plus exactly these eleven stable patches:
 
 1. disable automatic restore while retaining explicit restore;
 2. bound tracker response size, request duration, and announce cadence;
@@ -550,7 +560,11 @@ ADR-19 selects rqbit v8.1.1 plus exactly these nine stable patches:
 6. bound peer piece/metadata response backlog;
 7. bound DHT and metadata-discovery work;
 8. enforce the 10 MiB peer-metadata ceiling before allocation; and
-9. propagate file-sizing failures instead of logging and continuing.
+9. propagate file-sizing failures instead of logging and continuing;
+10. make the session PEX toggle authoritative for inbound and outgoing PEX;
+    and
+11. expose a feature-gated, test-only DHT bootstrap constructor so loopback
+    discovery tests never depend on public bootstrap hosts.
 
 The machine-readable order is
 [`contrib/rqbit/maintained-series.txt`](../contrib/rqbit/maintained-series.txt).
@@ -1469,7 +1483,7 @@ torrent_dir = "/data/torrents"          # immutable seed payloads
 [torrent]
 enabled = false
 listen_port = 6881                       # one TCP/IPv4 peer port in v1
-dht = false                              # safe until per-add magnet suppression exists
+dht = false                              # public discovery; opt in after reviewing hash exposure
 pex = true
 local_discovery = false
 upnp_port_forwarding = false
@@ -1494,13 +1508,13 @@ source_redirects = 5
   it. The adapter admits exactly one explicit non-zero port, rather than
   exposing rqbit's raw range probe or allowing port `0`; failure to bind is a
   startup error when the feature is enabled.
-- `dht = false`, `pex = true`: public swarm discovery benefits from DHT, but
-  the engine must suppress both for private torrents regardless of config.
-  Stable rqbit cannot suppress DHT per unresolved magnet, so the dormant
-  adapter rejects magnets while session DHT is enabled; tracker or explicit
-  peer resolution remains available when DHT is disabled. The safe
-  first-release default is therefore DHT off. A reviewed per-add suppression
-  mechanism can later make DHT-on magnet resolution safe.
+- `dht = false`, `pex = true`: DHT remains opt-in because it publicly queries
+  hashes. When enabled it resolves trackerless magnets before their private
+  bit is known; public validated metadata proceeds and private metadata is
+  rejected before managed admission. That rejection cannot retract the
+  earlier lookup. With DHT disabled, a magnet needs a supported tracker or an
+  explicitly supplied peer source. The engine suppresses DHT and PEX after
+  private metainfo is known.
   When `socks_proxy_url` is set, settings validation requires `dht = false`
   because librqbit 8.1.1 does not proxy DHT UDP traffic.
 - `local_discovery = false`: LAN multicast reveals torrent participation and
@@ -1712,14 +1726,14 @@ For metainfo marked private:
 - preserve the private flag through resume and cluster handoff;
 - add an interop test that observes no DHT announce or PEX messages.
 
-An unresolved magnet is privacy-unknown input. Stable rqbit 8.1.1 constructs
-its DHT peer stream before BEP 9 metadata reveals the private bit and exposes
-no per-add DHT override. The dormant adapter therefore rejects all magnets in
-a DHT-enabled session before calling rqbit. With session DHT disabled, magnets
-may resolve through embedded HTTP(S) trackers or explicitly supplied peers and
-the returned metainfo is then subjected to the full private-torrent contract.
-This restriction can be relaxed only after a reviewed engine API makes
-pre-metadata discovery policy explicit.
+An unresolved magnet is privacy-unknown input. With session DHT enabled, nzbd
+permits public lookup of that unknown hash, resolves BEP 9 metadata in
+list-only mode, and applies the complete metainfo and private-torrent contract
+before storage or managed peer handoff. A private result is rejected, but the
+lookup exposure has already happened. With DHT disabled, magnets may resolve
+through validated HTTP(S)/UDP trackers or explicitly supplied peers; a
+trackerless magnet with no other source fails immediately with actionable
+guidance.
 
 If the selected library cannot prove this per torrent, M0 fails. Private
 tracker rules are not a UI preference.
@@ -2396,7 +2410,7 @@ passed the isolated adapter suite on 2026-08-09 UTC across Linux x86_64 GNU,
 Linux x86_64 musl, Linux aarch64 musl, macOS aarch64, and Windows x86_64. The
 [maintained-engine sampled-memory run](https://github.com/pjunod/nzbd/actions/runs/31837867629)
 passed the same five targets on 2026-08-14 UTC after deriving the exact
-nine-patch engine: 100-torrent sampled RSS growth ranged from 2,863,104 to
+then-current nine-patch engine: 100-torrent sampled RSS growth ranged from 2,863,104 to
 5,144,576 bytes, and 100,000-file preflight growth ranged from 3,768,320 to
 27,295,744 bytes. Exact
 baselines, maxima, and timings are recorded in the M0 report. This is useful
@@ -2523,10 +2537,11 @@ becomes reachable.
   malformed v1, v2-only, and hybrid topics fail by stable name. Version-looking
   text in display names and tracker URLs is an explicit negative fixture. A
   fake BEP 9 peer also proves resolved metainfo is revalidated in list-only
-  mode before any payload storage exists. A DHT-enabled-session case proves
-  privacy-unknown magnet input is rejected before an explicit peer is
-  contacted, and the paired DHT-disabled case proves a private magnet can
-  still resolve through that explicit peer. A separate libFuzzer target passes
+  mode before any payload storage exists. A loopback DHT node proves a
+  trackerless public magnet sends `get_peers`, resolves metadata without
+  `announce_peer`, and leaves no managed handle. Paired private fixtures prove
+  both adapter entry points reject after metadata inspection, while the
+  DHT-disabled explicit-peer path remains available. A separate libFuzzer target passes
   valid UTF-8 to the exact preflight in normal and proxy modes. Its seven
   contract-checked seeds cover valid v1, lowercase-base32 normalization,
   v2-only, hybrid, authority-form rejection, eager-selection rejection, and
@@ -2773,7 +2788,7 @@ both review passes as follows:
 
 | Decision | Disposition |
 |---|---|
-| Engine | Pin the exact rqbit v8.1.1 archive plus the ordered nine-patch maintained series, generated vendor, and integrity CI. Evaluate `libtorrent-rasterbar` only if that bounded maintenance model cannot pass M0. |
+| Engine | Pin the exact rqbit v8.1.1 archive plus the ordered eleven-patch maintained series, generated vendor, and integrity CI. Evaluate `libtorrent-rasterbar` only if that bounded maintenance model cannot pass M0. |
 | Transport | Accept TCP/IPv4-only for the first release; uTP and IPv6 wait for a stable 9.x line and repeatable resume/interop proof. |
 | Torrent format | Accept v1 `.torrent`/`btih` magnets only; the M0 adapter rejects v2-only and hybrid metainfo/magnets with distinct named errors. |
 | Queue schema | Version 2 is the torrent-free envelope; M1b writes version 3 with the torrent variant and defaulted record; M2 writes version 4 for protected pending admissions, with schema-3 migration and exact old-reader rejection. |

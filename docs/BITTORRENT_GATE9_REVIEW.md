@@ -1,10 +1,10 @@
 # BitTorrent gate 9 review — accept measured cost, not silent risk drift
 
-**Status:** all eleven dispositions recorded; maintained implementation and
-refreshed native measurements pass; independent review complete ·
+**Status:** all eleven original dispositions recorded; the 2026-09-20
+test-only DHT hook awaits this change's derivation proof ·
 **Date:** 2026-08-07 · **Disposition and amendment recorded:** 2026-08-14 ·
 **Accepted:** 2026-08-14 · **Status reconciled:** 2026-08-22 ·
-**Engine:** rqbit v8.1.1 archive plus the ordered nine-patch maintained series ·
+**Engine:** rqbit v8.1.1 archive plus the ordered eleven-patch maintained series ·
 **Decision owner:** ADR-19 in
 [BITTORRENT_PROPOSAL.md](BITTORRENT_PROPOSAL.md)
 
@@ -25,6 +25,13 @@ items 6–11. The immutable archive checksum, exact patch membership/order,
 clean application, byte-identical vendor, and focused behavior tests pass. The
 [2026-08-14 maintained-engine run](https://github.com/pjunod/nzbd/actions/runs/31837867629)
 also refreshes the measurements on all five native targets.
+
+The 2026-09-20 amendment adds patch `0020`, which exposes a constructor only
+under the engine's `test-support` feature so nzbd can inject loopback DHT
+bootstrap nodes. It adds no production option, socket, discovery source, or
+resource budget. The prior measurements remain historical evidence; the
+eleven-patch derivation and focused upstream suites must pass on the amended
+head before this review is current again.
 
 No production BitTorrent path is enabled by this review or by its recorded
 disposition. Gate 8 uses the maintained selective-restore option. Gate 7

@@ -1182,7 +1182,7 @@ const models = (jobs) => jobs.map((j, i) => T.rowModel(j, { idx: i, count: jobs.
   eq(JSON.parse(add.body).source.type, "magnet", "the JSON names the source kind");
   eq(JSON.parse(add.body).category, "tv", "the JSON carries add options");
   eq(scheduledTimeouts.includes(45000), false,
-    "magnet admission is not aborted after a hidden durable reservation can exist");
+    "magnet admission waits for the server-owned 120 s deadline and cleanup result");
 
   scheduledTimeouts.length = 0;
   await T.addTorrentUri("https://tracker.example/file.torrent", {});
@@ -1204,11 +1204,14 @@ const models = (jobs) => jobs.map((j, i) => T.rowModel(j, { idx: i, count: jobs.
   ok(add.url.includes("category=movies%20%26%20tv"), "the raw category is URL encoded");
 
   routes.set("/api/v1/jobs", { status: 503, body: { error: "BitTorrent is disabled" } });
+  sandbox.document.getElementById("torrent-uri").value = "magnet:?xt=urn:btih:def";
   await T.addTorrentUri("magnet:?xt=urn:btih:def", {});
   const torrentMsg = sandbox.document.getElementById("addtorrent-msg");
   ok(torrentMsg.textContent.includes("BitTorrent is disabled"),
     "torrent intake shows the daemon's actionable rejection");
   eq(torrentMsg.className, "bad", "a rejected torrent is visibly an error");
+  eq(sandbox.document.getElementById("torrent-uri").value, "magnet:?xt=urn:btih:def",
+    "a rejected magnet remains available for correction and retry");
 
   // (a) a parked delete offers Undo
   reset();
@@ -1960,6 +1963,11 @@ const models = (jobs) => jobs.map((j, i) => T.rowModel(j, { idx: i, count: jobs.
     const advice = T.enableAdvisory({ torrent: { listen_port: 6881, dht: true, socks_proxy_url: "socks5://localhost:1080" }, cluster: { enabled: true } });
     ok(advice.includes("unmet"), "incompatible configuration is advisory");
     ok(advice.includes("unknown"), "unverified runtime readiness is explicit");
+    ok(advice.includes("review") && advice.includes("unknown magnet hash"),
+      "DHT hash exposure is an explicit advisory when selected");
+    ok(T.enableAdvisory({ torrent: { listen_port: 6881, dht: false }, cluster: {} })
+      .includes("trackerless magnets have no discovery source"),
+      "DHT-off readiness explains the trackerless-magnet consequence");
     ok(!advice.includes("disabled"), "readiness never disables an enable switch");
     for (const [port, state] of [[65534, "met"], [65535, "unmet"]]) {
       ok(T.enableAdvisory({ torrent: { listen_port: port } }).includes(`<b>${state}</b> · A peer TCP port`),

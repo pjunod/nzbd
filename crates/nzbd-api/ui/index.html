@@ -4079,8 +4079,9 @@ async function addTorrentUri(raw, rawOptions) {
     res = await post("/api/v1/jobs", {
       headers: { "content-type": "application/json", ...CLIENT_HDRS },
       body: JSON.stringify(request),
-      // Magnet resolution has no atomic backend timeout/cleanup contract:
-      // aborting here can report failure after the durable reservation exists.
+      // Magnet resolution and pre-commit cleanup are server-bounded at 120 s.
+      // Keep the client open for that result; a browser abort is not an
+      // atomic cancellation request.
       // Remote .torrent fetches are server-bounded at 30 s, so 45 s still
       // protects that path from a dead connection without racing its limit.
       timeoutMs: request.source.type === "magnet" ? null : 45000,
@@ -4405,9 +4406,10 @@ const SETTINGS_SECTIONS = [
     ["queue.crc_check", "CRC check", "check"],
     ["queue.continue_partial", "resume partials on restart", "check"],
   ]},
-  { key: "torrent", title: "BitTorrent", desc: "Single-node v1 BitTorrent. Enabling starts a public peer listener after restart. The active-download limit is shared with Usenet; seeding is unlimited unless you set a ratio or time. Cluster mode, UPnP, local discovery, IPv6, uTP and v2 torrents are not supported.", fields: [
+  { key: "torrent", title: "BitTorrent", desc: "Single-node v1 BitTorrent. Enabling starts a public peer listener after restart. DHT can find peers for trackerless magnets, but may query a hash before metadata reveals that a torrent is private. Private torrents require DHT off. The active-download limit is shared with Usenet; seeding is unlimited unless you set a ratio or time. Cluster mode, UPnP, local discovery, IPv6, uTP and v2 torrents are not supported.", fields: [
     ["torrent.listen_port", "peer TCP listen port", "num"],
-    ["torrent.dht", "DHT discovery", "check"],
+    ["torrent.dht", "DHT discovery", "check", null,
+      "Finds peers for trackerless magnets. A magnet hash may be queried before private status is known; private torrents require DHT off. DHT cannot be used with a SOCKS proxy. Restart required."],
     ["torrent.pex", "peer exchange (PEX)", "check"],
     ["torrent.upload_limit_kib", "upload limit (KiB/s, 0 = unlimited)", "num"],
     ["torrent.stop_seeding_on_complete", "stop seeding when download completes (default for new torrents)", "check"],
@@ -4489,6 +4491,9 @@ function enableAdvisory(config) {
     item(c.enabled ? "unmet" : "met", "Single-node execution: BitTorrent and cluster execution cannot run together.") +
     item(t.socks_proxy_url && t.dht ? "unmet" : "met", "A SOCKS proxy requires DHT off because DHT traffic bypasses the proxy.") +
     item(Number.isInteger(t.listen_port) && t.listen_port > 0 && t.listen_port <= 65534 ? "met" : "unmet", "A peer TCP port from 1 to 65534 is configured.") +
+    item(t.dht ? "review" : "met", t.dht
+      ? "DHT is selected: trackerless public magnets work, but an unknown magnet hash can be queried publicly before private status is known."
+      : "DHT is off: use a tracker-bearing magnet or .torrent file; trackerless magnets have no discovery source.") +
     item("unknown", "Verify the peer port is available, firewall rules match your intent, and the payload directory is writable with sufficient free space.") +
     `</ul><p class="desc">Based on the form values; this is not a connectivity or disk probe. Enabling starts peer networking after restart. Normal configuration and runtime validation still apply.</p></div>` + clusterAdvisory(config);
 }
