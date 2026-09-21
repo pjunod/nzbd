@@ -119,8 +119,22 @@ impl TorrentPhase {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 pub struct SeedPolicy {
+    /// Stop once the selected payload is verified. Zero numeric limits still
+    /// mean unlimited, so this intent must be represented independently.
+    #[serde(default)]
+    pub stop_on_complete: bool,
     pub ratio_limit: Option<f64>,
     pub time_limit_secs: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TorrentStopReason {
+    Manual,
+    DownloadComplete,
+    RatioLimit,
+    TimeLimit,
+    StorageFull,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -174,6 +188,8 @@ pub struct TorrentRecord {
     /// Canonical payload path after verification.
     pub content_path: Option<PathBuf>,
     pub seed_policy: SeedPolicy,
+    #[serde(default)]
+    pub stop_reason: Option<TorrentStopReason>,
     pub last_activity_unix: Option<i64>,
     /// Redacted, display-safe, and bounded by the backend before persistence.
     pub last_error: Option<String>,
@@ -207,6 +223,8 @@ mod torrent_control_tests {
         .unwrap();
         assert_eq!(record.control_intent, TorrentControlIntent::Running);
         assert_eq!(record.removal_intent, None);
+        assert!(!record.seed_policy.stop_on_complete);
+        assert_eq!(record.stop_reason, None);
     }
 }
 

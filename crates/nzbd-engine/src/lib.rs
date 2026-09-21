@@ -392,6 +392,7 @@ pub struct AddOpts {
     /// Torrent-only cumulative seeding-time limit in seconds. `None` or zero
     /// means unlimited; non-torrent admission ignores it.
     pub seed_time_limit_secs: Option<u64>,
+    pub stop_seeding_on_complete: Option<bool>,
     /// Duplicate-detection metadata (key/score/mode) carried on the job.
     pub dupe: Option<nzbd_types::DupeInfo>,
     /// Add in Paused state (NZBGet `AddPaused`).

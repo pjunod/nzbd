@@ -118,8 +118,9 @@ test-strict: ## Like `test`, but a missing par2/7z is a failure, not a skip (as 
 	NZBD_REQUIRE_TOOLS=1 $(CARGO) test --workspace
 
 .PHONY: ui-test
-ui-test: ## Fast UI boot smoke test only (executes the embedded page script via node)
+ui-test: ## Embedded UI boot and stable-DOM regression harnesses
 	node crates/nzbd/tests/ui_boot_harness.js crates/nzbd-api/ui/index.html
+	node crates/nzbd/tests/ui_dom_harness.js crates/nzbd-api/ui/index.html
 
 .PHONY: fmt
 fmt: ## Format the whole workspace
@@ -203,6 +204,8 @@ fast-check-rust: ## Reviewed merge candidate: compile/lint Rust and run bounded 
 .PHONY: fast-check-torrent
 fast-check-torrent: ## Reviewed torrent changes: bounded transfer, recovery, and release-dispatch checks
 	$(CARGO) test --locked -p nzbd-engine --lib torrent_
+	$(CARGO) test --locked -p nzbd-engine --lib owner::tests::seed_policy_
+	$(CARGO) test --locked -p nzbd-api -p nzbd-config -p nzbd-types -p nzbd-state -p nzbd-qbit-compat --lib
 	$(CARGO) test --locked -p nzbd-engine --test e2e single_node_startup_restores_torrent_rows_before_backend_attachment -- --exact
 	$(CARGO) test --locked -p nzbd-engine --test e2e cluster_authority_adoption_refuses_dormant_torrent_rows_without_rewrite -- --exact
 	RQBIT_SERIES_DISPATCH_ONLY=1 scripts/check-rqbit-maintained-patch-series.sh

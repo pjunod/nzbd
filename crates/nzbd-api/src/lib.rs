@@ -804,6 +804,8 @@ async fn get_job_torrent(State(st): State<ApiState>, Path(id): Path<u32>) -> Res
                 "seeding_seconds": torrent.seeding_seconds,
                 "seed_ratio_limit": torrent.seed_policy.ratio_limit,
                 "seed_time_limit_secs": torrent.seed_policy.time_limit_secs,
+                "seed_policy": torrent.seed_policy,
+                "stop_reason": torrent.stop_reason,
                 "ready_at_unix": torrent.ready_at_unix,
                 "last_activity_unix": torrent.last_activity_unix,
                 "last_error": torrent.last_error,
@@ -812,6 +814,54 @@ async fn get_job_torrent(State(st): State<ApiState>, Path(id): Path<u32>) -> Res
             None => not_found(),
         },
         Ok(None) => not_found(),
+        Err(_) => error(StatusCode::SERVICE_UNAVAILABLE, "queue owner unavailable"),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SetSeedPolicyBody {
+    #[serde(default)]
+    use_defaults: bool,
+    #[serde(default)]
+    stop_on_complete: bool,
+    ratio_limit: Option<f64>,
+    time_limit_secs: Option<u64>,
+}
+
+async fn set_seed_policy(
+    State(st): State<ApiState>,
+    Path(id): Path<u32>,
+    Json(body): Json<SetSeedPolicyBody>,
+) -> Response {
+    if body.ratio_limit.is_some_and(|v| !v.is_finite() || v <= 0.0)
+        || body.time_limit_secs == Some(0)
+    {
+        return error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "Limits must be positive; use null for unlimited",
+        );
+    }
+    let job = match st.engine.export_job(JobId(id)).await {
+        Ok(Some(job)) if job.torrent.is_some() => job,
+        Ok(_) => return not_found(),
+        Err(_) => return error(StatusCode::SERVICE_UNAVAILABLE, "queue owner unavailable"),
+    };
+    let policy = if body.use_defaults {
+        let Some(service) = &st.torrent else {
+            return error(StatusCode::SERVICE_UNAVAILABLE, "BitTorrent is disabled");
+        };
+        service.seed_defaults(job.category.as_deref())
+    } else {
+        nzbd_types::SeedPolicy {
+            stop_on_complete: body.stop_on_complete,
+            ratio_limit: body.ratio_limit,
+            time_limit_secs: body.time_limit_secs,
+        }
+    };
+    match st.engine.set_torrent_seed_policy(JobId(id), policy).await {
+        Ok(true) => Json(json!({"ok": true, "seed_policy": policy})).into_response(),
+        Ok(false) => error(StatusCode::CONFLICT, "Could not save seeding policy"),
         Err(_) => error(StatusCode::SERVICE_UNAVAILABLE, "queue owner unavailable"),
     }
 }
@@ -872,6 +922,9 @@ struct AddJobQuery {
     /// Fetch the NZB from this URL instead of the request body.
     url: Option<String>,
     paused: Option<bool>,
+    seed_ratio_limit: Option<f64>,
+    seed_time_limit_secs: Option<u64>,
+    stop_seeding_on_complete: Option<bool>,
     dupe_key: Option<String>,
     dupe_score: Option<i32>,
     /// URL-encoded JSON object of string→string, set on the job at admit
@@ -959,6 +1012,9 @@ async fn add_job(
                     category: q.category,
                     priority: q.priority.unwrap_or(0),
                     paused: q.paused.unwrap_or(false),
+                    seed_ratio_limit: q.seed_ratio_limit,
+                    seed_time_limit_secs: q.seed_time_limit_secs,
+                    stop_seeding_on_complete: q.stop_seeding_on_complete,
                     ..Default::default()
                 },
             )
@@ -1971,6 +2027,7 @@ async fn openapi() -> Response {
             },
             "/api/v1/jobs/{id}": { "get": { "summary": "Job detail" } },
             "/api/v1/jobs/{id}/priority": { "put": { "summary": "Set scheduler priority; higher values run first and 900 is force" } },
+            "/api/v1/jobs/{id}/torrent/seed-policy": { "put": { "summary": "Set stop_on_complete, positive ratio_limit/time_limit_secs (null = unlimited), or use_defaults; never starts a stopped torrent" } },
             "/api/v1/jobs/{id}/actions/{action}": { "post": { "summary": "pause|resume|delete|delete-files|move-*|post-restart-*; delete answers {ok, parked}" } },
             "/api/v1/queue/actions/{action}": { "post": { "summary": "pause|resume" } },
             "/api/v1/queue/speed-limit": { "put": { "summary": "Set speed limit (bytes_per_sec)" } },
@@ -2620,6 +2677,10 @@ pub fn router_with(state: ApiState) -> Router {
         .route("/api/v1/jobs/{id}/priority", put(set_job_priority))
         .route("/api/v1/jobs/{id}/files", get(get_job_files))
         .route("/api/v1/jobs/{id}/torrent", get(get_job_torrent))
+        .route(
+            "/api/v1/jobs/{id}/torrent/seed-policy",
+            put(set_seed_policy),
+        )
         .route("/api/v1/jobs/{id}/torrent-file", get(get_job_torrent_file))
         .route("/api/v1/jobs/{id}/nzb", get(get_job_nzb))
         .route("/api/v1/jobs/{id}/actions/{action}", post(job_action))
@@ -2761,6 +2822,11 @@ mod tests {
             ratio: 0.0,
             seeding_seconds: 0,
             useful_peers: 0,
+            torrent_phase: None,
+            torrent_control_intent: None,
+            seed_policy: None,
+            seed_stop_reason: None,
+            torrent_error: None,
             dupe_key: String::new(),
             dupe_score: 0,
             params: vec![],

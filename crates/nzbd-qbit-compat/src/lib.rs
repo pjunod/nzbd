@@ -596,6 +596,7 @@ async fn set_share_limits(State(state): State<QbitState>, body: Bytes) -> Respon
             .set_torrent_seed_policy(
                 id,
                 SeedPolicy {
+                    stop_on_complete: false,
                     ratio_limit: ratio,
                     time_limit_secs: time,
                 },

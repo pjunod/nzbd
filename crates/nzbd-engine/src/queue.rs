@@ -253,6 +253,7 @@ impl QueueState {
             paused: opts.paused,
             seed_ratio_limit: opts.seed_ratio_limit,
             seed_time_limit_secs: opts.seed_time_limit_secs,
+            stop_seeding_on_complete: opts.stop_seeding_on_complete,
             params: opts.params,
             client: opts.client,
         });
@@ -1755,6 +1756,7 @@ mod tests {
                 removal_intent: None,
                 removal_outcome: None,
                 removal_confirmed_at_unix: None,
+                stop_reason: None,
                 files: Vec::new(),
                 total_bytes: 100,
                 selected_bytes: 100,
@@ -2915,6 +2917,7 @@ mod tests {
             removal_intent: None,
             removal_outcome: None,
             removal_confirmed_at_unix: None,
+            stop_reason: None,
             files: vec![],
             total_bytes: 42,
             selected_bytes: 42,

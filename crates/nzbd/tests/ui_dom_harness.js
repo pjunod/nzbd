@@ -426,15 +426,15 @@ const models = (jobs) => jobs.map((j, i) => T.rowModel(j, { idx: i, count: jobs.
   const detail = tbody.children[1];
   // wrap children: head, pipeline, recovery, meta, files <details>, activity
   const wrap = detail.children[0].children[0];
-  const recovery = wrap.children[2];
+  const recovery = detail.__c.recovery;
   eq(recovery.hidden, true, "recovery controls stay out of ordinary downloads");
-  const filesBox = wrap.children[4];
+  const filesBox = detail.__c.filesBox;
   eq(filesBox.tag, "details", "the file list is foldable");
   eq(filesBox.open, true, "…and open by default in the queue");
   const filesBody = filesBox.children[1].children[1];
   eq(filesBody.children.length, 2, "one row per file");
   const fileRow = filesBody.children[0];
-  const logsBox = wrap.children[5];
+  const logsBox = detail.__c.logs;
   eq(logsBox.children.length, 1, "one activity line");
   const logLine = logsBox.children[0];
 
@@ -1436,6 +1436,82 @@ const models = (jobs) => jobs.map((j, i) => T.rowModel(j, { idx: i, count: jobs.
     ok(none.tip.includes("/api/v1/events"), "…with the explanation moved to its tooltip");
   }
 
+  // Torrent lifecycle, section paging, and the stable seeding editor.
+  {
+    reset();
+    T.collapsedSections.clear();
+    const seed = job(501, { kind: "torrent", status: "queued", ready: true,
+      torrent_phase: "seeding", torrent_control_intent: "running", upload_rate_bps: 840000,
+      uploaded_bytes: 640, ratio: .64, seeding_seconds: 3600, useful_peers: 3,
+      ready_at_unix: 1000, seed_policy: { stop_on_complete: false, ratio_limit: 2, time_limit_secs: 172800 } });
+    eq(T.sectionOf(seed), "seeding", "ready torrents never fall back to generic queued status");
+    eq(T.torrentStatus({ ...seed, upload_rate_bps: 0 }), "seeding · idle", "zero upload remains seeding");
+    eq(T.sectionOf({ ...seed, torrent_phase: "missing_files" }), "waiting", "missing files override readiness");
+    eq(T.sectionOf({ ...seed, status: "failed" }), "waiting", "failure cannot be hidden by a ready flag");
+    eq(T.sectionOf({ ...seed, torrent_phase: "checking" }), "checking", "piece verification has its own section");
+    eq(T.sectionOf({ ...seed, ready: false, torrent_phase: "fetching_metadata" }), "torrent_metadata", "magnet metadata is not fetching an NZB");
+    const held = { ...seed, ready: false, status: "paused", torrent_phase: "paused_download", torrent_error: "storage full", seed_stop_reason: "storage_full" };
+    eq(T.torrentStatus(held), "waiting for disk space", "storage holds are not queued or manually paused");
+    ok(T.rowModel(held).dRest.includes("storage full"), "the row explains the storage hold");
+    const stopped = { ...seed, id: 502, status: "paused", torrent_control_intent: "paused", seed_stop_reason: "manual" };
+    eq(T.sectionOf(stopped), "completed", "accepted stop intent moves a ready torrent before backend acknowledgement");
+    const row = T.rowModel(seed);
+    eq(row.barHidden, true, "seeds have no misleading download bar");
+    eq(row.moveHidden, true, "seeds have no download queue arrows");
+    eq(row.pauseLabel, "stop seeding", "the action states exactly what it stops");
+    ok(row.dRest.includes("uploaded") && row.dRest.includes("3 peers"), "seeding rows expose upload and peer metrics");
+    eq(T.rowModel(stopped).pauseLabel, "start seeding", "manual stops can be reversed");
+    eq(T.rowModel({ ...stopped, ratio: 2 }).pauseAction, "seed-options", "reached limits need a policy change before restart");
+
+    T.store.jobsLoaded = true;
+    T.store.jobs = [job(1), ...Array.from({ length: 100 }, (_, i) => ({ ...seed, id: i + 2 })), stopped,
+      ...Array.from({ length: 30 }, (_, i) => job(600 + i, { status: "queued" }))];
+    T.setPageSize(20); T.setPage(0);
+    let qm = T.queueModels();
+    eq(qm.filter(m => m.kind === "job").length, 20, "expanded sections share the row budget");
+    eq(qm.find(m => m.key === "sec:seeding").count, "100", "section counts include off-page torrents");
+    T.toggleSection("seeding");
+    qm = T.queueModels();
+    ok(!qm.some(m => m.kind === "job" && m.rowCls.includes("job-seeding")), "collapsed seeds use no row slots");
+    ok(qm.some(m => m.kind === "job" && m.rowCls.includes("job-waiting")), "waiting jobs surface past a large hidden seed collection");
+    ok(qm.find(m => m.key === "sec:seeding").summary.includes("uploaded"), "collapsed sections retain upload instrumentation");
+    const body = node("tbody");
+    T.reconcileRows(body, qm, fake);
+    const section = body.children.find(n => n.__c && n.__c.toggle && n.__c.toggle.dataset.section === "seeding");
+    eq(section.__c.toggle.attrs["aria-expanded"], "false", "collapsed state is accessible");
+    T.toggleSection("completed"); T.toggleSection("waiting");
+    eq(T.queueModels().filter(m => m.kind === "job").length, 1, "all large sections can fold independently");
+    T.toggleSection("seeding");
+    eq(T.queueModels().filter(m => m.kind === "job").length, 20, "reopening seeds restores pagination");
+    T.collapsedSections.clear();
+
+    const detail = T.detailModel(seed);
+    eq(detail.torPeers, "3", "inspector exposes peer count");
+    eq(detail.torRatio, "0.64", "inspector exposes share ratio");
+    eq(detail.torTime, "1h", "inspector exposes cumulative seeding time");
+    ok(detail.torPolicy.includes("first limit reached"), "the stopping rule is explicit");
+    const panel = node("tbody");
+    T.seedDrafts.set(seed.id, { mode: "limits", ratio: "3.5", hours: "" });
+    T.reconcileRows(panel, [T.detailModel(seed)], fake);
+    const input = panel.children[0].__c.seedRatio;
+    T.reconcileRows(panel, [T.detailModel({ ...seed, uploaded_bytes: 900, ratio: .9 })], fake);
+    ok(panel.children[0].__c.seedRatio === input, "live upload ticks preserve the editor node");
+    eq(input.value, "3.5", "live ticks preserve an unsaved policy edit");
+    eq(T.seedBody(T.seedDraft(seed)).ratio_limit, 3.5, "the edited ratio reaches the wire");
+    eq(T.seedBody({ mode: "stop" }).stop_on_complete, true, "stop after download is explicit, not a zero ratio");
+    let invalid = false;
+    try { T.seedBody({ mode: "limits", ratio: "0", hours: "" }); } catch { invalid = true; }
+    ok(invalid, "zero cannot silently mean stop after download");
+    const query = T.torrentQuery({ stop_seeding_on_complete: true, seed_ratio_limit: 0, seed_time_limit_secs: 0 });
+    ok(query.includes("stop_seeding_on_complete=true"), "raw torrent uploads carry completion policy");
+    eq(T.torrentRequest("magnet:?xt=urn:btih:x", { stop_seeding_on_complete: true }).stop_seeding_on_complete,
+      true, "typed admissions carry completion policy");
+    T.seedDrafts.clear();
+    T.store.jobs = [];
+    T.setPage(0);
+    reset();
+  }
+
   // --- sections: what it is doing, above what is waiting ------------------
   {
     const post = (stage, over) =>
@@ -1603,7 +1679,7 @@ const models = (jobs) => jobs.map((j, i) => T.rowModel(j, { idx: i, count: jobs.
     eq(dm.recoverHidden, false, "a live post-processing job exposes recovery controls");
     const tbody = node("tbody");
     T.reconcileRows(tbody, [dm], fake);
-    const recovery = tbody.children[0].children[0].children[0].children[2];
+    const recovery = tbody.children[0].__c.recovery;
     eq(recovery.hidden, false, "the recovery row is visible while post-processing");
     eq(recovery.children.length, 7, "label plus six safe restart boundaries");
     eq(recovery.children[3].dataset.action, "post-restart-unpack",
@@ -1880,6 +1956,24 @@ const models = (jobs) => jobs.map((j, i) => T.rowModel(j, { idx: i, count: jobs.
     const failure = controls.find(control => control.dataset.path === "post.failure_action");
     ok(!!failure, "the form uses the canonical failure_action field");
     eq(failure?.value, config.post.failure_action, "the form shows the configured failure policy");
+    ok(form.innerHTML.includes('data-settings-view="dev"'), "settings renders a Dev view");
+    const advice = T.enableAdvisory({ torrent: { listen_port: 6881, dht: true, socks_proxy_url: "socks5://localhost:1080" }, cluster: { enabled: true } });
+    ok(advice.includes("unmet"), "incompatible configuration is advisory");
+    ok(advice.includes("unknown"), "unverified runtime readiness is explicit");
+    ok(!advice.includes("disabled"), "readiness never disables an enable switch");
+    for (const [port, state] of [[65534, "met"], [65535, "unmet"]]) {
+      ok(T.enableAdvisory({ torrent: { listen_port: port } }).includes(`<b>${state}</b> · A peer TCP port`),
+        `port ${port} readiness matches configuration validation`);
+    }
+    const generalCard = { dataset: { settingsView: "general" }, hidden: false };
+    const devCard = { dataset: { settingsView: "dev" }, hidden: true };
+    const queryBeforeViews = form.querySelectorAll;
+    form.querySelectorAll = sel => sel === "[data-settings-view]" ? [generalCard, devCard] : [];
+    doc.getElementById("cfg-dev").onclick();
+    ok(generalCard.hidden && !devCard.hidden, "Dev shows feature controls");
+    doc.getElementById("cfg-general").onclick();
+    ok(!generalCard.hidden && devCard.hidden, "General restores normal settings");
+    form.querySelectorAll = queryBeforeViews;
     enable.checked = true;
     const originalQuery = form.querySelectorAll;
     const edited = process.env.NZBD_UI_CONFIG ? controls : controls.filter(control =>

@@ -1,5 +1,14 @@
 # nzbd — Project Status
 
+## Torrent queue lifecycle — 2026-09-20
+
+**Status:** adversarial review approved after fixes. UI boot, 599 DOM
+assertions, formatting, and diff checks pass. Required CI and merge state are
+tracked in [PR #232](https://github.com/pjunod/nzbd/pull/232).
+See [the live work status](docs/TORRENT_QUEUE_STATUS.md) for scope, decisions,
+review findings, validation, and merge progress. Existing queue layout retained;
+seeding and completion gain distinct sections, metrics, and durable controls.
+
 ## Settings form schema repair — 2026-09-20
 
 **Status:** adversarial review approved; final local fast lane passed.

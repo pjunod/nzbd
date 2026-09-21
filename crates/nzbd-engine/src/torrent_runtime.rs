@@ -25,6 +25,7 @@ pub fn normalized_seed_policy(
     time_secs: Option<u64>,
 ) -> nzbd_types::SeedPolicy {
     nzbd_types::SeedPolicy {
+        stop_on_complete: false,
         ratio_limit: ratio.filter(|ratio| ratio.is_finite() && *ratio > 0.0),
         time_limit_secs: time_secs.filter(|seconds| *seconds > 0),
     }
@@ -34,15 +35,28 @@ pub fn normalized_seed_policy(
 /// rate. Exact equality reaches the limit, and an empty selection cannot
 /// manufacture an infinite ratio.
 pub fn seed_policy_reached(torrent: &TorrentRecord) -> bool {
-    let ratio_reached = torrent.seed_policy.ratio_limit.is_some_and(|limit| {
+    seed_policy_stop_reason(torrent).is_some()
+}
+
+pub fn seed_policy_stop_reason(torrent: &TorrentRecord) -> Option<nzbd_types::TorrentStopReason> {
+    use nzbd_types::TorrentStopReason;
+    if torrent.seed_policy.stop_on_complete && torrent.ready_at_unix.is_some() {
+        return Some(TorrentStopReason::DownloadComplete);
+    }
+    if torrent.seed_policy.ratio_limit.is_some_and(|limit| {
         torrent.selected_bytes > 0
             && (torrent.uploaded_bytes as f64) >= (torrent.selected_bytes as f64 * limit)
-    });
-    let time_reached = torrent
+    }) {
+        return Some(TorrentStopReason::RatioLimit);
+    }
+    if torrent
         .seed_policy
         .time_limit_secs
-        .is_some_and(|limit| torrent.seeding_seconds >= limit);
-    ratio_reached || time_reached
+        .is_some_and(|limit| torrent.seeding_seconds >= limit)
+    {
+        return Some(TorrentStopReason::TimeLimit);
+    }
+    None
 }
 
 /// Return whether the unsaved accounting window reached its durable bound.
@@ -493,6 +507,9 @@ pub fn reconcile_fact_with_roots(
                     };
                     torrent.last_error =
                         (reason == StopReason::StorageFull).then(|| STORAGE_FULL_ERROR.to_owned());
+                    if storage_hold {
+                        torrent.stop_reason = Some(nzbd_types::TorrentStopReason::StorageFull);
+                    }
                     job.status = JobStatus::Paused;
                 }
                 StopReason::SchedulerYield => {
@@ -519,6 +536,9 @@ pub fn reconcile_fact_with_roots(
                     }
                 }
                 StopReason::SeedPolicyReached => {
+                    torrent.stop_reason = torrent
+                        .stop_reason
+                        .or_else(|| seed_policy_stop_reason(torrent));
                     torrent.phase = TorrentPhase::PausedSeed;
                     job.status = JobStatus::Paused;
                 }
@@ -533,6 +553,7 @@ pub fn reconcile_fact_with_roots(
             let torrent = job.torrent.as_mut().unwrap();
             torrent.last_error = None;
             if job.status != JobStatus::Paused {
+                torrent.stop_reason = None;
                 // A newly started backend needs a fresh discovery window;
                 // the previous run's idle clock cannot immediately yield it.
                 torrent.last_activity_unix = Some(now_unix);
@@ -710,6 +731,7 @@ mod tests {
                 removal_intent: None,
                 removal_outcome: None,
                 removal_confirmed_at_unix: None,
+                stop_reason: None,
                 files: vec![
                     TorrentFileRecord {
                         path: "one".into(),
@@ -759,9 +781,30 @@ mod tests {
         assert!(!seed_policy_reached(torrent));
         torrent.uploaded_bytes = 150;
         assert!(seed_policy_reached(torrent));
+        assert_eq!(
+            seed_policy_stop_reason(torrent),
+            Some(nzbd_types::TorrentStopReason::RatioLimit)
+        );
         torrent.uploaded_bytes = 0;
         torrent.seeding_seconds = 90;
         assert!(seed_policy_reached(torrent));
+        assert_eq!(
+            seed_policy_stop_reason(torrent),
+            Some(nzbd_types::TorrentStopReason::TimeLimit)
+        );
+        torrent.seed_policy = SeedPolicy {
+            stop_on_complete: true,
+            ..Default::default()
+        };
+        assert!(
+            !seed_policy_reached(torrent),
+            "unverified bytes must not trigger completion policy"
+        );
+        torrent.ready_at_unix = Some(123);
+        assert_eq!(
+            seed_policy_stop_reason(torrent),
+            Some(nzbd_types::TorrentStopReason::DownloadComplete)
+        );
     }
 
     #[test]

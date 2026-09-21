@@ -44,6 +44,41 @@ seeding; their protocol chip, ratio, upload rate, peers, seeding time,
 pause/resume, and keep/delete-payload controls identify the different
 lifecycle.
 
+**Feature enable controls.** Open **Settings → Dev → Enable features** for
+BitTorrent and Usenet clustering. The readiness list updates from your form
+values, marks unmet conditions, and labels disk, port, and cross-node checks
+that still require operator verification. Advisories never disable an enable
+switch. Save and restart to apply enable changes; normal configuration
+validation still rejects unsupported combinations such as torrent and cluster
+execution together. Seeding controls and queue sections have no extra gate.
+
+**Torrent lifecycle.** Ready torrents share in **Seeding** and move to
+**Completed** when seeding stops. An idle seed is still available to peers;
+zero upload speed does not put it back in Waiting. Metadata retrieval and
+piece checking have their own sections. Missing files and errors remain
+visible as failures rather than claiming the payload is ready.
+
+Fold **Seeding**, **Completed**, or **Waiting** using its heading. Your browser
+remembers each choice. Counts cover the entire section, including off-page
+jobs; Seeding keeps its combined upload rate and uploaded bytes visible.
+Collapsed jobs consume no pagination slots, so a large seed collection cannot
+hide downloads or waiting jobs behind pages of folded rows.
+
+Open a torrent's name for files, upload speed and total, share ratio, useful
+peers, cumulative seeding time, completion timestamp, stopping reason, and
+the **After download** editor. Choose category/global defaults, stop after
+download, keep seeding, or a ratio/time limit. The first configured limit
+reached stops seeding. Blank limits mean unlimited; time excludes stopped
+periods. Applying defaults copies the active settings rather than subscribing
+the torrent to future configuration changes.
+
+**Stop seeding** retains files and survives restart. **Start seeding** resumes
+sharing; if a saved stop condition is already met, **seeding options** opens
+the editor so you can change it first. Editing a policy never starts a stopped
+torrent. **Remove torrent** keeps payload files, while **delete data** is the
+separate destructive action. Stop after download still permits uploading
+pieces while downloading; it stops seeding after verification completes.
+
 **Display** in the control row keeps three browser-local choices. **Layout**
 offers Classic, Plex, and Theater; Classic is the exact nzbd layout from before
 the selector and remains the default. Plex moves primary tabs into a pinned
@@ -284,6 +319,8 @@ POST /api/v1/jobs                   add a job (NZB content or URL)
 GET  /api/v1/jobs/{id}
 GET  /api/v1/jobs/{id}/files        per-file segment progress
 GET  /api/v1/jobs/{id}/nzb          the job's NZB, regenerated from queue state
+GET  /api/v1/jobs/{id}/torrent      torrent lifecycle and effective policy
+PUT  /api/v1/jobs/{id}/torrent/seed-policy   edit the effective policy
 POST /api/v1/jobs/{id}/actions/{action}     pause|resume|delete|delete-files|move-*
 POST /api/v1/queue/actions/{action}
 PUT  /api/v1/queue/speed-limit
@@ -297,6 +334,23 @@ GET  /healthz                       liveness (always unauthenticated)
 
 With `[api] password` set, authenticate with HTTP Basic or
 `Authorization: Bearer <token>`.
+
+**Torrent policy.** The policy PUT accepts `stop_on_complete` (boolean),
+`ratio_limit` (positive number or null), and `time_limit_secs` (positive integer
+or null). For example, `{"ratio_limit":2,"time_limit_secs":172800}` stops at
+ratio 2 or 48 hours; `{"stop_on_complete":true}` stops after download.
+`{"use_defaults":true}` copies the active category/global defaults. Invalid
+limits return 422. Zero remains the unlimited spelling at admission and in
+configuration; the policy PUT uses null so it cannot be confused with stopping
+immediately. Native admission accepts `stop_seeding_on_complete` alongside
+`seed_ratio_limit` and `seed_time_limit_secs` in typed JSON or raw-upload query
+parameters. Omitted values inherit defaults.
+
+Queue/SSE rows include `torrent_phase`, `torrent_control_intent`, `seed_policy`,
+`seed_stop_reason`, and `torrent_error`, alongside the existing transfer
+counters. The generic `status` remains unchanged for compatibility. Use the
+torrent fields and `ready` to present the lifecycle, rather than inferring
+seeding from a 100% progress bar.
 
 **Delete and requeue.** `actions/delete` answers
 `{"ok":true,"parked":true|false}`. When `parked` is true the daemon has
