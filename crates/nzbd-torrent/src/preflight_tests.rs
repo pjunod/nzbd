@@ -1578,6 +1578,7 @@ async fn serve_metadata_peer(listener: TcpListener, info: Vec<u8>, info_hash: [u
         .write_all(&peer_extended_message(response_extension_id, &response))
         .await
         .unwrap();
+    tokio::time::sleep(Duration::from_secs(2)).await;
 }
 
 fn dht_transaction_id(packet: &[u8]) -> [u8; 2] {
@@ -1635,8 +1636,12 @@ async fn serve_dht_node(
     let mut saw_get_peers = false;
     let mut saw_announce = false;
     loop {
-        let received =
-            tokio::time::timeout(Duration::from_secs(5), socket.recv_from(&mut packet)).await;
+        let receive_timeout = if saw_get_peers {
+            Duration::from_secs(1)
+        } else {
+            Duration::from_secs(5)
+        };
+        let received = tokio::time::timeout(receive_timeout, socket.recv_from(&mut packet)).await;
         let Ok(Ok((length, source))) = received else {
             break;
         };
@@ -1669,18 +1674,6 @@ async fn serve_dht_node(
             .send_to(&dht_response(transaction, node_id, node, peer), source)
             .await
             .unwrap();
-        if saw_get_peers {
-            break;
-        }
-    }
-
-    if saw_get_peers {
-        let drain = tokio::time::timeout(Duration::from_millis(250), socket.recv_from(&mut packet));
-        if let Ok(Ok((length, _))) = drain.await {
-            saw_announce |= packet[..length]
-                .windows(b"13:announce_peer".len())
-                .any(|window| window == b"13:announce_peer");
-        }
     }
     assert!(saw_get_peers, "DHT fixture never received get_peers");
     saw_announce
