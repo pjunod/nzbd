@@ -10,6 +10,7 @@ publish = false
 
 [features]
 fuzzing = []
+test-support = ["librqbit/test-support"]
 
 [[example]]
 name = "m0_metainfo_pressure_memory"
@@ -31,6 +32,7 @@ url = { workspace = true }
 
 [dev-dependencies]
 anyhow = { workspace = true }
+librqbit = { workspace = true, features = ["test-support"] }
 rcgen = { workspace = true }
 sha1 = "0.10"
 tempfile = { workspace = true }

@@ -182,10 +182,11 @@ async fn magnet_metadata_is_preflighted_before_payload_storage_exists() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn dht_enabled_session_rejects_magnet_before_contacting_an_explicit_peer() {
-    let (_info, info_hash) = private_info();
+async fn dht_enabled_session_rejects_private_metadata_after_resolution() {
+    let (info, info_hash) = private_info();
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
     let peer = listener.local_addr().unwrap();
+    let peer_task = tokio::spawn(metadata_peer(listener, info, info_hash));
 
     let root = tempfile::tempdir().unwrap();
     let session = TorrentSession::start(
@@ -198,7 +199,7 @@ async fn dht_enabled_session_rejects_magnet_before_contacting_an_explicit_peer()
     .await
     .unwrap();
     let magnet = format!(
-        "magnet:?xt=urn:btih:{}&tr=http%3A%2F%2F127.0.0.1%3A9%2Fannounce",
+        "magnet:?xt=urn:btih:{}",
         info_hash
             .iter()
             .map(|byte| format!("{byte:02x}"))
@@ -214,16 +215,42 @@ async fn dht_enabled_session_rejects_magnet_before_contacting_an_explicit_peer()
         )
         .await;
 
+    tokio::time::timeout(Duration::from_secs(5), peer_task)
+        .await
+        .expect("metadata peer did not finish")
+        .expect("metadata peer failed");
     assert!(
-        matches!(result, Err(TorrentError::MagnetWithDht)),
-        "unexpected result from the private-magnet discovery guard"
+        matches!(result, Err(TorrentError::PrivateMetainfoWithDht)),
+        "private metadata must be rejected after the permitted unknown-hash lookup"
     );
-    assert!(
-        tokio::time::timeout(Duration::from_millis(250), listener.accept())
-            .await
-            .is_err(),
-        "magnet rejection must happen before rqbit contacts an explicit peer"
+    assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+
+    session.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn trackerless_magnet_without_dht_or_initial_peers_is_actionable() {
+    let (_info, info_hash) = unsafe_info();
+    let root = tempfile::tempdir().unwrap();
+    let session = TorrentSession::start(root.path().to_path_buf(), TorrentSessionConfig::default())
+        .await
+        .unwrap();
+    let magnet = format!(
+        "magnet:?xt=urn:btih:{}&dn=trackerless",
+        info_hash
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
     );
+
+    let error = match session
+        .add_magnet(magnet, TorrentAddConfig::default())
+        .await
+    {
+        Ok(_) => panic!("trackerless magnet was admitted without a peer source"),
+        Err(error) => error,
+    };
+    assert!(matches!(error, TorrentError::MagnetDiscoveryUnavailable));
     assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
 
     session.stop().await;

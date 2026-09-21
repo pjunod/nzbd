@@ -545,7 +545,37 @@ impl Session {
     #[inline(never)]
     pub fn new_with_opts(
         default_output_folder: PathBuf,
+        opts: SessionOptions,
+    ) -> BoxFuture<'static, anyhow::Result<Arc<Self>>> {
+        Self::new_with_opts_and_dht_bootstrap(default_output_folder, opts, None)
+    }
+
+    /// Construct a session with deterministic DHT bootstrap nodes for
+    /// downstream loopback tests. This is deliberately absent unless the
+    /// `test-support` feature is enabled.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn new_with_opts_for_test(
+        default_output_folder: PathBuf,
+        opts: SessionOptions,
+        dht_bootstrap_addrs: Vec<SocketAddr>,
+    ) -> BoxFuture<'static, anyhow::Result<Arc<Self>>> {
+        Self::new_with_opts_and_dht_bootstrap(
+            default_output_folder,
+            opts,
+            Some(
+                dht_bootstrap_addrs
+                    .into_iter()
+                    .map(|address| address.to_string())
+                    .collect(),
+            ),
+        )
+    }
+
+    fn new_with_opts_and_dht_bootstrap(
+        default_output_folder: PathBuf,
         mut opts: SessionOptions,
+        dht_bootstrap_addrs: Option<Vec<String>>,
     ) -> BoxFuture<'static, anyhow::Result<Arc<Self>>> {
         async move {
             let peer_id = opts
@@ -574,6 +604,7 @@ impl Session {
             } else {
                 let dht = if opts.disable_dht_persistence {
                     DhtBuilder::with_config(DhtConfig {
+                        bootstrap_addrs: dht_bootstrap_addrs,
                         cancellation_token: Some(token.child_token()),
                         ..Default::default()
                     })
