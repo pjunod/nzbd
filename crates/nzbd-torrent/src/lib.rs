@@ -6,6 +6,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod identity;
 mod source_fetch;
 
 #[cfg(test)]
@@ -1343,8 +1344,11 @@ fn session_options(
         // construction must admit nothing until the queue owner explicitly
         // restores its authoritative jobs.
         disable_auto_restore: true,
-        peer_id: None,
+        // One Runner identity per engine session: a BEP 20 peer ID, a
+        // matching HTTP User-Agent, and (in the peer options) the BEP 10 `v`.
+        peer_id: Some(identity::generate_peer_id()),
         peer_opts: Some(explicit_peer_connection_options(metainfo_max_bytes)),
+        http_user_agent: Some(identity::CLIENT_USER_AGENT.to_owned()),
         known_peer_limit: Some(max_known_peers_per_torrent.unwrap_or(MAX_KNOWN_PEERS_PER_TORRENT)),
         known_peer_limit_total: Some(max_known_peers_total.unwrap_or(MAX_KNOWN_PEERS_TOTAL)),
         defer_writes_up_to: None,
@@ -1371,6 +1375,7 @@ fn explicit_peer_connection_options(metainfo_max_bytes: Option<u32>) -> PeerConn
         read_write_timeout: Some(PEER_READ_WRITE_TIMEOUT),
         keep_alive_interval: Some(PEER_KEEP_ALIVE_INTERVAL),
         max_metadata_size: Some(metainfo_max_bytes.unwrap_or(DEFAULT_MAX_METAINFO_BYTES as u32)),
+        client_version: Some(identity::CLIENT_HANDSHAKE_VERSION),
     }
 }
 
@@ -2514,7 +2519,12 @@ mod tests {
         assert!(!options.fastresume);
         assert!(options.persistence.is_none());
         assert!(options.disable_auto_restore);
-        assert!(options.peer_id.is_none());
+        let peer_id = options.peer_id.expect("peer ID must identify Runner");
+        assert_eq!(peer_id.0[..8], identity::peer_id_prefix());
+        assert_eq!(
+            options.http_user_agent.as_deref(),
+            Some(identity::CLIENT_USER_AGENT)
+        );
         let peer_options = options.peer_opts.expect("peer policy must be explicit");
         assert_eq!(peer_options.connect_timeout, Some(PEER_CONNECT_TIMEOUT));
         assert_eq!(
@@ -2528,6 +2538,10 @@ mod tests {
         assert_eq!(
             peer_options.max_metadata_size,
             Some(DEFAULT_MAX_METAINFO_BYTES as u32)
+        );
+        assert_eq!(
+            peer_options.client_version,
+            Some(identity::CLIENT_HANDSHAKE_VERSION)
         );
         assert!(options.listen_port_range.is_none());
         assert!(!options.enable_upnp_port_forwarding);

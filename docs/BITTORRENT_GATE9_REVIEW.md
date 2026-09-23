@@ -4,7 +4,7 @@
 refreshed native measurements pass; independent review complete ·
 **Date:** 2026-08-07 · **Disposition and amendment recorded:** 2026-08-14 ·
 **Accepted:** 2026-08-14 · **Status reconciled:** 2026-08-22 ·
-**Engine:** rqbit v8.1.1 archive plus the ordered eleven-patch maintained series ·
+**Engine:** rqbit v8.1.1 archive plus the ordered twelve-patch maintained series ·
 **Decision owner:** ADR-19 in
 [BITTORRENT_PROPOSAL.md](BITTORRENT_PROPOSAL.md)
 
@@ -33,6 +33,23 @@ resource budget. The prior measurements remain historical evidence. The
 amended eleven-patch derivation, vendor drift check, focused upstream suites,
 release-mode DHT dispatch proof, and complete upstream workspace check passed
 locally on 2026-09-20; PR CI is the publication record for that evidence.
+
+The 2026-09-22 amendment adds patch `0021`. It adds two embedder options (the
+session HTTP `User-Agent` and the BEP 10 `v` string) and changes tracker
+announce content and timing. Each torrent's tracker session polls its own
+statistics every 5 s until the download is complete, then every 30 s (the
+statistics provider now caches the torrent handle instead of scanning the
+session). `completed` goes out once, promptly after a successful announce;
+failed announces back off from 60 s to 30 minutes instead of retrying every
+minute. When a tracker session ends, one `stopped` per tracker that was sent
+`started` is spawned, bounded to 2 s; a restarted torrent waits for it before
+its next `started`, and `Session::stop` waits up to 3 s for these before
+cancelling the session's network tasks. Magnet peer lookups send no events.
+It adds no dependency, feature, listener, or discovery source. Under the
+renewal rule the twelve-patch derivation, vendor drift check, focused upstream
+suites (including the new tracker lifecycle, backoff, UDP and identity
+proofs), release-mode DHT dispatch proof, and upstream workspace check passed
+locally on 2026-09-22; PR CI is the publication record.
 
 No production BitTorrent path is enabled by this review or by its recorded
 disposition. Gate 8 uses the maintained selective-restore option. Gate 7

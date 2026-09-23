@@ -1,5 +1,46 @@
 # nzbd — Project Status
 
+## Torrent client identity and tracker compliance — 2026-09-22
+
+**Status:** implemented and adversarially reviewed; findings fixed. Local
+gates on the final tree: full rqbit series proof, `make fast-check`, and one
+full `cargo test --workspace --no-fail-fast` (permission-based tests that
+root bypasses re-run green as an unprivileged user; one pre-existing
+`local_swarm` pause race fixed). Branch `claude/runner-tracker-identity`;
+the PR records CI and merge.
+
+Trackers used to see stable rqbit 8.1.1 (`-rQ8110-`, no HTTP User-Agent,
+`v = rqbit 8.1.1`). A review of what those announces contained found protocol
+defects that cost private-tracker users ratio or credibility:
+
+- a passkey carried in the announce URL's query was replaced by the announce
+  parameters, so query-passkey trackers never saw it;
+- HTTP trackers never received `completed` or `stopped`; UDP trackers got
+  `started` on every announce while downloading and `completed` on every
+  announce while seeding;
+- `downloaded` was verified progress, so data already on disk was charged
+  as downloaded again on every start;
+- no `key`, and the response's `tracker id` was never parsed (wrong
+  dictionary key) or echoed.
+
+Fix: maintained patch `0021` (twelfth in the series) adds embedder-set
+User-Agent and BEP 10 `v` and a shared HTTP/UDP announce lifecycle; nzbd
+reports Runner everywhere (`nzbd_torrent::identity`, BEP 20 prefix `-RN`).
+Adversarial review found four defects in the first cut, all fixed: a
+rejected `completed` was retried every 5 s; magnet lookups produced spurious
+seeder-looking `started`/`stopped` pairs; UDP `stopped` died with the session
+on shutdown; and per-tracker 5 s polls scanned every torrent. Now: backoff
+60 s → 30 min, lookups send no events, `Session::stop` waits (≤3 s) for
+`stopped`, a restart's `started` waits for the previous `stopped`, one cheap
+poll per torrent, and logged tracker URLs are reduced to scheme/host/port.
+Proofs: 11 new tracker-comms tests (lifecycle, backoff, passkey query, key,
+tracker id, early `completed`, `stopped` on drop, restart ordering, UDP
+parity, no-event lookups, log redaction), 4 new librqbit tests (User-Agent,
+`v`, session-relative `downloaded`), 4 identity unit tests, and one
+end-to-end private-swarm test asserting everything a tracker and a remote
+peer observe, including the shutdown `stopped`.
+Docs: CONFIGURATION `[torrent]` client identity; ADR-19 amendment item 12.
+
 ## Torrent queue lifecycle — 2026-09-20
 
 **Status:** adversarial review approved after fixes. UI boot, 599 DOM

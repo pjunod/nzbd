@@ -10,12 +10,10 @@ use std::{
 
 use librqbit_core::hash_id::Id20;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TrackerRequestEvent {
     Started,
-    #[allow(dead_code)]
     Stopped,
-    #[allow(dead_code)]
     Completed,
 }
 
@@ -33,7 +31,7 @@ pub struct TrackerRequest {
     pub ip: Option<std::net::IpAddr>,
     pub numwant: Option<usize>,
     pub key: Option<String>,
-    pub trackerid: Option<String>,
+    pub trackerid: Option<Vec<u8>>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -158,7 +156,7 @@ pub struct TrackerResponse<'a> {
     #[allow(dead_code)]
     #[serde(rename = "min interval")]
     pub min_interval: Option<u64>,
-    #[allow(dead_code)]
+    #[serde(rename = "tracker id", borrow)]
     pub tracker_id: Option<ByteBuf<'a>>,
     #[allow(dead_code)]
     pub incomplete: u64,
@@ -198,10 +196,12 @@ impl TrackerRequest {
             write!(s, "&numwant={numwant}").unwrap();
         }
         if let Some(key) = &self.key {
-            write!(s, "&key={key}").unwrap();
+            s.push_str("&key=");
+            s.push_str(u::encode(key).as_ref());
         }
         if let Some(trackerid) = &self.trackerid {
-            write!(s, "&trackerid={trackerid}").unwrap();
+            s.push_str("&trackerid=");
+            s.push_str(u::encode_binary(trackerid).as_ref());
         }
         s
     }

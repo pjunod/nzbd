@@ -68,6 +68,10 @@ pub const SUPPORTED_SCHEMES: [&str; 3] = ["http:", "https:", "magnet:"];
 
 pub type TorrentId = usize;
 
+/// Upper bound on how long `Session::stop` waits for tracker sessions to end
+/// and their `stopped` announces (each bounded to 2 s) to finish.
+const TRACKER_SHUTDOWN_GRACE: Duration = Duration::from_secs(3);
+
 /// Marker attached to errors produced after a peer supplied hash-valid but
 /// structurally unusable magnet metadata.
 #[derive(Debug)]
@@ -125,6 +129,7 @@ pub struct Session {
     pub(crate) connector: Arc<StreamConnector>,
     reqwest_client: reqwest::Client,
     udp_tracker_client: UdpTrackerClient,
+    tracker_lifecycle: tracker_comms::TrackerLifecycleRegistry,
 
     // Lifecycle management
     cancellation_token: CancellationToken,
@@ -437,6 +442,10 @@ pub struct SessionOptions {
     /// Configure default peer connection options. Can be overriden per torrent.
     pub peer_opts: Option<PeerConnectionOptions>,
 
+    /// HTTP `User-Agent` sent with tracker announces and every other request
+    /// made by the session's HTTP client. None sends no User-Agent header.
+    pub http_user_agent: Option<String>,
+
     /// Default maximum retained known-peer records per torrent. None preserves
     /// the existing unlimited behavior.
     pub known_peer_limit: Option<usize>,
@@ -699,17 +708,10 @@ impl Session {
                 None => None,
             };
 
-            let reqwest_client = {
-                let builder = if let Some(proxy_url) = opts.socks_proxy_url.as_ref() {
-                    let proxy = reqwest::Proxy::all(proxy_url)
-                        .context("error creating socks5 proxy for HTTP")?;
-                    reqwest::Client::builder().proxy(proxy)
-                } else {
-                    reqwest::Client::builder()
-                };
-
-                builder.build().context("error building HTTP(S) client")?
-            };
+            let reqwest_client = session_http_client(
+                opts.socks_proxy_url.as_deref(),
+                opts.http_user_agent.as_deref(),
+            )?;
 
             let stream_connector = Arc::new(StreamConnector::from(proxy_config));
 
@@ -749,6 +751,7 @@ impl Session {
                     opts.concurrent_init_limit.unwrap_or(3),
                 )),
                 udp_tracker_client,
+                tracker_lifecycle: Default::default(),
                 ratelimits: Limits::new(opts.ratelimits),
                 peer_limit: opts.peer_limit,
                 peer_semaphore_total: opts
@@ -960,6 +963,7 @@ impl Session {
                 .keep_alive_interval
                 .or(self.peer_opts.keep_alive_interval),
             max_metadata_size: other.max_metadata_size.or(self.peer_opts.max_metadata_size),
+            client_version: other.client_version.or(self.peer_opts.client_version),
         }
     }
 
@@ -991,6 +995,12 @@ impl Session {
                 debug!("error pausing torrent: {e:#}");
             }
         }
+        // Pausing ends each torrent's tracker session; let the final
+        // `stopped` announces go out before the UDP tracker client and the
+        // rest of the session's network tasks are cancelled.
+        self.tracker_lifecycle
+            .wait_for_stopped_announces(TRACKER_SHUTDOWN_GRACE)
+            .await;
         self.cancellation_token.cancel();
         // this sucks, but hopefully will be enough
         tokio::time::sleep(Duration::from_secs(1)).await;
@@ -1271,6 +1281,7 @@ impl Session {
                     force_tracker_interval: opts.force_tracker_interval,
                     peer_connect_timeout: peer_opts.connect_timeout,
                     peer_read_write_timeout: peer_opts.read_write_timeout,
+                    peer_client_version: peer_opts.client_version,
                     allow_overwrite: opts.overwrite,
                     output_folder,
                     disk_write_queue: self.disk_write_tx.clone(),
@@ -1471,7 +1482,8 @@ impl Session {
 
         let tracker_rx_stats = PeerRxTorrentInfo {
             info_hash,
-            session: self.clone(),
+            session: Arc::downgrade(self),
+            torrent: Default::default(),
         };
         let tracker_rx = TrackerComms::start(
             info_hash,
@@ -1482,6 +1494,9 @@ impl Session {
             announce_port,
             self.reqwest_client.clone(),
             self.udp_tracker_client.clone(),
+            // Only a torrent's own announcing stream is a tracker session;
+            // a peer lookup (paused or list-only add) sends no events.
+            announce.then(|| self.tracker_lifecycle.clone()),
         );
 
         let initial_peers_rx = if initial_peers.is_empty() {
@@ -1621,19 +1636,33 @@ fn remove_files_and_dirs(infos: &FileInfos, files: &dyn TorrentStorage) {
 // Ad adapter for converting stats into the format that tracker_comms accepts.
 struct PeerRxTorrentInfo {
     info_hash: Id20,
-    session: Arc<Session>,
+    session: std::sync::Weak<Session>,
+    /// Found once, then read directly: tracker sessions poll statistics.
+    torrent: parking_lot::Mutex<std::sync::Weak<ManagedTorrent>>,
 }
 
 impl tracker_comms::TorrentStatsProvider for PeerRxTorrentInfo {
     fn get(&self) -> tracker_comms::TrackerCommsStats {
-        let mt = self.session.with_torrents(|torrents| {
-            for (_, mt) in torrents {
-                if mt.info_hash() == self.info_hash {
-                    return Some(mt.clone());
+        let cached = self.torrent.lock().upgrade();
+        let mt = match cached {
+            Some(mt) => Some(mt),
+            None => {
+                let found = self.session.upgrade().and_then(|session| {
+                    session.with_torrents(|torrents| {
+                        for (_, mt) in torrents {
+                            if mt.info_hash() == self.info_hash {
+                                return Some(mt.clone());
+                            }
+                        }
+                        None
+                    })
+                });
+                if let Some(mt) = &found {
+                    *self.torrent.lock() = Arc::downgrade(mt);
                 }
+                found
             }
-            None
-        });
+        };
         let mt = match mt {
             Some(mt) => mt,
             None => {
@@ -1641,22 +1670,143 @@ impl tracker_comms::TorrentStatsProvider for PeerRxTorrentInfo {
                 return Default::default();
             }
         };
-        let stats = mt.stats();
+        tracker_stats(&mt.stats())
+    }
+}
 
-        use crate::torrent_state::stats::TorrentStatsState as TS;
-        use tracker_comms::TrackerCommsStatsState as S;
+/// The session's HTTP client, used for tracker announces and blocklists.
+fn session_http_client(
+    socks_proxy_url: Option<&str>,
+    user_agent: Option<&str>,
+) -> anyhow::Result<reqwest::Client> {
+    let builder = if let Some(proxy_url) = socks_proxy_url {
+        let proxy =
+            reqwest::Proxy::all(proxy_url).context("error creating socks5 proxy for HTTP")?;
+        reqwest::Client::builder().proxy(proxy)
+    } else {
+        reqwest::Client::builder()
+    };
 
-        tracker_comms::TrackerCommsStats {
-            downloaded_bytes: stats.progress_bytes,
-            total_bytes: stats.total_bytes,
-            uploaded_bytes: stats.uploaded_bytes,
-            torrent_state: match stats.state {
-                TS::Initializing => S::Initializing,
-                TS::Live => S::Live,
-                TS::Paused => S::Paused,
-                TS::Error => S::None,
-            },
-        }
+    let builder = match user_agent {
+        Some(user_agent) => builder.user_agent(user_agent),
+        None => builder,
+    };
+
+    builder.build().context("error building HTTP(S) client")
+}
+
+/// Convert engine statistics into the totals a tracker announce reports.
+fn tracker_stats(stats: &crate::TorrentStats) -> tracker_comms::TrackerCommsStats {
+    use crate::torrent_state::stats::TorrentStatsState as TS;
+    use tracker_comms::TrackerCommsStatsState as S;
+
+    tracker_comms::TrackerCommsStats {
+        // Trackers account `downloaded` as payload fetched since the
+        // `started` announce. Verified progress would also count data that
+        // was already on disk, charging it to the user again.
+        downloaded_bytes: stats
+            .live
+            .as_ref()
+            .map(|live| live.snapshot.fetched_bytes)
+            .unwrap_or_default(),
+        total_bytes: stats.total_bytes,
+        left_bytes: stats.total_bytes.saturating_sub(stats.progress_bytes),
+        uploaded_bytes: stats.uploaded_bytes,
+        torrent_state: match stats.state {
+            TS::Initializing => S::Initializing,
+            TS::Live => S::Live,
+            TS::Paused => S::Paused,
+            TS::Error => S::None,
+        },
+    }
+}
+
+#[cfg(test)]
+mod client_identity_tests {
+    use super::{session_http_client, tracker_stats};
+    use crate::torrent_state::live::stats::snapshot::StatsSnapshot;
+    use crate::torrent_state::stats::{LiveStats, Speed};
+    use crate::{TorrentStats, TorrentStatsState};
+    use std::io::{Read, Write};
+
+    #[test]
+    fn tracker_downloaded_counts_fetched_payload_not_existing_data() {
+        let stats = TorrentStats {
+            state: TorrentStatsState::Live,
+            file_progress: Vec::new(),
+            error: None,
+            progress_bytes: 900,
+            uploaded_bytes: 70,
+            total_bytes: 1000,
+            finished: false,
+            live: Some(LiveStats {
+                snapshot: StatsSnapshot {
+                    fetched_bytes: 120,
+                    ..Default::default()
+                },
+                average_piece_download_time: None,
+                download_speed: Speed::default(),
+                upload_speed: Speed::default(),
+                time_remaining: None,
+            }),
+        };
+        let tracker = tracker_stats(&stats);
+        assert_eq!(tracker.downloaded_bytes, 120);
+        assert_eq!(tracker.uploaded_bytes, 70);
+        assert_eq!(tracker.get_left_to_download_bytes(), 100);
+        assert!(!tracker.is_completed());
+
+        let paused = TorrentStats {
+            state: TorrentStatsState::Paused,
+            live: None,
+            progress_bytes: 1000,
+            ..stats
+        };
+        let tracker = tracker_stats(&paused);
+        assert_eq!(tracker.downloaded_bytes, 0);
+        assert_eq!(tracker.get_left_to_download_bytes(), 0);
+    }
+
+    #[tokio::test]
+    async fn session_http_client_sends_the_configured_user_agent() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let mut heads = Vec::new();
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut head = Vec::new();
+                let mut byte = [0u8; 1];
+                while !head.ends_with(b"\r\n\r\n") && stream.read(&mut byte).unwrap() == 1 {
+                    head.push(byte[0]);
+                }
+                stream
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                    .unwrap();
+                heads.push(String::from_utf8(head).unwrap().to_ascii_lowercase());
+            }
+            heads
+        });
+        let url = format!("http://{address}/announce");
+        session_http_client(None, Some("Runner/0.2.0"))
+            .unwrap()
+            .get(&url)
+            .send()
+            .await
+            .unwrap();
+        session_http_client(None, None)
+            .unwrap()
+            .get(&url)
+            .send()
+            .await
+            .unwrap();
+        let heads = server.join().unwrap();
+        assert!(
+            heads[0].contains("\r\nuser-agent: runner/0.2.0\r\n"),
+            "{}",
+            heads[0]
+        );
+        assert!(!heads[1].contains("user-agent"), "{}", heads[1]);
     }
 }
 

@@ -159,6 +159,7 @@ fn source_client_builder(
     tls_config: ClientConfig,
 ) -> reqwest::ClientBuilder {
     Client::builder()
+        .user_agent(crate::identity::CLIENT_USER_AGENT)
         .no_proxy()
         .use_preconfigured_tls(tls_config)
         .redirect(reqwest::redirect::Policy::none())

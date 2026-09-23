@@ -496,6 +496,7 @@ async fn async_main(opts: Opts, cancel: CancellationToken) -> anyhow::Result<()>
             read_write_timeout: Some(opts.peer_read_write_timeout),
             ..Default::default()
         }),
+        http_user_agent: None,
         known_peer_limit: None,
         known_peer_limit_total: None,
         listen_port_range: if !opts.disable_tcp_listen {
