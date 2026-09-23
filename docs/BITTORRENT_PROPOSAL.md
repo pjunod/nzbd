@@ -3,7 +3,7 @@
 **Status:** ADR-19 implemented for single-node v1; M2 lifecycle/policy/activation,
 M3 native surfaces, and M4 qBittorrent compatibility are implemented; the
 magnet DHT amendment is locally qualified and awaits PR publication ·
-**Decision:** pin the reproducibly derived eleven-patch rqbit v8.1.1 engine;
+**Decision:** pin the reproducibly derived twelve-patch rqbit v8.1.1 engine;
 complete single-node M2–M5 before separately approving M6 ·
 **Written:** 2026-08-05 · **Revised:** 2026-09-20 ·
 **Verified against:** rqbit v8.1.1 (`00b97485160ff5b5aa2b379ea0815d568ec665f0`) ·
@@ -46,6 +46,8 @@ until ADR-19 was amended with a maintained fix or a different engine. The
 rqbit v8.1.1 vendor from the immutable release archive plus a small ordered
 patch series. The 2026-09-20 magnet amendment adds the eleventh patch: a
 feature-gated loopback-test constructor, not an operator bootstrap setting.
+The 2026-09-22 tracker-compliance amendment adds the twelfth: Runner's client
+identity and a BEP 3/15-conformant announce lifecycle (§4.3.3 item 12).
 This is an explicit dependency boundary, not permission to wire another
 daemon session.
 
@@ -553,7 +555,7 @@ and [public torrent statistics](https://docs.rs/librqbit/8.1.1/librqbit/struct.T
 #### 4.3.3 Maintained-engine amendment — selected 2026-08-14
 
 This amendment supersedes the release-only conclusions in §§4.3.1–4.3.2.
-ADR-19 selects rqbit v8.1.1 plus exactly these eleven stable patches:
+ADR-19 selects rqbit v8.1.1 plus exactly these twelve stable patches:
 
 1. disable automatic restore while retaining explicit restore;
 2. bound tracker response size, request duration, and announce cadence;
@@ -567,7 +569,17 @@ ADR-19 selects rqbit v8.1.1 plus exactly these eleven stable patches:
 10. make the session PEX toggle authoritative for inbound and outgoing PEX;
     and
 11. expose a feature-gated, test-only DHT bootstrap constructor so loopback
-    discovery tests never depend on public bootstrap hosts.
+    discovery tests never depend on public bootstrap hosts; and
+12. let nzbd present one client identity (tracker `User-Agent`, BEP 10 `v`,
+    with the BEP 20 peer ID it already controls) and announce the way private
+    trackers account for ratio: the tracker URL's own query survives, `key`
+    is stable per tracker session, `tracker id` is echoed, `downloaded`
+    counts only payload fetched in the session, `completed` goes out once
+    when an incomplete download finishes, and `stopped` is sent best-effort
+    when the tracker session ends. Stable 8.1.1 dropped query-string
+    passkeys, never sent `completed`/`stopped` over HTTP, repeated
+    `started`/`completed` on every UDP announce, and reported
+    already-present data as downloaded.
 
 The machine-readable order is
 [`contrib/rqbit/maintained-series.txt`](../contrib/rqbit/maintained-series.txt).
@@ -2794,7 +2806,7 @@ both review passes as follows:
 
 | Decision | Disposition |
 |---|---|
-| Engine | Pin the exact rqbit v8.1.1 archive plus the ordered eleven-patch maintained series, generated vendor, and integrity CI. Evaluate `libtorrent-rasterbar` only if that bounded maintenance model cannot pass M0. |
+| Engine | Pin the exact rqbit v8.1.1 archive plus the ordered twelve-patch maintained series, generated vendor, and integrity CI. Evaluate `libtorrent-rasterbar` only if that bounded maintenance model cannot pass M0. |
 | Transport | Accept TCP/IPv4-only for the first release; uTP and IPv6 wait for a stable 9.x line and repeatable resume/interop proof. |
 | Torrent format | Accept v1 `.torrent`/`btih` magnets only; the M0 adapter rejects v2-only and hybrid metainfo/magnets with distinct named errors. |
 | Queue schema | Version 2 is the torrent-free envelope; M1b writes version 3 with the torrent variant and defaulted record; M2 writes version 4 for protected pending admissions, with schema-3 migration and exact old-reader rejection. |

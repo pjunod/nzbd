@@ -93,6 +93,18 @@ container firewall. The Developer settings tab shows these prerequisites and
 their current form-derived state as advice; it never disables the operator's
 explicit enable control.
 
+**Client identity.** Trackers and peers see Runner, never the embedded
+engine: peer ID prefix `-RN<major><minor><patch>0-` (`-RN0200-` for 0.2.0,
+twelve random bytes after it, new each daemon start), HTTP `User-Agent:
+Runner/<version>` on tracker announces and `.torrent` downloads, and
+`Runner <version>` in the BEP 10 handshake. Announces follow BEP 3/15:
+passkeys in the announce URL's query are kept, `key` is stable per tracker
+session, `tracker id` is echoed, `downloaded` counts only payload fetched
+since `started`, `completed` is sent once within about five seconds of a
+download finishing, and pausing or removing a torrent sends one best-effort
+`stopped`. Private trackers that allow only listed clients will not know
+`RN` until Runner is added to their allowlist.
+
 Sonarr and Radarr can use nzbd as a qBittorrent client at the normal nzbd API
 URL. Use the existing nzbd username/password, or put `[api].token` in the
 client's API-key field. The compatibility surface reports Web API `2.8.1` and

@@ -1,5 +1,34 @@
 # nzbd — Project Status
 
+## Torrent client identity and tracker compliance — 2026-09-22
+
+**Status:** implemented; full rqbit series proof and the fast lane pass
+locally. PR, review, and CI state are tracked in the PR linked from this branch
+(`claude/runner-tracker-identity`).
+
+Trackers used to see stable rqbit 8.1.1 (`-rQ8110-`, no HTTP User-Agent,
+`v = rqbit 8.1.1`). A review of what those announces contained found protocol
+defects that cost private-tracker users ratio or credibility:
+
+- a passkey carried in the announce URL's query was replaced by the announce
+  parameters, so query-passkey trackers never saw it;
+- HTTP trackers never received `completed` or `stopped`; UDP trackers got
+  `started` on every announce while downloading and `completed` on every
+  announce while seeding;
+- `downloaded` was verified progress, so data already on disk was charged
+  as downloaded again on every start;
+- no `key`, and the response's `tracker id` was never parsed (wrong
+  dictionary key) or echoed.
+
+Fix: maintained patch `0021` (twelfth in the series) adds embedder-set
+User-Agent and BEP 10 `v` and a shared HTTP/UDP announce lifecycle; nzbd
+reports Runner everywhere (`nzbd_torrent::identity`, BEP 20 prefix `-RN`).
+Proofs: 7 new tracker-comms tests (lifecycle, passkey query, key, tracker id,
+early `completed`, `stopped` on drop), 4 new librqbit tests (User-Agent, `v`,
+session-relative `downloaded`), 4 identity unit tests, and one end-to-end
+private-swarm test asserting everything a tracker and a remote peer observe.
+Docs: CONFIGURATION `[torrent]` client identity; ADR-19 amendment item 12.
+
 ## Torrent queue lifecycle — 2026-09-20
 
 **Status:** adversarial review approved after fixes. UI boot, 599 DOM

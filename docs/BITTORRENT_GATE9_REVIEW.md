@@ -4,7 +4,7 @@
 refreshed native measurements pass; independent review complete ·
 **Date:** 2026-08-07 · **Disposition and amendment recorded:** 2026-08-14 ·
 **Accepted:** 2026-08-14 · **Status reconciled:** 2026-08-22 ·
-**Engine:** rqbit v8.1.1 archive plus the ordered eleven-patch maintained series ·
+**Engine:** rqbit v8.1.1 archive plus the ordered twelve-patch maintained series ·
 **Decision owner:** ADR-19 in
 [BITTORRENT_PROPOSAL.md](BITTORRENT_PROPOSAL.md)
 
@@ -33,6 +33,20 @@ resource budget. The prior measurements remain historical evidence. The
 amended eleven-patch derivation, vendor drift check, focused upstream suites,
 release-mode DHT dispatch proof, and complete upstream workspace check passed
 locally on 2026-09-20; PR CI is the publication record for that evidence.
+
+The 2026-09-22 amendment adds patch `0021`. It adds two embedder options (the
+session HTTP `User-Agent` and the BEP 10 `v` string) and changes tracker
+announce content and timing: `completed` is sent once when a download that was
+incomplete in the session finishes (detected by a five-second statistics poll
+while the announce loop sleeps), and one bounded `stopped` announce (five
+seconds, only to trackers that accepted `started`) is spawned when a torrent's
+tracker session ends. It adds no dependency, feature, listener, or discovery
+source; the extra traffic is at most one `completed` and one `stopped` per
+tracker per torrent session. Under the renewal rule the twelve-patch
+derivation, vendor drift check, focused upstream suites (including the new
+tracker lifecycle and identity proofs), release-mode DHT dispatch proof, and
+upstream workspace check passed locally on 2026-09-22; PR CI is the
+publication record.
 
 No production BitTorrent path is enabled by this review or by its recorded
 disposition. Gate 8 uses the maintained selective-restore option. Gate 7
