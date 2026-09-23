@@ -86,7 +86,14 @@ async fn downloader(
     };
     if prove_live_rate_change {
         tokio::time::timeout(Duration::from_secs(5), async {
-            while handle.stats().progress_bytes == 0 {
+            // Initializing also reports progress (bytes checked so far), and
+            // an initializing torrent cannot be paused: wait for verified
+            // progress on a live download.
+            loop {
+                let stats = handle.stats();
+                if stats.phase == TorrentPhase::Live && stats.progress_bytes > 0 {
+                    break;
+                }
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
         })
