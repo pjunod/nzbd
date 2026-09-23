@@ -101,8 +101,9 @@ Runner/<version>` on tracker announces and `.torrent` downloads, and
 passkeys in the announce URL's query are kept, `key` is stable per tracker
 session, `tracker id` is echoed, `downloaded` counts only payload fetched
 since `started`, `completed` is sent once within about five seconds of a
-download finishing, and pausing or removing a torrent sends one best-effort
-`stopped`. Private trackers that allow only listed clients will not know
+download finishing, failed announces back off from one minute to thirty, and
+pausing, removing, or shutting down sends one `stopped` (best effort, at most
+two seconds; shutdown waits up to three). Private trackers that allow only listed clients will not know
 `RN` until Runner is added to their allowlist.
 
 Sonarr and Radarr can use nzbd as a qBittorrent client at the normal nzbd API

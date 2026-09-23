@@ -68,6 +68,10 @@ pub const SUPPORTED_SCHEMES: [&str; 3] = ["http:", "https:", "magnet:"];
 
 pub type TorrentId = usize;
 
+/// Upper bound on how long `Session::stop` waits for tracker sessions to end
+/// and their `stopped` announces (each bounded to 2 s) to finish.
+const TRACKER_SHUTDOWN_GRACE: Duration = Duration::from_secs(3);
+
 /// Marker attached to errors produced after a peer supplied hash-valid but
 /// structurally unusable magnet metadata.
 #[derive(Debug)]
@@ -125,6 +129,7 @@ pub struct Session {
     pub(crate) connector: Arc<StreamConnector>,
     reqwest_client: reqwest::Client,
     udp_tracker_client: UdpTrackerClient,
+    tracker_lifecycle: tracker_comms::TrackerLifecycleRegistry,
 
     // Lifecycle management
     cancellation_token: CancellationToken,
@@ -746,6 +751,7 @@ impl Session {
                     opts.concurrent_init_limit.unwrap_or(3),
                 )),
                 udp_tracker_client,
+                tracker_lifecycle: Default::default(),
                 ratelimits: Limits::new(opts.ratelimits),
                 peer_limit: opts.peer_limit,
                 peer_semaphore_total: opts
@@ -989,6 +995,12 @@ impl Session {
                 debug!("error pausing torrent: {e:#}");
             }
         }
+        // Pausing ends each torrent's tracker session; let the final
+        // `stopped` announces go out before the UDP tracker client and the
+        // rest of the session's network tasks are cancelled.
+        self.tracker_lifecycle
+            .wait_for_stopped_announces(TRACKER_SHUTDOWN_GRACE)
+            .await;
         self.cancellation_token.cancel();
         // this sucks, but hopefully will be enough
         tokio::time::sleep(Duration::from_secs(1)).await;
@@ -1470,7 +1482,8 @@ impl Session {
 
         let tracker_rx_stats = PeerRxTorrentInfo {
             info_hash,
-            session: self.clone(),
+            session: Arc::downgrade(self),
+            torrent: Default::default(),
         };
         let tracker_rx = TrackerComms::start(
             info_hash,
@@ -1481,6 +1494,9 @@ impl Session {
             announce_port,
             self.reqwest_client.clone(),
             self.udp_tracker_client.clone(),
+            // Only a torrent's own announcing stream is a tracker session;
+            // a peer lookup (paused or list-only add) sends no events.
+            announce.then(|| self.tracker_lifecycle.clone()),
         );
 
         let initial_peers_rx = if initial_peers.is_empty() {
@@ -1620,19 +1636,33 @@ fn remove_files_and_dirs(infos: &FileInfos, files: &dyn TorrentStorage) {
 // Ad adapter for converting stats into the format that tracker_comms accepts.
 struct PeerRxTorrentInfo {
     info_hash: Id20,
-    session: Arc<Session>,
+    session: std::sync::Weak<Session>,
+    /// Found once, then read directly: tracker sessions poll statistics.
+    torrent: parking_lot::Mutex<std::sync::Weak<ManagedTorrent>>,
 }
 
 impl tracker_comms::TorrentStatsProvider for PeerRxTorrentInfo {
     fn get(&self) -> tracker_comms::TrackerCommsStats {
-        let mt = self.session.with_torrents(|torrents| {
-            for (_, mt) in torrents {
-                if mt.info_hash() == self.info_hash {
-                    return Some(mt.clone());
+        let cached = self.torrent.lock().upgrade();
+        let mt = match cached {
+            Some(mt) => Some(mt),
+            None => {
+                let found = self.session.upgrade().and_then(|session| {
+                    session.with_torrents(|torrents| {
+                        for (_, mt) in torrents {
+                            if mt.info_hash() == self.info_hash {
+                                return Some(mt.clone());
+                            }
+                        }
+                        None
+                    })
+                });
+                if let Some(mt) = &found {
+                    *self.torrent.lock() = Arc::downgrade(mt);
                 }
+                found
             }
-            None
-        });
+        };
         let mt = match mt {
             Some(mt) => mt,
             None => {

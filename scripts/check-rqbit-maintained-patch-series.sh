@@ -180,9 +180,16 @@ fi
     'tracker_comms::tests::announce_url_keeps_the_trackers_own_query' \
     'tracker_comms::tests::lifecycle_sends_started_until_accepted_then_completed_once' \
     'tracker_comms::tests::lifecycle_never_reports_completed_for_a_session_that_started_complete' \
+    'tracker_comms::tests::observation_needs_a_live_incomplete_session_before_completion' \
+    'tracker_comms::tests::failed_announces_back_off' \
+    'tracker_comms::tests::logged_tracker_endpoints_omit_passkeys' \
     'tracker_comms::tests::udp_events_use_bep15_codes' \
     'tracker_comms::tests::http_response_tracker_id_is_parsed' \
-    'tracker_comms::tests::http_announces_follow_the_tracker_lifecycle'
+    'tracker_comms::tests::http_announces_follow_the_tracker_lifecycle' \
+    'tracker_comms::tests::a_rejected_completed_waits_for_the_retry_interval' \
+    'tracker_comms::tests::peer_lookups_send_no_lifecycle_events' \
+    'tracker_comms::tests::a_restarted_session_announces_started_after_the_previous_stopped' \
+    'tracker_comms::tests::udp_announces_follow_the_same_lifecycle'
   do
     if ! grep -Fxq "$exact_test: test" <<<"$tracker_tests"; then
       echo "maintained rqbit tracker proof was not discovered: $exact_test" >&2

@@ -343,6 +343,11 @@ async fn trackers_and_peers_see_one_runner_identity_and_a_compliant_announce_lif
     .await;
     assert_eq!(stopped.get("key"), started.get("key"));
     assert_eq!(stopped.get("trackerid"), Some("runner"));
+    assert_eq!(
+        stopped.get("downloaded"),
+        Some(payload.len().to_string().as_str())
+    );
+    assert_eq!(stopped.get("left"), Some("0"));
 
     let recorded = announces.lock().unwrap().clone();
     for announce in &recorded {
@@ -366,6 +371,12 @@ async fn trackers_and_peers_see_one_runner_identity_and_a_compliant_announce_lif
         .any(|a| a.port() == seeder_address.port() && a.event() == Some("completed")));
 
     downloader.stop().await;
+    // Shutting a session down waits for its final stopped announces.
     seeder.stop().await;
+    assert!(announces
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|a| a.port() == seeder_address.port() && a.event() == Some("stopped")));
     tracker_task.abort();
 }

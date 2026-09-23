@@ -36,17 +36,20 @@ locally on 2026-09-20; PR CI is the publication record for that evidence.
 
 The 2026-09-22 amendment adds patch `0021`. It adds two embedder options (the
 session HTTP `User-Agent` and the BEP 10 `v` string) and changes tracker
-announce content and timing: `completed` is sent once when a download that was
-incomplete in the session finishes (detected by a five-second statistics poll
-while the announce loop sleeps), and one bounded `stopped` announce (five
-seconds, only to trackers that accepted `started`) is spawned when a torrent's
-tracker session ends. It adds no dependency, feature, listener, or discovery
-source; the extra traffic is at most one `completed` and one `stopped` per
-tracker per torrent session. Under the renewal rule the twelve-patch
-derivation, vendor drift check, focused upstream suites (including the new
-tracker lifecycle and identity proofs), release-mode DHT dispatch proof, and
-upstream workspace check passed locally on 2026-09-22; PR CI is the
-publication record.
+announce content and timing. Each torrent's tracker session polls its own
+statistics every 5 s until the download is complete, then every 30 s (the
+statistics provider now caches the torrent handle instead of scanning the
+session). `completed` goes out once, promptly after a successful announce;
+failed announces back off from 60 s to 30 minutes instead of retrying every
+minute. When a tracker session ends, one `stopped` per tracker that was sent
+`started` is spawned, bounded to 2 s; a restarted torrent waits for it before
+its next `started`, and `Session::stop` waits up to 3 s for these before
+cancelling the session's network tasks. Magnet peer lookups send no events.
+It adds no dependency, feature, listener, or discovery source. Under the
+renewal rule the twelve-patch derivation, vendor drift check, focused upstream
+suites (including the new tracker lifecycle, backoff, UDP and identity
+proofs), release-mode DHT dispatch proof, and upstream workspace check passed
+locally on 2026-09-22; PR CI is the publication record.
 
 No production BitTorrent path is enabled by this review or by its recorded
 disposition. Gate 8 uses the maintained selective-restore option. Gate 7

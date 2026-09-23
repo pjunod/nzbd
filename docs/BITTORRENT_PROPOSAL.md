@@ -579,7 +579,8 @@ ADR-19 selects rqbit v8.1.1 plus exactly these twelve stable patches:
     when the tracker session ends. Stable 8.1.1 dropped query-string
     passkeys, never sent `completed`/`stopped` over HTTP, repeated
     `started`/`completed` on every UDP announce, and reported
-    already-present data as downloaded.
+    already-present data as downloaded. Failed announces now back off
+    from 60 s to 30 minutes.
 
 The machine-readable order is
 [`contrib/rqbit/maintained-series.txt`](../contrib/rqbit/maintained-series.txt).
@@ -589,7 +590,8 @@ the vendor from that archive, applies every patch in order, compares the result
 byte-for-byte with `contrib/rqbit/vendor`, and runs the exact affected upstream
 tests. The checked-in vendor is generated output and must never be hand-edited.
 
-The series is about 2,800 changed lines and stays within the “small,
+The series is about 3,500 changed lines (patch 0021 is roughly half of that,
+most of it tests) and stays within the “small,
 maintainable engine change” branch of this ADR. It does not add a second
 runtime, change the queue owner, or adopt rqbit's private persistence format.
 The heavier `libtorrent-rasterbar` FFI/packaging fallback is therefore not

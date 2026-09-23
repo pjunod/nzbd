@@ -23,10 +23,19 @@ defects that cost private-tracker users ratio or credibility:
 Fix: maintained patch `0021` (twelfth in the series) adds embedder-set
 User-Agent and BEP 10 `v` and a shared HTTP/UDP announce lifecycle; nzbd
 reports Runner everywhere (`nzbd_torrent::identity`, BEP 20 prefix `-RN`).
-Proofs: 7 new tracker-comms tests (lifecycle, passkey query, key, tracker id,
-early `completed`, `stopped` on drop), 4 new librqbit tests (User-Agent, `v`,
-session-relative `downloaded`), 4 identity unit tests, and one end-to-end
-private-swarm test asserting everything a tracker and a remote peer observe.
+Adversarial review found four defects in the first cut, all fixed: a
+rejected `completed` was retried every 5 s; magnet lookups produced spurious
+seeder-looking `started`/`stopped` pairs; UDP `stopped` died with the session
+on shutdown; and per-tracker 5 s polls scanned every torrent. Now: backoff
+60 s → 30 min, lookups send no events, `Session::stop` waits (≤3 s) for
+`stopped`, a restart's `started` waits for the previous `stopped`, one cheap
+poll per torrent, and logged tracker URLs are reduced to scheme/host/port.
+Proofs: 11 new tracker-comms tests (lifecycle, backoff, passkey query, key,
+tracker id, early `completed`, `stopped` on drop, restart ordering, UDP
+parity, no-event lookups, log redaction), 4 new librqbit tests (User-Agent,
+`v`, session-relative `downloaded`), 4 identity unit tests, and one
+end-to-end private-swarm test asserting everything a tracker and a remote
+peer observe, including the shutdown `stopped`.
 Docs: CONFIGURATION `[torrent]` client identity; ADR-19 amendment item 12.
 
 ## Torrent queue lifecycle — 2026-09-20
