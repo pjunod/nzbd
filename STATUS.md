@@ -2,9 +2,12 @@
 
 ## Torrent client identity and tracker compliance — 2026-09-22
 
-**Status:** implemented; full rqbit series proof and the fast lane pass
-locally. PR, review, and CI state are tracked in the PR linked from this branch
-(`claude/runner-tracker-identity`).
+**Status:** implemented and adversarially reviewed; findings fixed. Local
+gates on the final tree: full rqbit series proof, `make fast-check`, and one
+full `cargo test --workspace --no-fail-fast` (permission-based tests that
+root bypasses re-run green as an unprivileged user; one pre-existing
+`local_swarm` pause race fixed). Branch `claude/runner-tracker-identity`;
+the PR records CI and merge.
 
 Trackers used to see stable rqbit 8.1.1 (`-rQ8110-`, no HTTP User-Agent,
 `v = rqbit 8.1.1`). A review of what those announces contained found protocol
