@@ -9,3 +9,4 @@
 0018-propagate-file-sizing-errors.patch
 0019-disable-peer-exchange.patch
 0020-expose-test-only-dht-bootstrap.patch
+0021-configurable-client-identity-and-announce-lifecycle.patch

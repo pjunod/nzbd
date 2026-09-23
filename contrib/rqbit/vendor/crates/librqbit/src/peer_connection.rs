@@ -69,6 +69,11 @@ pub struct PeerConnectionOptions {
     /// Maximum BEP 9 metadata size accepted from a peer before allocation.
     /// Defaults to 32 MiB when unset.
     pub max_metadata_size: Option<u32>,
+
+    /// Client name and version advertised in the BEP 10 extended handshake
+    /// `v` field. Defaults to `client_name_and_version()` when unset.
+    #[serde(skip)]
+    pub client_version: Option<&'static str>,
 }
 
 pub(crate) struct PeerConnection<H> {
@@ -291,7 +296,9 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
 
         if supports_extended {
             let mut my_extended = ExtendedHandshake::new();
-            my_extended.v = Some(ByteBuf(crate::client_name_and_version().as_bytes()));
+            my_extended.v = Some(ByteBuf(
+                extended_handshake_client_version(&self.options).as_bytes(),
+            ));
             my_extended.yourip = Some(PeerIP(self.addr.ip()));
             self.handler
                 .update_my_extended_handshake(&mut my_extended)?;
@@ -485,6 +492,41 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
                 r
             }
         }
+    }
+}
+
+/// The BEP 10 `v` this connection advertises.
+fn extended_handshake_client_version(options: &PeerConnectionOptions) -> &'static str {
+    options
+        .client_version
+        .unwrap_or_else(crate::client_name_and_version)
+}
+
+#[cfg(test)]
+mod client_version_tests {
+    use super::{extended_handshake_client_version, PeerConnectionOptions};
+
+    #[test]
+    fn configured_client_version_replaces_the_engine_default() {
+        assert_eq!(
+            extended_handshake_client_version(&PeerConnectionOptions::default()),
+            crate::client_name_and_version()
+        );
+        let options = PeerConnectionOptions {
+            client_version: Some("Runner 0.2.0"),
+            ..Default::default()
+        };
+        assert_eq!(extended_handshake_client_version(&options), "Runner 0.2.0");
+    }
+
+    #[test]
+    fn client_version_is_not_part_of_serialized_options() {
+        let options = PeerConnectionOptions {
+            client_version: Some("Runner 0.2.0"),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&options).unwrap();
+        assert!(!json.contains("Runner"), "{json}");
     }
 }
 
