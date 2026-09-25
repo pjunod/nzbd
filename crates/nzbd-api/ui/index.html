@@ -3621,8 +3621,8 @@ async function setHistorySyncPaused(paused) {
   renderHistoryEnable();
   try {
     const response = await post("/api/v1/history-sync/" + (paused ? "pause" : "resume"));
-    if (!response.ok) throw new Error("History synchronization: " + response.status);
-    renderHistorySync(await response.json());
+    if (!response.ok) throw new Error("History synchronization: " + response.error);
+    renderHistorySync(response.body);
   } catch (error) {
     $("history-loading").hidden = false;
     $("history-loading").textContent = error.message;
@@ -3775,7 +3775,7 @@ async function jobAction(id, action, op) {
     return null;
   }
   if (op) op.at = Date.now(); // the TTL clock starts when the server agreed
-  refreshAll();
+  refreshAll(true);
   return res.body || {};
 }
 async function histAction(id, action) {
@@ -3784,7 +3784,7 @@ async function histAction(id, action) {
     toast({ text: action + " failed — " + res.error, kind: "error", ttlMs: 10000 });
     return null;
   }
-  refreshHistory().catch(() => {});
+  refreshHistory(true).catch(() => {});
   return res.body || {};
 }
 function toggleJob(id) {
@@ -3851,7 +3851,7 @@ async function requeueJob(job, name) {
     return;
   }
   toast({ text: "“" + name + "” is back in the queue" });
-  refreshAll();
+  refreshAll(true);
 }
 
 // ---- two-step inline arming ---------------------------------------------
@@ -4261,9 +4261,9 @@ document.querySelectorAll("nav.tabs button").forEach(b => b.onclick = () => {
 });
 
 // ---- refresh loop: SSE tick-driven with poll fallback --------------------
-function refreshTab() {
+function refreshTab(forceHistory = false) {
   if (activeTab === "queue") refreshQueue().catch(() => {});
-  if (activeTab === "history") refreshHistory().catch(() => {});
+  if (activeTab === "history") refreshHistory(forceHistory).catch(() => {});
   // Logs are a live tail now. Re-polling over a healthy stream would
   // replace the ring every 5 s — discarding the lines the stream just
   // delivered along with any "N skipped" markers, and re-downloading 300
@@ -4273,9 +4273,9 @@ function refreshTab() {
     refreshLogs().catch(() => {});
   if (activeTab === "settings") loadSettings().catch(() => {});
 }
-function refreshAll() {
+function refreshAll(forceHistory = false) {
   refreshStatus().catch(() => {});
-  refreshTab();
+  refreshTab(forceHistory);
 }
 let debounce = null;
 function nudge() { clearTimeout(debounce); debounce = setTimeout(refreshAll, 150); }

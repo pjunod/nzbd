@@ -101,7 +101,7 @@ pub struct HistoryDb {
     conn: Mutex<Connection>,
     reader: Mutex<Connection>,
     sync: SyncControl,
-    _writer_lock: Option<File>,
+    _writer_locks: Vec<File>,
     jsonl: Option<PathBuf>,
     /// Spool for regenerated NZBs of deleted jobs (`nzbs/<job>.nzb` in the
     /// original state directory, even after index relocation). A convenience for
@@ -153,7 +153,7 @@ impl HistoryDb {
         mode: HistoryMode,
         spool_dir: Option<&Path>,
     ) -> Result<HistoryDb, StateError> {
-        let writer_lock = sync::writer_lock(jsonl_dir, tag, mode)?;
+        let writer_locks = sync::writer_lock(jsonl_dir, tag, mode)?;
         if let Some(parent) = db_path.parent() {
             fsx::create_dir_all(parent)?;
         }
@@ -257,7 +257,7 @@ impl HistoryDb {
             conn: Mutex::new(conn),
             reader: Mutex::new(reader),
             sync: SyncControl::new(mode, paused, db_path),
-            _writer_lock: writer_lock,
+            _writer_locks: writer_locks,
             jsonl,
             spool: spool_dir
                 .map(Path::to_path_buf)

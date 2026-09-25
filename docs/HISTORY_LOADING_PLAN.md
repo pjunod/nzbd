@@ -28,7 +28,8 @@ record. The implemented behavior is:
   Consumer observations enqueue without storage I/O and retry even while paused.
 - Replay uses stable opened-file snapshots, conservative fingerprints with a
   60-second verification scan, and transactions bounded to 16 entries or
-  128 KiB of source text. Existing-row updates avoid AUTOINCREMENT churn and
+  128 KiB of source text; tombstones use 16-key batches with the same
+  cancellation and timing contract. Existing-row updates avoid AUTOINCREMENT churn and
   preserve the original merge rules. Local mutation generations fence stale
   replay publication. These batch caps are conservative implementation values;
   only local storage has been benchmarked, not GlusterFS after this change.

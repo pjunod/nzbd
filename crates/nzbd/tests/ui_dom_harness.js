@@ -1834,6 +1834,29 @@ const models = (jobs) => jobs.map((j, i) => T.rowModel(j, { idx: i, count: jobs.
     routes.clear(); seen.length = 0;
   }
 
+  // A successful action must bypass a poll that began before the mutation.
+  {
+    routes.clear(); seen.length = 0;
+    routes.set("/api/v1/clients", { status: 200, body: { clients: [] } });
+    routes.set("/api/v1/history/1/actions/delete", { status: 200, body: { ok: true } });
+    let release, requests = 0;
+    routes.set("/api/v1/history", () => {
+      if (++requests === 1) return new Promise(resolve => { release = resolve; });
+      return { status: 200, body: { total: 0, entries: [] } };
+    });
+    T.setHistoryPagingForTest(0, 20, 1);
+    const old = T.refreshHistory();
+    await T.histAction(1, "delete");
+    await T.refreshHistory();
+    ok(requests >= 2, "acknowledged deletion starts a fresh history request");
+    eq(T.store.history.length, 0, "post-delete snapshot is displayed");
+    release({ status: 200, body: { total: 1, entries: [{ job: 1, name: "deleted", status: "SUCCESS", size: 1, completed_at_unix: 100 }] } });
+    await old;
+    eq(T.store.history.length, 0, "pre-delete response cannot restore a deleted row");
+    T.setHistoryPagingForTest(0, 20, 0);
+    routes.clear(); seen.length = 0;
+  }
+
   // --- the log ring keeps a budget per class ------------------------------
   // The defect: one shared 500-line ring means a per-file flood evicts every
   // system and job line, so the Logs tab goes blank exactly when a download
@@ -1955,11 +1978,15 @@ const models = (jobs) => jobs.map((j, i) => T.rowModel(j, { idx: i, count: jobs.
     let syncState = { mode: "local_only", state: "paused", paused: true,
       placement: "network_or_fuse", index_path: "/processing/history.sqlite",
       repair_pending: true, last_duration_ms: 0, last_bytes_read: 0 };
-    routes.set("/api/v1/history-sync", () => ({ status: 200, body: syncState }));
     routes.set("/api/v1/history-sync/resume", () => {
       syncState = { ...syncState, paused: false, state: "idle" };
       return { status: 200, body: syncState };
     });
+    routes.set("/api/v1/history-sync/pause", () => {
+      syncState = { ...syncState, paused: true, state: "paused" };
+      return { status: 200, body: syncState };
+    });
+    routes.set("/api/v1/history-sync", () => ({ status: 200, body: syncState }));
     await vm.runInContext("loadSettings(true)", sandbox);
     ok(form.innerHTML.includes('data-settings-view="dev"><h3>Enable history synchronization'),
       "history enable control lives in Dev settings");
@@ -1969,6 +1996,15 @@ const models = (jobs) => jobs.map((j, i) => T.rowModel(j, { idx: i, count: jobs.
       "unmet storage readiness does not disable enablement");
     await vm.runInContext("toggleHistorySync()", sandbox);
     eq(syncState.paused, false, "Dev enable resumes synchronization on network storage");
+    ok(doc.getElementById("history-sync-info").textContent.includes("idle"),
+      "successful resume updates displayed synchronization state");
+    eq(doc.getElementById("cfg-history-sync-enable").textContent, "Pause history synchronization",
+      "successful resume offers the inverse operation");
+    await vm.runInContext("toggleHistorySync()", sandbox);
+    eq(syncState.paused, true, "the next click pauses instead of resuming again");
+    ok(doc.getElementById("history-sync-info").textContent.includes("paused"),
+      "successful pause renders the new state");
+
     eq(vm.runInContext("cfgDirty", sandbox), false, "live enable does not dirty config form");
     eq(doc.getElementById("cfg-history-sync-enable").disabled, false,
       "live enable is available after completion");

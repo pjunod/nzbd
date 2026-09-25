@@ -351,11 +351,7 @@ impl HistoryDb {
                 }
             }
         }
-        {
-            let _mutation = self.sync.mutation.lock().unwrap();
-            self.replay_checkpoint(quiet, generation)?;
-            self.apply_tombstones(&tombstones)?;
-        }
+        self.replay_tombstones(&tombstones, quiet, generation)?;
         let mut batch = Vec::new();
         let mut batch_bytes = 0;
         for (fp, file) in &mut snapshots {
@@ -389,6 +385,67 @@ impl HistoryDb {
         p.fingerprints = fingerprints;
         p.last_full = Some(Instant::now());
         self.sync.dirty.store(false, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn replay_tombstones(
+        &self,
+        tombstones: &HashSet<HistoryKey>,
+        quiet: bool,
+        generation: u64,
+    ) -> Result<(), StateError> {
+        if tombstones.is_empty() {
+            return Ok(());
+        }
+        // One indexed snapshot avoids rescanning the growing tombstone table
+        // for every batch. The live delete path keeps its atomic transaction.
+        let existing = {
+            let conn = self.reader.lock().unwrap();
+            let mut statement = conn
+                .prepare("SELECT job_id, completed_at FROM history_tombstones")
+                .map_err(sql_error)?;
+            let keys = statement
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .map_err(sql_error)?
+                .collect::<Result<HashSet<HistoryKey>, _>>()
+                .map_err(sql_error)?;
+            keys
+        };
+        let pending: Vec<_> = tombstones.difference(&existing).copied().collect();
+        for batch in pending.chunks(16) {
+            self.replay_tombstone_batch(batch, quiet, generation)?;
+        }
+        Ok(())
+    }
+
+    fn replay_tombstone_batch(
+        &self,
+        keys: &[HistoryKey],
+        quiet: bool,
+        generation: u64,
+    ) -> Result<(), StateError> {
+        let _mutation = self.sync.mutation.lock().unwrap();
+        self.replay_checkpoint(quiet, generation)?;
+        let mut conn = self.conn.lock().unwrap();
+        let started = Instant::now();
+        let tx = conn.transaction().map_err(sql_error)?;
+        for (job, at) in keys {
+            self.replay_checkpoint(quiet, generation)?;
+            tx.prepare_cached(
+                "INSERT OR IGNORE INTO history_tombstones(job_id,completed_at) VALUES(?1,?2)",
+            )
+            .map_err(sql_error)?
+            .execute(rusqlite::params![job, at])
+            .map_err(sql_error)?;
+            tx.prepare_cached("DELETE FROM history WHERE job_id=?1 AND completed_at=?2")
+                .map_err(sql_error)?
+                .execute(rusqlite::params![job, at])
+                .map_err(sql_error)?;
+        }
+        tx.commit().map_err(sql_error)?;
+        self.sync
+            .max_batch_ms
+            .fetch_max(started.elapsed().as_millis() as u64, Ordering::Relaxed);
         Ok(())
     }
 
@@ -498,9 +555,9 @@ pub(super) fn writer_lock(
     dir: Option<&Path>,
     tag: Option<&str>,
     mode: HistoryMode,
-) -> Result<Option<std::fs::File>, StateError> {
-    if mode != HistoryMode::LocalOnly && tag.is_none() {
-        return Ok(None);
+) -> Result<Vec<std::fs::File>, StateError> {
+    if dir.is_none() && mode == HistoryMode::Shared && tag.is_none() {
+        return Ok(vec![]);
     }
     if mode == HistoryMode::LocalOnly && tag.is_some() {
         return Err(StateError::Corrupt(
@@ -511,6 +568,25 @@ pub(super) fn writer_lock(
         StateError::Corrupt("local-only history requires its portable directory".into())
     })?;
     fsx::create_dir_all(dir)?;
+    // The common authority lock is held before observing the directory, so
+    // even a peer that has not appended yet excludes the local-only fast path.
+    let authority_path = dir.join(".history-authority.lock");
+    let authority = fsx::open_append(&authority_path)?;
+    let result = if mode == HistoryMode::LocalOnly {
+        authority.try_lock()
+    } else {
+        authority.try_lock_shared()
+    };
+    result.map_err(|e| {
+        StateError::Corrupt(format!(
+            "history directory {} has incompatible ownership: {e}",
+            dir.display()
+        ))
+    })?;
+    let mut locks = vec![authority];
+    if mode == HistoryMode::Shared && tag.is_none() {
+        return Ok(locks);
+    }
     if mode == HistoryMode::LocalOnly
         && log_paths(dir)?
             .iter()
@@ -531,7 +607,8 @@ pub(super) fn writer_lock(
             path.display()
         ))
     })?;
-    Ok(Some(file))
+    locks.push(file);
+    Ok(locks)
 }
 
 fn placement(path: &Path) -> &'static str {
@@ -733,6 +810,85 @@ mod tests {
         due(&db);
         db.refresh().unwrap();
         assert_eq!(db.sync_status().passes, 2);
+    }
+
+    #[test]
+    fn directory_authority_excludes_cross_mode_writers_in_both_orders() {
+        let t = tempfile::tempdir().unwrap();
+        let logs = t.path().join("history");
+        let local_db = local(t.path(), t.path());
+        assert!(
+            HistoryDb::open_tagged(&t.path().join("peer.sqlite"), Some(&logs), Some("peer"))
+                .is_err()
+        );
+        assert!(HistoryDb::open(&t.path().join("generic.sqlite"), Some(&logs)).is_err());
+        drop(local_db);
+        let peer = HistoryDb::open_tagged(&t.path().join("peer.sqlite"), Some(&logs), Some("peer"))
+            .unwrap();
+        // No peer log exists yet, but its authority must already exclude local.
+        assert!(!logs.join("history.peer.jsonl").exists());
+        assert!(HistoryDb::open_configured(
+            &t.path().join("local2.sqlite"),
+            Some(&logs),
+            None,
+            HistoryMode::LocalOnly,
+            None
+        )
+        .is_err());
+        let other =
+            HistoryDb::open_tagged(&t.path().join("other.sqlite"), Some(&logs), Some("other"))
+                .unwrap();
+        assert!(HistoryDb::open_tagged(
+            &t.path().join("duplicate.sqlite"),
+            Some(&logs),
+            Some("peer")
+        )
+        .is_err());
+        drop((peer, other));
+        assert!(HistoryDb::open_configured(
+            &t.path().join("local2.sqlite"),
+            Some(&logs),
+            None,
+            HistoryMode::LocalOnly,
+            None
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn tombstone_catchup_is_resumable_between_bounded_batches() {
+        let t = tempfile::tempdir().unwrap();
+        let db = local(t.path(), t.path());
+        for id in 1..=50 {
+            db.record(&entry(id, 100)).unwrap();
+        }
+        let keys: Vec<_> = (1..=49).map(|id| (id, 100)).collect();
+        let generation = db.sync.generation.load(Ordering::SeqCst);
+        db.replay_tombstone_batch(&keys[..16], true, generation)
+            .unwrap();
+        db.set_sync_paused(true).unwrap();
+        assert!(db
+            .replay_tombstone_batch(&keys[16..32], true, generation)
+            .is_err());
+        assert_eq!(
+            db.count_filtered(true).unwrap(),
+            34,
+            "pause preserves only committed batches"
+        );
+        db.set_sync_paused(false).unwrap();
+        db.replay_tombstones(&keys.into_iter().collect(), true, generation)
+            .unwrap();
+        assert_eq!(
+            db.list_filtered(100, true).unwrap()[0].job,
+            crate::JobId(50)
+        );
+        assert_eq!(db.count_filtered(true).unwrap(), 1);
+        db.replay_logs(false).unwrap();
+        assert_eq!(
+            db.count_filtered(true).unwrap(),
+            1,
+            "old portable entries cannot undo committed tombstones"
+        );
     }
 
     #[test]
