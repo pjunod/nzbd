@@ -1,5 +1,16 @@
 # nzbd — Project Status
 
+## History loading performance — 2026-09-25
+
+**Status:** adversarial review findings addressed; local affected checks passed.
+Live CI and merge status are tracked in PR [#237](https://github.com/pjunod/runner/pull/237).
+[Live delivery status](docs/HISTORY_LOADING_STATUS.md) tracks review, final
+verification, and merge. Indexed page reads no longer await replay; an owned
+worker handles shared reconciliation and local repair. Local index relocation,
+consistent pagination, and Dev enable controls preserve the recovery contracts
+in the [reviewed proposal](docs/HISTORY_LOADING_PLAN.md).
+
+
 ## Pending torrent startup readiness — 2026-09-25
 
 **Status:** `nuc3` service restored after three saved magnets delayed API

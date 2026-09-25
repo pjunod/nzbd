@@ -157,15 +157,9 @@ pub struct StorageRoot {
 /// malformed and is refused before the daemon starts.
 pub const MAX_STORAGE_ROOTS: usize = 64;
 
-/// `[history]` — how much finished-job history to keep (ARCHITECTURE.md
-/// §8.6).
-///
-/// History was unbounded, and unbounded is not free even when the row
-/// count looks small. Every read re-unions the authoritative JSONL from
-/// the state volume, so the file's *length* — not the number of rows you
-/// asked for — sets what a history page costs: 179 entries took 3.1 s on
-/// nuc3's network state mount (field report 2026-07-29). Trimming is what
-/// keeps that bounded; paging alone would not have.
+/// `[history]` — retention and optional persistent local index placement.
+/// Listings read SQLite directly; shared portable logs reconcile in the
+/// background. Retention bounds stored data and recovery/reconciliation work.
 ///
 /// Two bounds, because they answer different questions and either one
 /// alone leaves a hole. A count bound answers "how big may this get" and
@@ -175,6 +169,9 @@ pub const MAX_STORAGE_ROOTS: usize = 64;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields, default)]
 pub struct HistorySection {
+    /// Persistent local index directory. Logs and parked NZBs stay in state_dir.
+    /// Changing this copies the active index at startup, preserving cursors.
+    pub index_dir: Option<PathBuf>,
     /// Keep at most this many entries (0 = unlimited).
     pub keep_max: u32,
     /// Drop entries finished more than this many days ago (0 = forever).
@@ -188,6 +185,7 @@ impl Default for HistorySection {
         // still a JSONL small enough to re-read on a slow mount; ninety
         // days is the window in which anyone asks "did that ever come in?"
         HistorySection {
+            index_dir: None,
             keep_max: 1000,
             keep_days: 90,
         }
@@ -1605,6 +1603,20 @@ bind = "0.0.0.0:6789"
 "#;
 
     #[test]
+    fn history_index_location_is_optional_and_requires_restart() {
+        let old = Config::default();
+        let mut new = old.clone();
+        new.history.index_dir = Some("/local/history".into());
+        let text = to_toml(&new).unwrap();
+        assert_eq!(
+            Config::from_toml(&text).unwrap().history.index_dir,
+            new.history.index_dir
+        );
+        assert!(diff_sections(&old, &new).1.contains(&"history"));
+        assert!(old.history.index_dir.is_none());
+    }
+
+    #[test]
     fn parses_and_maps() {
         let cfg = Config::from_toml(SAMPLE).unwrap();
         assert_eq!(cfg.servers.len(), 2);
@@ -2351,6 +2363,9 @@ pub fn diff_sections(old: &Config, new: &Config) -> (Vec<&'static str>, Vec<&'st
     }
     if old.api != new.api {
         restart.push("api");
+    }
+    if old.history != new.history {
+        restart.push("history");
     }
     if old.post != new.post {
         restart.push("post-processing");

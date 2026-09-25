@@ -423,6 +423,7 @@ fn open_history(
     jsonl_dir: &std::path::Path,
     node_tag: Option<&str>,
     retention: nzbd_state::history::Retention,
+    index_dir: Option<&std::path::Path>,
 ) -> anyhow_lite::Result<Arc<nzbd_state::history::HistoryDb>> {
     for dir in [local_dir, jsonl_dir] {
         std::fs::create_dir_all(dir).map_err(|source| {
@@ -436,10 +437,20 @@ fn open_history(
             ))
         })?;
     }
-    let db = nzbd_state::history::HistoryDb::open_tagged(
-        &local_dir.join("history.sqlite"),
+    let index_dir = index_dir.map(nzbd_config::expand_home);
+    let db = nzbd_state::history::HistoryDb::open_configured(
+        &index_dir
+            .as_deref()
+            .unwrap_or(local_dir)
+            .join("history.sqlite"),
         Some(jsonl_dir),
         node_tag,
+        if node_tag.is_some() {
+            nzbd_state::history::HistoryMode::Shared
+        } else {
+            nzbd_state::history::HistoryMode::LocalOnly
+        },
+        Some(&local_dir.join("nzbs")),
     )
     .map(Arc::new)
     .map_err(|e| anyhow_lite::Error::msg(format!("history db: {}", with_fs_hint(e))))?;
@@ -453,6 +464,11 @@ fn open_history(
         // Retention is a housekeeping bound, not a correctness one. A
         // daemon that cannot trim still has every entry it ever had.
         Err(e) => tracing::warn!(error = %with_fs_hint(e), "history retention trim failed"),
+    }
+    let status = db.sync_status();
+    if status.placement != "local" {
+        tracing::warn!(path = %status.index_path.display(), placement = status.placement,
+            "history index is not verified local; configure history.index_dir on persistent local storage");
     }
     Ok(db)
 }
@@ -764,10 +780,13 @@ fn run(
                 &state_dir.join("history"),
                 None,
                 history_retention(&cfg),
+                cfg.history.index_dir.as_deref(),
             )?)
         } else {
             None
         };
+        let _history_worker = history_db.as_ref().map(|db| db.start_worker()).transpose()
+            .map_err(|e| anyhow_lite::Error::msg(e.to_string()))?;
         engine_cfg.history = history_db.clone();
         let engine = Engine::spawn(engine_cfg).await.map_err(with_fs_hint)?;
         if !cfg.torrent.enabled {
@@ -1107,6 +1126,7 @@ fn run(
         // runtime; PP is crash-safe and re-runs on the next pass. Filesystem
         // probes use detached OS threads, so a wedged syscall cannot make
         // Tokio runtime teardown wait for it.
+        if let Some(worker) = &_history_worker { worker.stop(); }
         feed_cancel.cancel();
         pp_cancel.cancel();
         torrent_cancel.cancel();
@@ -1223,6 +1243,7 @@ async fn run_cluster(
             &jsonl_dir,
             Some(&c.node_name),
             history_retention(&cfg),
+            cfg.history.index_dir.as_deref(),
         )?;
         Some(nzbd_cluster::PpSetup {
             // Cluster PP stage timings are not wired to this node's
@@ -1675,6 +1696,7 @@ mod tests {
             &tmp.path().join("history-jsonl"),
             None,
             nzbd_state::history::Retention::UNLIMITED,
+            None,
         ) {
             Err(err) => err,
             Ok(_) => panic!("a history directory below a regular file must fail"),

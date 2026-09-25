@@ -168,3 +168,15 @@ pub(super) fn truncate(p: &Path) -> Result<(), StateError> {
     )?;
     sync_data(&file, p)
 }
+
+pub(super) fn canonicalize(path: &Path) -> Result<std::path::PathBuf, StateError> {
+    ctx(std::fs::canonicalize(path), "resolve path", path)
+}
+
+pub(super) fn exists(path: &Path) -> Result<bool, StateError> {
+    ctx(path.try_exists(), "inspect path", path)
+}
+
+pub(super) fn read_to_string(path: &Path) -> Result<String, StateError> {
+    ctx(std::fs::read_to_string(path), "read", path)
+}
