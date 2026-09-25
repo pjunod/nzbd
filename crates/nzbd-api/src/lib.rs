@@ -2,6 +2,7 @@
 //! history, SSE events, Prometheus `/metrics` and HTTP auth
 //! (ARCHITECTURE.md §10.1). OpenAPI + roles are the remaining items.
 
+mod artifacts;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
@@ -2602,7 +2603,8 @@ async fn history_action(
             _ => return error(StatusCode::INTERNAL_SERVER_ERROR, "history lookup failed"),
         };
         if let Some(torrent) = entry
-            .record.as_ref()
+            .record
+            .as_ref()
             .and_then(|record| record.torrent.as_ref())
         {
             if torrent.payload == nzbd_types::TorrentPayloadDisposition::Retained {
@@ -2621,6 +2623,33 @@ async fn history_action(
                 _ => error(StatusCode::INTERNAL_SERVER_ERROR, "history store error"),
             };
         }
+        let inventory = st.engine.artifacts();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(10), tokio::task::spawn_blocking(move || {
+            let artifact = match inventory.for_job(job.0)? {
+                Some(a) => a,
+                None => entry.final_dir.as_deref().map(std::path::Path::new)
+                    .map(|p| inventory.for_path(p)).transpose()?.flatten()
+                    .ok_or_else(|| nzbd_state::artifacts::Error::Conflict("payload ownership needs Files inspection and adoption; History retained".into()))?,
+            };
+            let key = format!("history-delete-{}", artifact.id);
+            let op = match inventory.operation(&key) {
+                Ok(op) => op,
+                Err(nzbd_state::artifacts::Error::NotFound) => inventory.request_delete(&artifact.id, artifact.revision, &key, 0)?,
+                Err(e) => return Err(e),
+            };
+            let op = inventory.execute_delete(&op.id)?;
+            if op.state != "succeeded" { return Err(nzbd_state::artifacts::Error::Conflict(format!("operation {} {}: {}", op.id, op.state, op.error.unwrap_or_default()))); }
+            db.delete(job).map_err(|e| nzbd_state::artifacts::Error::Conflict(e.to_string()))?;
+            Ok(true)
+        })).await;
+        return match result {
+            Ok(Ok(Ok(_))) => Json(json!({"ok":true,"files_removed":true})).into_response(),
+            Ok(Ok(Err(e))) => error(StatusCode::CONFLICT, &e.to_string()),
+            _ => error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "file deletion pending; History retained; retry the same request",
+            ),
+        };
     }
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -2637,27 +2666,6 @@ async fn history_action(
         "restore" => db.restore(job).map(|ok| (ok, None)),
         "hide" => db.hide(job, Some(&by), now).map(|ok| (ok, None)),
         "delete" => db.delete(job).map(|ok| (ok, None)),
-        "delete-files" => {
-            let Some(entry) = db.get(job)? else {
-                return Ok((false, None));
-            };
-            let dir = entry.final_dir.ok_or_else(|| nzbd_state::StateError::Corrupt(
-                "cannot delete files: final directory is unknown; History retained".into()
-            ))?;
-            let path = std::path::Path::new(&dir);
-            // An absent or unavailable path is not proof of removal. Retain
-            // the row and its retry handle until deletion is confirmed.
-            let metadata = std::fs::symlink_metadata(path).map_err(|source| nzbd_state::StateError::Io {
-                op: "inspect payload before deletion", path: path.into(), source,
-            })?;
-            if !metadata.is_dir() || metadata.file_type().is_symlink() || path.parent().is_none() {
-                return Err(nzbd_state::StateError::Corrupt("cannot delete files: invalid payload directory; History retained".into()));
-            }
-            std::fs::remove_dir_all(path).map_err(|source| nzbd_state::StateError::Io {
-                op: "delete payload (History retained)", path: path.into(), source,
-            })?;
-            db.delete(job).map(|ok| (ok, Some(true)))
-        }
         _ => Ok((false, None)),
     })
     .await;
@@ -2673,7 +2681,10 @@ async fn history_action(
             ),
         },
         Ok(Err(e)) => error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
-        Err(_) => error(StatusCode::INTERNAL_SERVER_ERROR, "history operation interrupted; retry required"),
+        Err(_) => error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "history operation interrupted; retry required",
+        ),
     }
 }
 
@@ -2696,6 +2707,7 @@ pub fn router_with(state: ApiState) -> Router {
         torrent.max_request_body_bytes().saturating_add(64 * 1024)
     });
     Router::new()
+        .merge(artifacts::router())
         .route("/api/v1/status", get(get_status))
         .route(
             "/api/v1/jobs",
@@ -3109,17 +3121,31 @@ mod tests {
             "job": 71, "name": "preserve", "category": null,
             "final_dir": blocked.to_str(), "status": "FAILURE", "size": 15,
             "completed_at_unix": 1
-        })).unwrap();
+        }))
+        .unwrap();
         db.record(&entry).unwrap();
         let app = router_with(ApiState {
-            engine: engine.clone(), history: Some(db.clone()), torrent: None,
-            log: None, setup: None, clients: None, shutdown: None,
-            pp_stats: None, pp_manager: None, events: None,
+            engine: engine.clone(),
+            history: Some(db.clone()),
+            torrent: None,
+            log: None,
+            setup: None,
+            clients: None,
+            shutdown: None,
+            pp_stats: None,
+            pp_manager: None,
+            events: None,
         });
         for _ in 0..2 {
-            let response = app.clone().oneshot(axum::http::Request::post(
-                "/api/v1/history/71/actions/delete-files"
-            ).body(axum::body::Body::empty()).unwrap()).await.unwrap();
+            let response = app
+                .clone()
+                .oneshot(
+                    axum::http::Request::post("/api/v1/history/71/actions/delete-files")
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
             assert!(!response.status().is_success());
             assert!(db.get(JobId(71)).unwrap().is_some());
             assert_eq!(std::fs::read(&blocked).unwrap(), b"not a directory");

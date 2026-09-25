@@ -1024,6 +1024,7 @@ try {
   <nav class="tabs">
     <button data-tab="queue" class="active">Queue</button>
     <button data-tab="history">History</button>
+    <button data-tab="files">Files</button>
     <button data-tab="logs">Logs</button>
     <button data-tab="settings">Settings</button>
   </nav>
@@ -1050,6 +1051,19 @@ try {
         </select>
       </label>
     </div>
+  </section>
+
+  <section id="tab-files" hidden>
+    <h2>Files needing attention</h2>
+    <p>Owned payloads survive History cleanup. Unknown folders stay on review hold until you inspect and adopt them.</p>
+    <button onclick="scanFiles()">Scan configured folders</button>
+    <button onclick="refreshFiles()">Refresh inventory</button>
+    <span id="files-message" role="status"></span>
+    <div id="files-list"></div>
+    <button onclick="filesOffset=Math.max(0,filesOffset-100);refreshFiles()">Previous</button>
+    <button onclick="filesOffset+=100;refreshFiles()">Next</button>
+    <div id="files-detail"></div>
+    <h3>Recovery handoffs</h3><div id="files-recoveries"></div>
   </section>
 
   <section id="tab-history" hidden>
@@ -4251,12 +4265,75 @@ $("torrent-file").onchange = async () => {
   $("torrent-file").value = "";
 };
 
+
+// ---- durable file ownership ----------------------------------------------
+let filesOffset = 0, filesBusy = false, selectedArtifact = null;
+async function fileRequest(path, body, method = "POST") {
+  const response = await jfetch("/api/v1/" + path, {method, headers:{"Content-Type":"application/json"}, body: body == null ? undefined : JSON.stringify(body)});
+  const value = await response.json();
+  if (!response.ok) throw new Error(value.error || "File operation failed: " + response.status);
+  return value;
+}
+function filesError(e) { $("files-message").textContent = e.message; }
+async function refreshFiles() {
+  if (filesBusy) return;
+  filesBusy = true;
+  try {
+    const response = await jfetch("/api/v1/artifacts?offset=" + filesOffset);
+    if (!response.ok) throw new Error("Inventory unavailable (" + response.status + ")");
+    const data = await response.json();
+    $("files-list").innerHTML = data.entries.map(({artifact:a,files,bytes,earliest_expiry}) => `<article class="cfg-card"><button data-artifact="${esc(a.id)}">${esc(a.path)}</button><p>${esc(a.state)} · ${files} entries · ${fmtBytes(bytes)} · ${a.owned ? "owned" : "needs adoption"} · ${a.keep ? "Keep" : a.hold ? esc(a.hold) : earliest_expiry ? "earliest expiry " + new Date(earliest_expiry*1000).toLocaleString() : "no automatic expiry"}</p>${a.error ? `<p>${esc(a.error)}</p>` : ""}</article>`).join("") || "No inventory entries on this page.";
+    $("files-list").querySelectorAll("[data-artifact]").forEach(b => b.onclick = () => openArtifact(b.dataset.artifact));
+    const recoveries = await jfetch("/api/v1/recoveries");
+    if (recoveries.ok) $("files-recoveries").innerHTML = (await recoveries.json()).map(r => `<p>${esc(r.id)} · ${esc(r.state)} · ${r.files.length} files${r.error ? " · " + esc(r.error) : ""}</p>`).join("") || "No recovery handoffs.";
+  } catch(e) { filesError(e); } finally { filesBusy = false; }
+}
+async function scanFiles() { try { await fileRequest("artifacts/scan"); $("files-message").textContent="Scan requested. Refresh to see discovered folders; existing media remains held."; } catch(e) { filesError(e); } }
+async function openArtifact(id) {
+  try {
+    const a = await fileRequest("artifacts/"+id,null,"GET");
+    const f = await fileRequest("artifacts/"+id+"/files",null,"GET");
+    selectedArtifact=a;
+    $("files-detail").innerHTML=`<h3>${esc(a.path)}</h3><p>${esc(a.hold || "No hold")} · revision ${a.revision}</p><button data-file-action="inspect">Inspect files</button><button data-file-action="adopt">Adopt and Keep</button><button data-file-action="keep">${a.keep ? "Remove Keep (fresh retention)" : "Keep indefinitely"}</button><button data-file-action="delete">Delete owned files (8-second Undo)</button><p>Select files to copy for Curator recovery. Originals remain held until a complete import receipt.</p>${f.files.map(x=>`<label style="display:block"><input type="checkbox" class="recovery-file" value="${esc(x.path)}" ${x.identity.directory ? "disabled" : ""}> ${esc(x.path)} · ${fmtBytes(x.identity.bytes)}</label>`).join("")}<p>Showing ${f.files.length} of ${f.total} entries.</p><button data-file-action="stage">Stage selected recovery files</button><span id="file-operation" role="status"></span>`;
+    $("files-detail").querySelectorAll("[data-file-action]").forEach(b=>b.onclick=()=>artifactAction(b.dataset.fileAction));
+  } catch(e){filesError(e);}
+}
+async function artifactAction(action) {
+  const a=selectedArtifact;if(!a)return;
+  try {
+    const base="artifacts/"+a.id;
+    if(action==="inspect"){await fileRequest(base+"/inspect");$("files-message").textContent="Inspection requested. Reopen the folder when the scan finishes.";return;}
+    if(action==="adopt") await fileRequest(base+"/adopt",{revision:a.revision});
+    if(action==="keep") await fileRequest(base+"/retention",{revision:a.revision,keep:!a.keep});
+    if(action==="delete") {
+      const op=await fileRequest(base+"/delete",{revision:a.revision,idempotency_key:crypto.randomUUID(),undo_seconds:8});
+      $("file-operation").innerHTML=`Deletion queued. <button id="undo-file-delete">Undo</button>`;
+      $("undo-file-delete").onclick=async()=>{try{await fileRequest("artifact-operations/"+op.id+"/cancel");$("file-operation").textContent="Deletion cancelled";}catch(e){filesError(e);}};
+      return;
+    }
+    if(action==="stage") {
+      const files=[...document.querySelectorAll(".recovery-file:checked")].map(e=>e.value);
+      await fileRequest(base+"/recoveries",{revision:a.revision,idempotency_key:crypto.randomUUID(),files});
+      $("files-message").textContent="Recovery staging requested. Follow the handoff status below; claim and import it in Curator.";
+      return;
+    }
+    await openArtifact(a.id);await refreshFiles();
+  }catch(e){filesError(e);}
+}
+async function loadFileSettings(){
+  if(!$("cfg-files-enable"))return;
+  try{const data=await fileRequest("artifacts/settings",null,"GET");const s=data.settings;$("cfg-files-enable").checked=s.enabled;$("cfg-files-days").value=s.failed_retention_days;$("cfg-files-root").value=s.recovery_root;$("cfg-files-advisory").textContent=data.advisory.map(a=>a.requirement+": "+(a.met===true?"met":a.met===false?"unmet":"verify")+(a.detail?". "+a.detail:"")).join(" · ");}catch(e){$("cfg-files-advisory").textContent=e.message;}
+}
+async function saveFileSettings(){
+  try{await fileRequest("artifacts/settings",{enabled:$("cfg-files-enable").checked,failed_retention_days:Number($("cfg-files-days").value),recovery_root:$("cfg-files-root").value,consumer_token:$("cfg-files-token").value||null},"PUT");$("cfg-files-token").value="";await loadFileSettings();}catch(e){$("cfg-files-advisory").textContent=e.message;}
+}
+
 // ---- tabs ---------------------------------------------------------------
 let activeTab = "queue";
 document.querySelectorAll("nav.tabs button").forEach(b => b.onclick = () => {
   activeTab = b.dataset.tab;
   document.querySelectorAll("nav.tabs button").forEach(x => x.classList.toggle("active", x === b));
-  for (const t of ["queue", "history", "logs", "settings"]) $("tab-" + t).hidden = t !== activeTab;
+  for (const t of ["queue", "history", "files", "logs", "settings"]) $("tab-" + t).hidden = t !== activeTab;
   refreshAll();
 });
 
@@ -4264,6 +4341,7 @@ document.querySelectorAll("nav.tabs button").forEach(b => b.onclick = () => {
 function refreshTab(forceHistory = false) {
   if (activeTab === "queue") refreshQueue().catch(() => {});
   if (activeTab === "history") refreshHistory(forceHistory).catch(() => {});
+  if (activeTab === "files") refreshFiles().catch(() => {});
   // Logs are a live tail now. Re-polling over a healthy stream would
   // replace the ring every 5 s — discarding the lines the stream just
   // delivered along with any "N skipped" markers, and re-downloading 300
@@ -4558,6 +4636,7 @@ const SETTINGS_SECTIONS = [
     ["torrent.enabled", "enable BitTorrent after restart", "check"],
     ["cluster.enabled", "enable Usenet clustering after restart", "check"],
   ]},
+  { key: "file-lifecycle", dev: true, title: "Enable file lifecycle automation", desc: "Live setting. Readiness is advisory: enable remains available. Files, ownership records and manual recovery actions are always available. Seven days means seven days of eligible daemon uptime; downtime extends retention.", fields: [] },
   { key: "history-sync", dev: true, title: "Enable history synchronization", desc: "Enabled by default. This live control persists immediately and needs no restart or Save. Persistent local storage is recommended; readiness is advisory and never prevents enabling. Pausing leaves indexed reads and local completions available.", fields: [] },
   { key: "dev", dev: true, title: "Usenet cluster", desc: "Multi-node Usenet execution. Configure the voter roster in General → Advanced TOML.", fields: [
     ["cluster.cluster_id", "cluster identity", "text"],
@@ -4731,6 +4810,7 @@ function renderSettingsForm() {
     } else {
       body = `<div class="cfg-grid">` +
         sec.fields.map(([p, l, t, o, help]) => fieldControl(p, l, t, o, help)).join("") + `</div>`;
+      if (sec.key === "file-lifecycle") body = `<label><input id="cfg-files-enable" type="checkbox" data-live="true"> Enable automatic failed-file retention</label><label>Future failed retention (days; 0 keeps forever) <input id="cfg-files-days" type="number" min="0" max="3650" value="7" data-live="true"></label><label>Recovery root <input id="cfg-files-root" data-live="true"></label><label>Curator recovery credential (blank keeps existing) <input id="cfg-files-token" type="password" autocomplete="new-password" data-live="true"></label><button type="button" data-live="true" onclick="saveFileSettings()">Apply lifecycle settings</button><p id="cfg-files-advisory"></p>`;
       if (sec.key === "history-sync") body = `<button id="cfg-history-sync-enable" type="button" data-live="true" onclick="toggleHistorySync()">Enable history synchronization</button><p id="cfg-history-sync-advisory" class="desc"></p>`;
       if (sec.key === "enable") body += `<div id="cfg-enable-advisory">${enableAdvisory(cfgModel)}</div>`;
     }
@@ -4753,6 +4833,7 @@ function renderSettingsForm() {
   });
   showSettingsView(settingsView);
   renderHistoryEnable();
+  loadFileSettings();
   form.oninput = () => {
     cfgDirty = true; $("cfg-save").disabled = !cfgInfo.writable;
     try { $("cfg-enable-advisory").innerHTML = enableAdvisory(collectSettingsForm()); }
