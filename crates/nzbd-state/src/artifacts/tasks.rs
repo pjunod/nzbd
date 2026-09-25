@@ -10,7 +10,7 @@ impl Inventory {
         request_id: &str,
         request: serde_json::Value,
     ) -> Result<Operation> {
-        if !matches!(kind, "inspect" | "scan" | "stage") {
+        if !matches!(kind, "inspect" | "scan" | "stage" | "prune") {
             return Err(Error::Conflict("unknown task kind".into()));
         }
         let _guard = self.mutation.lock().unwrap();
@@ -39,7 +39,7 @@ impl Inventory {
             state: "queued".into(),
             request,
             created_at: now(),
-            not_before: now(),
+            not_before: now() + if kind == "prune" { 8 } else { 0 },
             attempts: 0,
             next_retry: 0,
             error: None,
@@ -49,7 +49,7 @@ impl Inventory {
     }
     pub fn execute_task(&self, key: &str) -> Result<Operation> {
         let mut op = self.operation(key)?;
-        if !matches!(op.state.as_str(), "queued" | "running") {
+        if !matches!(op.state.as_str(), "queued" | "running") || op.not_before > now() {
             return Ok(op);
         }
         op.state = "running".into();
@@ -57,6 +57,11 @@ impl Inventory {
         save_operation(&self.db.lock().unwrap(), &op)?;
         let request: serde_json::Value = serde_json::from_str(&op.request)?;
         let result = match op.kind.as_str() {
+            "prune" => self.prune_receipted_source(
+                request["recovery"]
+                    .as_str()
+                    .ok_or_else(|| Error::Conflict("missing recovery".into()))?,
+            ),
             "inspect" => self.inspect(&op.artifact).map(|_| ()),
             "stage" => (|| {
                 let revision = request["revision"]
@@ -127,7 +132,7 @@ impl Inventory {
     pub fn run_tasks(&self) -> Result<()> {
         let keys = {
             let db = self.db.lock().unwrap();
-            let mut stmt=db.prepare("SELECT id FROM operations WHERE state IN ('queued','running') AND json_extract(data,'$.kind') IN ('inspect','scan','stage') LIMIT 5")?;
+            let mut stmt=db.prepare("SELECT id FROM operations WHERE state IN ('queued','running') AND json_extract(data,'$.kind') IN ('inspect','scan','stage','prune') AND json_extract(data,'$.not_before')<=unixepoch() ORDER BY json_extract(data,'$.created_at') LIMIT 5")?;
             let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
             rows.collect::<std::result::Result<Vec<_>, _>>()?
         };

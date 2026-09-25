@@ -1480,6 +1480,11 @@ impl Owner {
             }
             QueueCommand::QuiescePayload { job, reply } => {
                 let result = (|| {
+                    if self.delegated.contains_key(&job) {
+                        return Err(
+                            "remote writer lease must be retired before payload deletion".into(),
+                        );
+                    }
                     let record = self.state.job_mut(job).ok_or("job not found")?;
                     if record.torrent.is_some()
                         || matches!(

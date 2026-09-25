@@ -1,6 +1,6 @@
 # File lifecycle — implementation status
 
-**Status:** building · **Updated:** 2026-09-25 · **Tests:** deferred until final review
+**Status:** final review preparation · **Updated:** 2026-09-25 · **Tests:** deferred until final review
 
 Companion to [the implementation plan](FILE_LIFECYCLE_PLAN.md) and
 [the design review](FILE_LIFECYCLE_REVIEW.md). This page tracks delivery;
@@ -84,3 +84,31 @@ Quality, source and episode metadata are committed with each file receipt.
 Remaining construction includes platform and cluster compatibility, operational
 backup/retention controls, deeper failure regression coverage and final docs.
 No adversarial implementation review or unit tests have run yet.
+
+## 6. Operational controls checkpoint
+
+Added existing-retention preview/apply, offline inventory backup, protected root
+checks at execution, receipt-scoped source cleanup, paged recovery selection,
+capacity previews and low-cardinality lifecycle metrics. Large staging copies
+release the global mutation coordinator while their durable source hold remains
+in force; new downloads need not wait for the copy. Legacy recursive move and
+failure-disposition helpers were removed in favor of the ownership journal.
+
+Curator now uses a transaction-local library revision to detect concurrent API
+edits before committing recovery metadata. Native probing, concrete destination
+names, per-file progress and informational claim heartbeats are wired. The unit
+regression cases are written but have not run. Final review/test evidence and
+performance measurements are still pending; no PR has been opened or merged.
+
+## 7. Review boundary
+
+Implementation and operator documentation are ready for adversarial inspection.
+Recovery preview hashing now runs as a persisted Curator background operation;
+receipt delivery runs independently of long copies. Regression sources cover
+transaction rollback, concurrent target edits, cancelled imports, interrupted
+publication, protected roots and receipt-scoped cleanup. An ignored million-row
+inventory performance fixture is reserved for the final verification phase.
+
+Compilation/type checks are the only validation performed so far. Unit tests,
+repository gates, the performance fixture, PR creation and merge are next, after
+review findings are addressed. No deployment or live-media cleanup is planned.

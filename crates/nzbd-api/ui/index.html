@@ -1059,6 +1059,7 @@ try {
     <button onclick="scanFiles()">Scan configured folders</button>
     <button onclick="refreshFiles()">Refresh inventory</button>
     <span id="files-message" role="status"></span>
+    <label><input type="checkbox" id="files-show-terminal" onchange="filesOffset=0;refreshFiles()"> Show cleared payload records</label>
     <div id="files-list"></div>
     <button onclick="filesOffset=Math.max(0,filesOffset-100);refreshFiles()">Previous</button>
     <button onclick="filesOffset+=100;refreshFiles()">Next</button>
@@ -4284,22 +4285,28 @@ async function refreshFiles() {
       $("files-message").textContent = op.kind + ": " + op.state + (op.error ? " — " + op.error : "");
       if (["succeeded", "failed", "cancelled", "review"].includes(op.state)) filesOperation = null;
     }
-    const response = await jfetch("/api/v1/artifacts?offset=" + filesOffset);
+    const response = await jfetch("/api/v1/artifacts?offset=" + filesOffset + "&include_terminal=" + $("files-show-terminal").checked);
     if (!response.ok) throw new Error("Inventory unavailable (" + response.status + ")");
     const data = await response.json();
     $("files-list").innerHTML = data.entries.map(({artifact:a,files,bytes,earliest_expiry}) => `<article class="cfg-card"><button data-artifact="${esc(a.id)}">${esc(a.path)}</button><p>${esc(a.state)} · ${files} entries · ${fmtBytes(bytes)} · ${a.owned ? "owned" : "needs adoption"} · ${a.keep ? "Keep" : a.hold ? esc(a.hold) : earliest_expiry ? "earliest expiry " + new Date(earliest_expiry*1000).toLocaleString() : "no automatic expiry"}</p>${a.error ? `<p>${esc(a.error)}</p>` : ""}</article>`).join("") || "No inventory entries on this page.";
     $("files-list").querySelectorAll("[data-artifact]").forEach(b => b.onclick = () => openArtifact(b.dataset.artifact));
     const recoveries = await jfetch("/api/v1/recoveries");
-    if (recoveries.ok) $("files-recoveries").innerHTML = (await recoveries.json()).map(r => `<p>${esc(r.id)} · ${esc(r.state)} · ${r.files.length} files${r.error ? " · " + esc(r.error) : ""}</p>`).join("") || "No recovery handoffs.";
+    if (recoveries.ok) $("files-recoveries").innerHTML = (await recoveries.json()).map(r => `<p>${esc(r.id)} · ${esc(r.state)} · ${r.files.length} files${r.error ? " · " + esc(r.error) : ""} ${["imported","partial"].includes(r.state)?`<button data-prune-source="${esc(r.id)}">Delete receipted source files (8-second Undo)</button>`:""}</p>`).join("") || "No recovery handoffs.";
+    $("files-recoveries").querySelectorAll("[data-prune-source]").forEach(button=>button.onclick=async()=>{try{const op=await fileRequest("recoveries/"+button.dataset.pruneSource+"/delete-receipted-source");filesOperation=op.id;button.textContent="Undo source cleanup";button.onclick=async()=>{try{await fileRequest("artifact-operations/"+op.id+"/cancel");button.textContent="Cleanup cancelled";}catch(e){filesError(e);}};}catch(e){filesError(e);}});
   } catch(e) { filesError(e); } finally { filesBusy = false; }
 }
 async function scanFiles() { try { filesOperation=(await fileRequest("artifacts/scan")).id; $("files-message").textContent="Scan requested. Refresh to see discovered folders; existing media remains held."; } catch(e) { filesError(e); } }
-async function openArtifact(id) {
+let recoverySelections = new Set();
+async function openArtifact(id, offset=0) {
   try {
     const a = await fileRequest("artifacts/"+id,null,"GET");
-    const f = await fileRequest("artifacts/"+id+"/files",null,"GET");
+    const f = await fileRequest("artifacts/"+id+"/files?offset="+offset,null,"GET");
+    if(selectedArtifact?.id!==id || selectedArtifact?.revision!==a.revision) recoverySelections.clear();
     selectedArtifact=a;
-    $("files-detail").innerHTML=`<h3>${esc(a.path)}</h3><p>${esc(a.hold || "No hold")} · revision ${a.revision}</p><button data-file-action="inspect">Inspect files</button><button data-file-action="adopt">Adopt and Keep</button><button data-file-action="release-review">Release reviewed hold</button><button data-file-action="keep">${a.keep ? "Remove Keep (fresh retention)" : "Keep indefinitely"}</button><button data-file-action="delete">Delete owned files (8-second Undo)</button><p>Select files to copy for Curator recovery. Originals remain held until a complete import receipt.</p>${f.files.map(x=>`<label style="display:block"><input type="checkbox" class="recovery-file" value="${esc(x.path)}" ${x.identity.directory ? "disabled" : ""}> ${esc(x.path)} · ${fmtBytes(x.identity.bytes)}</label>`).join("")}<p>Showing ${f.files.length} of ${f.total} entries.</p><button data-file-action="stage">Stage selected recovery files</button><span id="file-operation" role="status"></span>`;
+    $("files-detail").innerHTML=`<h3>${esc(a.path)}</h3><p>${esc(a.hold || "No hold")} · revision ${a.revision}</p><button data-file-action="inspect">Inspect files</button><button data-file-action="adopt">Adopt and Keep</button><button data-file-action="release-review">Release reviewed hold</button><button data-file-action="keep">${a.keep ? "Remove Keep (fresh retention)" : "Keep indefinitely"}</button><button data-file-action="delete">Delete owned files (8-second Undo)</button><p>Select files to copy for Curator recovery. Originals remain held until a complete import receipt.</p>${f.files.map(x=>`<label style="display:block"><input type="checkbox" class="recovery-file" value="${esc(x.path)}" ${x.identity.directory ? "disabled" : ""} ${recoverySelections.has(x.path) ? "checked" : ""}> ${esc(x.path)} · ${fmtBytes(x.identity.bytes)}</label>`).join("")}<p>Entries ${offset+1}–${offset+f.files.length} of ${f.total}. <button id="file-prev" ${offset===0?"disabled":""}>Previous files</button><button id="file-next" ${offset+f.files.length>=f.total?"disabled":""}>Next files</button></p><button data-file-action="stage">Preview selected recovery files</button><span id="file-operation" role="status"></span>`;
+    $("file-prev").onclick=()=>openArtifact(id,Math.max(0,offset-200));
+    $("file-next").onclick=()=>openArtifact(id,offset+200);
+    $("files-detail").querySelectorAll(".recovery-file").forEach(box=>box.onchange=()=>{if(box.checked)recoverySelections.add(box.value);else recoverySelections.delete(box.value);});
     $("files-detail").querySelectorAll("[data-file-action]").forEach(b=>b.onclick=()=>artifactAction(b.dataset.fileAction));
   } catch(e){filesError(e);}
 }
@@ -4313,14 +4320,17 @@ async function artifactAction(action) {
     if(action==="keep") await fileRequest(base+"/retention",{revision:a.revision,keep:!a.keep});
     if(action==="delete") {
       const op=await fileRequest(base+"/delete",{revision:a.revision,idempotency_key:crypto.randomUUID(),undo_seconds:8});
+      filesOperation=op.id;
       $("file-operation").innerHTML=`Deletion queued. <button id="undo-file-delete">Undo</button>`;
       $("undo-file-delete").onclick=async()=>{try{await fileRequest("artifact-operations/"+op.id+"/cancel");$("file-operation").textContent="Deletion cancelled";}catch(e){filesError(e);}};
       return;
     }
     if(action==="stage") {
-      const files=[...document.querySelectorAll(".recovery-file:checked")].map(e=>e.value);
-      filesOperation=(await fileRequest(base+"/recoveries",{revision:a.revision,idempotency_key:crypto.randomUUID(),files})).id;
-      $("files-message").textContent="Recovery staging requested. Follow the handoff status below; claim and import it in Curator.";
+      const files=[...recoverySelections];
+      const request={revision:a.revision,idempotency_key:crypto.randomUUID(),files};
+      const p=await fileRequest(base+"/recoveries",{...request,preview:true});
+      $("file-operation").innerHTML=`<p>Retain ${fmtBytes(p.source_bytes)} original bytes, add ${fmtBytes(p.additional_staging_bytes)} staging bytes and up to ${fmtBytes(p.additional_library_bytes)} library bytes. Staging has ${fmtBytes(p.staging_available_bytes)} available and needs a ${fmtBytes(p.reserve_bytes)} reserve. ${esc(p.library_capacity)}. ${esc(p.verification)}.</p><button id="confirm-recovery-stage">Stage this selection</button>`;
+      $("confirm-recovery-stage").onclick=async()=>{try{filesOperation=(await fileRequest(base+"/recoveries",request)).id;$("files-message").textContent="Recovery staging requested. Follow the handoff status below; claim and import it in Curator.";$("file-operation").textContent="Staging queued.";}catch(e){filesError(e);}};
       return;
     }
     await openArtifact(a.id);await refreshFiles();
@@ -4332,6 +4342,11 @@ async function loadFileSettings(){
 }
 async function saveFileSettings(){
   try{await fileRequest("artifacts/settings",{enabled:$("cfg-files-enable").checked,failed_retention_days:Number($("cfg-files-days").value),recovery_root:$("cfg-files-root").value,consumer_token:$("cfg-files-token").value||null},"PUT");$("cfg-files-token").value="";await loadFileSettings();}catch(e){$("cfg-files-advisory").textContent=e.message;}
+}
+
+let retentionPreviewId=null;
+async function previewExistingRetention(){
+  try{const p=await fileRequest("artifacts/retention-preview",{days:Number($("cfg-files-days").value)});retentionPreviewId=p.id;$("cfg-files-policy-preview").innerHTML=`<p>${p.entries.length} owned failures will receive ${p.days===0?"indefinite retention":p.days+" fresh days of eligible uptime"}. Kept, held and unknown directories are excluded. Maximum ${p.limit} per preview.</p><ul>${p.entries.map(e=>`<li>${esc(e.path)} · was ${e.previous_seconds/86400} days</li>`).join("")}</ul><button type="button" data-live="true" id="apply-files-policy">Apply this preview</button>`;$("apply-files-policy").onclick=async()=>{try{await fileRequest("artifacts/retention-apply/"+retentionPreviewId);$("cfg-files-policy-preview").textContent="Retention preview applied. Every changed timer starts fresh.";}catch(e){$("cfg-files-policy-preview").textContent=e.message;}};}catch(e){$("cfg-files-policy-preview").textContent=e.message;}
 }
 
 // ---- tabs ---------------------------------------------------------------
@@ -4816,7 +4831,7 @@ function renderSettingsForm() {
     } else {
       body = `<div class="cfg-grid">` +
         sec.fields.map(([p, l, t, o, help]) => fieldControl(p, l, t, o, help)).join("") + `</div>`;
-      if (sec.key === "file-lifecycle") body = `<label><input id="cfg-files-enable" type="checkbox" data-live="true"> Enable automatic failed-file retention</label><label>Future failed retention (days; 0 keeps forever) <input id="cfg-files-days" type="number" min="0" max="3650" value="7" data-live="true"></label><label>Recovery root <input id="cfg-files-root" data-live="true"></label><label>Curator recovery credential (blank keeps existing) <input id="cfg-files-token" type="password" autocomplete="new-password" data-live="true"></label><button type="button" data-live="true" onclick="saveFileSettings()">Apply lifecycle settings</button><p id="cfg-files-advisory"></p>`;
+      if (sec.key === "file-lifecycle") body = `<label><input id="cfg-files-enable" type="checkbox" data-live="true"> Enable automatic failed-file retention</label><label>Future failed retention (days; 0 keeps forever) <input id="cfg-files-days" type="number" min="0" max="3650" value="7" data-live="true"></label><label>Recovery root <input id="cfg-files-root" data-live="true"></label><label>Curator recovery credential (blank keeps existing) <input id="cfg-files-token" type="password" autocomplete="new-password" data-live="true"></label><button type="button" data-live="true" onclick="saveFileSettings()">Apply lifecycle settings</button><p id="cfg-files-advisory"></p><button type="button" data-live="true" onclick="previewExistingRetention()">Preview retention for existing failures</button><div id="cfg-files-policy-preview"></div>`;
       if (sec.key === "history-sync") body = `<button id="cfg-history-sync-enable" type="button" data-live="true" onclick="toggleHistorySync()">Enable history synchronization</button><p id="cfg-history-sync-advisory" class="desc"></p>`;
       if (sec.key === "enable") body += `<div id="cfg-enable-advisory">${enableAdvisory(cfgModel)}</div>`;
     }

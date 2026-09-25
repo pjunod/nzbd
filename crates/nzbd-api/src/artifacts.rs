@@ -20,6 +20,14 @@ pub fn router() -> Router<ApiState> {
             get(settings).put(put_settings),
         )
         .route("/api/v1/artifacts/scan", post(scan))
+        .route(
+            "/api/v1/artifacts/retention-preview",
+            post(preview_retention),
+        )
+        .route(
+            "/api/v1/artifacts/retention-apply/{id}",
+            post(apply_retention),
+        )
         .route("/api/v1/artifacts/{id}", get(detail))
         .route("/api/v1/artifacts/{id}/files", get(files))
         .route("/api/v1/artifacts/{id}/events", get(events))
@@ -39,6 +47,10 @@ pub fn router() -> Router<ApiState> {
         .route("/api/v1/recoveries/{id}/claim", post(claim))
         .route("/api/v1/recoveries/{id}/receipt", post(receipt))
         .route("/api/v1/recoveries/{id}/cancel", post(cancel_recovery))
+        .route(
+            "/api/v1/recoveries/{id}/delete-receipted-source",
+            post(prune_source),
+        )
         .route("/api/v1/recoveries/{id}/cancel-ack", post(cancel_ack))
 }
 fn failure(e: Error) -> Response {
@@ -61,13 +73,15 @@ async fn work<T: serde::Serialize + Send + 'static>(
 #[derive(Default, Deserialize)]
 struct Page {
     #[serde(default)]
+    include_terminal: bool,
+    #[serde(default)]
     offset: usize,
     #[serde(default)]
     after: i64,
 }
 async fn list(State(st): State<ApiState>, Query(p): Query<Page>) -> Response {
     let db = st.engine.artifacts();
-    work(move||{let mut rows=db.list(p.offset,100)?;let now=nzbd_state::artifacts::now();let mut out=Vec::new();for a in &mut rows {let total=a.files.len();let bytes=a.files.iter().filter(|f|!f.identity.directory).map(|f|f.identity.bytes).sum::<u64>();a.files.clear();out.push(json!({"artifact":a,"files":total,"bytes":bytes,"earliest_expiry":a.earliest_expiry(now)}));}Ok(json!({"entries":out,"offset":p.offset,"limit":100}))}).await
+    work(move||{let mut rows=db.list_visible(p.offset,100,p.include_terminal)?;let now=nzbd_state::artifacts::now();let mut out=Vec::new();for a in &mut rows {let total=a.files.len();let bytes=a.files.iter().filter(|f|!f.identity.directory).map(|f|f.identity.bytes).sum::<u64>();a.files.clear();out.push(json!({"artifact":a,"files":total,"bytes":bytes,"earliest_expiry":a.earliest_expiry(now)}));}Ok(json!({"entries":out,"offset":p.offset,"limit":100}))}).await
 }
 async fn detail(State(st): State<ApiState>, Path(id): Path<String>) -> Response {
     let db = st.engine.artifacts();
@@ -265,6 +279,8 @@ async fn scan(State(st): State<ApiState>) -> Response {
 }
 #[derive(Deserialize)]
 struct Stage {
+    #[serde(default)]
+    preview: bool,
     revision: u64,
     idempotency_key: String,
     files: Vec<String>,
@@ -296,6 +312,9 @@ async fn stage(
             StatusCode::CONFLICT,
             "recovery root overlaps a download, state, watch or category role",
         );
+    }
+    if body.preview {
+        return work(move || db.preview_recovery(&id, body.revision, &body.files, &root)).await;
     }
     match db.submit_task(
         "stage",
@@ -375,4 +394,32 @@ async fn cancel_ack(
         Err(r) => return r,
     };
     work(move || db.cancel_recovery(&id, Some(&who), true)).await
+}
+
+#[derive(Deserialize)]
+struct PolicyDays {
+    days: u32,
+}
+async fn preview_retention(State(st): State<ApiState>, Json(body): Json<PolicyDays>) -> Response {
+    let db = st.engine.artifacts();
+    work(move || db.preview_retention(body.days)).await
+}
+async fn apply_retention(State(st): State<ApiState>, Path(id): Path<String>) -> Response {
+    let db = st.engine.artifacts();
+    work(move || db.apply_retention(&id)).await
+}
+
+async fn prune_source(State(st): State<ApiState>, Path(id): Path<String>) -> Response {
+    let db = st.engine.artifacts();
+    let r = match db.recovery(&id) {
+        Ok(r) => r,
+        Err(e) => return failure(e),
+    };
+    if let Err(response) = validate_artifact_role(&st, &r.artifact) {
+        return response;
+    }
+    match db.submit_task("prune", &r.artifact, "", json!({"recovery":id})) {
+        Ok(op) => (StatusCode::ACCEPTED, Json(op)).into_response(),
+        Err(e) => failure(e),
+    }
 }

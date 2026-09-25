@@ -43,8 +43,8 @@ pub struct Receipt {
     pub manifest_digest: String,
     pub files: Vec<ReceiptFile>,
 }
-fn save(db: &Connection, r: &Recovery) -> Result<()> {
-    db.execute("INSERT INTO recoveries(id,artifact,state,data) VALUES(?1,?2,?3,?4) ON CONFLICT(id) DO UPDATE SET state=excluded.state,data=excluded.data",params![r.id,r.artifact,r.state,serde_json::to_string(r)?])?;
+pub(super) fn save(db: &Connection, r: &Recovery) -> Result<()> {
+    db.execute("INSERT INTO recoveries(id,artifact,state,data) VALUES(?1,?2,?3,?4) ON CONFLICT(id) DO UPDATE SET state=CASE WHEN recoveries.state='cancel_pending' AND excluded.state IN ('staging','publishing') THEN recoveries.state ELSE excluded.state END,data=CASE WHEN recoveries.state='cancel_pending' AND excluded.state IN ('staging','publishing') THEN json_set(excluded.data,'$.state','cancel_pending') ELSE excluded.data END",params![r.id,r.artifact,r.state,serde_json::to_string(r)?])?;
     Ok(())
 }
 fn digest(file: &mut File) -> Result<String> {
@@ -72,6 +72,52 @@ impl Inventory {
     }
     /// Copies are independent inodes. Originals are held before scratch is
     /// allocated, and remain held through ambiguous claims or partial receipts.
+    pub fn preview_recovery(
+        &self,
+        key: &str,
+        revision: u64,
+        paths: &[String],
+        root: &Path,
+    ) -> Result<serde_json::Value> {
+        let a = self.get(key)?;
+        if a.revision != revision
+            || !a.owned
+            || a.hold.is_some()
+            || !matches!(a.state.as_str(), "parked_failed" | "retained" | "completed")
+        {
+            return Err(Error::Conflict(
+                "stale selection, unowned or held source".into(),
+            ));
+        }
+        self.verify(&a)?;
+        if paths.is_empty() || paths.len() > 1000 {
+            return Err(Error::Conflict("select 1–1000 regular files".into()));
+        }
+        let mut seen = std::collections::HashSet::new();
+        let mut bytes = 0u64;
+        for path in paths {
+            if !seen.insert(path) {
+                return Err(Error::Conflict("duplicate selection".into()));
+            }
+            let f = a
+                .files
+                .iter()
+                .find(|f| &f.path == path && !f.identity.directory)
+                .ok_or_else(|| Error::Conflict("selection changed".into()))?;
+            bytes = bytes.saturating_add(f.identity.bytes);
+        }
+        fs::absolute(root)?;
+        let mut volume = root;
+        while !volume.try_exists()? {
+            volume = volume
+                .parent()
+                .ok_or_else(|| Error::Conflict("recovery volume unavailable".into()))?;
+        }
+        let available = fs::available_bytes(&fs::open_dir(volume)?)?;
+        Ok(
+            serde_json::json!({"revision":revision,"selected_files":paths.len(),"source_bytes":bytes,"additional_staging_bytes":bytes,"additional_library_bytes":bytes,"reserve_bytes":1073741824u64,"staging_available_bytes":available,"staging_capacity_met":available>=bytes.saturating_add(1073741824),"recovery_root":root,"library_capacity":"Curator checks its own library volume before import","verification":"Copy digests verify identical bytes; media completeness is assessed separately in Curator"}),
+        )
+    }
     pub fn stage_recovery(
         &self,
         key: &str,
@@ -188,6 +234,7 @@ impl Inventory {
             tx.commit()?;
             r
         };
+        drop(_guard); // The durable hold protects this source while other jobs keep admitting.
         let result = (|| {
             let required: u64 = selected.iter().map(|f| f.identity.bytes).sum();
             let mut volume = root;
@@ -206,7 +253,13 @@ impl Inventory {
             let published = root.join("published");
             std::fs::create_dir_all(&staging)?;
             std::fs::create_dir_all(&published)?;
-            fs::open_dir(&staging)?;
+            let staging_dir = fs::open_dir(&staging)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                staging_dir.set_permissions(std::fs::Permissions::from_mode(0o700))?;
+            }
+            staging_dir.sync_all()?;
             fs::open_dir(&published)?;
             let scratch = staging.join(&r.id);
             std::fs::create_dir(&scratch)?;
@@ -216,6 +269,9 @@ impl Inventory {
             let payload = scratch.join("payload");
             std::fs::create_dir(&payload)?;
             for f in selected {
+                if self.recovery(&r.id)?.state == "cancel_pending" {
+                    return Err(Error::Conflict("staging cancelled".into()));
+                }
                 let mut input = fs::open_relative(&source, &f.path)?;
                 if fs::identity(&input.metadata()?) != f.identity {
                     return Err(Error::Conflict("source identity changed".into()));
@@ -261,6 +317,10 @@ impl Inventory {
             File::open(&staging)?.sync_all()?;
             // Journal the complete manifest before publication. Crash recovery
             // may validate it and finish the acknowledgement without recopying.
+            let _publication_guard = self.mutation.lock().unwrap();
+            if self.recovery(&r.id)?.state == "cancel_pending" {
+                return Err(Error::Conflict("staging cancelled".into()));
+            }
             r.state = "publishing".into();
             save(&self.db.lock().unwrap(), &r)?;
             if r.published.exists() {
@@ -274,11 +334,29 @@ impl Inventory {
             self.register_publication(&r)?;
             Ok(())
         })();
+        let _guard = self.mutation.lock().unwrap();
+        let cancelled = self.recovery(&r.id)?.state == "cancel_pending";
         match result {
             Ok(()) => r.state = "published".into(),
             Err(e) => {
                 r.state = "failed".into();
                 r.error = Some(e.to_string());
+                let scratch = root.join(".staging").join(&r.id);
+                if scratch.try_exists().unwrap_or(false) {
+                    self.discover_unlocked(scratch.parent().unwrap(), &scratch)?;
+                }
+            }
+        }
+        if cancelled {
+            r.state = "cancelled".into();
+            let mut source = self.get(&r.artifact)?;
+            source.hold = Some("review: cancelled recovery".into());
+            source.revision += 1;
+            save_artifact(&self.db.lock().unwrap(), &source)?;
+            if let Ok(mut staged) = self.get(&format!("recovery-{}", r.id)) {
+                staged.hold = Some("review: cancelled recovery staging".into());
+                staged.revision += 1;
+                save_artifact(&self.db.lock().unwrap(), &staged)?;
             }
         }
         r.updated_at = now();
@@ -288,6 +366,22 @@ impl Inventory {
     /// Resolve publication from its durable manifest. Incomplete copying is
     /// retained for explicit review; it is never recursively erased on restart.
     fn resume_publication(&self, mut r: Recovery) -> Result<Recovery> {
+        if r.state == "cancel_pending" && r.consumer.is_none() {
+            r.state = "cancelled".into();
+            r.updated_at = now();
+            let mut source = self.get(&r.artifact)?;
+            source.hold = Some("review: cancelled recovery".into());
+            source.revision += 1;
+            save_artifact(&self.db.lock().unwrap(), &source)?;
+            save(&self.db.lock().unwrap(), &r)?;
+            if let Some(root) = r.published.parent().and_then(Path::parent) {
+                let scratch = root.join(".staging").join(&r.id);
+                if scratch.try_exists().unwrap_or(false) {
+                    self.discover_unlocked(scratch.parent().unwrap(), &scratch)?;
+                }
+            }
+            return Ok(r);
+        }
         if !matches!(r.state.as_str(), "staging" | "publishing") {
             return Ok(r);
         }
@@ -365,7 +459,7 @@ impl Inventory {
         let pending = {
             let db = self.db.lock().unwrap();
             let mut stmt = db.prepare(
-                "SELECT data FROM recoveries WHERE state IN ('staging','publishing') LIMIT 10",
+                "SELECT data FROM recoveries WHERE state IN ('staging','publishing') OR (state='cancel_pending' AND json_extract(data,'$.consumer') IS NULL) LIMIT 10",
             )?;
             let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
             rows.collect::<std::result::Result<Vec<_>, _>>()?
@@ -389,7 +483,12 @@ impl Inventory {
                 "manifest changed or missing import id".into(),
             ));
         }
-        if r.consumer.as_deref() == Some(consumer) && r.import_id.as_deref() == Some(import_id) {
+        if r.consumer.as_deref() == Some(consumer)
+            && r.import_id.as_deref() == Some(import_id)
+            && matches!(r.state.as_str(), "claimed" | "imported")
+        {
+            r.updated_at = now();
+            save(&self.db.lock().unwrap(), &r)?;
             return Ok(r);
         }
         if r.state != "published" || r.consumer.is_some() {
@@ -491,6 +590,14 @@ impl Inventory {
     ) -> Result<Recovery> {
         let _guard = self.mutation.lock().unwrap();
         let mut r = self.recovery(key)?;
+        if matches!(r.state.as_str(), "staging" | "publishing")
+            || (r.state == "cancel_pending" && r.consumer.is_none())
+        {
+            r.state = "cancel_pending".into();
+            r.updated_at = now();
+            save(&self.db.lock().unwrap(), &r)?;
+            return Ok(r);
+        }
         if r.state == "imported" {
             return Err(Error::Conflict("import already committed".into()));
         }
@@ -520,5 +627,141 @@ impl Inventory {
         r.updated_at = now();
         save(&self.db.lock().unwrap(), &r)?;
         Ok(r)
+    }
+}
+
+impl Inventory {
+    /// Explicit, receipt-scoped source cleanup. Other source files and partial
+    /// failures remain held; a receipt never authorizes deleting a whole tree.
+    pub fn prune_receipted_source(&self, key: &str) -> Result<()> {
+        let _guard = self.mutation.lock().unwrap();
+        let r = self.recovery(key)?;
+        if !matches!(r.state.as_str(), "imported" | "partial") {
+            return Err(Error::Conflict(
+                "a final per-file receipt is required".into(),
+            ));
+        }
+        let receipt = r
+            .receipt
+            .as_ref()
+            .ok_or_else(|| Error::Conflict("no final receipt".into()))?;
+        let mut a = self.get(&r.artifact)?;
+        if a.terminal() {
+            return Ok(());
+        }
+        if !a.owned || a.keep {
+            return Err(Error::Conflict("source is unowned or kept".into()));
+        }
+        if a.hold.as_deref().is_some_and(|hold| {
+            hold != format!("recovery:{}", r.id)
+                && hold != "review: unselected source files remain"
+                && hold != "review: unselected source files remain after receipt cleanup"
+        }) {
+            return Err(Error::Conflict("source has an unrelated hold".into()));
+        }
+        self.verify_root(&a)?;
+        if !a.path.try_exists()? {
+            a.state = "source_gone".into();
+            a.hold = None;
+            a.updated_at = now();
+            a.revision += 1;
+            save_artifact(&self.db.lock().unwrap(), &a)?;
+            return Ok(());
+        }
+        let dir = self.verify(&a)?;
+        let mut removals = Vec::new();
+        for imported in receipt
+            .files
+            .iter()
+            .filter(|f| matches!(f.result.as_str(), "imported" | "already_present"))
+        {
+            let selected = r
+                .files
+                .iter()
+                .find(|f| f.id == imported.id)
+                .ok_or_else(|| Error::Conflict("receipt file missing from manifest".into()))?;
+            let Some(entry) = a
+                .files
+                .iter()
+                .find(|f| f.path == selected.path && !f.identity.directory)
+            else {
+                continue;
+            };
+            let mut file = match fs::open_relative(&dir, &entry.path) {
+                Ok(file) => file,
+                Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e),
+            };
+            if fs::identity(&file.metadata()?) != entry.identity
+                || digest(&mut file)? != selected.sha256
+            {
+                return Err(Error::Conflict(
+                    "source file changed after recovery staging".into(),
+                ));
+            }
+            removals.push(entry.clone());
+        }
+        // Verify every selected file before removing any of them.
+        for entry in &removals {
+            fs::remove_entry(&dir, entry)?;
+        }
+        let mut directories = a
+            .files
+            .iter()
+            .filter(|e| e.identity.directory)
+            .cloned()
+            .collect::<Vec<_>>();
+        directories.sort_by_key(|e| std::cmp::Reverse(e.path.matches('/').count()));
+        for entry in directories {
+            match fs::open_relative(&dir, &entry.path) {
+                Ok(child) if fs::names(&child)?.is_empty() => {
+                    fs::remove_entry(&dir, &entry)?;
+                }
+                Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => (),
+                Err(e) => return Err(e),
+                _ => (),
+            }
+        }
+        let remaining = fs::manifest(&dir, 100_000)?;
+        if remaining.is_empty() {
+            let root = self.verify_root(&a)?;
+            let current = fs::open_at(&root, a.path.file_name().unwrap().as_ref(), true)?;
+            let observed = fs::identity(&current.metadata()?);
+            if !a
+                .identity
+                .as_ref()
+                .is_some_and(|i| i.same_object(&observed))
+            {
+                return Err(Error::Conflict("source directory changed".into()));
+            }
+            fs::unlink(&root, a.path.file_name().unwrap().as_ref(), true)?;
+            a.state = "deleted".into();
+            a.hold = None;
+        } else {
+            // Directory mtimes change as selected children are removed, but
+            // additions or substituted objects revoke remaining ownership.
+            if remaining.iter().any(|f| {
+                !a.files.iter().any(|old| {
+                    old.path == f.path
+                        && old.identity.same_object(&f.identity)
+                        && (f.identity.directory || old.identity == f.identity)
+                })
+            }) {
+                a.owned = false;
+                a.keep = true;
+            }
+            a.hold = Some("review: unselected source files remain after receipt cleanup".into());
+        }
+        a.files = remaining;
+        a.revision += 1;
+        a.updated_at = now();
+        save_artifact(&self.db.lock().unwrap(), &a)?;
+        event(
+            &self.db.lock().unwrap(),
+            &a.id,
+            "receipt_source_cleanup",
+            key,
+        )?;
+        Ok(())
     }
 }

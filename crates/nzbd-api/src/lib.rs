@@ -1125,7 +1125,17 @@ async fn park_snapshot(st: &ApiState, job: JobId) -> Option<Parked> {
 
 /// Write the parked record + spool. Called only after the engine confirmed
 /// the delete, so history can never claim a job that is still queued.
-async fn park_write(st: &ApiState, parked: Parked) -> bool {
+async fn park_write(st: &ApiState, mut parked: Parked) -> bool {
+    if let Ok(Some(a)) = st.engine.artifacts().for_job(parked.entry.job.0) {
+        parked.entry.params.retain(|(k, _)| k != "Artifact:Id");
+        parked
+            .entry
+            .params
+            .push(("Artifact:Id".into(), a.id.clone()));
+        if !a.terminal() {
+            parked.entry.final_dir = Some(a.path.to_string_lossy().into_owned());
+        }
+    }
     let Some(db) = st.history.clone() else {
         return false;
     };
@@ -1749,6 +1759,10 @@ async fn metrics(State(st): State<ApiState>) -> Response {
     }
     use std::fmt::Write;
     let mut out = String::with_capacity(1024);
+    let inventory = st.engine.artifacts();
+    if let Ok(Ok(lifecycle)) = tokio::task::spawn_blocking(move || inventory.metrics()).await {
+        out.push_str(&lifecycle);
+    }
     let m = &mut out;
     let _ = writeln!(m, "# TYPE nzbd_download_rate_bytes_per_second gauge");
     let _ = writeln!(
@@ -2599,7 +2613,17 @@ async fn history_action(
         let lookup = db.clone();
         let entry = match tokio::task::spawn_blocking(move || lookup.get(job)).await {
             Ok(Ok(Some(entry))) => entry,
-            Ok(Ok(None)) => return not_found(),
+            Ok(Ok(None)) => {
+                let inventory = st.engine.artifacts();
+                if let Ok(Some(a)) = inventory.for_job(id) {
+                    if let Ok(op) = inventory.operation(&format!("history-delete-{}", a.id)) {
+                        if op.state == "succeeded" {
+                            return Json(json!({"ok":true,"files_removed":true})).into_response();
+                        }
+                    }
+                }
+                return not_found();
+            }
             _ => return error(StatusCode::INTERNAL_SERVER_ERROR, "history lookup failed"),
         };
         if let Some(torrent) = entry
@@ -2628,6 +2652,8 @@ async fn history_action(
             let artifact_id = entry.params.iter().find(|(k,_)| k == "Artifact:Id")
                 .map(|(_,v)|v).ok_or_else(||nzbd_state::artifacts::Error::Conflict("legacy History has no allocation identity; inspect and delete it through Files".into()))?;
             let artifact = inventory.get(artifact_id)?;
+            if artifact.job!=Some(job.0) {return Err(nzbd_state::artifacts::Error::Conflict("History allocation belongs to another job".into()));}
+            if artifact.state=="deleted" { db.delete(job).map_err(|e|nzbd_state::artifacts::Error::Conflict(e.to_string()))?; return Ok(true); }
             if entry.final_dir.as_deref().map(std::path::Path::new) != Some(artifact.path.as_path()) {
                 return Err(nzbd_state::artifacts::Error::Conflict("History path does not match the owned generation".into()));
             }
@@ -2695,6 +2721,19 @@ async fn history_action(
 /// not from whenever the first SSE client happens to connect. Every caller
 /// already builds its router inside one.
 pub fn router_with(state: ApiState) -> Router {
+    if let Some(setup) = &state.setup {
+        let roots = setup
+            .current
+            .lock()
+            .unwrap()
+            .storage_roots()
+            .into_iter()
+            .map(|r| r.path)
+            .collect::<Vec<_>>();
+        if let Err(error) = state.engine.artifacts().protect_roots(&roots) {
+            tracing::error!(%error,"could not persist protected directory roles");
+        }
+    }
     let state = ApiState {
         events: state
             .events

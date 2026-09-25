@@ -23,6 +23,8 @@ Optionally runs as a **multi-node cluster** over a shared work volume.
 Follow [file lifecycle progress](docs/FILE_LIFECYCLE_STATUS.md) for the
 [ownership and recovery plan](docs/FILE_LIFECYCLE_PLAN.md) and its
 [design review](docs/FILE_LIFECYCLE_REVIEW.md).
+See [file lifecycle operations](docs/FILE_LIFECYCLE_OPERATIONS.md) for retention,
+recovery mounts, cancellation and backup/restore.
 
 ## Highlights
 

@@ -3,6 +3,8 @@
 //! SQLite owns intent and policy; external sidecars own allocation identity.
 //! Nothing in a media payload is a marker or grants permission to remove it.
 mod fs;
+mod policy;
+pub use policy::{RetentionChange, RetentionPreview};
 mod recovery;
 mod relocation;
 mod tasks;
@@ -134,6 +136,7 @@ pub struct Inventory {
     // Serialized mutation coordinator. Reads never wait for filesystem work.
     mutation: Mutex<()>,
     clocks: Mutex<std::collections::HashMap<String, (u64, Instant)>>,
+    reconcile_cursor: Mutex<String>,
 }
 
 pub fn now() -> i64 {
@@ -196,6 +199,8 @@ impl Inventory {
         db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;
           CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);
           CREATE TABLE IF NOT EXISTS artifacts(id TEXT PRIMARY KEY,job INTEGER,path TEXT NOT NULL,state TEXT NOT NULL,updated_at INTEGER NOT NULL,data TEXT NOT NULL);
+          CREATE INDEX IF NOT EXISTS artifacts_recent ON artifacts(updated_at DESC,id);
+          CREATE INDEX IF NOT EXISTS artifacts_live_recent ON artifacts(updated_at DESC,id) WHERE state NOT IN ('deleted','source_gone');
           CREATE INDEX IF NOT EXISTS artifacts_job ON artifacts(job);
           CREATE INDEX IF NOT EXISTS artifacts_path ON artifacts(path);
           CREATE INDEX IF NOT EXISTS artifacts_state ON artifacts(state,updated_at);
@@ -219,7 +224,7 @@ impl Inventory {
             db.query_row("SELECT value FROM meta WHERE key='installation'", [], |r| {
                 r.get(0)
             })?;
-        File::open(state_dir)?.sync_all()?;
+        fs::sync_directory(&fs::open_dir(state_dir)?)?;
         Ok(Self {
             db: Mutex::new(db),
             _process_lock: process_lock,
@@ -227,6 +232,7 @@ impl Inventory {
             installation,
             mutation: Mutex::new(()),
             clocks: Mutex::new(std::collections::HashMap::new()),
+            reconcile_cursor: Mutex::new(String::new()),
         })
     }
     pub fn settings(&self) -> Result<Settings> {
@@ -277,9 +283,21 @@ impl Inventory {
         Ok(raw.map(|s| serde_json::from_str(&s)).transpose()?)
     }
     pub fn list(&self, offset: usize, limit: usize) -> Result<Vec<Artifact>> {
+        self.list_visible(offset, limit, true)
+    }
+    pub fn list_visible(
+        &self,
+        offset: usize,
+        limit: usize,
+        include_terminal: bool,
+    ) -> Result<Vec<Artifact>> {
         let db = self.db.lock().unwrap();
-        let mut stmt = db
-            .prepare("SELECT data FROM artifacts ORDER BY updated_at DESC,id LIMIT ?1 OFFSET ?2")?;
+        let query = if include_terminal {
+            "SELECT data FROM artifacts ORDER BY updated_at DESC,id LIMIT ?1 OFFSET ?2"
+        } else {
+            "SELECT data FROM artifacts WHERE state NOT IN ('deleted','source_gone') ORDER BY updated_at DESC,id LIMIT ?1 OFFSET ?2"
+        };
+        let mut stmt = db.prepare(query)?;
         let rows = stmt.query_map(params![limit.min(200) as i64, offset as i64], |r| {
             r.get::<_, String>(0)
         })?;
@@ -295,7 +313,15 @@ impl Inventory {
         let dir = self.state_dir.join("artifact-identities").join(&a.id);
         std::fs::create_dir_all(&dir)?;
         let target = dir.join(format!("{}.json", a.generation));
-        let tmp = dir.join(format!("{}.tmp", a.generation));
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let tmp = dir.join(format!(
+            "{}.{}.{nonce}.tmp",
+            a.generation,
+            std::process::id()
+        ));
         let mut file = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -304,9 +330,9 @@ impl Inventory {
             file.write_all(&serde_json::to_vec(&serde_json::json!({"installation":self.installation,"artifact":a.id,"generation":a.generation,"path":a.path,"root":a.root,"root_identity":a.root_identity,"identity":a.identity}))?)?;
             file.sync_all()?;
             std::fs::rename(&tmp, &target)?;
-            File::open(&dir)?.sync_all()?;
-            File::open(dir.parent().unwrap())?.sync_all()?;
-            File::open(&self.state_dir)?.sync_all()?;
+            fs::sync_directory(&fs::open_dir(&dir)?)?;
+            fs::sync_directory(&fs::open_dir(dir.parent().unwrap())?)?;
+            fs::sync_directory(&fs::open_dir(&self.state_dir)?)?;
             Ok(())
         })();
         if result.is_err() {
@@ -351,8 +377,8 @@ impl Inventory {
             root_identity,
             identity: None,
             state: "allocating".into(),
-            owned: true,
-            keep: false,
+            owned: cfg!(unix),
+            keep: !cfg!(unix),
             hold: None,
             created_at: now(),
             updated_at: now(),
@@ -365,7 +391,7 @@ impl Inventory {
         save_artifact(&db, &a)?;
         drop(db);
         std::fs::create_dir(path)?;
-        root_file.sync_all()?;
+        fs::sync_directory(&root_file)?;
         a.identity = Some(fs::identity(&fs::open_dir(path)?.metadata()?));
         self.sidecar(&a)?;
         a.state = "active".into();
@@ -405,7 +431,7 @@ impl Inventory {
             if a.state == "allocating" {
                 if !a.path.try_exists()? && live {
                     std::fs::create_dir(&a.path)?;
-                    fs::open_dir(&a.root)?.sync_all()?;
+                    fs::sync_directory(&fs::open_dir(&a.root)?)?;
                 }
                 if !a.path.try_exists()? {
                     a.state = "source_gone".into();
@@ -455,12 +481,17 @@ impl Inventory {
         let _guard = self.mutation.lock().unwrap();
         let raws = {
             let db = self.db.lock().unwrap();
-            let mut stmt = db.prepare("SELECT data FROM artifacts WHERE state IN ('completed','retained','unknown','retiring') LIMIT 1000")?;
-            let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+            let mut stmt = db.prepare("SELECT data FROM artifacts WHERE state IN ('completed','retained','unknown','retiring') AND id>?1 ORDER BY id LIMIT 1000")?;
+            let cursor = self.reconcile_cursor.lock().unwrap().clone();
+            let rows = stmt.query_map([cursor], |r| r.get::<_, String>(0))?;
             rows.collect::<std::result::Result<Vec<_>, _>>()?
         };
+        if raws.is_empty() {
+            self.reconcile_cursor.lock().unwrap().clear();
+        }
         for raw in raws {
             let mut a: Artifact = serde_json::from_str(&raw)?;
+            *self.reconcile_cursor.lock().unwrap() = a.id.clone();
             if self.verify_root(&a).is_err() {
                 continue;
             }
@@ -477,39 +508,32 @@ impl Inventory {
         Ok(())
     }
 
-    pub fn begin_transition(&self, job: u32, destination: &Path) -> Result<()> {
-        let _guard = self.mutation.lock().unwrap();
-        let mut a = self.for_job(job)?.ok_or(Error::NotFound)?;
-        if a.hold.as_deref().is_some_and(|h| h != "review")
-            || !matches!(a.state.as_str(), "active" | "transitioning")
-        {
-            return Err(Error::Conflict(
-                "payload is not available to post-processing".into(),
-            ));
-        }
-        let mut db = self.db.lock().unwrap();
-        let tx = db.transaction()?;
-        let op = Operation {
-            id: format!("transition-{}-{}", a.id, a.revision),
-            artifact: a.id.clone(),
-            kind: "transition".into(),
-            state: "running".into(),
-            request: destination.to_string_lossy().into(),
-            created_at: now(),
-            not_before: 0,
-            attempts: 1,
-            next_retry: 0,
-            error: None,
-        };
-        a.state = "transitioning".into();
-        a.revision += 1;
-        save_operation(&tx, &op)?;
-        save_artifact(&tx, &a)?;
-        tx.commit()?;
+    pub fn protect_roots(&self, roots: &[PathBuf]) -> Result<()> {
+        self.db.lock().unwrap().execute("INSERT INTO meta VALUES('protected_roots',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",[serde_json::to_string(roots)?])?;
         Ok(())
     }
-
     fn verify_root(&self, a: &Artifact) -> Result<File> {
+        let raw: Option<String> = self
+            .db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT value FROM meta WHERE key='protected_roots'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(raw) = raw {
+            let roots: Vec<PathBuf> = serde_json::from_str(&raw)?;
+            if roots
+                .iter()
+                .any(|root| root == &a.path || root.starts_with(&a.path))
+            {
+                return Err(Error::Conflict(
+                    "payload overlaps a configured directory role".into(),
+                ));
+            }
+        }
         let root = fs::open_dir(&a.root)?;
         if !a
             .root_identity
@@ -654,7 +678,10 @@ impl Inventory {
         let _guard = self.mutation.lock().unwrap();
         let mut a = self.get(key)?;
         let dir = self.verify(&a)?;
-        if a.state == "active" || a.state == "active_unverified" {
+        if matches!(
+            a.state.as_str(),
+            "active" | "active_unverified" | "transitioning" | "retiring" | "deleting"
+        ) {
             return Err(Error::Conflict(
                 "writers must finish before inspection".into(),
             ));
@@ -672,6 +699,12 @@ impl Inventory {
         Ok(a)
     }
     pub fn adopt(&self, key: &str, revision: u64) -> Result<Artifact> {
+        if !cfg!(unix) {
+            return Err(Error::Conflict(
+                "checked destructive ownership requires descriptor-relative filesystem support"
+                    .into(),
+            ));
+        }
         let _guard = self.mutation.lock().unwrap();
         let mut a = self.get(key)?;
         if a.revision != revision
@@ -842,7 +875,7 @@ impl Inventory {
         }
         let mut db = self.db.lock().unwrap();
         let tx = db.transaction()?;
-        let pending:Option<String>=tx.query_row("SELECT data FROM operations WHERE artifact=?1 AND state IN ('queued','running','retry') LIMIT 1",[key],|r|r.get(0)).optional()?;
+        let pending:Option<String>=tx.query_row("SELECT data FROM operations WHERE artifact=?1 AND state IN ('queued','running','retry') AND json_extract(data,'$.kind')='delete' LIMIT 1",[key],|r|r.get(0)).optional()?;
         if let Some(raw) = pending {
             return Ok(serde_json::from_str(&raw)?);
         }
@@ -866,7 +899,7 @@ impl Inventory {
     pub fn cancel_delete(&self, key: &str) -> Result<Operation> {
         let _guard = self.mutation.lock().unwrap();
         let mut op = self.operation(key)?;
-        if op.state != "queued" {
+        if op.state != "queued" || !matches!(op.kind.as_str(), "delete" | "prune") {
             return Err(Error::Conflict(
                 "deletion already started or finished".into(),
             ));
@@ -878,6 +911,9 @@ impl Inventory {
     pub fn execute_delete(&self, key: &str) -> Result<Operation> {
         let _guard = self.mutation.lock().unwrap();
         let mut op = self.operation(key)?;
+        if op.kind != "delete" {
+            return Err(Error::Conflict("not a deletion operation".into()));
+        }
         if matches!(op.state.as_str(), "succeeded" | "cancelled" | "review")
             || op.not_before > now()
             || op.next_retry > now()
@@ -900,15 +936,14 @@ impl Inventory {
         }
         let result = (|| {
             let root = self.verify_root(&a)?;
-            let dir = match self.verify(&a) {
-                Ok(dir) => dir,
-                Err(Error::Io(e))
-                    if e.kind() == std::io::ErrorKind::NotFound && op.attempts > 1 =>
-                {
-                    return Ok(())
+            if op.attempts > 1 {
+                match std::fs::symlink_metadata(&a.path) {
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                    Err(e) => return Err(e.into()),
+                    Ok(_) => (),
                 }
-                Err(e) => return Err(e),
-            };
+            }
+            let dir = self.verify(&a)?;
             let observed = fs::manifest(&dir, 100_000)?;
             // A restarted partial deletion may have fewer entries, never more
             // or different ones. Every surviving regular file is revalidated.
@@ -1002,8 +1037,10 @@ impl Inventory {
                 let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
                 rows.collect::<std::result::Result<Vec<_>, _>>()?
             };
+            let mut active_clocks = std::collections::HashSet::new();
             for raw in raws {
                 let mut a: Artifact = serde_json::from_str(&raw)?;
+                active_clocks.insert(a.id.clone());
                 if enabled && a.eligible() {
                     let elapsed = {
                         let mut clocks = self.clocks.lock().unwrap();
@@ -1032,6 +1069,10 @@ impl Inventory {
                     self.clocks.lock().unwrap().remove(&a.id);
                 }
             }
+            self.clocks
+                .lock()
+                .unwrap()
+                .retain(|key, _| active_clocks.contains(key));
             tx.commit()?;
         }
         for (key, revision) in due {
@@ -1050,7 +1091,6 @@ impl Inventory {
                 tracing::warn!(operation=%key,error=%e,"artifact deletion remains pending");
             }
         }
-        self.reconcile_relocations()?;
         self.reconcile_recoveries()?;
         self.run_tasks()?;
         self.reconcile_missing()?;
@@ -1069,6 +1109,25 @@ impl Inventory {
         let count = rows.len();
         for raw in rows {
             let mut a: Artifact = serde_json::from_str(&raw)?;
+            // No live operation consults sidecars for terminal payloads. Keep
+            // the small SQL identity/idempotency record, retire bulky manifests
+            // and internal sidecar scratch after the diagnostic window.
+            let identities = self.state_dir.join("artifact-identities");
+            let directory = identities.join(&a.id);
+            if directory.try_exists()? {
+                let dir = fs::open_dir(&directory)?;
+                for entry in fs::manifest(&dir, 100)? {
+                    if entry.identity.directory
+                        || !(entry.path.ends_with(".json") || entry.path.ends_with(".tmp"))
+                    {
+                        return Err(Error::Conflict(
+                            "unexpected allocation sidecar entry".into(),
+                        ));
+                    }
+                    fs::remove_entry(&dir, &entry)?;
+                }
+                fs::unlink(&fs::open_dir(&identities)?, Path::new(&a.id), true)?;
+            }
             a.files.clear();
             save_artifact(&tx, &a)?;
         }

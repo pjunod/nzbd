@@ -262,3 +262,206 @@ fn claimed_recovery_never_releases_on_cancel_without_worker_acknowledgement() {
         "cancelled staging requires review"
     );
 }
+
+#[test]
+fn inspection_of_added_bytes_revokes_automatic_ownership() {
+    let (_tmp, db, root) = fixture();
+    let a = parked(&db, &root);
+    std::fs::write(a.path.join("another.mkv"), b"unrelated").unwrap();
+    let observed = db.inspect(&a.id).unwrap();
+    assert!(!observed.owned && observed.keep);
+    assert!(db
+        .request_delete(&a.id, observed.revision, "after-inspect", 0)
+        .is_err());
+}
+#[test]
+fn a_missing_sidecar_never_becomes_success_on_retry() {
+    let (_tmp, db, root) = fixture();
+    let a = parked(&db, &root);
+    let op = db
+        .request_delete(&a.id, a.revision, "marker-lost", 0)
+        .unwrap();
+    std::fs::remove_file(
+        db.state_dir
+            .join("artifact-identities")
+            .join(&a.id)
+            .join(format!("{}.json", a.generation)),
+    )
+    .unwrap();
+    let mut result = db.execute_delete(&op.id).unwrap();
+    assert_eq!(result.state, "retry");
+    result.next_retry = 0;
+    save_operation(&db.db.lock().unwrap(), &result).unwrap();
+    assert_eq!(db.execute_delete(&op.id).unwrap().state, "retry");
+    assert!(a.path.exists());
+}
+#[test]
+fn retention_preview_is_atomic_and_never_shortens_elapsed_eligibility() {
+    let (_tmp, db, root) = fixture();
+    let a = parked(&db, &root);
+    let p = db.preview_retention(1).unwrap();
+    assert_eq!(p.entries.len(), 1);
+    let kept = db.retention(&a.id, a.revision, true, None).unwrap();
+    assert!(db.apply_retention(&p.id).is_err());
+    assert_eq!(db.get(&a.id).unwrap().retention_seconds, 7 * 86400);
+    db.retention(&a.id, kept.revision, false, None).unwrap();
+    let p = db.preview_retention(1).unwrap();
+    db.apply_retention(&p.id).unwrap();
+    let a = db.get(&a.id).unwrap();
+    assert_eq!(a.retention_seconds, 86400);
+    assert_eq!(a.eligible_seconds, 0);
+    assert!(a.deadline.unwrap() >= now() + 86399);
+}
+#[test]
+fn relocation_refuses_existing_destination_and_commits_identity_after_rename() {
+    let (tmp, db, root) = fixture();
+    let source = root.join("live");
+    db.allocate(9, &root, &source).unwrap();
+    std::fs::write(source.join("media.mkv"), b"whole media").unwrap();
+    let target_root = tmp.path().join("failed");
+    std::fs::create_dir(&target_root).unwrap();
+    let target = target_root.join("live");
+    std::fs::create_dir(&target).unwrap();
+    assert!(db.relocate(9, &target).is_err());
+    assert!(source.exists());
+    std::fs::remove_dir(&target).unwrap();
+    db.relocate(9, &target).unwrap();
+    assert!(!source.exists());
+    assert_eq!(
+        std::fs::read(target.join("media.mkv")).unwrap(),
+        b"whole media"
+    );
+    let a = db
+        .finish(9, &target, &target_root, "parked_failed")
+        .unwrap();
+    assert_eq!(a.path, target);
+    assert!(a.owned);
+}
+#[test]
+fn published_recovery_reconciles_after_lost_acknowledgement() {
+    let (tmp, db, root) = fixture();
+    let a = parked(&db, &root);
+    let mut r = db
+        .stage_recovery(
+            &a.id,
+            a.revision,
+            "restart-stage",
+            &["episode.mkv".into()],
+            &tmp.path().join("recovery"),
+        )
+        .unwrap();
+    r.state = "publishing".into();
+    recovery::save(&db.db.lock().unwrap(), &r).unwrap();
+    db.reconcile_recoveries().unwrap();
+    assert_eq!(db.recovery(&r.id).unwrap().state, "published");
+    assert!(db.get(&a.id).unwrap().hold.is_some());
+}
+#[test]
+fn protected_role_change_refuses_an_already_queued_deletion() {
+    let (_tmp, db, root) = fixture();
+    let a = parked(&db, &root);
+    let op = db
+        .request_delete(&a.id, a.revision, "root-role", 0)
+        .unwrap();
+    db.protect_roots(&[a.path.clone()]).unwrap();
+    assert_eq!(db.execute_delete(&op.id).unwrap().state, "review");
+    assert!(a.path.exists());
+}
+#[test]
+fn offline_backup_restores_only_with_explicit_quarantine() {
+    let (tmp, db, root) = fixture();
+    let a = parked(&db, &root);
+    db.request_delete(&a.id, a.revision, "pre-backup", 0)
+        .unwrap();
+    let backup = tmp.path().join("backup");
+    db.backup(&backup).unwrap();
+    assert!(backup.join("backup.json").exists());
+    let restored = Inventory::open(&backup).unwrap();
+    restored.quarantine_restore().unwrap();
+    assert_eq!(restored.operation("pre-backup").unwrap().state, "review");
+    assert!(restored.get(&a.id).unwrap().keep);
+}
+
+#[test]
+fn receipt_cleanup_leaves_unselected_source_bytes_held() {
+    let (tmp, db, root) = fixture();
+    let path = root.join("job");
+    db.allocate(1, &root, &path).unwrap();
+    std::fs::write(path.join("selected.mkv"), b"selected").unwrap();
+    std::fs::write(path.join("other.mkv"), b"other").unwrap();
+    let a = db.finish(1, &path, &root, "parked_failed").unwrap();
+    let r = db
+        .stage_recovery(
+            &a.id,
+            a.revision,
+            "selection",
+            &["selected.mkv".into()],
+            &tmp.path().join("recovery"),
+        )
+        .unwrap();
+    db.claim_recovery(&r.id, "curator", "import", &r.manifest_digest)
+        .unwrap();
+    db.recovery_receipt(
+        &r.id,
+        "curator",
+        Receipt {
+            import_id: "import".into(),
+            manifest_digest: r.manifest_digest.clone(),
+            files: r
+                .files
+                .iter()
+                .map(|f| ReceiptFile {
+                    id: f.id.clone(),
+                    bytes: f.bytes,
+                    sha256: f.sha256.clone(),
+                    result: "imported".into(),
+                })
+                .collect(),
+        },
+    )
+    .unwrap();
+    db.prune_receipted_source(&r.id).unwrap();
+    assert!(!path.join("selected.mkv").exists());
+    assert_eq!(std::fs::read(path.join("other.mkv")).unwrap(), b"other");
+    assert!(db.get(&a.id).unwrap().hold.is_some());
+    db.prune_receipted_source(&r.id).unwrap();
+    assert!(path.join("other.mkv").exists());
+}
+
+#[test]
+#[ignore = "release performance fixture; run once during final verification"]
+fn lifecycle_scale_one_million_tombstones() {
+    let (tmp, db, root) = fixture();
+    let sample = parked(&db, &root);
+    let started = Instant::now();
+    {
+        let mut connection = db.db.lock().unwrap();
+        let tx = connection.transaction().unwrap();
+        for i in 0..1_000_000 {
+            let mut a = sample.clone();
+            a.id = format!("benchmark-{i:08}");
+            a.job = None;
+            a.path = root.join(&a.id);
+            a.state = "source_gone".into();
+            a.files.clear();
+            a.updated_at = 1;
+            save_artifact(&tx, &a).unwrap();
+        }
+        tx.commit().unwrap();
+    }
+    let mut times = Vec::new();
+    for _ in 0..100 {
+        let start = Instant::now();
+        assert_eq!(db.list(0, 100).unwrap().len(), 100);
+        times.push(start.elapsed().as_secs_f64() * 1000.0);
+    }
+    times.sort_by(f64::total_cmp);
+    let bytes = std::fs::metadata(tmp.path().join("state/artifacts.sqlite"))
+        .unwrap()
+        .len();
+    eprintln!("lifecycle rows=1000001 list_p95_ms={:.3} database_bytes={} preparation_seconds={:.1} os={} arch={}",times[94],bytes,started.elapsed().as_secs_f64(),std::env::consts::OS,std::env::consts::ARCH);
+    assert!(
+        times[94] < 200.0,
+        "cached first-page latency exceeded design target"
+    );
+}

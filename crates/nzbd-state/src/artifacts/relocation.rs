@@ -64,6 +64,7 @@ impl Inventory {
             save_operation(&tx, &op)?;
             tx.commit()?;
         }
+        drop(guard);
         let result = (|| {
             match fs::rename_exclusive(&source.path, destination) {
                 Ok(()) => (),
@@ -74,7 +75,7 @@ impl Inventory {
                     let scratch_path = root.join(format!(".runner-{key}"));
                     // An existing name is never authority, even after a crash.
                     std::fs::create_dir(&scratch_path)?;
-                    root_dir.sync_all()?;
+                    fs::sync_directory(&root_dir)?;
                     let scratch_dir = fs::open_dir(&scratch_path)?;
                     let mut scratch = source.clone();
                     scratch.id = format!("scratch-{key}");
@@ -85,7 +86,7 @@ impl Inventory {
                     scratch.root_identity = relocation.destination_root.clone();
                     scratch.identity = Some(fs::identity(&scratch_dir.metadata()?));
                     scratch.files.clear();
-                    scratch.state = "retained".into();
+                    scratch.state = "active".into();
                     scratch.owned = true;
                     scratch.keep = true;
                     scratch.hold = Some("review: relocation staging".into());
@@ -134,9 +135,9 @@ impl Inventory {
                     }
                     // Every nested directory entry must be durable before publication.
                     for entry in source.files.iter().rev().filter(|e| e.identity.directory) {
-                        fs::open_relative(&scratch_dir, &entry.path)?.sync_all()?;
+                        fs::sync_directory(&fs::open_relative(&scratch_dir, &entry.path)?)?;
                     }
-                    scratch_dir.sync_all()?;
+                    fs::sync_directory(&scratch_dir)?;
                     scratch.files = fs::manifest(&scratch_dir, 100_000)?;
                     relocation.scratch = Some(scratch.clone());
                     op.request = serde_json::to_string(&relocation)?;
@@ -146,16 +147,23 @@ impl Inventory {
                 }
                 Err(e) => return Err(e),
             }
+            let _guard = self.mutation.lock().unwrap();
             self.commit_relocation(&mut op, &relocation)
         })();
+        let guard = self.mutation.lock().unwrap();
         if let Err(e) = &result {
             op.state = "review".into();
             op.error = Some(e.to_string());
             save_operation(&self.db.lock().unwrap(), &op)?;
+            if let Some(scratch) = &relocation.scratch {
+                let mut row = self.get(&scratch.id)?;
+                row.state = "retained".into();
+                save_artifact(&self.db.lock().unwrap(), &row)?;
+            }
             // Keep the source identity at its known location when publication
             // did not happen, allowing PP to report retained files accurately.
             if let Ok(_) = self.verify(&relocation.source) {
-                let mut retained = relocation.source.clone();
+                let mut retained = self.get(&relocation.source.id)?;
                 retained.state = "active".into();
                 retained.error = Some(e.to_string());
                 save_artifact(&self.db.lock().unwrap(), &retained)?;
@@ -191,7 +199,7 @@ impl Inventory {
         if files != expected.files {
             return Err(Error::Conflict("move publication contents changed".into()));
         }
-        let mut current = movement.source.clone();
+        let mut current = self.get(&movement.source.id)?;
         current.path = movement.destination.clone();
         current.root = root.into();
         current.root_identity = movement.destination_root.clone();
@@ -216,6 +224,7 @@ impl Inventory {
             } else {
                 Some("review".into())
             };
+            old.keep = current.keep;
             old.retention_seconds = 0;
             old.deadline = None;
             self.sidecar(&old)?;
@@ -258,6 +267,12 @@ impl Inventory {
             if let Err(e) = self.commit_relocation(&mut op, &movement) {
                 op.state = "review".into();
                 op.error = Some(format!("interrupted move: {e}"));
+                if let Some(scratch) = &movement.scratch {
+                    if let Ok(mut row) = self.get(&scratch.id) {
+                        row.state = "retained".into();
+                        save_artifact(&self.db.lock().unwrap(), &row)?;
+                    }
+                }
                 save_operation(&self.db.lock().unwrap(), &op)?;
                 let mut a = self.get(&op.artifact)?;
                 a.hold = Some("review: interrupted move".into());

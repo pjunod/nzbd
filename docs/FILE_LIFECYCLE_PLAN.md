@@ -1,7 +1,7 @@
 # File lifecycle — retained failures, orphan detection, and recovery
 
 **Status:** revised after agent and Opus review; full scope retained;
-not implemented ·
+implementation in progress; see [delivery status](FILE_LIFECYCLE_STATUS.md) ·
 **Written / reviewed:** 2026-09-25 ·
 **Scope approved:** retention, durable ownership, attention view, and Curator
 recovery handoff · **Existing directory cleanup:** completed by the user.
@@ -18,9 +18,9 @@ for delivery and review. Re-verify source symbols before implementation.
 If an implementation changes ordinary download readiness, History cursor
 meaning, or cluster publication authority, review that change separately.
 
-This document specifies future behavior. New configuration, tables, APIs,
-tests, and UI described below do not exist unless explicitly labeled
-**existing**. It does not request another cleanup of the user's files.
+This document is the approved design contract. The [delivery status](FILE_LIFECYCLE_STATUS.md)
+and [operations guide](FILE_LIFECYCLE_OPERATIONS.md) distinguish implemented
+behavior and verified results from remaining acceptance work. It does not request another cleanup of the user's files.
 The independent findings and their disposition are recorded in
 [FILE_LIFECYCLE_REVIEW.md](FILE_LIFECYCLE_REVIEW.md).
 The user reaffirmed that this initiative includes both the immediate fix

@@ -15,7 +15,18 @@ pub fn identity(meta: &fs::Metadata) -> Identity {
             directory: meta.is_dir(),
         }
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        Identity {
+            device: 0,
+            inode: meta.creation_time(),
+            bytes: meta.len(),
+            modified: meta.last_write_time().to_string(),
+            directory: meta.is_dir(),
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         Identity {
             device: 0,
@@ -161,25 +172,110 @@ mod unix {
 #[cfg(unix)]
 pub use unix::{names, open_at, open_dir, unlink};
 
-// On platforms without descriptor-relative primitives the view is available;
-// mutation reports why ownership could not be proven instead of using recursion.
-#[cfg(not(unix))]
-pub fn open_dir(_: &Path) -> Result<File> {
-    Err(Error::Conflict(
-        "descriptor-relative filesystem access unavailable on this platform".into(),
-    ))
+// Windows retains ordinary queue/PP operation and cached inspection. Checked
+// destructive ownership remains unavailable until a handle-relative unlink
+// implementation exists; admission on this platform creates unowned records.
+#[cfg(windows)]
+mod windows {
+    use super::*;
+    use std::os::windows::{
+        ffi::OsStringExt,
+        fs::{MetadataExt, OpenOptionsExt},
+        io::AsRawHandle,
+    };
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFinalPathNameByHandleW, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
+        FILE_FLAG_OPEN_REPARSE_POINT,
+    };
+    fn handle_path(dir: &File) -> Result<std::path::PathBuf> {
+        let mut buf = vec![0u16; 32768];
+        let n = unsafe {
+            GetFinalPathNameByHandleW(dir.as_raw_handle(), buf.as_mut_ptr(), buf.len() as u32, 0)
+        };
+        if n == 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        if n as usize >= buf.len() {
+            return Err(Error::Conflict("handle path too long".into()));
+        }
+        Ok(std::ffi::OsString::from_wide(&buf[..n as usize]).into())
+    }
+    fn open(path: &Path) -> Result<File> {
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)?;
+        if file.metadata()?.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(Error::Conflict("reparse point requires review".into()));
+        }
+        Ok(file)
+    }
+    pub fn open_dir(path: &Path) -> Result<File> {
+        absolute(path)?;
+        let mut current = std::path::PathBuf::new();
+        for part in path.components() {
+            current.push(part.as_os_str());
+            if matches!(part, Component::Normal(_)) {
+                let file = open(&current)?;
+                if !file.metadata()?.is_dir() {
+                    return Err(Error::Conflict("not a directory".into()));
+                }
+            }
+        }
+        open(path)
+    }
+    pub fn open_at(dir: &File, path: &Path, directory: bool) -> Result<File> {
+        if path.components().count() != 1
+            || !matches!(path.components().next(), Some(Component::Normal(_)))
+        {
+            return Err(Error::Conflict("invalid child name".into()));
+        }
+        let file = open(&handle_path(dir)?.join(path))?;
+        if directory && !file.metadata()?.is_dir() {
+            return Err(Error::Conflict("not a directory".into()));
+        }
+        Ok(file)
+    }
+    pub fn names(dir: &File) -> Result<Vec<std::ffi::OsString>> {
+        let entries = fs::read_dir(handle_path(dir)?)?
+            .take(100002)
+            .map(|entry| entry.map(|e| e.file_name()))
+            .collect::<std::io::Result<Vec<_>>>()?;
+        if entries.len() > 100001 {
+            return Err(Error::Conflict(
+                "directory enumeration limit reached".into(),
+            ));
+        }
+        Ok(entries)
+    }
 }
-#[cfg(not(unix))]
+#[cfg(windows)]
+pub use windows::{names, open_at, open_dir};
+#[cfg(not(any(unix, windows)))]
+pub fn open_dir(_: &Path) -> Result<File> {
+    Err(Error::Conflict("filesystem access unsupported".into()))
+}
+#[cfg(not(any(unix, windows)))]
 pub fn open_at(_: &File, _: &Path, _: bool) -> Result<File> {
     open_dir(Path::new("/"))
 }
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 pub fn names(_: &File) -> Result<Vec<std::ffi::OsString>> {
-    Err(Error::Conflict("descriptor enumeration unavailable".into()))
+    Err(Error::Conflict("enumeration unsupported".into()))
 }
 #[cfg(not(unix))]
 pub fn unlink(_: &File, _: &Path, _: bool) -> Result<()> {
     Err(Error::Conflict("descriptor deletion unavailable".into()))
+}
+
+pub fn sync_directory(dir: &File) -> Result<()> {
+    #[cfg(unix)]
+    dir.sync_all()?;
+    // Windows cannot flush a read-only directory handle. No destructive
+    // ownership is granted there; each written regular file is still flushed.
+    #[cfg(not(unix))]
+    let _ = dir;
+    Ok(())
 }
 
 pub fn manifest(dir: &File, limit: usize) -> Result<Vec<FileEntry>> {
@@ -335,9 +431,16 @@ pub fn rename_exclusive(from: &Path, to: &Path) -> Result<()> {
     source.sync_all()?;
     Ok(())
 }
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 pub fn rename_exclusive(_: &Path, _: &Path) -> Result<()> {
     Err(Error::Conflict(
         "exclusive directory publication unavailable on this platform".into(),
     ))
+}
+
+#[cfg(windows)]
+pub fn rename_exclusive(from: &Path, to: &Path) -> Result<()> {
+    // Windows rename fails if a destination directory already exists.
+    std::fs::rename(from, to)?;
+    Ok(())
 }
