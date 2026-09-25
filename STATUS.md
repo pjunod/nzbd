@@ -10,7 +10,7 @@ retries pending network sources in a cancellable background task. Review
 findings added a real-daemon regression, accurate concurrent-removal logs,
 continued retries after infrastructure errors, and bounded shutdown. The
 daemon test passes and fails when the old startup call is restored. Required
-CI and the `nuc3` rollout ordering check remain.
+PR checks passed on 2026-09-25; the `nuc3` rollout ordering check remains.
 
 ## Torrent client identity and tracker compliance — 2026-09-22
 

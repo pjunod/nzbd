@@ -16,9 +16,9 @@ before serving, then retry pending magnet and URL admissions after the API
 listener is bound. A source that cannot be reached may remain pending for a
 later retry; it must not keep the API and Docker health check offline.
 
-The code is committed and the focused tests pass. The image on `nuc3` still
-runs the earlier code. Required CI and deployment validation remain before
-the PR is merged and rolled out.
+The code is committed, the focused tests pass, and required PR checks
+passed on 2026-09-25. The image on `nuc3` still runs the earlier code.
+Merge and deployment validation remain.
 
 ## What happened on `nuc3`
 
@@ -131,6 +131,7 @@ PR #236. Local verification completed on 2026-09-25:
 | `cargo test -p nzbd-api --locked --offline recovery_keeps_transient_magnet_failures_and_reaps_policy_failures` | Pass | A timed-out magnet remains pending; policy failures are deterministic. |
 | `cargo test -p nzbd --test daemon --locked --offline pending_magnet_does_not_block_api_startup` | Pass in 2.96 s | The real daemon serves `/healthz` with a saved unresolved magnet. Restoring the old `.recover()` call makes it fail at the 15 s deadline. |
 | Pre-push `cargo check --workspace --all-targets` | Pass after review changes | Workspace targets type-check. |
+| Required PR checks, including Rust merge candidate and main promotion gate | Pass on 2026-09-25 | CI accepted the reviewed code; production ordering remains to be checked after deployment. |
 
 The loopback HTTP test needs local socket permission. Its first run in the
 restricted sandbox failed at socket bind with `Operation not permitted`; it
