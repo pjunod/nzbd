@@ -2,7 +2,8 @@
 
 ## History loading performance — 2026-09-25
 
-**Status:** implementation complete, preparing the combined adversarial review.
+**Status:** combined adversarial review in progress for
+PR [#237](https://github.com/pjunod/runner/pull/237).
 [Live delivery status](docs/HISTORY_LOADING_STATUS.md) tracks review, final
 verification, and merge. Indexed page reads no longer await replay; an owned
 worker handles shared reconciliation and local repair. Local index relocation,

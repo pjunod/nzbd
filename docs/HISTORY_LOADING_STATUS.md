@@ -1,13 +1,14 @@
 # History loading implementation status
 
-**Status:** implementation complete; preparing combined review ·
+**Status:** combined adversarial review in progress ·
 **Updated:** 2026-09-25
 
 The [reviewed plan](HISTORY_LOADING_PLAN.md) records the diagnosis, nuc3
 measurements, and recovery contracts. This page tracks delivery of its first
 release. Work uses an independent clone at
 `/private/tmp/nzbd-history-loading`, branch `codex/history-loading`, based on
-main `2f84dfb`. The user's working repositories are not used for implementation.
+main `2f84dfb`. Delivery PR: [#237](https://github.com/pjunod/runner/pull/237)
+(draft during review). The user's working repositories are not used for implementation.
 
 | Step | State | Evidence / next action |
 |------|-------|------------------------|
@@ -15,7 +16,7 @@ main `2f84dfb`. The user's working repositories are not used for implementation.
 | 2. Own and bound reconciliation | Complete | Single worker and pass gate, local-only repair, mutation fencing, transactional batches, unchanged-log skips. |
 | 3. Preserve storage and recovery | Complete | Optional local index relocation preserves cursor IDs, committed WAL state, observations, tombstones, and spool location. |
 | 4. Browser and operator controls | Complete | Latest-request rendering, loading feedback, persisted pause/resume, Dev enable control with advisory readiness. |
-| 5. Adversarial review | Pending | One combined review after the implementation commits; address findings before tests. |
+| 5. Adversarial review | In progress | Reviewing commits `3cb9e16` and `b91ca96`; address findings before tests. |
 | 6. Final verification | Pending | Run unit tests only after review remediation. Use the required PR CI lane and avoid duplicate suites. |
 | 7. Merge combined PR | Pending | Merge after final checks pass; record the PR and validation evidence here. |
 
