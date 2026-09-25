@@ -2596,18 +2596,13 @@ async fn history_action(
     }
     if action == "delete-files" {
         let lookup = db.clone();
-        let entry = tokio::task::spawn_blocking(move || {
-            lookup
-                .list_filtered(10_000, true)
-                .ok()
-                .and_then(|entries| entries.into_iter().find(|entry| entry.job == job))
-        })
-        .await
-        .ok()
-        .flatten();
+        let entry = match tokio::task::spawn_blocking(move || lookup.get(job)).await {
+            Ok(Ok(Some(entry))) => entry,
+            Ok(Ok(None)) => return not_found(),
+            _ => return error(StatusCode::INTERNAL_SERVER_ERROR, "history lookup failed"),
+        };
         if let Some(torrent) = entry
-            .as_ref()
-            .and_then(|entry| entry.record.as_ref())
+            .record.as_ref()
             .and_then(|record| record.torrent.as_ref())
         {
             if torrent.payload == nzbd_types::TorrentPayloadDisposition::Retained {
@@ -2643,16 +2638,25 @@ async fn history_action(
         "hide" => db.hide(job, Some(&by), now).map(|ok| (ok, None)),
         "delete" => db.delete(job).map(|ok| (ok, None)),
         "delete-files" => {
-            let dir = db
-                .list_filtered(10_000, true)
-                .ok()
-                .and_then(|v| v.into_iter().find(|e| e.job == job))
-                .and_then(|e| e.final_dir);
-            let removed = dir.as_ref().is_some_and(|d| {
-                let p = std::path::Path::new(d);
-                p.is_dir() && std::fs::remove_dir_all(p).is_ok()
-            });
-            db.delete(job).map(|ok| (ok, Some(removed)))
+            let Some(entry) = db.get(job)? else {
+                return Ok((false, None));
+            };
+            let dir = entry.final_dir.ok_or_else(|| nzbd_state::StateError::Corrupt(
+                "cannot delete files: final directory is unknown; History retained".into()
+            ))?;
+            let path = std::path::Path::new(&dir);
+            // An absent or unavailable path is not proof of removal. Retain
+            // the row and its retry handle until deletion is confirmed.
+            let metadata = std::fs::symlink_metadata(path).map_err(|source| nzbd_state::StateError::Io {
+                op: "inspect payload before deletion", path: path.into(), source,
+            })?;
+            if !metadata.is_dir() || metadata.file_type().is_symlink() || path.parent().is_none() {
+                return Err(nzbd_state::StateError::Corrupt("cannot delete files: invalid payload directory; History retained".into()));
+            }
+            std::fs::remove_dir_all(path).map_err(|source| nzbd_state::StateError::Io {
+                op: "delete payload (History retained)", path: path.into(), source,
+            })?;
+            db.delete(job).map(|ok| (ok, Some(true)))
         }
         _ => Ok((false, None)),
     })
@@ -2668,7 +2672,8 @@ async fn history_action(
                 "unknown action (restore|hide|delete|delete-files|requeue)",
             ),
         },
-        _ => error(StatusCode::INTERNAL_SERVER_ERROR, "history store error"),
+        Ok(Err(e)) => error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+        Err(_) => error(StatusCode::INTERNAL_SERVER_ERROR, "history operation interrupted; retry required"),
     }
 }
 
@@ -3091,6 +3096,35 @@ mod tests {
         let v = body_json(resp).await;
         assert_eq!(v["ok"], true, "the delete itself still works");
         assert_eq!(v["parked"], false, "…but there is no Undo to offer");
+    }
+
+    #[tokio::test]
+    async fn failed_history_file_deletion_preserves_the_retry_record() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = test_engine(&tmp).await;
+        let db = Arc::new(HistoryDb::open(&tmp.path().join("history.sqlite"), None).unwrap());
+        let blocked = tmp.path().join("payload");
+        std::fs::write(&blocked, b"not a directory").unwrap();
+        let entry: nzbd_state::HistoryEntry = serde_json::from_value(json!({
+            "job": 71, "name": "preserve", "category": null,
+            "final_dir": blocked.to_str(), "status": "FAILURE", "size": 15,
+            "completed_at_unix": 1
+        })).unwrap();
+        db.record(&entry).unwrap();
+        let app = router_with(ApiState {
+            engine: engine.clone(), history: Some(db.clone()), torrent: None,
+            log: None, setup: None, clients: None, shutdown: None,
+            pp_stats: None, pp_manager: None, events: None,
+        });
+        for _ in 0..2 {
+            let response = app.clone().oneshot(axum::http::Request::post(
+                "/api/v1/history/71/actions/delete-files"
+            ).body(axum::body::Body::empty()).unwrap()).await.unwrap();
+            assert!(!response.status().is_success());
+            assert!(db.get(JobId(71)).unwrap().is_some());
+            assert_eq!(std::fs::read(&blocked).unwrap(), b"not a directory");
+        }
+        engine.shutdown().await;
     }
 
     #[tokio::test]

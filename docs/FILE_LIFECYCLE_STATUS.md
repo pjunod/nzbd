@@ -41,4 +41,5 @@ before merging. No deployment is included.
 
 ## 3. Validation record
 
+F0 code and failure regression tests are written; execution is deferred.
 No tests have run for this implementation. No PR has been opened or merged.
