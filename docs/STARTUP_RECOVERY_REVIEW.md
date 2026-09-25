@@ -130,7 +130,7 @@ PR #236. Local verification completed on 2026-09-25:
 | `cargo test -p nzbd-api --locked --offline recover_removes_a_deterministically_unusable_pending_magnet` | Pass | Existing deterministic rejection behavior remains. |
 | `cargo test -p nzbd-api --locked --offline recovery_keeps_transient_magnet_failures_and_reaps_policy_failures` | Pass | A timed-out magnet remains pending; policy failures are deterministic. |
 | `cargo test -p nzbd --test daemon --locked --offline pending_magnet_does_not_block_api_startup` | Pass in 2.96 s | The real daemon serves `/healthz` with a saved unresolved magnet. Restoring the old `.recover()` call makes it fail at the 15 s deadline. |
-| Pre-push `cargo check --workspace --all-targets` | Pass on the earlier PR head; rerun on review changes | Workspace targets type-check. |
+| Pre-push `cargo check --workspace --all-targets` | Pass after review changes | Workspace targets type-check. |
 
 The loopback HTTP test needs local socket permission. Its first run in the
 restricted sandbox failed at socket bind with `Operation not permitted`; it
