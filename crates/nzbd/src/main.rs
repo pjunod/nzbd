@@ -871,7 +871,7 @@ fn run(
                 ..Default::default()
             });
             service
-                .recover()
+                .recover_active()
                 .await
                 .map_err(|error| anyhow_lite::Error::msg(format!("torrent recovery: {error}")))?;
             torrent_executor = Some(service.spawn_backend_executor().map_err(|error| {
@@ -1047,6 +1047,30 @@ fn run(
         let tls_setup = tls::server_config(&cfg, &cfg.state_dir())
             .map_err(|e| anyhow_lite::Error::msg(e.to_string()))?;
         let listener = tokio::net::TcpListener::bind(&bind).await?;
+        // Pending magnets and source URLs can be unreachable for minutes.
+        // The listener and restored torrents are ready before retrying them.
+        let pending_cancel = torrent_cancel.clone();
+        let pending_recovery = torrent_service.clone().map(|service| {
+            tokio::spawn(async move {
+                loop {
+                    let result = tokio::select! {
+                        _ = pending_cancel.cancelled() => return,
+                        result = service.recover_pending() => result,
+                    };
+                    match result {
+                        Ok(_) => return,
+                        Err(error) => tracing::error!(
+                            %error,
+                            "pending torrent recovery failed; retrying in 30 seconds"
+                        ),
+                    }
+                    tokio::select! {
+                        _ = pending_cancel.cancelled() => return,
+                        _ = tokio::time::sleep(Duration::from_secs(30)) => {}
+                    }
+                }
+            })
+        });
         let listener_address = listener.local_addr()?;
         let _advertiser =
             discovery::Advertiser::start(&cfg.api, listener_address, None, tls_setup.is_some());
@@ -1086,6 +1110,16 @@ fn run(
         feed_cancel.cancel();
         pp_cancel.cancel();
         torrent_cancel.cancel();
+        if let Some(mut recovery) = pending_recovery {
+            if tokio::time::timeout(Duration::from_secs(1), &mut recovery)
+                .await
+                .is_err()
+            {
+                // A retry interrupted after the queue owner commits but before
+                // registry attachment is reconstructed by the next restore.
+                recovery.abort();
+            }
+        }
         if let Some(service) = &torrent_service {
             service.shutdown().await;
         }

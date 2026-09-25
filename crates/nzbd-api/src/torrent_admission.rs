@@ -230,6 +230,12 @@ impl TorrentAdmissionService {
     /// Orphans are removed; linked sources remain until `finish` has made the
     /// descriptor and structural replacement durable.
     pub async fn recover(&self) -> Result<Vec<AdmissionResult>, AdmissionError> {
+        self.recover_active().await?;
+        self.recover_pending().await
+    }
+
+    /// Restore durable torrents without waiting for network-sourced admissions.
+    pub async fn recover_active(&self) -> Result<(), AdmissionError> {
         let snapshot = nzbd_state::SnapshotStore::open(&self.state_dir)?
             .load()?
             .unwrap_or_default();
@@ -268,7 +274,6 @@ impl TorrentAdmissionService {
             );
         }
 
-        let mut restored = Vec::new();
         for request in restore_plan.requests {
             let job = snapshot.jobs.iter().find(|job| job.id == request.job);
             let Some(job) = job else {
@@ -341,7 +346,17 @@ impl TorrentAdmissionService {
                 );
             }
         }
+        Ok(())
+    }
 
+    /// Retry pending sources after the API listener is ready. Magnet lookup
+    /// can take 120 seconds per job and must not hold the health check offline.
+    pub async fn recover_pending(&self) -> Result<Vec<AdmissionResult>, AdmissionError> {
+        let snapshot = nzbd_state::SnapshotStore::open(&self.state_dir)?
+            .load()?
+            .unwrap_or_default();
+        let source_store = PendingSourceStore::open(&self.state_dir)?;
+        let mut restored = Vec::new();
         for pending in snapshot.pending_admissions {
             let opts = AddOpts {
                 category: pending.category.clone(),
@@ -382,22 +397,36 @@ impl TorrentAdmissionService {
             .await;
             match attempt {
                 Ok(result) => restored.push(result),
+                Err(AdmissionError::MissingPending) => tracing::info!(
+                    job = pending.job_id.0,
+                    "pending torrent admission was removed during recovery"
+                ),
                 Err(error)
                     if pending.source == TorrentSource::Magnet
                         && deterministic_magnet_recovery_failure(&error) =>
                 {
-                    self.engine.cancel_torrent_admission(pending.job_id).await?;
-                    tracing::warn!(
-                        job = pending.job_id.0,
-                        error = %error,
-                        "deterministically rejected pending magnet was removed during recovery"
-                    );
+                    match self.engine.cancel_torrent_admission(pending.job_id).await {
+                        Ok(true) => tracing::warn!(
+                            job = pending.job_id.0,
+                            error = %error,
+                            "deterministically rejected pending magnet was removed during recovery"
+                        ),
+                        Ok(false) => tracing::info!(
+                            job = pending.job_id.0,
+                            "pending torrent admission was removed during recovery"
+                        ),
+                        Err(cancel_error) => tracing::error!(
+                            job = pending.job_id.0,
+                            error = %cancel_error,
+                            "could not remove rejected pending magnet; continuing recovery"
+                        ),
+                    }
                 }
                 Err(error) => tracing::warn!(
                     job = pending.job_id.0,
                     source = ?pending.source,
                     error = %error,
-                    "pending torrent admission could not be recovered; it remains durable for a later retry"
+                    "pending torrent admission could not be recovered; continuing with later jobs"
                 ),
             }
         }
@@ -2476,7 +2505,24 @@ mod tests {
         );
         assert!(!raw.to_string().contains("restart-secret"));
 
-        let recovered = service.recover().await.unwrap();
+        // Boot restores local state first; remote source fetches can wait
+        // until after the API has started accepting health probes.
+        tokio::time::timeout(std::time::Duration::from_secs(1), service.recover_active())
+            .await
+            .expect("local recovery stalled on a network source")
+            .unwrap();
+        assert_eq!(store.inventory().unwrap(), vec![job]);
+        assert_eq!(
+            nzbd_state::SnapshotStore::open(&state)
+                .unwrap()
+                .load()
+                .unwrap()
+                .unwrap()
+                .pending_admissions
+                .len(),
+            1
+        );
+        let recovered = service.recover_pending().await.unwrap();
         server.await.unwrap();
         assert_eq!(recovered.len(), 1);
         assert_eq!(recovered[0].id, job);

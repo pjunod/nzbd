@@ -912,6 +912,80 @@ fn strip_chunking(body: &[u8]) -> Vec<u8> {
     out
 }
 
+/// An unreachable saved magnet must not hold the real daemon's health
+/// listener offline. The tracker accepts TCP but never answers, so the
+/// metadata attempt stays in flight beyond the readiness budget.
+#[test]
+fn pending_magnet_does_not_block_api_startup() {
+    let tmp = tempfile::tempdir().unwrap();
+    let api_port = free_port();
+    let peer_port = free_port();
+    let addr = format!("127.0.0.1:{api_port}");
+    let tracker = bind_listener("127.0.0.1:0").unwrap();
+    let tracker_port = tracker.local_addr().unwrap().port();
+    let main_dir = tmp.path().join("data");
+    let state_dir = main_dir.join("queue");
+    let dest_dir = main_dir.join("complete");
+    let magnet = format!(
+        "magnet:?xt=urn:btih:1111111111111111111111111111111111111111&tr=http%3A%2F%2F127.0.0.1%3A{tracker_port}%2Fannounce"
+    );
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let engine = nzbd_engine::Engine::spawn(nzbd_engine::EngineConfig::single_node(
+            vec![],
+            state_dir.clone(),
+            dest_dir.clone(),
+            nzbd_engine::Tuning::default(),
+            None,
+        ))
+        .await
+        .unwrap();
+        engine
+            .reserve_torrent_admission(
+                nzbd_types::TorrentSource::Magnet,
+                magnet.into_bytes(),
+                nzbd_engine::AddOpts::default(),
+            )
+            .await
+            .unwrap();
+        engine.shutdown().await;
+    });
+
+    let cfg_path = tmp.path().join("nzbd.toml");
+    std::fs::write(
+        &cfg_path,
+        format!(
+            "[paths]\nmain_dir = \"{}\"\ndest_dir = \"{}\"\n\n[api]\nbind = \"{addr}\"\n\n[torrent]\nenabled = true\ndht = false\nlisten_port = {peer_port}\n",
+            main_dir.display(),
+            dest_dir.display(),
+        ),
+    )
+    .unwrap();
+
+    let (stderr, stderr_path) = daemon_stderr(tmp.path());
+    let child = spawn_child(
+        Command::new(env!("CARGO_BIN_EXE_nzbd"))
+            .args(["run", "--config"])
+            .arg(&cfg_path)
+            .stdout(Stdio::null())
+            .stderr(stderr),
+    )
+    .expect("spawn nzbd");
+    let daemon = KillOnDrop::new(child, stderr_path);
+    wait_healthy(&daemon, &addr, Duration::from_secs(15)).unwrap_or_else(|cause| panic!("{cause}"));
+
+    let snapshot = nzbd_state::SnapshotStore::open(&state_dir)
+        .unwrap()
+        .load()
+        .unwrap()
+        .unwrap();
+    assert_eq!(snapshot.pending_admissions.len(), 1);
+    // Keep the silent tracker bound until the daemon is dropped.
+    drop(daemon);
+    drop(tracker);
+}
+
 /// Regression: an open SSE stream (`/api/v1/events`) must NOT block a
 /// restart. The browser keeps that connection alive, so graceful
 /// shutdown has to end it — otherwise the daemon hangs mid-restart and
