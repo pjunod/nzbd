@@ -349,6 +349,8 @@ try {
 
   .cfg-meta { color: var(--muted); font-size: 12px; margin-top: 12px; line-height: 1.5; }
   .cfg-meta code { color: var(--ink2); }
+  #history-sync, #history-loading { margin: 8px 0; font-size: 12px; overflow-wrap: anywhere; }
+  #history-sync button { margin: 4px 8px; }
   #cfg-form { margin-top: 4px; }
   .cfg-card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
     padding: 14px 16px 10px; margin-top: 12px; }
@@ -1052,6 +1054,11 @@ try {
 
   <section id="tab-history" hidden>
     <div id="clients-strip" hidden></div>
+    <div id="history-loading" role="status" hidden></div>
+    <div id="history-sync" class="muted" hidden>
+      <span id="history-sync-info"></span>
+      <button id="history-sync-toggle" type="button">Pause synchronization</button>
+    </div>
     <table>
       <thead><tr><th>Job</th><th>Status</th><th>Handoff</th><th class="num">Size</th>
         <th>Finished</th><th style="width:170px"></th></tr></thead>
@@ -3562,31 +3569,116 @@ async function refreshQueue() {
   pending.reconcile(jobs);
   renderQueue();
 }
-async function refreshHistory() {
-  refreshClients().catch(() => {});
-  const r = await jfetch("/api/v1/history?limit=" + historyPageSize +
-                         "&offset=" + (historyPage * historyPageSize));
-  if (r.status === 501) { store.history = "off"; renderHistory(); return; }
-  if (!r.ok) throw new Error("history " + r.status);
-  const body = await r.json();
-  const entries = body.entries;
-  if (!Array.isArray(entries)) throw new Error("history: malformed response");
-  // `total` is the server's count of matching rows. An older daemon that
-  // does not send it leaves the pager describing the page it has, which
-  // is the honest fallback — never a guess dressed up as a total.
-  historyTotal = Number.isFinite(body.total)
-    ? body.total
-    : historyPage * historyPageSize + entries.length;
-  // The page may have moved out from under us (a trim, a forget, another
-  // client's delete). Landing on an empty page past the end reads as "my
-  // history vanished", so step back and re-ask once.
-  const pages = historyPages();
-  if (!entries.length && historyTotal > 0 && historyPage > pages - 1) {
-    historyPage = pages - 1;
-    return refreshHistory();
+let historyRequestGeneration = 0;
+let historyInFlight = null;
+let historySync = null;
+let historySyncRevision = 0;
+let historySyncBusy = false;
+function renderHistorySync(status) {
+  if (!status) return;
+  historySync = status;
+  $("history-sync").hidden = false;
+  const age = status.last_success_age_secs == null ? "never" : status.last_success_age_secs + "s ago";
+  const mode = status.mode === "local_only" ? "Local history" : "Shared history";
+  $("history-sync-info").textContent = mode + " · " + status.state +
+    " · last pass " + status.last_duration_ms + " ms / " + fmtBytes(status.last_bytes_read) +
+    " · last reconciliation " + age + " · storage: " + status.placement +
+    " · index: " + status.index_path +
+    (status.repair_pending ? " · repair pending" : "") +
+    (status.paused ? " · peer updates and repair are paused; local writes continue" : "") +
+    (status.last_error ? " · " + status.last_error : "");
+  $("history-sync-toggle").textContent = status.paused ? "Resume synchronization" : "Pause synchronization";
+  renderHistoryEnable();
+}
+function renderHistoryEnable() {
+  const info = $("cfg-history-sync-advisory"), button = $("cfg-history-sync-enable");
+  if (!info || !button) return;
+  const s = historySync;
+  button.textContent = s && !s.paused ? "Pause history synchronization" : "Enable history synchronization";
+  button.disabled = historySyncBusy;
+  info.textContent = !s ? "Readiness unknown: synchronization status is unavailable. You can still enable it." :
+    "Persistent local index: " + (s.placement === "local" ? "met" : s.placement === "unknown" ? "unknown" : "unmet") +
+    " (" + s.placement + "). Index: " + s.index_path +
+    ". Recovery: " + (s.repair_pending ? "pending" : "met") +
+    ". Current state: " + s.state + ". " +
+    (s.mode === "local_only" ? "Local history is written immediately; synchronization repairs failed publication." : "Synchronization imports peer history in the background.") +
+    (s.last_error ? " Last error: " + s.last_error : "");
+}
+async function refreshHistorySync() {
+  const revision = historySyncRevision;
+  try {
+    const response = await jfetch("/api/v1/history-sync");
+    if (!response.ok) return;
+    const status = await response.json();
+    if (revision === historySyncRevision && !historySyncBusy) renderHistorySync(status);
+  } catch (_) { /* Existing indexed history and settings remain available. */ }
+}
+async function setHistorySyncPaused(paused) {
+  if (historySyncBusy) return;
+  historySyncBusy = true;
+  ++historySyncRevision;
+  $("history-sync-toggle").disabled = true;
+  renderHistoryEnable();
+  try {
+    const response = await post("/api/v1/history-sync/" + (paused ? "pause" : "resume"));
+    if (!response.ok) throw new Error("History synchronization: " + response.status);
+    renderHistorySync(await response.json());
+  } catch (error) {
+    $("history-loading").hidden = false;
+    $("history-loading").textContent = error.message;
+    const info = $("cfg-history-sync-advisory");
+    if (info) info.textContent = error.message;
+  } finally {
+    historySyncBusy = false;
+    ++historySyncRevision;
+    $("history-sync-toggle").disabled = false;
+    const button = $("cfg-history-sync-enable");
+    if (button) button.disabled = false;
   }
-  store.history = entries;
-  renderHistory();
+}
+async function toggleHistorySync() {
+  return setHistorySyncPaused(historySync ? !historySync.paused : false);
+}
+function refreshHistory(force = false) {
+  const page = historyPage, size = historyPageSize;
+  const key = page + ":" + size;
+  if (!force && historyInFlight && historyInFlight.key === key) return historyInFlight.promise;
+  const generation = ++historyRequestGeneration;
+  const syncRevision = historySyncRevision;
+  $("history-loading").hidden = false;
+  $("history-loading").textContent = "Loading history page " + (page + 1) + "… Previous results remain visible.";
+  refreshClients().catch(() => {});
+  const promise = (async () => {
+    try {
+      const r = await jfetch("/api/v1/history?limit=" + size + "&offset=" + (page * size));
+      if (generation !== historyRequestGeneration) return;
+      if (r.status === 501) { store.history = "off"; renderHistory(); $("history-loading").hidden = true; return; }
+      if (!r.ok) throw new Error("history " + r.status);
+      const body = await r.json();
+      if (generation !== historyRequestGeneration) return;
+      const entries = body.entries;
+      if (!Array.isArray(entries)) throw new Error("history: malformed response");
+      historyTotal = Number.isFinite(body.total) ? body.total : page * size + entries.length;
+      const pages = historyPages();
+      if (!entries.length && historyTotal > 0 && page > pages - 1) {
+        historyPage = pages - 1;
+        return refreshHistory(true);
+      }
+      store.history = entries;
+      renderHistory();
+      if (syncRevision === historySyncRevision && !historySyncBusy) renderHistorySync(body.sync);
+      $("history-loading").hidden = true;
+    } catch (error) {
+      if (generation === historyRequestGeneration) {
+        $("history-loading").textContent = "Could not load history: " + error.message;
+        throw error;
+      }
+    } finally {
+      if (generation === historyRequestGeneration) historyInFlight = null;
+    }
+  })();
+  historyInFlight = { key, promise };
+  return promise;
 }
 async function refreshClients() {
   const r = await jfetch("/api/v1/clients");
@@ -3951,6 +4043,7 @@ $("btn-active").onclick = async () => {
 for (const s of ["system", "job", "file"])
   $("lg-" + s).onchange = () => { renderLogs(); refreshLogs().catch(() => {}); };
 $("page-size").onchange = () => setPageSize(Number($("page-size").value));
+$("history-sync-toggle").onclick = toggleHistorySync;
 $("history-page-size").onchange = () =>
   setHistoryPageSize(Number($("history-page-size").value));
 
@@ -4450,7 +4543,9 @@ const SETTINGS_SECTIONS = [
     ["post.tool_timeout_secs", "tool timeout (s)", "num"],
     ["post.script_timeout_secs", "script timeout (s)", "num"],
   ]},
-  { key: "history", title: "History", desc: "How much finished-job history to keep. Trimming is not just tidiness \u2014 every history read re-reads the whole log from the state volume, so the log's length is what makes the History tab slow. Both bounds apply; whichever is reached first wins. Takes effect on save and again at every restart.", fields: [
+  { key: "history", title: "History", desc: "Choose how much completed history to retain and where its index lives. Both retention bounds apply. Changes take effect after restart.", fields: [
+    ["history.index_dir", "index directory (persistent local disk)", "text?", null,
+      "Optional. On restart, copies the active index here while keeping history logs and parked NZBs in their existing locations. Use an empty persistent local directory."],
     ["history.keep_max", "keep at most (entries, 0 = unlimited)", "num",
       null,
       "Counted newest-first, so the entries you keep are the ones on the first pages."],
@@ -4463,6 +4558,7 @@ const SETTINGS_SECTIONS = [
     ["torrent.enabled", "enable BitTorrent after restart", "check"],
     ["cluster.enabled", "enable Usenet clustering after restart", "check"],
   ]},
+  { key: "history-sync", dev: true, title: "Enable history synchronization", desc: "Enabled by default. This live control persists immediately and needs no restart or Save. Persistent local storage is recommended; readiness is advisory and never prevents enabling. Pausing leaves indexed reads and local completions available.", fields: [] },
   { key: "dev", dev: true, title: "Usenet cluster", desc: "Multi-node Usenet execution. Configure the voter roster in General → Advanced TOML.", fields: [
     ["cluster.cluster_id", "cluster identity", "text"],
     ["cluster.node_name", "unique node name", "text"],
@@ -4635,6 +4731,7 @@ function renderSettingsForm() {
     } else {
       body = `<div class="cfg-grid">` +
         sec.fields.map(([p, l, t, o, help]) => fieldControl(p, l, t, o, help)).join("") + `</div>`;
+      if (sec.key === "history-sync") body = `<button id="cfg-history-sync-enable" type="button" data-live="true" onclick="toggleHistorySync()">Enable history synchronization</button><p id="cfg-history-sync-advisory" class="desc"></p>`;
       if (sec.key === "enable") body += `<div id="cfg-enable-advisory">${enableAdvisory(cfgModel)}</div>`;
     }
     return `<div class="cfg-card" data-settings-view="${sec.dev ? "dev" : "general"}"><h3>${esc(sec.title)}</h3><p class="desc">${esc(sec.desc)}</p>${body}</div>`;
@@ -4655,6 +4752,7 @@ function renderSettingsForm() {
     inp.replaceWith(sel);
   });
   showSettingsView(settingsView);
+  renderHistoryEnable();
   form.oninput = () => {
     cfgDirty = true; $("cfg-save").disabled = !cfgInfo.writable;
     try { $("cfg-enable-advisory").innerHTML = enableAdvisory(collectSettingsForm()); }
@@ -4715,7 +4813,7 @@ function showRestartBanner(sections) {
 }
 
 async function loadSettings(force) {
-  if (cfgLoaded && !force) return;   // never clobber an open edit on refresh ticks
+  if (cfgLoaded && !force) { await refreshHistorySync(); return; } // Preserve open edits.
   const r = await jfetch("/api/v1/config");
   if (!r.ok) {
     $("cfg-meta").textContent = r.status === 401
@@ -4735,8 +4833,9 @@ async function loadSettings(force) {
         : "<code>" + esc(c.path) + "</code> isn't writable from the daemon — settings are read-only here; edit the file by hand and restart.")
     : "Running without <code>--config</code>: effective defaults, read-only. Start with <code>nzbd run --config nzbd.toml</code> to make settings editable.";
   if (!c.writable || !c.path) {
-    $("cfg-form").querySelectorAll("input,select,button").forEach(el => { el.disabled = true; });
+    $("cfg-form").querySelectorAll("input,select,button").forEach(el => { if (!el.dataset.live) el.disabled = true; });
   }
+  await refreshHistorySync();
   $("cfg-msg").textContent = ""; $("cfg-msg").className = "";
   return true;
 }

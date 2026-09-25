@@ -99,6 +99,7 @@ pub struct ClusterRuntime {
     leader_shared: Arc<LeaderShared>,
     client: ClusterClient,
     pp: Option<PpSetup>,
+    history_worker: Option<nzbd_state::history::HistoryWorker>,
     pp_manager: Option<nzbd_post::manager::PostManagerHandle>,
     control: Option<ControlStore>,
     diagnostics: watch::Receiver<serde_json::Value>,
@@ -361,6 +362,11 @@ impl ClusterRuntime {
                 }
             });
         }
+        let history_worker = pp
+            .as_ref()
+            .map(|s| s.history.start_worker())
+            .transpose()
+            .map_err(|e| ClusterError::Control(format!("history worker: {e}")))?;
         tracker.close();
 
         Ok(ClusterRuntime {
@@ -370,6 +376,7 @@ impl ClusterRuntime {
             leader_shared,
             client,
             pp,
+            history_worker,
             pp_manager,
             control,
             diagnostics,
@@ -487,6 +494,9 @@ impl ClusterRuntime {
 
     /// Stop cluster tasks, then flush the engine.
     pub async fn shutdown(&self) {
+        if let Some(worker) = &self.history_worker {
+            worker.stop();
+        }
         self.cancel.cancel();
         self.tracker.wait().await;
         self.engine.shutdown().await;

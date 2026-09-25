@@ -710,7 +710,6 @@ async fn history(state: &CompatState, params: &Value) -> Result<Value, (i64, &'s
     let ua = state.clients.as_ref().and_then(|c| c.current());
     let db = db.clone();
     let entries = tokio::task::spawn_blocking(move || {
-        let _ = db.refresh();
         let entries = db.list_filtered(1000, include_hidden)?;
         // The pull we exist to observe: this poll SAW these entries.
         let now = std::time::SystemTime::now()
@@ -1378,7 +1377,18 @@ mod tests {
             .note(Some("Radarr/5.26.2"), "history", 500);
         let r = dispatch(&state, "history", &json!([])).await.unwrap();
         assert_eq!(r.as_array().unwrap().len(), 1);
-        let e = &db.list_filtered(10, true).unwrap()[0];
+        let _history_worker = db.start_worker().unwrap();
+        let e = tokio::time::timeout(std::time::Duration::from_secs(6), async {
+            loop {
+                let e = db.list_filtered(10, true).unwrap().remove(0);
+                if e.seen_count > 0 {
+                    break e;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("background consumer observation");
         assert_eq!(e.seen_count, 1);
         assert!(e.first_seen_at_unix.is_some());
         assert_eq!(e.picked_up_by.as_deref(), Some("Radarr/5.26.2"));

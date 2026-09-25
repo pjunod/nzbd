@@ -153,7 +153,7 @@ async function routeFetch(url, init) {
     if (!String(url).includes(frag)) continue;
     // A route may be a function when a test needs consecutive calls to
     // answer differently (a page that empties out under the reader).
-    const res = typeof entry === "function" ? entry(url, init) : entry;
+    const res = typeof entry === "function" ? await entry(url, init) : entry;
     return { ok: res.status < 400, status: res.status, json: async () => res.body, text: async () => "" };
   }
   return { ok: false, status: 503, json: async () => ({}), text: async () => "" };
@@ -1810,6 +1810,30 @@ const models = (jobs) => jobs.map((j, i) => T.rowModel(j, { idx: i, count: jobs.
     seen.length = 0;
   }
 
+  // Navigation must own its response even when the older fetch finishes last.
+  {
+    routes.clear(); seen.length = 0;
+    routes.set("/api/v1/clients", { status: 200, body: { clients: [] } });
+    let release;
+    routes.set("/api/v1/history", url => {
+      if (url.includes("offset=0")) return new Promise(resolve => { release = resolve; });
+      return { status: 200, body: { total: 60, entries: [{ job: 99, name: "latest", status: "SUCCESS", size: 1, completed_at_unix: 100 }] } };
+    });
+    T.setHistoryPagingForTest(0, 20, 60);
+    const old = T.refreshHistory();
+    const coalesced = T.refreshHistory();
+    eq(old, coalesced, "timer refresh shares the in-flight request for the same page");
+    await T.setHistoryPage(1);
+    eq(T.store.history[0].job, 99, "new page renders without waiting for old page");
+    release({ status: 200, body: { total: 60, entries: [{ job: 1, name: "stale", status: "SUCCESS", size: 1, completed_at_unix: 100 }] } });
+    await old;
+    eq(T.store.history[0].job, 99, "older response cannot overwrite new page");
+    eq(T.getHistoryPaging().page, 1, "pager remains on selected page");
+    eq(sandbox.document.getElementById("history-loading").hidden, true, "old response cannot revive loading state");
+    T.setHistoryPagingForTest(0, 20, 0);
+    routes.clear(); seen.length = 0;
+  }
+
   // --- the log ring keeps a budget per class ------------------------------
   // The defect: one shared 500-line ring means a per-file flood evicts every
   // system and job line, so the Logs tab goes blank exactly when a download
@@ -1928,7 +1952,27 @@ const models = (jobs) => jobs.map((j, i) => T.rowModel(j, { idx: i, count: jobs.
         toml: "[torrent]\nenabled = true", pending_restart: stored.torrent.enabled ? ["torrent"] : [],
       } };
     });
+    let syncState = { mode: "local_only", state: "paused", paused: true,
+      placement: "network_or_fuse", index_path: "/processing/history.sqlite",
+      repair_pending: true, last_duration_ms: 0, last_bytes_read: 0 };
+    routes.set("/api/v1/history-sync", () => ({ status: 200, body: syncState }));
+    routes.set("/api/v1/history-sync/resume", () => {
+      syncState = { ...syncState, paused: false, state: "idle" };
+      return { status: 200, body: syncState };
+    });
     await vm.runInContext("loadSettings(true)", sandbox);
+    ok(form.innerHTML.includes('data-settings-view="dev"><h3>Enable history synchronization'),
+      "history enable control lives in Dev settings");
+    ok(doc.getElementById("cfg-history-sync-advisory").textContent.includes("unmet"),
+      "network storage readiness is advisory and visible");
+    eq(doc.getElementById("cfg-history-sync-enable").disabled, false,
+      "unmet storage readiness does not disable enablement");
+    await vm.runInContext("toggleHistorySync()", sandbox);
+    eq(syncState.paused, false, "Dev enable resumes synchronization on network storage");
+    eq(vm.runInContext("cfgDirty", sandbox), false, "live enable does not dirty config form");
+    eq(doc.getElementById("cfg-history-sync-enable").disabled, false,
+      "live enable is available after completion");
+
     ok(form.innerHTML.includes('data-path="torrent.listen_port" data-type="num" value="6881"'),
       "the BitTorrent form renders the API's default listen port");
     // Read controls from the renderer's markup instead of supplying a lone

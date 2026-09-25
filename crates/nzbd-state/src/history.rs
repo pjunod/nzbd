@@ -2,18 +2,23 @@
 //!
 //! Two layers: **append-only JSONL** files on the (possibly shared)
 //! volume — the crash-safe, mergeable source of truth — and a **local
-//! SQLite index** (rusqlite bundled) rebuilt from the JSONL when empty.
-//! SQLite never lives on a network filesystem (ADR-16). In cluster mode
+//! SQLite index** (rusqlite bundled) reconciled from JSONL at startup.
+//! Persistent local SQLite storage is recommended (ADR-16). In cluster mode
 //! every node appends to its OWN `history.<node>.jsonl` (cross-client
 //! O_APPEND interleaving on Gluster is not trustworthy); readers union
 //! all `history*.jsonl` files, deduped by (job, completed_at).
 
 use crate::{fsx, HistoryEntry, StateError};
 use rusqlite::{Connection, OptionalExtension};
+use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
+
+mod sync;
+pub use sync::{HistoryMode, HistorySyncStatus, HistoryWorker};
+use sync::{MutationGuard, SyncControl};
 
 /// Every column a [`HistoryEntry`] is read from, in the order the row
 /// mapper expects. `id` (the cursor `seq`) is appended last so adding it
@@ -94,12 +99,14 @@ fn unix_now() -> i64 {
 
 pub struct HistoryDb {
     conn: Mutex<Connection>,
+    reader: Mutex<Connection>,
+    sync: SyncControl,
+    _writer_lock: Option<File>,
     jsonl: Option<PathBuf>,
-    /// Local spool for the regenerated NZBs of deleted jobs (`nzbs/<job>.nzb`
-    /// beside the SQLite index). Local, not shared: it is a convenience for
+    /// Spool for regenerated NZBs of deleted jobs (`nzbs/<job>.nzb` in the
+    /// original state directory, even after index relocation). A convenience for
     /// undoing a delete on the node that served the click, not cluster state.
     spool: Option<PathBuf>,
-    last_refresh: Mutex<Option<Instant>>,
     /// Serializes appends against compaction. The JSONL has exactly one
     /// appending *process* (its own node), but several threads inside it;
     /// a tmp+rename landing between a thread's `open_append` and its write
@@ -134,9 +141,23 @@ impl HistoryDb {
         jsonl_dir: Option<&Path>,
         tag: Option<&str>,
     ) -> Result<HistoryDb, StateError> {
+        Self::open_configured(db_path, jsonl_dir, tag, HistoryMode::Shared, None)
+    }
+
+    /// Daemon wiring must opt in to local-only ownership explicitly. The
+    /// generic open methods remain shared, even without a writer tag.
+    pub fn open_configured(
+        db_path: &Path,
+        jsonl_dir: Option<&Path>,
+        tag: Option<&str>,
+        mode: HistoryMode,
+        spool_dir: Option<&Path>,
+    ) -> Result<HistoryDb, StateError> {
+        let writer_lock = sync::writer_lock(jsonl_dir, tag, mode)?;
         if let Some(parent) = db_path.parent() {
             fsx::create_dir_all(parent)?;
         }
+        sync::prepare_index(db_path, jsonl_dir, tag, spool_dir)?;
         let conn = Connection::open(db_path)
             .map_err(|e| StateError::Corrupt(format!("sqlite open {}: {e}", db_path.display())))?;
         conn.execute_batch(
@@ -204,6 +225,27 @@ impl HistoryDb {
         )
         .map_err(|e| StateError::Corrupt(format!("sqlite tombstone schema: {e}")))?;
 
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS history_completed_at_id
+                            ON history(completed_at DESC, id DESC);",
+        )
+        .map_err(|e| StateError::Corrupt(format!("history ordering index: {e}")))?;
+        let reader =
+            Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .map_err(|e| StateError::Corrupt(format!("history reader: {e}")))?;
+        reader
+            .busy_timeout(Duration::from_millis(100))
+            .map_err(|e| StateError::Corrupt(format!("history reader timeout: {e}")))?;
+        let paused = conn
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'history_sync_paused'",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(|e| StateError::Corrupt(e.to_string()))?
+            .unwrap_or(0)
+            != 0;
         let jsonl = jsonl_dir.map(|d| {
             let file = match tag {
                 Some(t) => format!("history.{t}.jsonl"),
@@ -213,9 +255,13 @@ impl HistoryDb {
         });
         let db = HistoryDb {
             conn: Mutex::new(conn),
+            reader: Mutex::new(reader),
+            sync: SyncControl::new(mode, paused, db_path),
+            _writer_lock: writer_lock,
             jsonl,
-            spool: db_path.parent().map(|d| d.join("nzbs")),
-            last_refresh: Mutex::new(None),
+            spool: spool_dir
+                .map(Path::to_path_buf)
+                .or_else(|| db_path.parent().map(|d| d.join("nzbs"))),
             jsonl_write: Mutex::new(()),
             durable_record: Mutex::new(()),
             retention: Mutex::new(Retention::UNLIMITED),
@@ -223,7 +269,9 @@ impl HistoryDb {
             spool_cache: Mutex::new(None),
         };
         db.rebuild_from_jsonl(false)?;
+        db.sync.mark_opened();
         db.sweep_spool();
+        sync::record_index_path(db_path, jsonl_dir, tag, spool_dir)?;
         Ok(db)
     }
 
@@ -246,20 +294,6 @@ impl HistoryDb {
         *self.retention.lock().unwrap()
     }
 
-    /// Pull in rows other nodes appended since open (cluster: call before
-    /// serving history reads). Throttled — at most one JSONL re-union per
-    /// 5 s no matter how often clients poll.
-    pub fn refresh(&self) -> Result<(), StateError> {
-        {
-            let mut last = self.last_refresh.lock().unwrap();
-            if last.is_some_and(|t| t.elapsed() < Duration::from_secs(5)) {
-                return Ok(());
-            }
-            *last = Some(Instant::now());
-        }
-        self.rebuild_from_jsonl(true)
-    }
-
     /// Import any JSONL rows the index doesn't have (fresh index after a
     /// leader failover, a wiped local disk, or another node's appends).
     /// Unions every `history*.jsonl` in the directory — duplicates are
@@ -268,8 +302,8 @@ impl HistoryDb {
     /// `quiet` marks the routine poll-path refresh: the upsert reports
     /// conflict-updates as affected rows, so counting THOSE made every
     /// 5 s history poll log "index rebuilt imported=57" forever (field
-    /// report 2026-07-25). New-row counts come from a real before/after
-    /// row count; the poll path logs at debug even then.
+    /// report 2026-07-25). Replay is now startup/background work; completion
+    /// timing and bytes are exposed through synchronization status.
     ///
     /// **Ingest honours the retention floor**, which is what makes a prune
     /// stick. Without it the rebuild is a machine for undoing retention:
@@ -279,91 +313,7 @@ impl HistoryDb {
     /// `docs/DEFECT_HISTORY_DELETE.md` documents for `delete`. The floor
     /// only ever rises, so it can't flap.
     fn rebuild_from_jsonl(&self, quiet: bool) -> Result<(), StateError> {
-        let Some(own) = &self.jsonl else {
-            return Ok(());
-        };
-        let Some(dir) = own.parent() else {
-            return Ok(());
-        };
-        let mut files: Vec<PathBuf> = match fsx::read_dir(dir) {
-            Ok(entries) => entries
-                .flatten()
-                .map(|e| e.path())
-                .filter(|p| {
-                    let n = p.file_name().unwrap_or_default().to_string_lossy();
-                    n.starts_with("history") && n.ends_with(".jsonl")
-                })
-                .collect(),
-            Err(e) if e.is_not_found() => return Ok(()),
-            Err(e) => return Err(e),
-        };
-        files.sort();
-        let floor = self.ingest_floor()?;
-        let mut tombstones = std::collections::HashSet::new();
-        for path in &files {
-            let Ok(file) = fsx::open(path) else {
-                continue;
-            };
-            for line in BufReader::new(file).split(b'\n') {
-                let line = fsx::ctx(line, "read", path)?;
-                if line.is_empty() {
-                    continue;
-                }
-                let Ok(probe) = serde_json::from_slice::<HistoryMutationProbe<'_>>(&line) else {
-                    continue;
-                };
-                if probe.op == Some("tombstone") {
-                    if let Ok(HistoryMutation::Tombstone {
-                        job,
-                        completed_at_unix,
-                    }) = serde_json::from_slice::<HistoryMutation>(&line)
-                    {
-                        tombstones.insert((job.0, completed_at_unix));
-                    }
-                }
-            }
-        }
-
-        // Apply every delete before replaying entries. File-name ordering is
-        // not a cross-node clock, so a tombstone is monotone: it wins over
-        // every copy of this immutable completion key on every node.
-        let removed = self.apply_tombstones(&tombstones)?;
-        let before = self.row_count()?;
-        let mut dropped = 0usize;
-        for path in &files {
-            let Ok(file) = fsx::open(path) else {
-                continue;
-            };
-            for line in BufReader::new(file).split(b'\n') {
-                let line = fsx::ctx(line, "read", path)?;
-                if line.is_empty() {
-                    continue;
-                }
-                let Ok(entry) = serde_json::from_slice::<HistoryEntry>(&line) else {
-                    continue; // tombstone / torn tail / unknown old format
-                };
-                if entry.completed_at_unix < floor {
-                    dropped += 1;
-                } else if !tombstones.contains(&(entry.job.0, entry.completed_at_unix)) {
-                    self.insert(&entry, false)?;
-                }
-            }
-        }
-        let imported = self.row_count()?.saturating_sub(before);
-        if imported > 0 {
-            if quiet {
-                tracing::debug!(imported, "history index picked up new JSONL rows");
-            } else {
-                tracing::info!(imported, "history index rebuilt from JSONL");
-            }
-        }
-        if dropped > 0 {
-            tracing::debug!(dropped, floor, "history ingest skipped pre-retention rows");
-        }
-        if removed > 0 {
-            tracing::debug!(removed, "history ingest applied durable tombstones");
-        }
-        Ok(())
+        self.replay_logs(quiet)
     }
 
     /// Merge previously unseen portable tombstones into the derived index,
@@ -450,18 +400,9 @@ impl HistoryDb {
         Ok(())
     }
 
-    fn row_count(&self) -> Result<u64, StateError> {
-        let conn = self.conn.lock().unwrap();
-        let count = conn
-            .query_row("SELECT COUNT(*) FROM history", [], |r| r.get::<_, i64>(0))
-            .map_err(|e| StateError::Corrupt(format!("sqlite count: {e}")))?;
-        u64::try_from(count)
-            .map_err(|e| StateError::Corrupt(format!("sqlite count was negative: {e}")))
-    }
-
     /// Visible row count — what the pager divides into pages.
     pub fn count_filtered(&self, include_hidden: bool) -> Result<u64, StateError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.reader.lock().unwrap();
         let sql = format!(
             "SELECT COUNT(*) FROM history {}",
             if include_hidden {
@@ -508,6 +449,10 @@ impl HistoryDb {
     /// tombstone survives this compaction even after the covered entry does
     /// not.
     pub fn prune(&self, now: i64) -> Result<usize, StateError> {
+        let _mutation = self.sync.mutation.lock().unwrap();
+        self.sync
+            .generation
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let r = self.retention();
         if r.is_unlimited() {
             return Ok(0);
@@ -743,7 +688,9 @@ impl HistoryDb {
     }
 
     pub fn record(&self, entry: &HistoryEntry) -> Result<(), StateError> {
+        let guard = MutationGuard::new(self);
         self.insert(entry, true)?;
+        guard.commit();
         self.maybe_prune();
         Ok(())
     }
@@ -754,7 +701,9 @@ impl HistoryDb {
     /// ordering guarantee usable: the consumer gets the event *and* the
     /// exact cursor, and never has to guess how far to page back.
     pub fn record_seq(&self, entry: &HistoryEntry) -> Result<i64, StateError> {
+        let guard = MutationGuard::new(self);
         let seq = self.insert_seq(entry, true).map(|(_, seq)| seq)?;
+        guard.commit();
         // After the seq is in hand: a trim must never be able to change
         // the cursor value this call is about to publish.
         self.maybe_prune();
@@ -829,6 +778,7 @@ impl HistoryDb {
         F: FnOnce() -> Result<(), StateError>,
     {
         let _guard = self.durable_record.lock().unwrap();
+        let mutation = MutationGuard::new(self);
         let key = (entry.job.0, entry.completed_at_unix);
         if let Some((seq, true)) = self
             .conn
@@ -842,6 +792,7 @@ impl HistoryDb {
             .optional()
             .map_err(|error| StateError::Corrupt(format!("sqlite lookup: {error}")))?
         {
+            mutation.commit();
             return Ok(seq);
         }
         append()?;
@@ -854,6 +805,7 @@ impl HistoryDb {
                 rusqlite::params![key.0, key.1],
             )
             .map_err(|error| StateError::Corrupt(format!("sqlite durable marker: {error}")))?;
+        mutation.commit();
         self.maybe_prune();
         Ok(seq)
     }
@@ -902,6 +854,32 @@ impl HistoryDb {
         self.query(&sql, rusqlite::params![limit as i64, offset as i64])
     }
 
+    /// A page and its total describe one WAL snapshot while replay writes.
+    pub fn read_page(
+        &self,
+        limit: usize,
+        offset: usize,
+        since: Option<i64>,
+    ) -> Result<(Vec<HistoryEntry>, u64), StateError> {
+        let mut conn = self.reader.lock().unwrap();
+        let tx = conn
+            .transaction()
+            .map_err(|e| StateError::Corrupt(e.to_string()))?;
+        let rows = if let Some(seq) = since {
+            Self::query_on(
+                &tx,
+                &format!("SELECT {COLUMNS} FROM history WHERE id > ?1 ORDER BY id ASC LIMIT ?2"),
+                rusqlite::params![seq, limit as i64],
+            )?
+        } else {
+            Self::query_on(&tx, &format!("SELECT {COLUMNS} FROM history ORDER BY completed_at DESC, id DESC LIMIT ?1 OFFSET ?2"), rusqlite::params![limit as i64, offset as i64])?
+        };
+        let total = tx
+            .query_row("SELECT COUNT(*) FROM history", [], |r| r.get::<_, i64>(0))
+            .map_err(|e| StateError::Corrupt(e.to_string()))?;
+        Ok((rows, total as u64))
+    }
+
     /// The cursor form: every entry newer than `since_seq`, oldest first.
     ///
     /// Ascending and hidden-inclusive, both deliberately. Ascending
@@ -931,7 +909,15 @@ impl HistoryDb {
         sql: &str,
         params: &[&dyn rusqlite::ToSql],
     ) -> Result<Vec<HistoryEntry>, StateError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.reader.lock().unwrap();
+        Self::query_on(&conn, sql, params)
+    }
+
+    fn query_on(
+        conn: &Connection,
+        sql: &str,
+        params: &[&dyn rusqlite::ToSql],
+    ) -> Result<Vec<HistoryEntry>, StateError> {
         let mut stmt = conn
             .prepare(sql)
             .map_err(|e| StateError::Corrupt(e.to_string()))?;
@@ -986,20 +972,91 @@ impl HistoryDb {
         client: Option<&str>,
         now_unix: i64,
     ) -> Result<(), StateError> {
-        let conn = self.conn.lock().unwrap();
-        for job in jobs {
-            conn.execute(
-                "UPDATE history SET
-                   first_seen = COALESCE(first_seen, ?2),
-                   last_seen = ?2,
-                   seen_count = seen_count + 1,
-                   picked_up_by = COALESCE(?3, picked_up_by)
-                 WHERE job_id = ?1",
-                rusqlite::params![job.0, now_unix, client],
-            )
-            .map_err(|e| StateError::Corrupt(e.to_string()))?;
+        {
+            let mut pending = self.sync.pending_seen.lock().unwrap();
+            for job in jobs {
+                // Observations are advisory and index-local. Bound memory if
+                // storage stays unavailable; report loss instead of blocking reads.
+                if pending.len() >= 10_000 && !pending.contains_key(&job.0) {
+                    return Err(StateError::Corrupt(
+                        "history observation backlog is full".into(),
+                    ));
+                }
+                let seen = pending.entry(job.0).or_insert(sync::Seen {
+                    first: now_unix,
+                    last: now_unix,
+                    count: 0,
+                    client: None,
+                });
+                seen.first = seen.first.min(now_unix);
+                seen.last = seen.last.max(now_unix);
+                seen.count = seen.count.saturating_add(1);
+                if let Some(client) = client {
+                    seen.client = Some(client.to_owned());
+                }
+            }
+        }
+        if let Some(thread) = self.sync.wake.lock().unwrap().as_ref() {
+            thread.unpark();
         }
         Ok(())
+    }
+
+    /// Never wait behind replay's writer connection to serve a consumer read.
+    /// Pending observations are retried by the owned worker, even when paused.
+    fn flush_seen(&self) -> Result<(), StateError> {
+        let Ok(mut conn) = self.conn.try_lock() else {
+            return Ok(());
+        };
+        // Move a bounded batch out before touching storage. HTTP enqueues never
+        // wait on a filesystem call, even when the worker's commit stalls.
+        let batch = {
+            let mut pending = self.sync.pending_seen.lock().unwrap();
+            let mut batch = Vec::new();
+            for _ in 0..256 {
+                let Some(item) = pending.pop_first() else {
+                    break;
+                };
+                batch.push(item);
+            }
+            batch
+        };
+        if batch.is_empty() {
+            return Ok(());
+        }
+        let result = (|| {
+            let tx = conn.transaction()?;
+            for (job, seen) in &batch {
+                tx.prepare_cached(
+                    "UPDATE history SET
+                    first_seen=MIN(COALESCE(first_seen,?2),?2), last_seen=MAX(COALESCE(last_seen,?3),?3),
+                    seen_count=seen_count+?4, picked_up_by=COALESCE(?5,picked_up_by) WHERE job_id=?1",
+                )?.execute(rusqlite::params![job, seen.first, seen.last, seen.count, seen.client])?;
+            }
+            tx.commit()
+        })();
+        if result.is_err() {
+            let mut pending = self.sync.pending_seen.lock().unwrap();
+            // At most 256 in-flight keys supplement the 10,000-key queue cap.
+            for (job, seen) in batch {
+                pending
+                    .entry(job)
+                    .and_modify(|new| {
+                        new.first = new.first.min(seen.first);
+                        new.last = new.last.max(seen.last);
+                        new.count = new.count.saturating_add(seen.count);
+                        if new.client.is_none() {
+                            new.client.clone_from(&seen.client);
+                        }
+                    })
+                    .or_insert(seen);
+            }
+        } else if !self.sync.pending_seen.lock().unwrap().is_empty() {
+            if let Some(thread) = self.sync.wake.lock().unwrap().as_ref() {
+                thread.unpark();
+            }
+        }
+        result.map_err(|e| StateError::Corrupt(e.to_string()))
     }
 
     /// Hide an entry (NZBGet HistoryDelete semantics). When a client did
@@ -1026,6 +1083,7 @@ impl HistoryDb {
         by_client: Option<&str>,
         removed_at: Option<i64>,
     ) -> Result<bool, StateError> {
+        let mutation = MutationGuard::new(self);
         let changed = {
             let conn = self.conn.lock().unwrap();
             conn.execute(
@@ -1046,9 +1104,10 @@ impl HistoryDb {
                 .into_iter()
                 .find(|e| e.job == job)
             {
-                let _ = self.append_jsonl(&entry);
+                self.append_jsonl(&entry)?;
             }
         }
+        mutation.commit();
         Ok(changed)
     }
 
@@ -1116,6 +1175,7 @@ impl HistoryDb {
     /// the old entry line; the tombstone wins, so neither UI history nor the
     /// forward cursor can resurrect it under a new rowid.
     pub fn delete(&self, job: crate::JobId) -> Result<bool, StateError> {
+        let mutation = MutationGuard::new(self);
         let completed_at = {
             let conn = self.conn.lock().unwrap();
             let mut stmt = conn
@@ -1136,6 +1196,7 @@ impl HistoryDb {
         // The record and its spooled NZB live and die together: an entry
         // nobody can see must not leave a file behind.
         self.drop_spool(job);
+        mutation.commit();
         Ok(!completed_at.is_empty())
     }
 

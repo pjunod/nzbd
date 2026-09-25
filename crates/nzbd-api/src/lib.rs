@@ -1900,6 +1900,34 @@ struct HistoryQuery {
     since_seq: Option<i64>,
 }
 
+async fn get_history_sync(State(st): State<ApiState>) -> Response {
+    match st.history {
+        Some(db) => Json(json!(db.sync_status())).into_response(),
+        None => error(StatusCode::NOT_IMPLEMENTED, "history store not configured"),
+    }
+}
+
+async fn history_sync_action(State(st): State<ApiState>, Path(action): Path<String>) -> Response {
+    let Some(db) = st.history else {
+        return error(StatusCode::NOT_IMPLEMENTED, "history store not configured");
+    };
+    let paused = match action.as_str() {
+        "pause" => true,
+        "resume" => false,
+        _ => return error(StatusCode::BAD_REQUEST, "expected pause or resume"),
+    };
+    match tokio::task::spawn_blocking(move || {
+        db.set_sync_paused(paused)?;
+        Ok::<_, nzbd_state::StateError>(db.sync_status())
+    })
+    .await
+    {
+        Ok(Ok(status)) => Json(json!(status)).into_response(),
+        Ok(Err(e)) => error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+        Err(e) => error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
 /// `GET /api/v1/history` — completed/failed jobs (NZBGet parity: finished
 /// jobs leave the queue and live here).
 ///
@@ -1938,13 +1966,7 @@ async fn get_history(
     let consumer = consumer_name(&headers);
     let now = unix_now();
     let entries = tokio::task::spawn_blocking(move || {
-        let _ = db.refresh(); // pick up other nodes' appends (throttled)
-        let rows = match since {
-            Some(seq) => db.list_since(seq, limit),
-            None => db.list_page(limit, offset, true),
-        };
-        let total = db.count_filtered(true).unwrap_or(0);
-        rows.map(|entries| {
+        db.read_page(limit, offset, since).map(|(entries, total)| {
             // Record the pull before decorating: this poll SAW these
             // entries. Both shapes count — a `since_seq` catch-up walk is
             // still the consumer reading them. A failure here is not worth
@@ -1985,16 +2007,17 @@ async fn get_history(
                     v
                 })
                 .collect::<Vec<_>>();
-            (entries, total)
+            (entries, total, db.sync_status())
         })
     })
     .await;
     match entries {
-        Ok(Ok((entries, total))) => Json(json!({
+        Ok(Ok((entries, total, sync))) => Json(json!({
             "entries": entries,
             "total": total,
             "offset": offset,
             "limit": limit,
+            "sync": sync,
         }))
         .into_response(),
         Ok(Err(e)) => error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
@@ -2042,6 +2065,8 @@ async fn openapi() -> Response {
                                               {"name": "since_seq", "in": "query",
                                                "description": "Cursor: entries with seq > N, ascending"}
                                           ] } },
+            "/api/v1/history-sync": { "get": { "summary": "History worker status, freshness, I/O and index placement" } },
+            "/api/v1/history-sync/{action}": { "post": { "summary": "Pause or resume background reconciliation; local writes continue" } },
             "/api/v1/history/{id}/actions/{action}": { "post": { "summary": "restore|hide|delete|delete-files|requeue" } },
             "/api/v1/logs": { "get": { "summary": "Recent daemon log entries" } },
             "/api/v1/events": { "get": { "summary": "Engine events (SSE); frames carry id: <seq>, Last-Event-ID resumes, 'reset' means poll-reconcile" } },
@@ -2692,6 +2717,8 @@ pub fn router_with(state: ApiState) -> Router {
         )
         .route("/api/v1/servers/test", post(test_server))
         .route("/api/v1/history", get(get_history))
+        .route("/api/v1/history-sync", get(get_history_sync))
+        .route("/api/v1/history-sync/{action}", post(history_sync_action))
         .route(
             "/api/v1/history/{id}/actions/{action}",
             post(history_action),
@@ -3680,7 +3707,32 @@ mod tests {
             }
         };
 
+        let paused = app
+            .clone()
+            .oneshot(
+                axum::http::Request::post("/api/v1/history-sync/pause")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(paused.status(), StatusCode::OK);
+        assert_eq!(body_json(paused).await["paused"], true);
+        let invalid = app
+            .clone()
+            .oneshot(
+                axum::http::Request::post("/api/v1/history-sync/forget")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
         let first = page(0, 10).await;
+        assert_eq!(
+            first["sync"]["paused"], true,
+            "paused reconciliation does not prevent indexed reads"
+        );
         assert_eq!(first["entries"].as_array().unwrap().len(), 10);
         assert_eq!(first["total"], 25, "total counts the list, not the page");
         assert_eq!(first["offset"], 0);
