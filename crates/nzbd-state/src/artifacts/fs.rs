@@ -70,6 +70,18 @@ mod unix {
     }
     pub fn open_dir(path: &Path) -> Result<File> {
         absolute(path)?;
+        // macOS system aliases are not payload links. Normalize these fixed
+        // OS roots, then require no-follow for every operator-owned component.
+        #[cfg(target_os = "macos")]
+        let normalized = if path.starts_with("/var") {
+            Path::new("/private/var").join(path.strip_prefix("/var").unwrap())
+        } else if path.starts_with("/tmp") {
+            Path::new("/private/tmp").join(path.strip_prefix("/tmp").unwrap())
+        } else {
+            path.to_path_buf()
+        };
+        #[cfg(target_os = "macos")]
+        let path = normalized.as_path();
         let mut dir = File::open("/")?;
         for c in path.components() {
             if let Component::Normal(n) = c {
@@ -116,6 +128,11 @@ mod unix {
             }
             let bytes = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
             if bytes != b"." && bytes != b".." {
+                if out.len() >= 100_001 {
+                    break Err(Error::Conflict(
+                        "directory enumeration limit reached".into(),
+                    ));
+                }
                 out.push(std::ffi::OsStr::from_bytes(bytes).to_os_string());
             }
         };
@@ -248,4 +265,79 @@ pub fn remove_entry(root: &File, entry: &FileEntry) -> Result<()> {
         return Err(Error::Conflict(format!("identity changed: {}", entry.path)));
     }
     unlink(&parent, Path::new(n), entry.identity.directory)
+}
+
+#[cfg(unix)]
+pub fn available_bytes(dir: &File) -> Result<u64> {
+    use std::os::fd::AsRawFd;
+    let mut stat = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    if unsafe { libc::fstatvfs(dir.as_raw_fd(), stat.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let stat = unsafe { stat.assume_init() };
+    Ok((stat.f_bavail as u64).saturating_mul(stat.f_frsize as u64))
+}
+#[cfg(not(unix))]
+pub fn available_bytes(_: &File) -> Result<u64> {
+    Err(Error::Conflict("free space is unavailable".into()))
+}
+
+/// Atomic publication must never replace an unrelated empty directory.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub fn rename_exclusive(from: &Path, to: &Path) -> Result<()> {
+    use std::ffi::CString;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::ffi::OsStrExt;
+    let source = open_dir(
+        from.parent()
+            .ok_or_else(|| Error::Conflict("missing source parent".into()))?,
+    )?;
+    let target = open_dir(
+        to.parent()
+            .ok_or_else(|| Error::Conflict("missing target parent".into()))?,
+    )?;
+    let a = CString::new(
+        from.file_name()
+            .ok_or_else(|| Error::Conflict("missing source name".into()))?
+            .as_bytes(),
+    )
+    .map_err(|_| Error::Conflict("invalid source".into()))?;
+    let b = CString::new(
+        to.file_name()
+            .ok_or_else(|| Error::Conflict("missing target name".into()))?
+            .as_bytes(),
+    )
+    .map_err(|_| Error::Conflict("invalid target".into()))?;
+    #[cfg(target_os = "linux")]
+    let rc = unsafe {
+        libc::renameat2(
+            source.as_raw_fd(),
+            a.as_ptr(),
+            target.as_raw_fd(),
+            b.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    #[cfg(target_os = "macos")]
+    let rc = unsafe {
+        libc::renameatx_np(
+            source.as_raw_fd(),
+            a.as_ptr(),
+            target.as_raw_fd(),
+            b.as_ptr(),
+            libc::RENAME_EXCL,
+        )
+    };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    target.sync_all()?;
+    source.sync_all()?;
+    Ok(())
+}
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub fn rename_exclusive(_: &Path, _: &Path) -> Result<()> {
+    Err(Error::Conflict(
+        "exclusive directory publication unavailable on this platform".into(),
+    ))
 }

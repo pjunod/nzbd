@@ -22,8 +22,8 @@ before merging. No deployment is included.
 | F2: discovery and Files attention view | Building | Bounded cached scans distinguish unknown, active and retained files |
 | F3: checked deletion and retention | Building | Exact owned files only; Keep, undo and dual clocks survive restart |
 | F4: recovery publication | Building | Verified independent copies, source holds and crash reconciliation |
-| F5: Curator recovery import | Planned | Target coordination, durable placement and receipt outbox |
-| F6: settings, cleanup and operations | Planned | Advisory Dev enable controls; receipt-driven cleanup; docs and final validation |
+| F5: Curator recovery import | Building | Target coordination, durable placement and receipt outbox |
+| F6: settings, cleanup and operations | Building | Advisory Dev enable controls; receipt-driven cleanup; docs and final validation |
 | Final adversarial review | Pending | Findings resolved before tests |
 | Final tests and PR merge | Pending | Required suites and CI green |
 
@@ -36,8 +36,8 @@ before merging. No deployment is included.
    file operations must still prove identity, ownership and quiescence.
 3. **User delivery instructions override Curator checkout and repeated-test
    rules.** Work stays in owned clones and tests run after final review.
-4. **CI draft behavior is awaiting the user preference.** Runner already skips
-   draft PR tests; Curator currently runs them. No draft PR has been opened.
+4. **CI behavior stays unchanged.** PRs remain unopened until the final review
+   boundary so Curator does not start unit tests during construction.
 
 ## 3. Validation record
 
@@ -54,3 +54,33 @@ and Dev advisory controls are wired. Recovery import integration and crash
 reconciliation are still in progress; these are not merge-ready changes.
 `cargo check -p nzbd-engine` and `cargo check -p nzbd-api` passed before the
 latest History routing changes. These are compilation checks, not test runs.
+
+Curator now has durable placement intentions, rollback copies retained until
+metadata commit, atomic per-file import receipts, an outbox delivery worker,
+recovery API generation and Recovery/Dev settings panels. Compilation of its
+Go API passed. Web dependency installation needed network permission; tests
+remain deferred. Crash reconciliation, capacity checks, recovery retries,
+explicit episode mapping and retention cleanup are still being completed.
+
+The shared Curator target coordinator initially serializes library imports.
+This trades parallel library writes for one clear authority across ordinary
+and recovery imports. Network downloading remains concurrent.
+
+## 5. Crash recovery checkpoint
+
+Recovery publication now reconciles a durable manifest against directory
+identity, exact file count, sizes and SHA-256 digests. Interrupted incomplete
+copies become visible retained inventory for review. Queue retirement is
+reconciled before writers start. Category moves and failed-payload parking use
+a journaled, exclusive publication; cross-volume copies verify their bytes and
+retire the exact original entries only after publication is committed.
+
+Curator records receipt delivery and local completion in one transaction.
+Placement reconciliation cleans verified temporary/rollback files after the
+metadata transaction. The Recovery view restores persisted activity and exposes
+cancellation, with a worker quiescence acknowledgement before releasing a claim.
+Quality, source and episode metadata are committed with each file receipt.
+
+Remaining construction includes platform and cluster compatibility, operational
+backup/retention controls, deeper failure regression coverage and final docs.
+No adversarial implementation review or unit tests have run yet.

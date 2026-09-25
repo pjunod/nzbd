@@ -4267,7 +4267,7 @@ $("torrent-file").onchange = async () => {
 
 
 // ---- durable file ownership ----------------------------------------------
-let filesOffset = 0, filesBusy = false, selectedArtifact = null;
+let filesOffset = 0, filesBusy = false, selectedArtifact = null, filesOperation = null;
 async function fileRequest(path, body, method = "POST") {
   const response = await jfetch("/api/v1/" + path, {method, headers:{"Content-Type":"application/json"}, body: body == null ? undefined : JSON.stringify(body)});
   const value = await response.json();
@@ -4279,6 +4279,11 @@ async function refreshFiles() {
   if (filesBusy) return;
   filesBusy = true;
   try {
+    if (filesOperation) {
+      const op = await fileRequest("artifact-operations/" + filesOperation, null, "GET");
+      $("files-message").textContent = op.kind + ": " + op.state + (op.error ? " — " + op.error : "");
+      if (["succeeded", "failed", "cancelled", "review"].includes(op.state)) filesOperation = null;
+    }
     const response = await jfetch("/api/v1/artifacts?offset=" + filesOffset);
     if (!response.ok) throw new Error("Inventory unavailable (" + response.status + ")");
     const data = await response.json();
@@ -4288,13 +4293,13 @@ async function refreshFiles() {
     if (recoveries.ok) $("files-recoveries").innerHTML = (await recoveries.json()).map(r => `<p>${esc(r.id)} · ${esc(r.state)} · ${r.files.length} files${r.error ? " · " + esc(r.error) : ""}</p>`).join("") || "No recovery handoffs.";
   } catch(e) { filesError(e); } finally { filesBusy = false; }
 }
-async function scanFiles() { try { await fileRequest("artifacts/scan"); $("files-message").textContent="Scan requested. Refresh to see discovered folders; existing media remains held."; } catch(e) { filesError(e); } }
+async function scanFiles() { try { filesOperation=(await fileRequest("artifacts/scan")).id; $("files-message").textContent="Scan requested. Refresh to see discovered folders; existing media remains held."; } catch(e) { filesError(e); } }
 async function openArtifact(id) {
   try {
     const a = await fileRequest("artifacts/"+id,null,"GET");
     const f = await fileRequest("artifacts/"+id+"/files",null,"GET");
     selectedArtifact=a;
-    $("files-detail").innerHTML=`<h3>${esc(a.path)}</h3><p>${esc(a.hold || "No hold")} · revision ${a.revision}</p><button data-file-action="inspect">Inspect files</button><button data-file-action="adopt">Adopt and Keep</button><button data-file-action="keep">${a.keep ? "Remove Keep (fresh retention)" : "Keep indefinitely"}</button><button data-file-action="delete">Delete owned files (8-second Undo)</button><p>Select files to copy for Curator recovery. Originals remain held until a complete import receipt.</p>${f.files.map(x=>`<label style="display:block"><input type="checkbox" class="recovery-file" value="${esc(x.path)}" ${x.identity.directory ? "disabled" : ""}> ${esc(x.path)} · ${fmtBytes(x.identity.bytes)}</label>`).join("")}<p>Showing ${f.files.length} of ${f.total} entries.</p><button data-file-action="stage">Stage selected recovery files</button><span id="file-operation" role="status"></span>`;
+    $("files-detail").innerHTML=`<h3>${esc(a.path)}</h3><p>${esc(a.hold || "No hold")} · revision ${a.revision}</p><button data-file-action="inspect">Inspect files</button><button data-file-action="adopt">Adopt and Keep</button><button data-file-action="release-review">Release reviewed hold</button><button data-file-action="keep">${a.keep ? "Remove Keep (fresh retention)" : "Keep indefinitely"}</button><button data-file-action="delete">Delete owned files (8-second Undo)</button><p>Select files to copy for Curator recovery. Originals remain held until a complete import receipt.</p>${f.files.map(x=>`<label style="display:block"><input type="checkbox" class="recovery-file" value="${esc(x.path)}" ${x.identity.directory ? "disabled" : ""}> ${esc(x.path)} · ${fmtBytes(x.identity.bytes)}</label>`).join("")}<p>Showing ${f.files.length} of ${f.total} entries.</p><button data-file-action="stage">Stage selected recovery files</button><span id="file-operation" role="status"></span>`;
     $("files-detail").querySelectorAll("[data-file-action]").forEach(b=>b.onclick=()=>artifactAction(b.dataset.fileAction));
   } catch(e){filesError(e);}
 }
@@ -4302,7 +4307,8 @@ async function artifactAction(action) {
   const a=selectedArtifact;if(!a)return;
   try {
     const base="artifacts/"+a.id;
-    if(action==="inspect"){await fileRequest(base+"/inspect");$("files-message").textContent="Inspection requested. Reopen the folder when the scan finishes.";return;}
+    if(action==="inspect"){filesOperation=(await fileRequest(base+"/inspect")).id;$("files-message").textContent="Inspection requested. Reopen the folder when the scan finishes.";return;}
+    if(action==="release-review") await fileRequest(base+"/release-review",{revision:a.revision});
     if(action==="adopt") await fileRequest(base+"/adopt",{revision:a.revision});
     if(action==="keep") await fileRequest(base+"/retention",{revision:a.revision,keep:!a.keep});
     if(action==="delete") {
@@ -4313,7 +4319,7 @@ async function artifactAction(action) {
     }
     if(action==="stage") {
       const files=[...document.querySelectorAll(".recovery-file:checked")].map(e=>e.value);
-      await fileRequest(base+"/recoveries",{revision:a.revision,idempotency_key:crypto.randomUUID(),files});
+      filesOperation=(await fileRequest(base+"/recoveries",{revision:a.revision,idempotency_key:crypto.randomUUID(),files})).id;
       $("files-message").textContent="Recovery staging requested. Follow the handoff status below; claim and import it in Curator.";
       return;
     }

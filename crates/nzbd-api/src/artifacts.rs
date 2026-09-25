@@ -25,6 +25,10 @@ pub fn router() -> Router<ApiState> {
         .route("/api/v1/artifacts/{id}/events", get(events))
         .route("/api/v1/artifacts/{id}/inspect", post(inspect))
         .route("/api/v1/artifacts/{id}/adopt", post(adopt))
+        .route(
+            "/api/v1/artifacts/{id}/release-review",
+            post(release_review),
+        )
         .route("/api/v1/artifacts/{id}/retention", post(retention))
         .route("/api/v1/artifacts/{id}/delete", post(delete))
         .route("/api/v1/artifact-operations/{id}", get(operation))
@@ -100,16 +104,10 @@ async fn cancel(State(st): State<ApiState>, Path(id): Path<String>) -> Response 
 }
 async fn inspect(State(st): State<ApiState>, Path(id): Path<String>) -> Response {
     let db = st.engine.artifacts();
-    tokio::task::spawn_blocking(move || {
-        if let Err(e) = db.inspect(&id) {
-            tracing::warn!(artifact=%id,error=%e,"artifact inspection failed");
-        }
-    });
-    (
-        StatusCode::ACCEPTED,
-        Json(json!({"state":"inspection_requested"})),
-    )
-        .into_response()
+    match db.submit_task("inspect", &id, "", json!({})) {
+        Ok(op) => (StatusCode::ACCEPTED, Json(op)).into_response(),
+        Err(e) => failure(e),
+    }
 }
 #[derive(Deserialize)]
 struct Revision {
@@ -120,8 +118,19 @@ async fn adopt(
     Path(id): Path<String>,
     Json(body): Json<Revision>,
 ) -> Response {
+    if let Err(response) = validate_artifact_role(&st, &id) {
+        return response;
+    }
     let db = st.engine.artifacts();
     work(move || db.adopt(&id, body.revision)).await
+}
+async fn release_review(
+    State(st): State<ApiState>,
+    Path(id): Path<String>,
+    Json(body): Json<Revision>,
+) -> Response {
+    let db = st.engine.artifacts();
+    work(move || db.release_review(&id, body.revision)).await
 }
 #[derive(Deserialize)]
 struct Retention {
@@ -149,6 +158,9 @@ async fn delete(
     Path(id): Path<String>,
     Json(body): Json<Delete>,
 ) -> Response {
+    if let Err(response) = validate_artifact_role(&st, &id) {
+        return response;
+    }
     let db = st.engine.artifacts();
     match tokio::task::spawn_blocking(move || {
         db.request_delete(&id, body.revision, &body.idempotency_key, body.undo_seconds)
@@ -161,6 +173,22 @@ async fn delete(
     }
 }
 
+fn validate_artifact_role(st: &ApiState, id: &str) -> Result<(), Response> {
+    let artifact = st.engine.artifacts().get(id).map_err(failure)?;
+    if let Some(cfg) = config(st) {
+        if cfg
+            .storage_roots()
+            .iter()
+            .any(|r| r.path == artifact.path || r.path.starts_with(&artifact.path))
+        {
+            return Err(error(
+                StatusCode::CONFLICT,
+                "artifact overlaps a configured directory role",
+            ));
+        }
+    }
+    Ok(())
+}
 fn config(st: &ApiState) -> Option<nzbd_config::Config> {
     st.setup.as_ref().map(|s| s.current.lock().unwrap().clone())
 }
@@ -199,69 +227,41 @@ async fn scan(State(st): State<ApiState>) -> Response {
         return error(StatusCode::SERVICE_UNAVAILABLE, "configuration unavailable");
     };
     let db = st.engine.artifacts();
-    let active: Vec<PathBuf> = st
-        .engine
-        .snapshot()
-        .jobs
-        .iter()
-        .map(|j| j.name.clone())
-        .map(|n| cfg.dest_dir().join(n))
-        .collect();
-    tokio::task::spawn_blocking(move || {
-        let mut roots = vec![
-            nzbd_config::expand_home(&cfg.paths.main_dir),
-            cfg.dest_dir(),
-            cfg.post
-                .failed_dir
-                .clone()
-                .unwrap_or_else(|| cfg.dest_dir().join(".failed")),
-        ];
-        if let Some(p) = &cfg.paths.inter_dir {
-            roots.push(nzbd_config::expand_home(p));
+    let mut active = Vec::new();
+    for summary in &st.engine.snapshot().jobs {
+        if let Ok(Some(job)) = st.engine.export_job(summary.id).await {
+            active.push(cfg.dest_dir().join(nzbd_engine::queue::job_dir_name(&job)));
         }
-        roots.sort();
-        roots.dedup();
-        let excluded = cfg.storage_roots();
-        let mut count = 0;
-        for root in roots {
-            let entries = match std::fs::read_dir(&root) {
-                Ok(e) => e,
-                Err(e) => {
-                    tracing::warn!(path=%root.display(),error=%e,"artifact scan root unavailable");
-                    continue;
-                }
-            };
-            for entry in entries {
-                if count >= 2000 {
-                    return;
-                }
-                let Ok(entry) = entry else {
-                    continue;
-                };
-                let path = entry.path();
-                if excluded.iter().any(|r| r.path == path)
-                    || path.file_name().is_some_and(|n| n == "recovery")
-                {
-                    continue;
-                }
-                if !entry
-                    .file_type()
-                    .is_ok_and(|t| t.is_dir() && !t.is_symlink())
-                {
-                    continue;
-                }
-                count += 1;
-                if let Err(e) = db.discover(&root, &path, active.contains(&path)) {
-                    tracing::warn!(path=%path.display(),error=%e,"artifact discovery failed");
-                }
-            }
+    }
+    let mut roots = vec![
+        nzbd_config::expand_home(&cfg.paths.main_dir),
+        cfg.dest_dir(),
+        cfg.post
+            .failed_dir
+            .clone()
+            .unwrap_or_else(|| nzbd_config::expand_home(&cfg.paths.main_dir).join("failed")),
+    ];
+    if let Some(p) = &cfg.paths.inter_dir {
+        roots.push(nzbd_config::expand_home(p));
+    }
+    roots.sort();
+    roots.dedup();
+    let mut excluded: Vec<_> = cfg.storage_roots().into_iter().map(|r| r.path).collect();
+    excluded.push(nzbd_config::expand_home(&cfg.paths.main_dir).join("recovery"));
+    if let Ok(settings) = db.settings() {
+        if !settings.recovery_root.as_os_str().is_empty() {
+            excluded.push(settings.recovery_root);
         }
-    });
-    (
-        StatusCode::ACCEPTED,
-        Json(json!({"state":"scan_requested","max_directories":2000})),
-    )
-        .into_response()
+    }
+    match db.submit_task(
+        "scan",
+        "installation",
+        "",
+        json!({"roots":roots,"excluded":excluded,"active":active}),
+    ) {
+        Ok(op) => (StatusCode::ACCEPTED, Json(op)).into_response(),
+        Err(e) => failure(e),
+    }
 }
 #[derive(Deserialize)]
 struct Stage {
@@ -297,23 +297,15 @@ async fn stage(
             "recovery root overlaps a download, state, watch or category role",
         );
     }
-    let key = body.idempotency_key.clone();
-    tokio::task::spawn_blocking(move || {
-        if let Err(e) = db.stage_recovery(
-            &id,
-            body.revision,
-            &body.idempotency_key,
-            &body.files,
-            &root,
-        ) {
-            tracing::warn!(artifact=%id,error=%e,"recovery staging refused");
-        }
-    });
-    (
-        StatusCode::ACCEPTED,
-        Json(json!({"request_id":key,"state":"staging_requested"})),
-    )
-        .into_response()
+    match db.submit_task(
+        "stage",
+        &id,
+        &body.idempotency_key,
+        json!({"revision":body.revision,"files":body.files,"root":root}),
+    ) {
+        Ok(op) => (StatusCode::ACCEPTED, Json(op)).into_response(),
+        Err(e) => failure(e),
+    }
 }
 async fn recoveries(State(st): State<ApiState>, Query(p): Query<Page>) -> Response {
     let db = st.engine.artifacts();

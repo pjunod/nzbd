@@ -130,6 +130,8 @@ pub struct EngineConfig {
     pub download_enabled: bool,
     /// Journal + snapshots live here (the shared volume in cluster mode).
     pub state_dir: PathBuf,
+    /// Node-local lifecycle database, separate from cluster journals.
+    pub artifact_dir: Option<PathBuf>,
     /// Completed jobs are written to `<dest_dir>/<job name>/`.
     pub dest_dir: PathBuf,
     /// Ordered configured torrent payload roots used only for removal safety.
@@ -171,6 +173,7 @@ impl EngineConfig {
             servers,
             download_enabled: true,
             state_dir,
+            artifact_dir: None,
             disk_guard_roots: vec![DiskGuardRoot {
                 label: "downloads".into(),
                 path: dest_dir.clone(),
@@ -248,6 +251,7 @@ impl Engine {
 
         let owner = Owner::recover(
             &cfg.state_dir,
+            cfg.artifact_dir.as_deref(),
             cfg.dest_dir.clone(),
             cfg.torrent_payload_roots.clone(),
             cfg.history.clone(),

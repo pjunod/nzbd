@@ -25,6 +25,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Quarantine file operations after restoring a backup. Stop the daemon first.
+    ArtifactsRestore {
+        #[arg(long)]
+        state_dir: PathBuf,
+    },
     /// Run the daemon.
     Run {
         /// Path to nzbd.toml (defaults are used if absent).
@@ -102,6 +107,15 @@ fn main() -> anyhow_lite::Result<()> {
 
     let cli = Cli::parse();
     match cli.command {
+        Command::ArtifactsRestore { state_dir } => {
+            let inventory = nzbd_state::artifacts::Inventory::open(&state_dir)
+                .map_err(|e| anyhow_lite::Error::msg(e.to_string()))?;
+            inventory
+                .quarantine_restore()
+                .map_err(|e| anyhow_lite::Error::msg(e.to_string()))?;
+            println!("Restored inventory quarantined. Review all held payloads before resuming retention.");
+            Ok(())
+        }
         Command::Run { config, bind } => loop {
             match run(config.clone(), bind.clone(), logbuf.clone())? {
                 RunOutcome::Exit => break Ok(()),

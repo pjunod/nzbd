@@ -25,6 +25,8 @@ pub struct Recovery {
     pub import_id: Option<String>,
     pub receipt: Option<Receipt>,
     pub error: Option<String>,
+    #[serde(default)]
+    pub scratch_identity: Option<Identity>,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -94,8 +96,10 @@ impl Inventory {
             let raw: Option<String> = stmt.query_row([request_id], |r| r.get(0)).optional()?;
             if let Some(raw) = raw {
                 let existing: Recovery = serde_json::from_str(&raw)?;
+                drop(stmt);
+                drop(db);
                 return if existing.request == request {
-                    Ok(existing)
+                    self.resume_publication(existing)
                 } else {
                     Err(Error::Conflict("idempotency key reused".into()))
                 };
@@ -172,6 +176,7 @@ impl Inventory {
                 import_id: None,
                 receipt: None,
                 error: None,
+                scratch_identity: None,
                 created_at: now(),
                 updated_at: now(),
             };
@@ -184,6 +189,17 @@ impl Inventory {
             r
         };
         let result = (|| {
+            let required: u64 = selected.iter().map(|f| f.identity.bytes).sum();
+            let mut volume = root;
+            while !volume.exists() {
+                volume = volume
+                    .parent()
+                    .ok_or_else(|| Error::Conflict("recovery volume unavailable".into()))?;
+            }
+            let available = fs::available_bytes(&fs::open_dir(volume)?)?;
+            if available < required.saturating_add(1024 * 1024 * 1024) {
+                return Err(Error::Conflict(format!("recovery staging needs {required} bytes plus 1 GiB reserve; {available} available")));
+            }
             std::fs::create_dir_all(root)?;
             fs::open_dir(root)?;
             let staging = root.join(".staging");
@@ -194,6 +210,9 @@ impl Inventory {
             fs::open_dir(&published)?;
             let scratch = staging.join(&r.id);
             std::fs::create_dir(&scratch)?;
+            r.scratch_identity = Some(fs::identity(&fs::open_dir(&scratch)?.metadata()?));
+            File::open(&staging)?.sync_all()?;
+            save(&self.db.lock().unwrap(), &r)?;
             let payload = scratch.join("payload");
             std::fs::create_dir(&payload)?;
             for f in selected {
@@ -249,9 +268,10 @@ impl Inventory {
                     "recovery publication already exists".into(),
                 ));
             }
-            std::fs::rename(&scratch, &r.published)?;
+            fs::rename_exclusive(&scratch, &r.published)?;
             File::open(&published)?.sync_all()?;
             File::open(&staging)?.sync_all()?;
+            self.register_publication(&r)?;
             Ok(())
         })();
         match result {
@@ -264,6 +284,96 @@ impl Inventory {
         r.updated_at = now();
         save(&self.db.lock().unwrap(), &r)?;
         Ok(r)
+    }
+    /// Resolve publication from its durable manifest. Incomplete copying is
+    /// retained for explicit review; it is never recursively erased on restart.
+    fn resume_publication(&self, mut r: Recovery) -> Result<Recovery> {
+        if !matches!(r.state.as_str(), "staging" | "publishing") {
+            return Ok(r);
+        }
+        let root = r
+            .published
+            .parent()
+            .and_then(Path::parent)
+            .ok_or_else(|| Error::Conflict("invalid recovery root".into()))?;
+        let scratch = root.join(".staging").join(&r.id);
+        let result = (|| {
+            if r.state != "publishing" {
+                return Err(Error::Conflict("copy interrupted before its complete manifest was durable; inspect retained staging".into()));
+            }
+            let location = if r.published.try_exists()? {
+                &r.published
+            } else {
+                &scratch
+            };
+            let dir = fs::open_dir(location)?;
+            let observed = fs::identity(&dir.metadata()?);
+            if !r
+                .scratch_identity
+                .as_ref()
+                .is_some_and(|i| i.same_object(&observed))
+            {
+                return Err(Error::Conflict(
+                    "publication directory identity changed".into(),
+                ));
+            }
+            let raw = fs::open_relative(&dir, "manifest.json")?;
+            let manifest: Recovery = serde_json::from_reader(raw)?;
+            if manifest.id != r.id
+                || manifest.generation != r.generation
+                || manifest.manifest_digest != r.manifest_digest
+            {
+                return Err(Error::Conflict("publication manifest changed".into()));
+            }
+            let entries = fs::manifest(&dir, 100_000)?;
+            if entries.iter().filter(|f| !f.identity.directory).count() != r.files.len() + 1 {
+                return Err(Error::Conflict("unexpected files in publication".into()));
+            }
+            for f in &r.files {
+                let mut input = fs::open_relative(&dir, &format!("payload/{}", f.path))?;
+                if input.metadata()?.len() != f.bytes || digest(&mut input)? != f.sha256 {
+                    return Err(Error::Conflict("publication digest changed".into()));
+                }
+            }
+            if location == &scratch {
+                fs::rename_exclusive(&scratch, &r.published)?;
+            }
+            self.register_publication(&r)?;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => {
+                r.state = "published".into();
+                r.error = None;
+            }
+            Err(e) => {
+                r.state = "failed".into();
+                r.error = Some(e.to_string());
+                // The inventory owns the diagnosis even when copying never
+                // reached publication. Adoption remains an explicit action.
+                if scratch.try_exists().unwrap_or(false) {
+                    self.discover_unlocked(scratch.parent().unwrap(), &scratch)?;
+                }
+            }
+        }
+        r.updated_at = now();
+        save(&self.db.lock().unwrap(), &r)?;
+        Ok(r)
+    }
+    pub fn reconcile_recoveries(&self) -> Result<()> {
+        let _guard = self.mutation.lock().unwrap();
+        let pending = {
+            let db = self.db.lock().unwrap();
+            let mut stmt = db.prepare(
+                "SELECT data FROM recoveries WHERE state IN ('staging','publishing') LIMIT 10",
+            )?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        for raw in pending {
+            self.resume_publication(serde_json::from_str(&raw)?)?;
+        }
+        Ok(())
     }
     pub fn claim_recovery(
         &self,
@@ -358,6 +468,15 @@ impl Inventory {
         }
         let mut db = self.db.lock().unwrap();
         let tx = db.transaction()?;
+        if complete {
+            let mut staged: Artifact = read(&tx, "artifacts", &format!("recovery-{}", r.id))?;
+            staged.state = "recovery_imported".into();
+            staged.hold = None;
+            staged.deadline = Some(now() + 86400);
+            staged.eligible_seconds = 0;
+            staged.revision += 1;
+            save_artifact(&tx, &staged)?;
+        }
         save(&tx, &r)?;
         save_artifact(&tx, &a)?;
         event(&tx, &a.id, "recovery_receipt", &r.state)?;
@@ -375,10 +494,12 @@ impl Inventory {
         if r.state == "imported" {
             return Err(Error::Conflict("import already committed".into()));
         }
-        if r.consumer.is_some() && !ack {
+        let final_partial = r.state == "partial" && r.receipt.is_some();
+        if r.consumer.is_some() && !ack && !final_partial {
             r.state = "cancel_pending".into();
         } else {
             if r.consumer.is_some()
+                && !final_partial
                 && (consumer != r.consumer.as_deref() || r.state != "cancel_pending")
             {
                 return Err(Error::Conflict(
@@ -387,6 +508,11 @@ impl Inventory {
             }
             r.state = "cancelled".into();
             let mut a = self.get(&r.artifact)?;
+            if let Ok(mut staged) = self.get(&format!("recovery-{}", r.id)) {
+                staged.hold = Some("review: cancelled recovery staging".into());
+                staged.revision += 1;
+                save_artifact(&self.db.lock().unwrap(), &staged)?;
+            }
             a.hold = Some("review: cancelled recovery".into());
             a.revision += 1;
             save_artifact(&self.db.lock().unwrap(), &a)?;

@@ -2625,12 +2625,12 @@ async fn history_action(
         }
         let inventory = st.engine.artifacts();
         let result = tokio::time::timeout(std::time::Duration::from_secs(10), tokio::task::spawn_blocking(move || {
-            let artifact = match inventory.for_job(job.0)? {
-                Some(a) => a,
-                None => entry.final_dir.as_deref().map(std::path::Path::new)
-                    .map(|p| inventory.for_path(p)).transpose()?.flatten()
-                    .ok_or_else(|| nzbd_state::artifacts::Error::Conflict("payload ownership needs Files inspection and adoption; History retained".into()))?,
-            };
+            let artifact_id = entry.params.iter().find(|(k,_)| k == "Artifact:Id")
+                .map(|(_,v)|v).ok_or_else(||nzbd_state::artifacts::Error::Conflict("legacy History has no allocation identity; inspect and delete it through Files".into()))?;
+            let artifact = inventory.get(artifact_id)?;
+            if entry.final_dir.as_deref().map(std::path::Path::new) != Some(artifact.path.as_path()) {
+                return Err(nzbd_state::artifacts::Error::Conflict("History path does not match the owned generation".into()));
+            }
             let key = format!("history-delete-{}", artifact.id);
             let op = match inventory.operation(&key) {
                 Ok(op) => op,
@@ -2663,7 +2663,7 @@ async fn history_action(
     // like a human clicked them away.
     let by = client_name(&headers).unwrap_or_else(|| "user".into());
     let result = tokio::task::spawn_blocking(move || match act.as_str() {
-        "restore" => db.restore(job).map(|ok| (ok, None)),
+        "restore" => db.restore(job).map(|ok| (ok, None::<bool>)),
         "hide" => db.hide(job, Some(&by), now).map(|ok| (ok, None)),
         "delete" => db.delete(job).map(|ok| (ok, None)),
         _ => Ok((false, None)),

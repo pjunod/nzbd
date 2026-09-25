@@ -695,6 +695,7 @@ impl Owner {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn recover(
         state_dir: &Path,
+        artifact_dir: Option<&Path>,
         dest_dir: PathBuf,
         torrent_payload_roots: Vec<PathBuf>,
         history: Option<Arc<nzbd_state::history::HistoryDb>>,
@@ -718,7 +719,7 @@ impl Owner {
         cancel: CancellationToken,
     ) -> Result<Owner, nzbd_state::StateError> {
         let artifacts = Arc::new(
-            nzbd_state::artifacts::Inventory::open(state_dir)
+            nzbd_state::artifacts::Inventory::open(artifact_dir.unwrap_or(state_dir))
                 .map_err(|e| nzbd_state::StateError::Corrupt(e.to_string()))?,
         );
         std::fs::create_dir_all(&dest_dir).map_err(|source| nzbd_state::StateError::Io {
@@ -744,6 +745,9 @@ impl Owner {
                 state = QueueState::from_doc(doc);
             }
 
+            artifacts
+                .reconcile_startup(&state.jobs.iter().map(|job| job.id.0).collect::<Vec<_>>())
+                .map_err(|e| nzbd_state::StateError::Corrupt(e.to_string()))?;
             for job in &state.jobs {
                 if job.torrent.is_none() {
                     artifacts
@@ -1970,6 +1974,16 @@ impl Owner {
         if matches!(job.status, JobStatus::Downloading) {
             job.status = JobStatus::Queued;
         }
+        if job.torrent.is_none() {
+            if let Err(error) = self.artifacts.register_legacy_active(
+                job.id.0,
+                &self.dest_dir,
+                &self.dest_dir.join(job_dir_name(&job)),
+            ) {
+                tracing::error!(job=job.id.0, %error, "cluster payload inventory unavailable");
+                return false;
+            }
+        }
         let job_id = job.id;
         let max_file = job.files.iter().map(|f| f.id.0).max().unwrap_or(0);
         self.state.next_job_id = self.state.next_job_id.max(job_id.0);
@@ -2963,11 +2977,35 @@ impl Owner {
         let Some(idx) = self.state.jobs.iter().position(|j| j.id == job_id) else {
             return false;
         };
+        let retiring = match self.artifacts.prepare_forget(job_id.0) {
+            Ok(a) => a,
+            Err(e) => {
+                tracing::error!(job=job_id.0,error=%e,"cannot forget payload ownership");
+                return false;
+            }
+        };
+        let mut stopping = Vec::new();
         let job = self.state.jobs.remove(idx);
         for f in &job.files {
-            self.writers.remove(&f.id); // dropped senders stop the writers
+            if let Some(writer) = self.writers.remove(&f.id) {
+                writer.stop.cancel();
+                stopping.push(writer);
+            }
             self.file_sizes.remove(&f.id);
             self.finalize_sent.remove(&f.id);
+        }
+        if let Some(artifact) = retiring {
+            let inventory = self.artifacts.clone();
+            self.tracker.spawn(async move {
+                for mut writer in stopping {
+                    if writer.stopped.wait_for(|done| *done).await.is_err() { return; }
+                }
+                let _ = tokio::task::spawn_blocking(move || {
+                    if let Err(e) = inventory.finish(job_id.0, &artifact.path, &artifact.root, "retained") {
+                        tracing::error!(job=job_id.0,error=%e,"retired payload remains on review hold");
+                    }
+                }).await;
+            });
         }
         self.pending_finalize.retain(|(j, _)| *j != job_id);
         self.attempts.retain(|r, _| r.job != job_id);
@@ -4311,6 +4349,7 @@ mod tests {
         let (backend, adapter) = crate::backend::backend_channel(1, 1);
         let owner = Owner::recover(
             &tmp.path().join("state"),
+            None,
             tmp.path().join("dest"),
             Vec::new(),
             None,
@@ -4353,6 +4392,7 @@ mod tests {
         let (backend, adapter) = crate::backend::backend_channel(1, 1);
         let owner = Owner::recover(
             &tmp.path().join("state"),
+            None,
             tmp.path().join("dest"),
             Vec::new(),
             None,

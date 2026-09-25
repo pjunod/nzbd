@@ -593,7 +593,8 @@ async fn handle_failed_job(
         Some(j) if !j.files.is_empty() => {
             let dir_name = nzbd_engine::queue::job_dir_name(j);
             let source = dest_dir.join(&dir_name);
-            let observed = dispose_failed(cfg, job, &source, dest_dir, &dir_name, "local").await;
+            let observed =
+                dispose_owned_failed(engine, cfg, job, &source, dest_dir, &dir_name, "local").await;
             match canonical_failed_disposition(cfg, dest_dir, &dir_name, &source) {
                 Some(committed) => Some(committed),
                 None => {
@@ -726,7 +727,7 @@ async fn handle_failed_job(
     if let Some(d) = disposition.as_ref() {
         fail_params.push(("Failure:Files".into(), d.note.clone()));
     }
-    let entry = HistoryEntry {
+    let mut entry = HistoryEntry {
         job,
         name: name.clone(),
         category: exported.as_ref().and_then(|j| j.category.clone()),
@@ -757,6 +758,24 @@ async fn handle_failed_job(
             .unwrap_or_default(),
         seq: 0,
     };
+    if let Some(path) = entry.final_dir.as_deref() {
+        let path = Path::new(path);
+        let state = if cfg.failure_action == FailureAction::Park {
+            "parked_failed"
+        } else {
+            "retained"
+        };
+        match engine
+            .artifacts()
+            .finish(job.0, path, path.parent().unwrap_or(dest_dir), state)
+        {
+            Ok(artifact) => entry.params.push(("Artifact:Id".into(), artifact.id)),
+            Err(e) => {
+                tracing::error!(job=job.0,error=%e,"failed payload inventory not committed; finalization held");
+                return;
+            }
+        }
+    }
     let h = history.clone();
     let record = entry.clone();
     let (history_seq, entry) =
@@ -1518,16 +1537,11 @@ async fn process_job_ctx_from(
                 if !(ctx.commit_ok)() {
                     return Err(PostError::Subprocess("pp lease lost before move".into()));
                 }
-                engine
-                    .artifacts()
-                    .begin_transition(job_id.0, &target)
-                    .map_err(|e| PostError::Subprocess(format!("file lifecycle: {e}")))?;
-                let from = dir.clone();
+                let inventory = engine.artifacts();
                 let to = target.clone();
-                let tag = ctx.tag.clone();
-                let moved = tokio::task::spawn_blocking(move || move_dir(&from, &to, &tag))
+                let moved = tokio::task::spawn_blocking(move || inventory.relocate(job_id.0, &to))
                     .await
-                    .unwrap_or_else(|e| Err(std::io::Error::other(e.to_string())));
+                    .unwrap_or_else(|e| Err(nzbd_state::artifacts::Error::Conflict(e.to_string())));
                 match moved {
                     Ok(()) => {
                         tracing::info!(
@@ -1694,11 +1708,7 @@ async fn process_job_ctx_from(
     let disposition = if outcome == PpFinal::Success {
         None
     } else {
-        engine
-            .artifacts()
-            .begin_transition(job_id.0, cfg.failed_dir.as_deref().unwrap_or(dest_dir))
-            .map_err(|e| PostError::Subprocess(format!("file lifecycle: {e}")))?;
-        Some(dispose_failed(cfg, job_id, &dir, dest_dir, &sanitized, &ctx.tag).await)
+        Some(dispose_owned_failed(engine, cfg, job_id, &dir, dest_dir, &sanitized, &ctx.tag).await)
     };
 
     // Close the last stage span BEFORE the export below reads the job:
@@ -1769,10 +1779,12 @@ async fn process_job_ctx_from(
             } else {
                 "retained"
             };
-            engine
+            let artifact = engine
                 .artifacts()
                 .finish(job_id.0, path, path.parent().unwrap_or(dest_dir), state)
                 .map_err(|e| PostError::Subprocess(format!("file lifecycle finalization: {e}")))?;
+            fin.params.retain(|(k, _)| k != "Artifact:Id");
+            fin.params.push(("Artifact:Id".into(), artifact.id));
         }
         let entry = HistoryEntry {
             job: job_id,
@@ -2012,6 +2024,70 @@ pub struct Disposition {
 /// Deleting is not destructive in the way it looks: the job's NZB is
 /// spooled beside its history entry, so `requeue` re-downloads exactly
 /// what was thrown away. Keeping it is what filled a terabyte.
+async fn dispose_owned_failed(
+    engine: &EngineHandle,
+    cfg: &PostConfig,
+    job: JobId,
+    dir: &Path,
+    dest: &Path,
+    name: &str,
+    tag: &str,
+) -> Disposition {
+    if !dir.exists() {
+        return Disposition {
+            note: "source unavailable; ownership review required".into(),
+            files_at: Some(dir.into()),
+        };
+    }
+    let inventory = engine.artifacts();
+    if cfg.failure_action == FailureAction::Delete {
+        let from = dir.to_path_buf();
+        let root = dir.parent().unwrap_or(dest).to_path_buf();
+        let result = tokio::task::spawn_blocking(move || {
+            let artifact = inventory.finish(job.0, &from, &root, "retained")?;
+            let key = format!("failed-delete-{}", artifact.id);
+            let op = match inventory.operation(&key) {
+                Ok(op) => op,
+                Err(nzbd_state::artifacts::Error::NotFound) => {
+                    inventory.request_delete(&artifact.id, artifact.revision, &key, 0)?
+                }
+                Err(e) => return Err(e),
+            };
+            inventory.execute_delete(&op.id)
+        })
+        .await;
+        return match result {
+            Ok(Ok(op)) if op.state == "succeeded" => Disposition {
+                note: "deleted".into(),
+                files_at: None,
+            },
+            other => Disposition {
+                note: format!("checked deletion pending: {other:?}"),
+                files_at: Some(dir.into()),
+            },
+        };
+    }
+    if cfg.failure_action == FailureAction::Park {
+        let target = cfg
+            .failed_dir
+            .clone()
+            .unwrap_or_else(|| dest.join(".failed"))
+            .join(name);
+        let to = target.clone();
+        return match tokio::task::spawn_blocking(move || inventory.relocate(job.0, &to)).await {
+            Ok(Ok(())) => Disposition {
+                note: format!("parked at {}", target.display()),
+                files_at: Some(target),
+            },
+            other => Disposition {
+                note: format!("checked move pending: {other:?}"),
+                files_at: Some(dir.into()),
+            },
+        };
+    }
+    dispose_failed(cfg, job, dir, dest, name, tag).await
+}
+
 pub async fn dispose_failed(
     cfg: &PostConfig,
     job_id: JobId,

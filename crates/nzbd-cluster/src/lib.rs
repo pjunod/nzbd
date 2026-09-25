@@ -182,6 +182,7 @@ impl ClusterRuntime {
             // ordinary downloads only while this process is a worker.
             download_enabled: false,
             state_dir: layout.state_dir(),
+            artifact_dir: Some(cfg.control_dir.join("file-lifecycle")),
             dest_dir: dest_dir.clone(),
             torrent_payload_roots: cfg.torrent_payload_roots.clone(),
             history: pp.as_ref().map(|setup| setup.history.clone()),
