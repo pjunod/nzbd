@@ -37,9 +37,11 @@ pub enum WriteCmd {
     },
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct WriterHandle {
     pub tx: mpsc::Sender<WriteCmd>,
+    pub stop: tokio_util::sync::CancellationToken,
+    pub stopped: tokio::sync::watch::Receiver<bool>,
 }
 
 /// Bounded queue per file: decoded segments are large, keep few in flight.
@@ -54,8 +56,14 @@ pub fn spawn_writer(
     engine_tx: mpsc::Sender<EngineMsg>,
 ) -> WriterHandle {
     let (tx, rx) = mpsc::channel(WRITER_QUEUE);
-    tracker.spawn(writer_task(job, file, dir, final_name, rx, engine_tx));
-    WriterHandle { tx }
+    let stop = tokio_util::sync::CancellationToken::new();
+    let cancellation = stop.clone();
+    let (done, stopped) = tokio::sync::watch::channel(false);
+    tracker.spawn(async move {
+        writer_task(job, file, dir, final_name, rx, engine_tx, cancellation).await;
+        let _ = done.send(true);
+    });
+    WriterHandle { tx, stop, stopped }
 }
 
 async fn writer_task(
@@ -65,13 +73,19 @@ async fn writer_task(
     final_name: String,
     mut rx: mpsc::Receiver<WriteCmd>,
     engine_tx: mpsc::Sender<EngineMsg>,
+    stop: tokio_util::sync::CancellationToken,
 ) {
     let part_path = dir.join(format!("{final_name}.part"));
     let final_path = dir.join(&final_name);
     let mut out: Option<File> = None;
     let mut preallocated = false;
 
-    while let Some(cmd) = rx.recv().await {
+    loop {
+        let cmd = tokio::select! {
+            biased;
+            _ = stop.cancelled() => break,
+            cmd = rx.recv() => match cmd { Some(cmd) => cmd, None => break },
+        };
         match cmd {
             WriteCmd::Segment {
                 seg_number,

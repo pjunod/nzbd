@@ -18,10 +18,10 @@ before merging. No deployment is included.
 | Milestone | State | Acceptance |
 |---|---|---|
 | F0: truthful deletion and consumer cleanup | Building | Failed/pending deletion preserves records and cannot trigger direct Curator removal |
-| F1: durable ownership and operation journal | Planned | Allocations precede writes; History retention cannot erase ownership |
-| F2: discovery and Files attention view | Planned | Bounded cached scans distinguish unknown, active and retained files |
-| F3: checked deletion and retention | Planned | Exact owned files only; Keep, undo and dual clocks survive restart |
-| F4: recovery publication | Planned | Verified independent copies, source holds and crash reconciliation |
+| F1: durable ownership and operation journal | Building | Allocations precede writes; History retention cannot erase ownership |
+| F2: discovery and Files attention view | Building | Bounded cached scans distinguish unknown, active and retained files |
+| F3: checked deletion and retention | Building | Exact owned files only; Keep, undo and dual clocks survive restart |
+| F4: recovery publication | Building | Verified independent copies, source holds and crash reconciliation |
 | F5: Curator recovery import | Planned | Target coordination, durable placement and receipt outbox |
 | F6: settings, cleanup and operations | Planned | Advisory Dev enable controls; receipt-driven cleanup; docs and final validation |
 | Final adversarial review | Pending | Findings resolved before tests |
@@ -43,3 +43,14 @@ before merging. No deployment is included.
 
 F0 code and failure regression tests are written; execution is deferred.
 No tests have run for this implementation. No PR has been opened or merged.
+
+## 4. Build checkpoint
+
+Runner now has an independent FULL-synchronous SQLite inventory, allocation
+sidecars, checked deletion journal, dual-clock retention and copy publication.
+Queue writer stop acknowledgements precede payload deletion. Existing active
+folders migrate without receiving automatic deletion authority. The Files UI
+and Dev advisory controls are wired. Recovery import integration and crash
+reconciliation are still in progress; these are not merge-ready changes.
+`cargo check -p nzbd-engine` and `cargo check -p nzbd-api` passed before the
+latest History routing changes. These are compilation checks, not test runs.

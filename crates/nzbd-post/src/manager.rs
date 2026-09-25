@@ -1518,6 +1518,10 @@ async fn process_job_ctx_from(
                 if !(ctx.commit_ok)() {
                     return Err(PostError::Subprocess("pp lease lost before move".into()));
                 }
+                engine
+                    .artifacts()
+                    .begin_transition(job_id.0, &target)
+                    .map_err(|e| PostError::Subprocess(format!("file lifecycle: {e}")))?;
                 let from = dir.clone();
                 let to = target.clone();
                 let tag = ctx.tag.clone();
@@ -1690,6 +1694,10 @@ async fn process_job_ctx_from(
     let disposition = if outcome == PpFinal::Success {
         None
     } else {
+        engine
+            .artifacts()
+            .begin_transition(job_id.0, cfg.failed_dir.as_deref().unwrap_or(dest_dir))
+            .map_err(|e| PostError::Subprocess(format!("file lifecycle: {e}")))?;
         Some(dispose_failed(cfg, job_id, &dir, dest_dir, &sanitized, &ctx.tag).await)
     };
 
@@ -1751,6 +1759,20 @@ async fn process_job_ctx_from(
             let _ = engine.import_job(fin, false, false).await;
             stages.close();
             return Ok(outcome);
+        }
+        if let Some(path) = &final_dir {
+            let path = Path::new(path);
+            let state = if outcome == PpFinal::Success {
+                "completed"
+            } else if cfg.failure_action == FailureAction::Park {
+                "parked_failed"
+            } else {
+                "retained"
+            };
+            engine
+                .artifacts()
+                .finish(job_id.0, path, path.parent().unwrap_or(dest_dir), state)
+                .map_err(|e| PostError::Subprocess(format!("file lifecycle finalization: {e}")))?;
         }
         let entry = HistoryEntry {
             job: job_id,
