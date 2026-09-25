@@ -871,7 +871,7 @@ fn run(
                 ..Default::default()
             });
             service
-                .recover()
+                .recover_active()
                 .await
                 .map_err(|error| anyhow_lite::Error::msg(format!("torrent recovery: {error}")))?;
             torrent_executor = Some(service.spawn_backend_executor().map_err(|error| {
@@ -1047,6 +1047,15 @@ fn run(
         let tls_setup = tls::server_config(&cfg, &cfg.state_dir())
             .map_err(|e| anyhow_lite::Error::msg(e.to_string()))?;
         let listener = tokio::net::TcpListener::bind(&bind).await?;
+        // Pending magnets and source URLs can be unreachable for minutes.
+        // The listener and restored torrents are ready before retrying them.
+        let pending_recovery = torrent_service.clone().map(|service| {
+            tokio::spawn(async move {
+                if let Err(error) = service.recover_pending().await {
+                    tracing::error!(%error, "pending torrent recovery stopped");
+                }
+            })
+        });
         let listener_address = listener.local_addr()?;
         let _advertiser =
             discovery::Advertiser::start(&cfg.api, listener_address, None, tls_setup.is_some());
@@ -1086,6 +1095,9 @@ fn run(
         feed_cancel.cancel();
         pp_cancel.cancel();
         torrent_cancel.cancel();
+        if let Some(recovery) = pending_recovery {
+            recovery.abort();
+        }
         if let Some(service) = &torrent_service {
             service.shutdown().await;
         }
