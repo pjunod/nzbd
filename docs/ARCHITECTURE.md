@@ -270,7 +270,23 @@ mutation as an unknown line, so a rolling cluster must finish upgrading before
 it relies on a new forget. See
 [DEFECT_HISTORY_DELETE.md](DEFECT_HISTORY_DELETE.md) for the defect and decision.
 
-**History retention.** The JSONL was unbounded, and "unbounded" turned out to cost more than disk: every history read re-unions the whole file (`refresh()`, throttled to 5 s), so the *log's length* — not the page size a client asks for — sets what a read costs. Measured on nuc3 2026-07-29: 179 entries, 3.1 s cold, on a network state volume. `[history] keep_max` / `keep_days` bound it (defaults 1000 / 90 days; `0` disables a bound, both apply and the first to bite wins; NZBGet's `KeepHistory` imports onto `keep_days`). A trim does three things together, and any one alone leaves the entry half-deleted: it deletes the index rows, **compacts this node's own JSONL** to the surviving keys, and raises a monotone `retention_floor` watermark that ingest honours — without the watermark the next refresh re-imports what the trim just dropped. A node rewrites only the file it alone appends to (`history.<node>.jsonl` in a cluster), never a peer's; the swap is tmp+rename so a concurrent reader sees the whole old file or the whole new one; and an in-process lock serializes it against this node's own appends. Every surviving entry line is kept, not just the newest per key — the reader merges `removed_at`/`picked_up_by` with `COALESCE`, so collapsing a key's lines would change what a rebuild reconstructs. Tombstones are also kept even when their covered entry lines disappear: a peer may retain an old copy indefinitely, so compaction cannot prove the delete evidence is globally safe to drop.
+**History loading and retention.** Native and compat listings read a local
+SQLite WAL snapshot; native page rows and total share one read transaction.
+Standalone stores explicitly opt into one-writer ownership and skip routine
+post-startup replay, retaining repair after failed local publication. Shared
+stores have one runtime-owned worker, a whole-pass synchronization gate,
+completion-based throttling, conservative file fingerprints with periodic
+verification, and bounded replay transactions. Readers use a separate SQLite
+connection, and consumer observations defer when replay owns the writer.
+Pause/resume and worker I/O/freshness/placement are visible in the History tab.
+`history.index_dir` permits an index copy to persistent local storage without
+moving logs or parked NZBs; a registered active path prevents selecting an
+abandoned copy. The actual mount classification is reported rather than assuming
+`state_dir` is local. See [HISTORY_LOADING_PLAN.md](HISTORY_LOADING_PLAN.md).
+
+Retention remains a storage and recovery bound (defaults 1000 entries / 90
+days; `0` disables a bound, both apply and the first to bite wins; NZBGet's
+`KeepHistory` imports onto `keep_days`). A trim does three things together, and any one alone leaves the entry half-deleted: it deletes the index rows, **compacts this node's own JSONL** to the surviving keys, and raises a monotone `retention_floor` watermark that ingest honours — without the watermark the next refresh re-imports what the trim just dropped. A node rewrites only the file it alone appends to (`history.<node>.jsonl` in a cluster), never a peer's; the swap is tmp+rename so a concurrent reader sees the whole old file or the whole new one; and an in-process lock serializes it against this node's own appends. Every surviving entry line is kept, not just the newest per key — the reader merges `removed_at`/`picked_up_by` with `COALESCE`, so collapsing a key's lines would change what a rebuild reconstructs. Tombstones are also kept even when their covered entry lines disappear: a peer may retain an old copy indefinitely, so compaction cannot prove the delete evidence is globally safe to drop.
 
 **What history keeps.** A history entry used to be a summary — name, status, size, health, params — and everything else the queue knew was dropped when the job left it: the file table, the article counts, which indexer it came from, who asked for it, how long it took. Those are exactly the questions asked *afterwards* ("which file was short?", "was this the release I think it was?", "where did I get this?"), so a record that answers them only while the job is still in the queue answers them at the one time nobody is asking (field report 2026-07-29). `HistoryEntry::record` is an optional `JobRecord` captured from the `Job` as it leaves: per-file rows (name, size, segments done/failed, par2 flag), article totals, par size, source URL, requesting client, queue-entry time, the storage directory, and the `original_name` the job was admitted under when it later renamed itself — so an *arr that added `cc310b99…` can still find the row. `None` on entries written before it existed, and the upsert merges it with `COALESCE`, so a later `hide` re-append (which carries no record) cannot erase one.
 

@@ -354,10 +354,11 @@ extension scripts. Scripts get NZBGet's exact `NZBPP_*` environment and
 `[NZB] KEY=value` command channel; exit codes 92–95 mean what they mean
 in NZBGet.
 
-## `[history]` — how much finished-job history to keep
+## `[history]` — retention and local index placement
 
 ```toml
 [history]
+# index_dir = "/local/nzbd-history" # optional persistent local bind; restart required
 keep_max = 1000    # keep at most this many entries (0 = unlimited)
 keep_days = 90     # drop entries finished longer ago than this (0 = forever)
 ```
@@ -368,14 +369,66 @@ answers *how big may this get* and holds when a week's backlog lands in a
 day; `keep_days` answers *how far back do I care* and holds when the
 daemon sits quiet for months.
 
-Trimming is not tidiness. The authoritative history log
-(`state/history/history.jsonl`) is re-read end to end on every history
-read, so the **log's length** — not the number of rows you asked for — is
-what a history page costs. On a network state volume that showed up as
-179 entries taking 3.1 s (nuc3, 2026-07-29); paging the UI would not have
-fixed it, because the expensive part happened before the page was chosen.
-A trim deletes the index rows, compacts the log to the survivors, and
-raises a watermark so a later rebuild will not re-import what went.
+History pages read the indexed SQLite view directly. A standalone daemon
+replays its portable log at startup and when a failed local publication needs
+repair; shared stores reconcile in a background worker. Trimming still bounds
+stored data and recovery work: it deletes index rows, compacts the portable
+log, and raises the watermark that prevents old peer entries from returning.
+
+**Local index placement.** Without `index_dir`, the database remains
+`<state_dir>/history.sqlite`. On a network-backed state directory, configure
+`index_dir` to an empty directory on a persistent local bind. Do not use a
+container's writable layer. The logs remain in their existing directory and
+parked NZBs remain under `<state_dir>/nzbs`; changing `queue_dir` would move
+other queue state as well and is not a substitute.
+
+The change takes effect after restart. Stop the old process first: upgraded
+processes hold a portable-directory writer lock, but an older binary does not
+honor that lock. Startup uses SQLite `VACUUM INTO` to copy committed data,
+including WAL, cursor IDs, observations, tombstones, and metadata. It then
+records the active index path in a hidden marker beside the portable logs.
+The old copy remains for inspection. An existing different destination is
+rejected rather than overwritten or silently selected.
+
+Do not delete only the registered index or switch back to its abandoned old
+copy: startup rejects a missing registered database and an existing stale
+migration target. To relocate again, choose a new empty directory so the
+active database is copied. An interrupted copy/cutover can require explicit
+operator recovery; preserve both files and inspect the active-path marker
+before removing anything. A legacy-binary rollback needs a quiesced copy of
+the latest database into its expected location and removal of the unsupported
+`index_dir` setting. Never copy only a live main database file while its WAL
+may contain committed writes.
+
+**Synchronization controls.** Settings → Dev → Enable history synchronization
+provides a live, persisted control with storage and recovery readiness advice.
+Readiness never blocks enabling, and the control works even if the config file
+is read-only. The performance fixes have no rollout flags. The History tab shows local/shared mode, worker
+state, last duration and bytes read, last successful reconciliation age,
+repair state, and index placement. Pause persists across restarts and stops
+new reconciliation passes, including admission-triggered refreshes. It stops
+an active pass at a safe boundary; a blocked filesystem call can delay that
+stop. Local writes and consumer observations continue. Startup recovery still
+runs before serving history, even when background reconciliation is paused.
+Resume permits catch-up on the next worker tick (normally within five seconds).
+
+The authenticated native API exposes the same surface:
+
+```text
+GET  /api/v1/history-sync
+POST /api/v1/history-sync/pause
+POST /api/v1/history-sync/resume
+```
+
+History responses also include `sync`. Shared history can lag peer changes by
+one worker interval plus reconciliation/storage visibility time; there is no
+hard five-second freshness guarantee. Consumer observations enqueue without request-time storage writes and are
+flushed by the worker even while reconciliation is paused. The queue is bounded
+to 10,000 job keys plus at most 256 in-flight keys; overflow reports an internal
+error and can drop advisory observations without delaying history reads. They remain advisory, index-local data.
+
+See [HISTORY_LOADING_PLAN.md](HISTORY_LOADING_PLAN.md) for the measured defect,
+implementation status, and performance validation boundaries.
 
 Trimming runs at startup and on a 60-second throttle as jobs finish, so
 lowering a bound takes effect when you restart, not when the next job
