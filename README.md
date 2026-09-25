@@ -20,6 +20,10 @@ Optionally runs as a **multi-node cluster** over a shared work volume.
 > the current plurx contracts and scopes the remaining authority, C3, and
 > operator work; [cluster progress](docs/CLUSTERING_STATUS.md) tracks delivery.
 
+Follow [file lifecycle progress](docs/FILE_LIFECYCLE_STATUS.md) for the
+[ownership and recovery plan](docs/FILE_LIFECYCLE_PLAN.md) and its
+[design review](docs/FILE_LIFECYCLE_REVIEW.md).
+
 ## Highlights
 
 - **Drop-in for the *arr apps** — Sonarr/Radarr/Lidarr connect to it as an
