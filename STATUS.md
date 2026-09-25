@@ -1,5 +1,17 @@
 # nzbd — Project Status
 
+## Pending torrent startup readiness — 2026-09-25
+
+**Status:** `nuc3` service restored after three saved magnets delayed API
+readiness for about six minutes; PR [#236](https://github.com/pjunod/runner/pull/236)
+contains the code fix and [review record](docs/STARTUP_RECOVERY_REVIEW.md).
+Not merged or deployed. The code restores local torrents, opens the API, then
+retries pending network sources in a cancellable background task. Review
+findings added a real-daemon regression, accurate concurrent-removal logs,
+continued retries after infrastructure errors, and bounded shutdown. The
+daemon test passes and fails when the old startup call is restored. Required
+CI and the `nuc3` rollout ordering check remain.
+
 ## Torrent client identity and tracker compliance — 2026-09-22
 
 **Status:** implemented and adversarially reviewed; findings fixed. Local

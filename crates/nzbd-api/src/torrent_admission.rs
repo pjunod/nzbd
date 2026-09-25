@@ -397,22 +397,36 @@ impl TorrentAdmissionService {
             .await;
             match attempt {
                 Ok(result) => restored.push(result),
+                Err(AdmissionError::MissingPending) => tracing::info!(
+                    job = pending.job_id.0,
+                    "pending torrent admission was removed during recovery"
+                ),
                 Err(error)
                     if pending.source == TorrentSource::Magnet
                         && deterministic_magnet_recovery_failure(&error) =>
                 {
-                    self.engine.cancel_torrent_admission(pending.job_id).await?;
-                    tracing::warn!(
-                        job = pending.job_id.0,
-                        error = %error,
-                        "deterministically rejected pending magnet was removed during recovery"
-                    );
+                    match self.engine.cancel_torrent_admission(pending.job_id).await {
+                        Ok(true) => tracing::warn!(
+                            job = pending.job_id.0,
+                            error = %error,
+                            "deterministically rejected pending magnet was removed during recovery"
+                        ),
+                        Ok(false) => tracing::info!(
+                            job = pending.job_id.0,
+                            "pending torrent admission was removed during recovery"
+                        ),
+                        Err(cancel_error) => tracing::error!(
+                            job = pending.job_id.0,
+                            error = %cancel_error,
+                            "could not remove rejected pending magnet; continuing recovery"
+                        ),
+                    }
                 }
                 Err(error) => tracing::warn!(
                     job = pending.job_id.0,
                     source = ?pending.source,
                     error = %error,
-                    "pending torrent admission could not be recovered; it remains durable for a later retry"
+                    "pending torrent admission could not be recovered; continuing with later jobs"
                 ),
             }
         }

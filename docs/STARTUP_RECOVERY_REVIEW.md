@@ -1,8 +1,8 @@
 # Startup recovery defect — pending magnets hold the API offline
 
 **Status:** root cause confirmed on `nuc3` 2026-09-25 · immediate service
-restored · code fix proposed in [PR #236](https://github.com/pjunod/runner/pull/236)
-and not yet deployed
+restored · review findings addressed in
+[PR #236](https://github.com/pjunod/runner/pull/236) · not yet deployed
 
 Companion to [DEPLOY.md](DEPLOY.md) (container operation) and
 [TORRENT_QUEUE_STATUS.md](TORRENT_QUEUE_STATUS.md) (torrent queue authority).
@@ -16,8 +16,9 @@ before serving, then retry pending magnet and URL admissions after the API
 listener is bound. A source that cannot be reached may remain pending for a
 later retry; it must not keep the API and Docker health check offline.
 
-The code is committed and its focused tests pass. The image on `nuc3` still
-runs the earlier code. Merging and deploying the PR is a separate decision.
+The code is committed and the focused tests pass. The image on `nuc3` still
+runs the earlier code. Required CI and deployment validation remain before
+the PR is merged and rolled out.
 
 ## What happened on `nuc3`
 
@@ -78,9 +79,12 @@ PR #236 separates `recover_active()` from `recover_pending()` in
 [`torrent_admission.rs`](../crates/nzbd-api/src/torrent_admission.rs).
 The daemon still restores saved local torrents before accepting requests.
 After binding the API listener it spawns one background pending-admission
-recovery task. Shutdown aborts that task before stopping the torrent
-session. The pending source sidecars and queue records keep their existing
-durability rules; a transient failure remains pending for a later restart.
+recovery task. Shutdown signals that task to cancel, waits up to 1 s, and
+aborts a straggler before stopping the torrent session. If interruption lands
+after the queue owner commits a descriptor but before in-memory registry
+attachment, the next boot restores it from the durable descriptor. Pending
+source sidecars and queue records keep their existing durability rules; a
+transient resolution failure remains pending for a later restart.
 
 ```
 new startup
@@ -92,20 +96,31 @@ new startup
 
 **Scope:** this change moves network sourced pending admission retries. It
 does not change magnet lookup deadlines, erase the three pending jobs, or
-make an unreachable magnet resolve. A different failure during local
-descriptor restore can still stop startup; that is outside this defect.
+make an unreachable magnet resolve. Retries remain sequential: N unreachable
+magnets can still take N × 120 s in the background, so the last one waits
+for its predecessors. Bounded concurrency and a surfaced attempt count are
+follow-up work. A different failure during local descriptor restore can
+still stop startup; that is outside this defect.
 
-**Concurrency to review:** the background task loads its pending snapshot
-after the listener is bound. A user can act on a pending job while a retry
-is underway. Reviewers should verify that completion and cancellation stay
-conditional on the queue owner's current reservation, and that a removed
-source is reported without recreating the job. Newly submitted admissions
-use the normal request path and are not part of this startup snapshot.
+**Concurrent removal:** the background task loads its pending snapshot
+after the listener is bound. The queue owner commits only if a reservation
+is still pending; `finish()` reports `MissingPending` if a user removed it.
+That case now logs removal instead of claiming the job is durable. A newly
+submitted admission follows the normal request path and is not in this
+startup snapshot.
+
+**Recovery errors:** a failed source read or resolution logs the job and
+allows later jobs in the snapshot to run. A failed cancellation of a
+deterministically rejected magnet also logs and continues. If opening the
+snapshot or pending source store fails, the background task logs the error
+and retries the pass after 30 s. The API stays available, but these failures
+are visible only in logs; persistent storage failure still needs operator
+attention.
 
 ## Evidence and acceptance
 
-The change is isolated on branch `codex/fix-pending-torrent-startup` at
-`7f98db5`. Local verification completed on 2026-09-25:
+The change is isolated on branch `codex/fix-pending-torrent-startup` in
+PR #236. Local verification completed on 2026-09-25:
 
 | Check | Result | What it establishes |
 |---|---|---|
@@ -113,17 +128,20 @@ The change is isolated on branch `codex/fix-pending-torrent-startup` at
 | `cargo check -p nzbd --locked --offline` | Pass | Daemon and changed API compile. |
 | `cargo test -p nzbd-api --locked --offline recover_resumes_a_durable_http_intent_and_reaps_orphans` | Pass | Local recovery leaves a pending source durable; a later retry completes it and reaps the orphan. |
 | `cargo test -p nzbd-api --locked --offline recover_removes_a_deterministically_unusable_pending_magnet` | Pass | Existing deterministic rejection behavior remains. |
-| Pre-push `cargo check --workspace --all-targets` | Pass | Workspace targets type-check. |
+| `cargo test -p nzbd-api --locked --offline recovery_keeps_transient_magnet_failures_and_reaps_policy_failures` | Pass | A timed-out magnet remains pending; policy failures are deterministic. |
+| `cargo test -p nzbd --test daemon --locked --offline pending_magnet_does_not_block_api_startup` | Pass in 2.96 s | The real daemon serves `/healthz` with a saved unresolved magnet. Restoring the old `.recover()` call makes it fail at the 15 s deadline. |
+| Pre-push `cargo check --workspace --all-targets` | Pass on the earlier PR head; rerun on review changes | Workspace targets type-check. |
 
 The loopback HTTP test needs local socket permission. Its first run in the
 restricted sandbox failed at socket bind with `Operation not permitted`; it
 passed when rerun with that permission. That failure was environmental, not
 an assertion failure.
 
-**Deployment acceptance:** after the PR is reviewed and merged, rebuild on
-`nuc3` with the three pending jobs still durable. The `nzbd listening` log
-line and a successful health probe must appear before any 120 s magnet
-timeout; `docker compose up -d --build` must start `nzbd-discovery` without
+**Deployment acceptance:** first record the pending IDs on `nuc3`; they were
+`[1616, 1617, 1618]` on 2026-09-25. If they have since been removed, do not
+claim the live three-job ordering check passed. After review and merge,
+rebuild with those jobs still durable. The `nzbd listening` log line and a
+successful health probe must appear before any 120 s magnet timeout; `docker compose up -d --build` must start `nzbd-discovery` without
 the dependency error. Later timeout warnings may still appear, and those
 jobs must remain pending. Check the queue and service state rather than
 treating a green health probe as proof that magnet metadata resolved.
@@ -138,6 +156,8 @@ not depend on rebuilding an old Git tree:
 
 ```bash
 cd /opt/noirr/nzbd
+docker exec nzbd cat /processing/queue/queue.json \
+  | python3 -c 'import json,sys; print([p["job_id"] for p in json.load(sys.stdin)["pending_admissions"]])'
 docker image tag nzbd:latest nzbd:pre-startup-recovery
 git pull --ff-only
 docker compose up -d --build
@@ -146,9 +166,12 @@ docker inspect nzbd --format '{{.State.Health.Status}}'
 docker logs --tail 40 nzbd
 ```
 
-**How to read it:** `nzbd` should become `healthy` promptly after its local
-restore, and `nzbd-discovery` should be `Up`. The API must be reachable while
-pending magnet retries are still running. The exact elapsed time for local
+**How to read it:** the first command prints pending IDs only, never source
+secrets. Record the IDs before updating; an empty list cannot demonstrate
+the original failure on this deployment. `nzbd` should become `healthy`
+promptly after local restore, and `nzbd-discovery` should be `Up`. The API
+must be reachable while pending magnet retries are still running. The exact
+elapsed time for local
 restore depends on the saved torrents, so the ordering of the listener and
 120 s warnings is the decisive check.
 

@@ -1049,10 +1049,25 @@ fn run(
         let listener = tokio::net::TcpListener::bind(&bind).await?;
         // Pending magnets and source URLs can be unreachable for minutes.
         // The listener and restored torrents are ready before retrying them.
+        let pending_cancel = torrent_cancel.clone();
         let pending_recovery = torrent_service.clone().map(|service| {
             tokio::spawn(async move {
-                if let Err(error) = service.recover_pending().await {
-                    tracing::error!(%error, "pending torrent recovery stopped");
+                loop {
+                    let result = tokio::select! {
+                        _ = pending_cancel.cancelled() => return,
+                        result = service.recover_pending() => result,
+                    };
+                    match result {
+                        Ok(_) => return,
+                        Err(error) => tracing::error!(
+                            %error,
+                            "pending torrent recovery failed; retrying in 30 seconds"
+                        ),
+                    }
+                    tokio::select! {
+                        _ = pending_cancel.cancelled() => return,
+                        _ = tokio::time::sleep(Duration::from_secs(30)) => {}
+                    }
                 }
             })
         });
@@ -1095,8 +1110,15 @@ fn run(
         feed_cancel.cancel();
         pp_cancel.cancel();
         torrent_cancel.cancel();
-        if let Some(recovery) = pending_recovery {
-            recovery.abort();
+        if let Some(mut recovery) = pending_recovery {
+            if tokio::time::timeout(Duration::from_secs(1), &mut recovery)
+                .await
+                .is_err()
+            {
+                // A retry interrupted after the queue owner commits but before
+                // registry attachment is reconstructed by the next restore.
+                recovery.abort();
+            }
         }
         if let Some(service) = &torrent_service {
             service.shutdown().await;
