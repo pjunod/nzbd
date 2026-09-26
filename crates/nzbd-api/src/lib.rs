@@ -2,6 +2,7 @@
 //! history, SSE events, Prometheus `/metrics` and HTTP auth
 //! (ARCHITECTURE.md §10.1). OpenAPI + roles are the remaining items.
 
+mod artifacts;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
@@ -1124,7 +1125,17 @@ async fn park_snapshot(st: &ApiState, job: JobId) -> Option<Parked> {
 
 /// Write the parked record + spool. Called only after the engine confirmed
 /// the delete, so history can never claim a job that is still queued.
-async fn park_write(st: &ApiState, parked: Parked) -> bool {
+async fn park_write(st: &ApiState, mut parked: Parked) -> bool {
+    if let Ok(Some(a)) = st.engine.artifacts().for_job(parked.entry.job.0) {
+        parked.entry.params.retain(|(k, _)| k != "Artifact:Id");
+        parked
+            .entry
+            .params
+            .push(("Artifact:Id".into(), a.id.clone()));
+        if !a.terminal() {
+            parked.entry.final_dir = Some(a.path.to_string_lossy().into_owned());
+        }
+    }
     let Some(db) = st.history.clone() else {
         return false;
     };
@@ -1748,6 +1759,10 @@ async fn metrics(State(st): State<ApiState>) -> Response {
     }
     use std::fmt::Write;
     let mut out = String::with_capacity(1024);
+    let inventory = st.engine.artifacts();
+    if let Ok(Ok(lifecycle)) = tokio::task::spawn_blocking(move || inventory.metrics()).await {
+        out.push_str(&lifecycle);
+    }
     let m = &mut out;
     let _ = writeln!(m, "# TYPE nzbd_download_rate_bytes_per_second gauge");
     let _ = writeln!(
@@ -2596,18 +2611,24 @@ async fn history_action(
     }
     if action == "delete-files" {
         let lookup = db.clone();
-        let entry = tokio::task::spawn_blocking(move || {
-            lookup
-                .list_filtered(10_000, true)
-                .ok()
-                .and_then(|entries| entries.into_iter().find(|entry| entry.job == job))
-        })
-        .await
-        .ok()
-        .flatten();
+        let entry = match tokio::task::spawn_blocking(move || lookup.get(job)).await {
+            Ok(Ok(Some(entry))) => entry,
+            Ok(Ok(None)) => {
+                let inventory = st.engine.artifacts();
+                if let Ok(Some(a)) = inventory.for_job(id) {
+                    if let Ok(op) = inventory.operation(&format!("history-delete-{}", a.id)) {
+                        if op.state == "succeeded" {
+                            return Json(json!({"ok":true,"files_removed":true})).into_response();
+                        }
+                    }
+                }
+                return not_found();
+            }
+            _ => return error(StatusCode::INTERNAL_SERVER_ERROR, "history lookup failed"),
+        };
         if let Some(torrent) = entry
+            .record
             .as_ref()
-            .and_then(|entry| entry.record.as_ref())
             .and_then(|record| record.torrent.as_ref())
         {
             if torrent.payload == nzbd_types::TorrentPayloadDisposition::Retained {
@@ -2626,6 +2647,35 @@ async fn history_action(
                 _ => error(StatusCode::INTERNAL_SERVER_ERROR, "history store error"),
             };
         }
+        let inventory = st.engine.artifacts();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(10), tokio::task::spawn_blocking(move || {
+            let artifact_id = entry.params.iter().find(|(k,_)| k == "Artifact:Id")
+                .map(|(_,v)|v).ok_or_else(||nzbd_state::artifacts::Error::Conflict("legacy History has no allocation identity; inspect and delete it through Files".into()))?;
+            let artifact = inventory.get(artifact_id)?;
+            if artifact.job!=Some(job.0) {return Err(nzbd_state::artifacts::Error::Conflict("History allocation belongs to another job".into()));}
+            if artifact.state=="deleted" { db.delete(job).map_err(|e|nzbd_state::artifacts::Error::Conflict(e.to_string()))?; return Ok(true); }
+            if entry.final_dir.as_deref().map(std::path::Path::new) != Some(artifact.path.as_path()) {
+                return Err(nzbd_state::artifacts::Error::Conflict("History path does not match the owned generation".into()));
+            }
+            let key = format!("history-delete-{}", artifact.id);
+            let op = match inventory.operation(&key) {
+                Ok(op) => op,
+                Err(nzbd_state::artifacts::Error::NotFound) => inventory.request_delete(&artifact.id, artifact.revision, &key, 0)?,
+                Err(e) => return Err(e),
+            };
+            let op = inventory.execute_delete(&op.id)?;
+            if op.state != "succeeded" { return Err(nzbd_state::artifacts::Error::Conflict(format!("operation {} {}: {}", op.id, op.state, op.error.unwrap_or_default()))); }
+            db.delete(job).map_err(|e| nzbd_state::artifacts::Error::Conflict(e.to_string()))?;
+            Ok(true)
+        })).await;
+        return match result {
+            Ok(Ok(Ok(_))) => Json(json!({"ok":true,"files_removed":true})).into_response(),
+            Ok(Ok(Err(e))) => error(StatusCode::CONFLICT, &e.to_string()),
+            _ => error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "file deletion pending; History retained; retry the same request",
+            ),
+        };
     }
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -2639,21 +2689,9 @@ async fn history_action(
     // like a human clicked them away.
     let by = client_name(&headers).unwrap_or_else(|| "user".into());
     let result = tokio::task::spawn_blocking(move || match act.as_str() {
-        "restore" => db.restore(job).map(|ok| (ok, None)),
+        "restore" => db.restore(job).map(|ok| (ok, None::<bool>)),
         "hide" => db.hide(job, Some(&by), now).map(|ok| (ok, None)),
         "delete" => db.delete(job).map(|ok| (ok, None)),
-        "delete-files" => {
-            let dir = db
-                .list_filtered(10_000, true)
-                .ok()
-                .and_then(|v| v.into_iter().find(|e| e.job == job))
-                .and_then(|e| e.final_dir);
-            let removed = dir.as_ref().is_some_and(|d| {
-                let p = std::path::Path::new(d);
-                p.is_dir() && std::fs::remove_dir_all(p).is_ok()
-            });
-            db.delete(job).map(|ok| (ok, Some(removed)))
-        }
         _ => Ok((false, None)),
     })
     .await;
@@ -2668,7 +2706,11 @@ async fn history_action(
                 "unknown action (restore|hide|delete|delete-files|requeue)",
             ),
         },
-        _ => error(StatusCode::INTERNAL_SERVER_ERROR, "history store error"),
+        Ok(Err(e)) => error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+        Err(_) => error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "history operation interrupted; retry required",
+        ),
     }
 }
 
@@ -2679,6 +2721,26 @@ async fn history_action(
 /// not from whenever the first SSE client happens to connect. Every caller
 /// already builds its router inside one.
 pub fn router_with(state: ApiState) -> Router {
+    if let Some(setup) = &state.setup {
+        let roots = setup
+            .current
+            .lock()
+            .unwrap()
+            .storage_roots()
+            .into_iter()
+            .map(|r| r.path)
+            .collect::<Vec<_>>();
+        if let Err(error) = state.engine.artifacts().protect_roots(&roots) {
+            tracing::error!(%error,"could not persist protected directory roles");
+        }
+        let cfg = setup.current.lock().unwrap().clone();
+        let inventory = state.engine.artifacts();
+        if let Err(error) =
+            inventory.configure_scan(artifacts::scan_request(&cfg, &inventory, Vec::new()))
+        {
+            tracing::error!(%error,"could not persist discovery scopes");
+        }
+    }
     let state = ApiState {
         events: state
             .events
@@ -2691,6 +2753,7 @@ pub fn router_with(state: ApiState) -> Router {
         torrent.max_request_body_bytes().saturating_add(64 * 1024)
     });
     Router::new()
+        .merge(artifacts::router())
         .route("/api/v1/status", get(get_status))
         .route(
             "/api/v1/jobs",
@@ -3091,6 +3154,49 @@ mod tests {
         let v = body_json(resp).await;
         assert_eq!(v["ok"], true, "the delete itself still works");
         assert_eq!(v["parked"], false, "…but there is no Undo to offer");
+    }
+
+    #[tokio::test]
+    async fn failed_history_file_deletion_preserves_the_retry_record() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = test_engine(&tmp).await;
+        let db = Arc::new(HistoryDb::open(&tmp.path().join("history.sqlite"), None).unwrap());
+        let blocked = tmp.path().join("payload");
+        std::fs::write(&blocked, b"not a directory").unwrap();
+        let entry: nzbd_state::HistoryEntry = serde_json::from_value(json!({
+            "job": 71, "name": "preserve", "category": null,
+            "final_dir": blocked.to_str(), "status": "FAILURE", "size": 15,
+            "completed_at_unix": 1
+        }))
+        .unwrap();
+        db.record(&entry).unwrap();
+        let app = router_with(ApiState {
+            engine: engine.clone(),
+            history: Some(db.clone()),
+            torrent: None,
+            log: None,
+            setup: None,
+            clients: None,
+            shutdown: None,
+            pp_stats: None,
+            pp_manager: None,
+            events: None,
+        });
+        for _ in 0..2 {
+            let response = app
+                .clone()
+                .oneshot(
+                    axum::http::Request::post("/api/v1/history/71/actions/delete-files")
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert!(!response.status().is_success());
+            assert!(db.get(JobId(71)).unwrap().is_some());
+            assert_eq!(std::fs::read(&blocked).unwrap(), b"not a directory");
+        }
+        engine.shutdown().await;
     }
 
     #[tokio::test]

@@ -19,6 +19,7 @@
 //!
 //! **History** in SQLite arrives in phase 2 (the trait is defined below).
 
+pub mod artifacts;
 mod fsx;
 pub mod history;
 pub mod torrent_sources;

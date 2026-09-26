@@ -67,6 +67,8 @@ pub enum EngineError {
     State(#[from] nzbd_state::StateError),
     #[error("tls: {0}")]
     Tls(String),
+    #[error("file lifecycle: {0}")]
+    Lifecycle(String),
     #[error("engine is shutting down")]
     Closed,
 }
@@ -128,6 +130,8 @@ pub struct EngineConfig {
     pub download_enabled: bool,
     /// Journal + snapshots live here (the shared volume in cluster mode).
     pub state_dir: PathBuf,
+    /// Node-local lifecycle database, separate from cluster journals.
+    pub artifact_dir: Option<PathBuf>,
     /// Completed jobs are written to `<dest_dir>/<job name>/`.
     pub dest_dir: PathBuf,
     /// Ordered configured torrent payload roots used only for removal safety.
@@ -169,6 +173,7 @@ impl EngineConfig {
             servers,
             download_enabled: true,
             state_dir,
+            artifact_dir: None,
             disk_guard_roots: vec![DiskGuardRoot {
                 label: "downloads".into(),
                 path: dest_dir.clone(),
@@ -246,6 +251,7 @@ impl Engine {
 
         let owner = Owner::recover(
             &cfg.state_dir,
+            cfg.artifact_dir.as_deref(),
             cfg.dest_dir.clone(),
             cfg.torrent_payload_roots.clone(),
             cfg.history.clone(),
@@ -273,6 +279,22 @@ impl Engine {
         // async run loop's first publish (UI "queue is empty" flash).
         let mut owner = owner;
         owner.seed_snapshot();
+        let artifacts = owner.artifacts.clone();
+        {
+            let inventory = artifacts.clone();
+            let stop = cancel.clone();
+            tracker.spawn(async move {
+                let mut interval = tokio::time::interval(Duration::from_secs(30));
+                loop {
+                    tokio::select! { _ = stop.cancelled() => break, _ = interval.tick() => {} }
+                    let inventory = inventory.clone();
+                    if let Ok(Err(e)) = tokio::task::spawn_blocking(move || inventory.tick()).await
+                    {
+                        tracing::error!(error = %e, "file lifecycle maintenance failed");
+                    }
+                }
+            });
+        }
         // Jobs recovered mid-fetch: their fetch tasks died with the old
         // process — re-spawn one per unique URL below (once the handle
         // exists) and fail same-URL pile-ups as duplicates.
@@ -352,6 +374,7 @@ impl Engine {
         tracker.close();
 
         let handle = EngineHandle {
+            artifacts,
             cmd_tx: engine_tx,
             shared,
             events,
@@ -429,6 +452,7 @@ fn with_client(mut params: Vec<(String, String)>, client: Option<String>) -> Vec
 /// Cloneable handle to a running engine.
 #[derive(Clone)]
 pub struct EngineHandle {
+    artifacts: Arc<nzbd_state::artifacts::Inventory>,
     cmd_tx: mpsc::Sender<EngineMsg>,
     shared: SharedSnapshot,
     events: broadcast::Sender<Event>,
@@ -449,6 +473,10 @@ pub struct BudgetApplyReceipt {
 }
 
 impl EngineHandle {
+    pub fn artifacts(&self) -> Arc<nzbd_state::artifacts::Inventory> {
+        self.artifacts.clone()
+    }
+
     /// Transfer the sole adapter endpoint to the backend runtime. There can
     /// be only one consumer because backend commands are ordered FIFO.
     pub fn take_backend_adapter(&self) -> Option<backend::BackendAdapterPort> {
@@ -661,7 +689,9 @@ impl EngineHandle {
             reply: tx,
         })
         .await?;
-        rx.await.map_err(|_| EngineError::Closed)
+        rx.await
+            .map_err(|_| EngineError::Closed)?
+            .map_err(EngineError::State)
     }
 
     pub async fn pause_job(&self, job: JobId) -> Result<bool, EngineError> {
@@ -675,6 +705,103 @@ impl EngineHandle {
     }
 
     pub async fn delete_job(&self, job: JobId, delete_files: bool) -> Result<bool, EngineError> {
+        let torrent = self
+            .snapshot()
+            .jobs
+            .iter()
+            .find(|j| j.id == job)
+            .is_some_and(|j| j.kind == nzbd_types::JobKind::Torrent);
+        if delete_files && !torrent {
+            let inventory = self.artifacts.clone();
+            let artifact = inventory
+                .for_job(job.0)
+                .map_err(|e| EngineError::Lifecycle(e.to_string()))?;
+            let Some(mut artifact) = artifact else {
+                return if self.snapshot().jobs.iter().any(|j| j.id == job) {
+                    Err(EngineError::Lifecycle(
+                        "payload ownership needs review".into(),
+                    ))
+                } else {
+                    Ok(false)
+                };
+            };
+            if artifact.state != "deleted" {
+                if !artifact.owned
+                    || artifact.keep
+                    || artifact
+                        .hold
+                        .as_deref()
+                        .is_some_and(|h| h != "waiting for writer stop")
+                {
+                    return Err(EngineError::Lifecycle(
+                        "payload has Keep, recovery, or ownership review hold".into(),
+                    ));
+                }
+                if matches!(artifact.state.as_str(), "active" | "retiring") {
+                    let (tx, rx) = oneshot::channel();
+                    self.send(QueueCommand::QuiescePayload { job, reply: tx })
+                        .await?;
+                    let writers = rx
+                        .await
+                        .map_err(|_| EngineError::Closed)?
+                        .map_err(EngineError::Lifecycle)?;
+                    for mut writer in writers {
+                        if !*writer.stopped.borrow() {
+                            tokio::time::timeout(
+                                Duration::from_secs(10),
+                                writer.stopped.wait_for(|done| *done),
+                            )
+                            .await
+                            .map_err(|_| {
+                                EngineError::Lifecycle("writer stopping; retry deletion".into())
+                            })?
+                            .map_err(|_| {
+                                EngineError::Lifecycle("writer acknowledgement lost".into())
+                            })?;
+                        }
+                    }
+                    artifact = inventory
+                        .finish(job.0, &artifact.path, &artifact.root, "retained")
+                        .map_err(|e| EngineError::Lifecycle(e.to_string()))?;
+                }
+                let op_id = format!("job-delete-{}", artifact.id);
+                let op = match inventory.operation(&op_id) {
+                    Ok(op) => op,
+                    Err(nzbd_state::artifacts::Error::NotFound) => inventory
+                        .request_delete(&artifact.id, artifact.revision, &op_id, 0)
+                        .map_err(|e| EngineError::Lifecycle(e.to_string()))?,
+                    Err(e) => return Err(EngineError::Lifecycle(e.to_string())),
+                };
+                let operation = op.id.clone();
+                let result = tokio::time::timeout(
+                    Duration::from_secs(10),
+                    tokio::task::spawn_blocking(move || inventory.execute_delete(&op.id)),
+                )
+                .await
+                .map_err(|_| {
+                    EngineError::Lifecycle(format!("operation {operation} pending; retry"))
+                })?
+                .map_err(|e| EngineError::Lifecycle(e.to_string()))?
+                .map_err(|e| EngineError::Lifecycle(e.to_string()))?;
+                if result.state != "succeeded" {
+                    return Err(EngineError::Lifecycle(format!(
+                        "operation {} {}: {}",
+                        result.id,
+                        result.state,
+                        result.error.unwrap_or_default()
+                    )));
+                }
+            }
+            // Only retire the queue after the durable terminal receipt exists.
+            let _ = self
+                .roundtrip_bool(|reply| QueueCommand::Delete {
+                    job,
+                    delete_files: false,
+                    reply,
+                })
+                .await?;
+            return Ok(true);
+        }
         self.roundtrip_bool(|reply| QueueCommand::Delete {
             job,
             delete_files,
@@ -1049,6 +1176,9 @@ impl EngineHandle {
     pub async fn shutdown(&self) {
         self.cancel.cancel();
         self.tracker.wait().await;
+        if let Err(error) = self.artifacts.close() {
+            tracing::error!(%error,"inventory shutdown failed");
+        }
     }
 
     async fn send(&self, cmd: QueueCommand) -> Result<(), EngineError> {

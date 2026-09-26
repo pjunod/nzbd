@@ -95,7 +95,7 @@ pub(crate) enum QueueCommand {
         paused: bool,
         /// Caller-supplied job params, applied in this same turn.
         params: Vec<(String, String)>,
-        reply: oneshot::Sender<JobId>,
+        reply: oneshot::Sender<Result<JobId, nzbd_state::StateError>>,
     },
     AddUrl {
         name: String,
@@ -137,6 +137,10 @@ pub(crate) enum QueueCommand {
     Resume {
         job: JobId,
         reply: oneshot::Sender<bool>,
+    },
+    QuiescePayload {
+        job: JobId,
+        reply: oneshot::Sender<Result<Vec<WriterHandle>, String>>,
     },
     Delete {
         job: JobId,
@@ -460,6 +464,8 @@ pub(crate) struct Owner {
     attempts: HashMap<SegRef, SegmentAttempt>,
     blocked: HashMap<ServerId, Instant>,
     writers: HashMap<FileId, WriterHandle>,
+    retiring_writers: HashMap<JobId, Vec<WriterHandle>>,
+    allocated_jobs: HashSet<JobId>,
     finalize_sent: HashSet<FileId>,
     pending_finalize: Vec<(JobId, FileId)>,
     /// Background par2-name inspections already started for each job.
@@ -584,6 +590,7 @@ pub(crate) struct Owner {
     /// explicit `post_fetch_files` lane remains available there.
     download_enabled: bool,
     dest_dir: PathBuf,
+    pub(crate) artifacts: Arc<nzbd_state::artifacts::Inventory>,
     torrent_payload_roots: Vec<PathBuf>,
 
     engine_tx: mpsc::Sender<EngineMsg>,
@@ -690,6 +697,7 @@ impl Owner {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn recover(
         state_dir: &Path,
+        artifact_dir: Option<&Path>,
         dest_dir: PathBuf,
         torrent_payload_roots: Vec<PathBuf>,
         history: Option<Arc<nzbd_state::history::HistoryDb>>,
@@ -712,6 +720,15 @@ impl Owner {
         tracker: TaskTracker,
         cancel: CancellationToken,
     ) -> Result<Owner, nzbd_state::StateError> {
+        let artifacts = Arc::new(
+            nzbd_state::artifacts::Inventory::open(artifact_dir.unwrap_or(state_dir))
+                .map_err(|e| nzbd_state::StateError::Corrupt(e.to_string()))?,
+        );
+        std::fs::create_dir_all(&dest_dir).map_err(|source| nzbd_state::StateError::Io {
+            op: "create download root",
+            path: dest_dir.clone(),
+            source,
+        })?;
         let marker = UncleanMarker::new(state_dir, journal_suffix);
         let was_unclean = marker.check_and_arm()?;
         let snap_store = SnapshotStore::open(state_dir)?;
@@ -730,6 +747,20 @@ impl Owner {
                 state = QueueState::from_doc(doc);
             }
 
+            artifacts
+                .reconcile_startup(&state.jobs.iter().map(|job| job.id.0).collect::<Vec<_>>())
+                .map_err(|e| nzbd_state::StateError::Corrupt(e.to_string()))?;
+            for job in &state.jobs {
+                if job.torrent.is_none() {
+                    artifacts
+                        .register_legacy_active(
+                            job.id.0,
+                            &dest_dir,
+                            &dest_dir.join(job_dir_name(job)),
+                        )
+                        .map_err(|e| nzbd_state::StateError::Corrupt(e.to_string()))?;
+                }
+            }
             // Legacy phase-1 global journal: fold once, then retire it.
             let legacy = FsJournal::open(state_dir)?;
             let mut replayed = legacy.replay()?;
@@ -794,12 +825,37 @@ impl Owner {
             );
         }
 
+        let mut allocated_jobs = HashSet::new();
+        let mut retiring_writers = HashMap::new();
+        // Validate recovered allocations before the actor starts. Segment
+        // scheduling subsequently consults only actor-owned admission state.
+        for job in &mut state.jobs {
+            if job.torrent.is_some() {
+                continue;
+            }
+            if let Some(a) = artifacts
+                .for_job(job.id.0)
+                .map_err(|e| nzbd_state::StateError::Corrupt(e.to_string()))?
+            {
+                if a.state == "active" {
+                    artifacts
+                        .allocate(job.id.0, &a.root, &a.path)
+                        .map_err(|e| nzbd_state::StateError::Corrupt(e.to_string()))?;
+                    allocated_jobs.insert(job.id);
+                } else if a.state == "retained" {
+                    job.status = JobStatus::Paused;
+                    retiring_writers.insert(job.id, Vec::new());
+                }
+            }
+        }
         let initial_disk_hold = tuning.min_free_disk_bytes > 0;
         Ok(Owner {
             state,
             attempts: HashMap::new(),
             blocked: HashMap::new(),
             writers: HashMap::new(),
+            retiring_writers,
+            allocated_jobs,
             finalize_sent: HashSet::new(),
             pending_finalize: Vec::new(),
             pending_name_inspections: HashMap::new(),
@@ -841,6 +897,7 @@ impl Owner {
             tuning,
             download_enabled,
             dest_dir,
+            artifacts,
             torrent_payload_roots,
             engine_tx,
             tracker,
@@ -1145,12 +1202,36 @@ impl Owner {
                 // Nothing has been written yet, so a better name may take
                 // the directory with it.
                 let name = self.name_from_requestor(id, true).unwrap_or(name);
+                if let Some(job) = self.state.job_mut(id) {
+                    let base = job_dir_name(job);
+                    // Requeue creates a new allocation, never implicitly adopts
+                    // bytes retained by the previous job incarnation.
+                    if self.dest_dir.join(&base).exists() {
+                        let mut suffix = 0u32;
+                        loop {
+                            let candidate = format!("{base}.job-{}-{suffix}", id.0);
+                            if !self.dest_dir.join(&candidate).exists() {
+                                job.dir_name = candidate;
+                                break;
+                            }
+                            suffix += 1;
+                        }
+                    }
+                }
+                let allocation = self.ensure_allocation(id);
+                if let Err(e) = allocation {
+                    self.state.jobs.retain(|j| j.id != id);
+                    let _ = reply.send(Err(nzbd_state::StateError::Corrupt(format!(
+                        "payload allocation: {e}"
+                    ))));
+                    return;
+                }
                 tracing::info!(job = id.0, %name, "job added");
                 self.save_snapshot(); // adds are durable immediately
                 self.publish_now();
                 self.emit(Event::JobAdded { job: id, name });
                 self.bump_epoch();
-                let _ = reply.send(id);
+                let _ = reply.send(Ok(id));
             }
             QueueCommand::AddUrl {
                 name,
@@ -1376,6 +1457,10 @@ impl Owner {
                 let _ = reply.send(ok);
             }
             QueueCommand::Resume { job, reply } => {
+                if self.retiring_writers.contains_key(&job) {
+                    let _ = reply.send(false);
+                    return;
+                }
                 if self
                     .state
                     .job(job)
@@ -1439,6 +1524,46 @@ impl Owner {
                     }
                 };
                 let _ = reply.send(ok);
+            }
+            QueueCommand::QuiescePayload { job, reply } => {
+                let result = (|| {
+                    if self.delegated.contains_key(&job) {
+                        return Err(
+                            "remote writer lease must be retired before payload deletion".into(),
+                        );
+                    }
+                    let record = self.state.job_mut(job).ok_or("job not found")?;
+                    if record.torrent.is_some()
+                        || matches!(
+                            record.status,
+                            JobStatus::Post { .. } | JobStatus::PostQueued
+                        )
+                    {
+                        return Err(
+                            "post-processing or torrent ownership must quiesce before deletion"
+                                .to_string(),
+                        );
+                    }
+                    self.artifacts
+                        .prepare_forget(job.0)
+                        .map_err(|e| e.to_string())?;
+                    record.status = JobStatus::Paused;
+                    self.allocated_jobs.remove(&job);
+                    let writers = self.retiring_writers.entry(job).or_default();
+                    for file in &record.files {
+                        if let Some(writer) = self.writers.remove(&file.id) {
+                            writer.stop.cancel();
+                            writers.push(writer);
+                        }
+                    }
+                    let writers = writers.clone();
+                    self.attempts.retain(|r, _| r.job != job);
+                    self.pending_finalize.retain(|(j, _)| *j != job);
+                    self.save_snapshot();
+                    self.publish_now();
+                    Ok(writers)
+                })();
+                let _ = reply.send(result);
             }
             QueueCommand::Delete {
                 job,
@@ -1801,6 +1926,10 @@ impl Owner {
                 let _ = reply.send(());
             }
             QueueCommand::SetJobStatus { job, status, reply } => {
+                if self.retiring_writers.contains_key(&job) {
+                    let _ = reply.send(false);
+                    return;
+                }
                 let ok = match self.state.job_mut(job) {
                     Some(j) => {
                         j.status = status;
@@ -1905,6 +2034,47 @@ impl Owner {
         }
         if matches!(job.status, JobStatus::Downloading) {
             job.status = JobStatus::Queued;
+        }
+        if job.torrent.is_none()
+            && !matches!(
+                job.status,
+                JobStatus::Completed | JobStatus::Failed | JobStatus::Deleted
+            )
+        {
+            let relative = std::path::PathBuf::from(job_dir_name(&job));
+            if relative
+                .components()
+                .any(|c| !matches!(c, std::path::Component::Normal(_)))
+            {
+                return false;
+            }
+            let path = self.dest_dir.join(relative);
+            // Cluster grants may use nested, fenced generation directories.
+            // Register their bytes without local deletion authority.
+            if let Err(error) = std::fs::create_dir_all(&path) {
+                tracing::error!(job=job.id.0,%error,"cannot create granted payload directory");
+                return false;
+            }
+            self.allocated_jobs.remove(&job.id);
+            if let Err(error) =
+                self.artifacts
+                    .register_legacy_active(job.id.0, path.parent().unwrap(), &path)
+            {
+                tracing::error!(job=job.id.0, %error, "cluster payload inventory unavailable");
+                return false;
+            }
+        }
+        if job.torrent.is_none() && self.artifacts.for_job(job.id.0).ok().flatten().is_none() {
+            let path = self.dest_dir.join(job_dir_name(&job));
+            if path.is_dir() {
+                if let Err(error) =
+                    self.artifacts
+                        .register_legacy_active(job.id.0, path.parent().unwrap(), &path)
+                {
+                    tracing::error!(%error,"cannot inventory legacy completed payload");
+                    return false;
+                }
+            }
         }
         let job_id = job.id;
         let max_file = job.files.iter().map(|f| f.id.0).max().unwrap_or(0);
@@ -2125,6 +2295,10 @@ impl Owner {
             }
             let Some(r) = lease else { break };
 
+            if let Err(e) = self.ensure_allocation(r.job) {
+                tracing::error!(job = r.job.0, error = %e, "payload allocation unavailable; download held");
+                break;
+            }
             let (message_id, writer) = {
                 let Some(seg) = self.state.segment_mut(r) else {
                     break;
@@ -2731,6 +2905,25 @@ impl Owner {
 
     // -- writers -------------------------------------------------------------
 
+    fn ensure_allocation(&mut self, job: JobId) -> Result<(), nzbd_state::artifacts::Error> {
+        if self.retiring_writers.contains_key(&job) {
+            return Err(nzbd_state::artifacts::Error::Conflict(
+                "writer retirement in progress".into(),
+            ));
+        }
+        if self.allocated_jobs.contains(&job) {
+            return Ok(());
+        }
+        let record = self
+            .state
+            .job(job)
+            .ok_or(nzbd_state::artifacts::Error::NotFound)?;
+        let dir = self.dest_dir.join(job_dir_name(record));
+        self.artifacts.allocate(job.0, &self.dest_dir, &dir)?;
+        self.allocated_jobs.insert(job);
+        Ok(())
+    }
+
     fn writer_for(&mut self, job: JobId, file: FileId) -> mpsc::Sender<WriteCmd> {
         if let Some(h) = self.writers.get(&file) {
             if !h.tx.is_closed() {
@@ -2752,6 +2945,11 @@ impl Owner {
         // par2 metadata mid-download must not split its files across two
         // directories.
         let dir = self.dest_dir.join(job_dir);
+        if let Err(e) = self.ensure_allocation(job) {
+            tracing::error!(job = job.0, error = %e, "writer held: allocation not committed");
+            let (tx, _) = mpsc::channel(1);
+            return tx;
+        }
         let h = spawn_writer(
             &self.tracker,
             job,
@@ -2874,14 +3072,42 @@ impl Owner {
     }
 
     fn delete_job(&mut self, job_id: JobId, delete_files: bool) -> bool {
+        if delete_files {
+            return false;
+        }
         let Some(idx) = self.state.jobs.iter().position(|j| j.id == job_id) else {
             return false;
         };
+        let retiring = match self.artifacts.prepare_forget(job_id.0) {
+            Ok(a) => a,
+            Err(e) => {
+                tracing::error!(job=job_id.0,error=%e,"cannot forget payload ownership");
+                return false;
+            }
+        };
+        let mut stopping = self.retiring_writers.remove(&job_id).unwrap_or_default();
+        self.allocated_jobs.remove(&job_id);
         let job = self.state.jobs.remove(idx);
         for f in &job.files {
-            self.writers.remove(&f.id); // dropped senders stop the writers
+            if let Some(writer) = self.writers.remove(&f.id) {
+                writer.stop.cancel();
+                stopping.push(writer);
+            }
             self.file_sizes.remove(&f.id);
             self.finalize_sent.remove(&f.id);
+        }
+        if let Some(artifact) = retiring {
+            let inventory = self.artifacts.clone();
+            self.tracker.spawn(async move {
+                for mut writer in stopping {
+                    if writer.stopped.wait_for(|done| *done).await.is_err() { return; }
+                }
+                let _ = tokio::task::spawn_blocking(move || {
+                    if let Err(e) = inventory.finish(job_id.0, &artifact.path, &artifact.root, "retained") {
+                        tracing::error!(job=job_id.0,error=%e,"retired payload remains on review hold");
+                    }
+                }).await;
+            });
         }
         self.pending_finalize.retain(|(j, _)| *j != job_id);
         self.attempts.retain(|r, _| r.job != job_id);
@@ -2900,16 +3126,8 @@ impl Owner {
                 );
             }
         }
-        if delete_files {
-            let dir = self.dest_dir.join(job_dir_name(&job));
-            tokio::spawn(async move {
-                if let Err(e) = tokio::fs::remove_dir_all(&dir).await {
-                    if e.kind() != std::io::ErrorKind::NotFound {
-                        tracing::warn!(dir = %dir.display(), error = %e, "delete files failed");
-                    }
-                }
-            });
-        }
+        // Destructive requests are completed by EngineHandle's inventory
+        // coordinator before this queue retirement command is sent.
         tracing::info!(job = job_id.0, name = %job.name, delete_files, "job deleted");
         self.save_snapshot();
         self.publish_now();
@@ -4233,6 +4451,7 @@ mod tests {
         let (backend, adapter) = crate::backend::backend_channel(1, 1);
         let owner = Owner::recover(
             &tmp.path().join("state"),
+            None,
             tmp.path().join("dest"),
             Vec::new(),
             None,
@@ -4275,6 +4494,7 @@ mod tests {
         let (backend, adapter) = crate::backend::backend_channel(1, 1);
         let owner = Owner::recover(
             &tmp.path().join("state"),
+            None,
             tmp.path().join("dest"),
             Vec::new(),
             None,
@@ -4299,6 +4519,56 @@ mod tests {
         )
         .unwrap();
         (tmp, owner, adapter)
+    }
+
+    #[tokio::test]
+    async fn payload_retirement_retries_keep_original_acknowledgements_and_fence_resume() {
+        let (_tmp, mut owner, _adapter) = control_test_owner();
+        std::fs::create_dir_all(&owner.dest_dir).unwrap();
+        let job = pending_job(1);
+        let file = job.files[0].id;
+        owner.state.jobs.push(job);
+        owner.ensure_allocation(JobId(1)).unwrap();
+        let (tx, _rx) = mpsc::channel(1);
+        let (done, stopped) = watch::channel(false);
+        owner.writers.insert(
+            file,
+            WriterHandle {
+                tx,
+                stop: CancellationToken::new(),
+                stopped,
+            },
+        );
+        let (reply, rx) = oneshot::channel();
+        owner.on_command(QueueCommand::QuiescePayload {
+            job: JobId(1),
+            reply,
+        });
+        let first = rx.await.unwrap().unwrap();
+        assert_eq!(first.len(), 1);
+        assert!(!*first[0].stopped.borrow());
+        drop(first); // the timed-out HTTP request loses its receivers
+        let (reply, rx) = oneshot::channel();
+        owner.on_command(QueueCommand::Resume {
+            job: JobId(1),
+            reply,
+        });
+        assert!(!rx.await.unwrap());
+        assert!(owner.ensure_allocation(JobId(1)).is_err());
+        let (reply, rx) = oneshot::channel();
+        owner.on_command(QueueCommand::QuiescePayload {
+            job: JobId(1),
+            reply,
+        });
+        let mut retry = rx.await.unwrap().unwrap();
+        assert_eq!(retry.len(), 1);
+        assert!(!*retry[0].stopped.borrow());
+        done.send(true).unwrap();
+        retry[0].stopped.wait_for(|v| *v).await.unwrap();
+        assert_eq!(
+            owner.artifacts.for_job(1).unwrap().unwrap().state,
+            "retiring"
+        );
     }
 
     fn control_torrent_job() -> Job {

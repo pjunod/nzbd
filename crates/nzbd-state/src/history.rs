@@ -820,6 +820,13 @@ impl HistoryDb {
         self.list_page(limit, 0, include_hidden)
     }
 
+    /// Exact indexed lookup, including hidden entries. Actions must not depend
+    /// on the size or ordering of the History page a client happened to read.
+    pub fn get(&self, job: crate::JobId) -> Result<Option<HistoryEntry>, StateError> {
+        let sql = format!("SELECT {COLUMNS} FROM history WHERE job_id = ?1 ORDER BY completed_at DESC, id DESC LIMIT 1");
+        Ok(self.query(&sql, &[&job.0])?.into_iter().next())
+    }
+
     /// One page of the newest-first view: `limit` entries starting at
     /// `offset`.
     ///

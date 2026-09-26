@@ -593,7 +593,16 @@ async fn handle_failed_job(
         Some(j) if !j.files.is_empty() => {
             let dir_name = nzbd_engine::queue::job_dir_name(j);
             let source = dest_dir.join(&dir_name);
-            let observed = dispose_failed(cfg, job, &source, dest_dir, &dir_name, "local").await;
+            let observed = dispose_failed(
+                engine.artifacts(),
+                cfg,
+                job,
+                &source,
+                dest_dir,
+                &dir_name,
+                "local",
+            )
+            .await;
             match canonical_failed_disposition(cfg, dest_dir, &dir_name, &source) {
                 Some(committed) => Some(committed),
                 None => {
@@ -726,7 +735,7 @@ async fn handle_failed_job(
     if let Some(d) = disposition.as_ref() {
         fail_params.push(("Failure:Files".into(), d.note.clone()));
     }
-    let entry = HistoryEntry {
+    let mut entry = HistoryEntry {
         job,
         name: name.clone(),
         category: exported.as_ref().and_then(|j| j.category.clone()),
@@ -757,6 +766,33 @@ async fn handle_failed_job(
             .unwrap_or_default(),
         seq: 0,
     };
+    if let Some(path) = entry.final_dir.as_deref() {
+        let path = Path::new(path);
+        let state = if entry
+            .params
+            .iter()
+            .any(|(k, v)| k == "Failure:Files" && v.starts_with("parked at "))
+        {
+            "parked_failed"
+        } else {
+            "retained"
+        };
+        match engine
+            .artifacts()
+            .finish(job.0, path, path.parent().unwrap_or(dest_dir), state)
+        {
+            Ok(artifact) => entry.params.push(("Artifact:Id".into(), artifact.id)),
+            Err(e) => {
+                tracing::error!(job=job.0,error=%e,"failed payload inventory not committed; finalization held");
+                return;
+            }
+        }
+    }
+    if !entry.params.iter().any(|(k, _)| k == "Artifact:Id") {
+        if let Ok(Some(a)) = engine.artifacts().for_job(job.0) {
+            entry.params.push(("Artifact:Id".into(), a.id));
+        }
+    }
     let h = history.clone();
     let record = entry.clone();
     let (history_seq, entry) =
@@ -1293,7 +1329,15 @@ async fn process_job_ctx_from(
     ctx: &PpCtx,
     from: RestartPoint,
 ) -> Result<PpFinal, PostError> {
-    let _ = engine.set_job_status(job_id, JobStatus::PostQueued).await;
+    if !engine
+        .set_job_status(job_id, JobStatus::PostQueued)
+        .await
+        .map_err(|e| PostError::Subprocess(e.to_string()))?
+    {
+        return Err(PostError::Subprocess(
+            "job vanished or payload retirement started".into(),
+        ));
+    }
     let Some(job) = engine
         .export_job(job_id)
         .await
@@ -1518,12 +1562,11 @@ async fn process_job_ctx_from(
                 if !(ctx.commit_ok)() {
                     return Err(PostError::Subprocess("pp lease lost before move".into()));
                 }
-                let from = dir.clone();
+                let inventory = engine.artifacts();
                 let to = target.clone();
-                let tag = ctx.tag.clone();
-                let moved = tokio::task::spawn_blocking(move || move_dir(&from, &to, &tag))
+                let moved = tokio::task::spawn_blocking(move || inventory.relocate(job_id.0, &to))
                     .await
-                    .unwrap_or_else(|e| Err(std::io::Error::other(e.to_string())));
+                    .unwrap_or_else(|e| Err(nzbd_state::artifacts::Error::Conflict(e.to_string())));
                 match moved {
                     Ok(()) => {
                         tracing::info!(
@@ -1690,7 +1733,18 @@ async fn process_job_ctx_from(
     let disposition = if outcome == PpFinal::Success {
         None
     } else {
-        Some(dispose_failed(cfg, job_id, &dir, dest_dir, &sanitized, &ctx.tag).await)
+        Some(
+            dispose_failed(
+                engine.artifacts(),
+                cfg,
+                job_id,
+                &dir,
+                dest_dir,
+                &sanitized,
+                &ctx.tag,
+            )
+            .await,
+        )
     };
 
     // Close the last stage span BEFORE the export below reads the job:
@@ -1751,6 +1805,44 @@ async fn process_job_ctx_from(
             let _ = engine.import_job(fin, false, false).await;
             stages.close();
             return Ok(outcome);
+        }
+        if let Some(path) = &final_dir {
+            let path = Path::new(path);
+            let state = if outcome == PpFinal::Success {
+                "completed"
+            } else if disposition
+                .as_ref()
+                .is_some_and(|d| d.note.starts_with("parked at "))
+            {
+                "parked_failed"
+            } else {
+                "retained"
+            };
+            // Script-selected or legacy moved output is visible, but never
+            // inherits deletion authority solely from a returned path.
+            let inventory = engine.artifacts();
+            if inventory
+                .for_job(job_id.0)
+                .ok()
+                .flatten()
+                .is_none_or(|a| a.path != path)
+            {
+                inventory
+                    .register_legacy_active(job_id.0, path.parent().unwrap_or(dest_dir), path)
+                    .map_err(|e| {
+                        PostError::Subprocess(format!("external result inventory: {e}"))
+                    })?;
+            }
+            let artifact = inventory
+                .finish(job_id.0, path, path.parent().unwrap_or(dest_dir), state)
+                .map_err(|e| PostError::Subprocess(format!("file lifecycle finalization: {e}")))?;
+            fin.params.retain(|(k, _)| k != "Artifact:Id");
+            fin.params.push(("Artifact:Id".into(), artifact.id));
+        }
+        if !fin.params.iter().any(|(k, _)| k == "Artifact:Id") {
+            if let Ok(Some(a)) = engine.artifacts().for_job(job_id.0) {
+                fin.params.push(("Artifact:Id".into(), a.id));
+            }
         }
         let entry = HistoryEntry {
             job: job_id,
@@ -1829,68 +1921,6 @@ async fn process_job_ctx_from(
         });
     }
     Ok(outcome)
-}
-
-/// Move a finished job folder to another root, across filesystems if need
-/// be.
-///
-/// `rename` is the fast path and the only atomic one. A category
-/// destination on a different volume — the usual homelab shape, download
-/// on the SSD, library on the NAS — answers `EXDEV`, and then the copy
-/// goes to a **sibling scratch directory** and is renamed into place only
-/// once every byte is on disk. Copying straight into `to` would leave a
-/// half-populated library folder if the process died mid-copy: the next
-/// attempt's `rename` would fail `ENOTEMPTY` forever, and in the meantime
-/// a truncated file would be sitting where a consumer expects a finished
-/// one. This way an interrupted move leaves only `<to>.pp-move`, which
-/// the next attempt removes, and the source is untouched until the commit
-/// succeeds — so a re-run is always either "not moved yet" or "moved",
-/// never "half moved".
-fn move_dir(from: &Path, to: &Path, tag: &str) -> std::io::Result<()> {
-    if let Some(parent) = to.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    // Clear any leftovers from an attempt that died mid-copy first, and
-    // unconditionally: whichever path this attempt takes, a completed move
-    // must not leave scratch behind in the library.
-    let scratch = to.with_file_name(format!(
-        "{}.pp-move.{tag}",
-        to.file_name().unwrap_or_default().to_string_lossy()
-    ));
-    let _ = std::fs::remove_dir_all(&scratch);
-    match std::fs::rename(from, to) {
-        Ok(()) => return Ok(()),
-        Err(e) if e.raw_os_error() == Some(18) => {} // EXDEV: different volume
-        Err(e) if e.kind() == std::io::ErrorKind::CrossesDevices => {}
-        Err(e) => return Err(e),
-    }
-    copy_dir_all(from, &scratch)?;
-    std::fs::rename(&scratch, to)?;
-    std::fs::remove_dir_all(from)
-}
-
-/// Recursive copy, fsyncing each file before it counts as written. The
-/// fsync is the difference between "the kernel accepted these bytes" and
-/// "these bytes survive a power cut", and the source is deleted right
-/// after — so without it a badly-timed crash loses the download outright.
-fn copy_dir_all(from: &Path, to: &Path) -> std::io::Result<()> {
-    std::fs::create_dir_all(to)?;
-    for entry in std::fs::read_dir(from)? {
-        let entry = entry?;
-        let target = to.join(entry.file_name());
-        if entry.file_type()?.is_dir() {
-            copy_dir_all(&entry.path(), &target)?;
-        } else {
-            std::fs::copy(entry.path(), &target)?;
-            if let Ok(f) = std::fs::File::open(&target) {
-                let _ = f.sync_all();
-            }
-        }
-    }
-    if let Ok(d) = std::fs::File::open(to) {
-        let _ = d.sync_all(); // the directory entries themselves
-    }
-    Ok(())
 }
 
 /// Narrow the discovered post-processing scripts to a category's
@@ -1980,100 +2010,78 @@ pub struct Disposition {
     pub files_at: Option<PathBuf>,
 }
 
-/// Dispose of the files of a job that ended in a terminal failure, per
-/// `[post] failure_action`, and describe what happened for the history row.
-///
-/// The one-dir-one-job invariant is what makes this safe to do wholesale:
-/// a job's directory contains that job's files and nothing else, so
-/// removing or moving the tree cannot take a neighbour's download with it.
-///
-/// Deleting is not destructive in the way it looks: the job's NZB is
-/// spooled beside its history entry, so `requeue` re-downloads exactly
-/// what was thrown away. Keeping it is what filled a terabyte.
-pub async fn dispose_failed(
+/// Apply a terminal failure disposition through the ownership journal.
+/// Missing paths, failed copies and incomplete deletion retain a visible
+/// record; only a durable deletion result can report that no files remain.
+async fn dispose_failed(
+    inventory: Arc<nzbd_state::artifacts::Inventory>,
     cfg: &PostConfig,
-    job_id: JobId,
+    job: JobId,
     dir: &Path,
-    dest_dir: &Path,
-    dir_name: &str,
-    tag: &str,
+    dest: &Path,
+    name: &str,
+    _tag: &str,
 ) -> Disposition {
-    let kept = |note: &str| Disposition {
-        note: note.into(),
-        files_at: Some(dir.to_path_buf()),
-    };
-    // Park is retried after disk recovery or authority handoff. A prior
-    // attempt may have completed the move before losing its fence, so the
-    // target is the durable idempotence witness when the source is gone.
-    let park_target = (cfg.failure_action == FailureAction::Park).then(|| {
-        cfg.failed_dir
-            .clone()
-            .unwrap_or_else(|| dest_dir.join(".failed"))
-            .join(dir_name)
-    });
-    if !dir.exists() {
-        if let Some(target) = park_target.filter(|target| target.exists()) {
-            return Disposition {
-                note: format!("parked at {}", target.display()),
-                files_at: Some(target),
-            };
-        }
+    if cfg.failure_action == FailureAction::Delete
+        && inventory
+            .for_job(job.0)
+            .ok()
+            .flatten()
+            .is_some_and(|a| a.state == "deleted")
+    {
         return Disposition {
-            note: "already gone".into(),
+            note: "deleted".into(),
             files_at: None,
         };
     }
-    match cfg.failure_action {
-        FailureAction::None => kept("kept"),
-        FailureAction::Delete => {
-            let d = dir.to_path_buf();
-            let res = tokio::task::spawn_blocking(move || std::fs::remove_dir_all(&d)).await;
-            match res {
-                Ok(Ok(())) => {
-                    tracing::warn!(job = job_id.0, dir = %dir.display(),
-                        "failed job: deleting its files (requeue re-downloads them)");
-                    Disposition {
-                        note: "deleted".into(),
-                        files_at: None,
-                    }
+    if cfg.failure_action == FailureAction::Delete {
+        let from = dir.to_path_buf();
+        let root = dir.parent().unwrap_or(dest).to_path_buf();
+        let result = tokio::task::spawn_blocking(move || {
+            let artifact = inventory.finish(job.0, &from, &root, "retained")?;
+            let key = format!("failed-delete-{}", artifact.id);
+            let op = match inventory.operation(&key) {
+                Ok(op) => op,
+                Err(nzbd_state::artifacts::Error::NotFound) => {
+                    inventory.request_delete(&artifact.id, artifact.revision, &key, 0)?
                 }
-                Ok(Err(e)) => {
-                    tracing::error!(job = job_id.0, dir = %dir.display(), error = %e,
-                        "failed job: could not delete its files — they stay on the volume");
-                    kept(&format!("delete failed: {e}"))
-                }
-                Err(e) => kept(&format!("delete failed: {e}")),
-            }
-        }
-        FailureAction::Park => {
-            let target = park_target.expect("Park computed its idempotent target");
-            let from = dir.to_path_buf();
-            let to = target.clone();
-            let tag = tag.to_string();
-            let res = tokio::task::spawn_blocking(move || {
-                if let Some(parent) = to.parent() {
-                    std::fs::create_dir_all(parent)?;
-                }
-                move_dir(&from, &to, &tag)
-            })
-            .await;
-            match res {
-                Ok(Ok(())) => {
-                    tracing::warn!(job = job_id.0, to = %target.display(),
-                        "failed job: parking its files off the destination tree");
-                    Disposition {
-                        note: format!("parked at {}", target.display()),
-                        files_at: Some(target),
-                    }
-                }
-                Ok(Err(e)) => {
-                    tracing::error!(job = job_id.0, to = %target.display(), error = %e,
-                        "failed job: could not park its files — they stay where they are");
-                    kept(&format!("park failed: {e}"))
-                }
-                Err(e) => kept(&format!("park failed: {e}")),
-            }
-        }
+                Err(e) => return Err(e),
+            };
+            inventory.execute_delete(&op.id)
+        })
+        .await;
+        return match result {
+            Ok(Ok(op)) if op.state == "succeeded" => Disposition {
+                note: "deleted".into(),
+                files_at: None,
+            },
+            other => Disposition {
+                note: format!("checked deletion pending: {other:?}"),
+                files_at: Some(dir.into()),
+            },
+        };
+    }
+    if cfg.failure_action == FailureAction::Park {
+        let target = cfg
+            .failed_dir
+            .clone()
+            .unwrap_or_else(|| dest.join(".failed"))
+            .join(name);
+        let to = target.clone();
+        return match tokio::task::spawn_blocking(move || inventory.relocate(job.0, &to)).await {
+            Ok(Ok(())) => Disposition {
+                note: format!("parked at {}", target.display()),
+                files_at: Some(target),
+            },
+            other => Disposition {
+                note: format!("checked move pending: {other:?}"),
+                files_at: Some(dir.into()),
+            },
+        };
+    }
+    Disposition {
+        note: "kept".into(),
+        files_at: Some(dir.into()),
     }
 }
 
@@ -2462,75 +2470,15 @@ mod decision_tests {
         assert!(select_scripts(found, &["absent".into()]).is_empty());
     }
 
-    /// Within one volume the move is a `rename`, and scratch from an
-    /// attempt that died mid-copy must be cleared whichever path this
-    /// attempt takes — a completed move may not leave `.pp-move` behind in
-    /// the library.
-    #[test]
-    fn move_dir_renames_in_place_and_clears_stale_scratch() {
-        let tmp = tempfile::tempdir().unwrap();
-        let from = tmp.path().join("staging/Some.Release");
-        std::fs::create_dir_all(from.join("Subs")).unwrap();
-        std::fs::write(from.join("film.mkv"), b"film").unwrap();
-        std::fs::write(from.join("Subs/en.srt"), b"subs").unwrap();
-
-        let to = tmp.path().join("library/Some.Release");
-        let scratch = tmp.path().join("library/Some.Release.pp-move.tag7");
-        std::fs::create_dir_all(&scratch).unwrap();
-        std::fs::write(scratch.join("half.mkv"), b"truncated").unwrap();
-
-        move_dir(&from, &to, "tag7").unwrap();
-
-        assert_eq!(std::fs::read(to.join("film.mkv")).unwrap(), b"film");
-        assert_eq!(std::fs::read(to.join("Subs/en.srt")).unwrap(), b"subs");
-        assert!(!from.exists(), "the source is consumed by the move");
-        assert!(
-            !scratch.exists(),
-            "a completed move must not leave scratch in the library"
-        );
-    }
-
-    /// EXDEV is the only rename error the move recovers from. Anything else
-    /// is a real failure and has to surface, not be papered over by a copy.
-    #[test]
-    fn move_dir_propagates_a_rename_error_that_is_not_a_volume_boundary() {
-        let tmp = tempfile::tempdir().unwrap();
-        let err = move_dir(
-            &tmp.path().join("no-such-source"),
-            &tmp.path().join("library/dest"),
-            "tag",
-        )
-        .unwrap_err();
-        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
-    }
-
-    /// The cross-volume path: a recursive copy that fsyncs each file before
-    /// it counts as written, because the source is deleted right after.
-    #[test]
-    fn copy_dir_all_reproduces_the_whole_tree() {
-        let tmp = tempfile::tempdir().unwrap();
-        let from = tmp.path().join("src");
-        std::fs::create_dir_all(from.join("a/b")).unwrap();
-        std::fs::write(from.join("top.bin"), b"top").unwrap();
-        std::fs::write(from.join("a/mid.bin"), b"mid").unwrap();
-        std::fs::write(from.join("a/b/deep.bin"), b"deep").unwrap();
-
-        let to = tmp.path().join("copy");
-        copy_dir_all(&from, &to).unwrap();
-
-        assert_eq!(std::fs::read(to.join("top.bin")).unwrap(), b"top");
-        assert_eq!(std::fs::read(to.join("a/mid.bin")).unwrap(), b"mid");
-        assert_eq!(std::fs::read(to.join("a/b/deep.bin")).unwrap(), b"deep");
-        assert!(std::fs::metadata(to.join("a/b")).unwrap().is_dir());
-
-        assert!(copy_dir_all(&tmp.path().join("absent"), &tmp.path().join("out")).is_err());
-    }
-
     #[tokio::test]
     async fn failure_action_none_keeps_the_files_where_they_are() {
         let tmp = tempfile::tempdir().unwrap();
         let dest = tmp.path().join("dest");
         let dir = dest.join("job");
+        std::fs::create_dir_all(&dest).unwrap();
+        let inventory =
+            Arc::new(nzbd_state::artifacts::Inventory::open(&tmp.path().join("state")).unwrap());
+        inventory.allocate(3, &dest, &dir).unwrap();
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("payload.bin"), b"bytes").unwrap();
 
@@ -2538,7 +2486,7 @@ mod decision_tests {
             failure_action: FailureAction::None,
             ..PostConfig::default()
         };
-        let d = dispose_failed(&cfg, JobId(3), &dir, &dest, "job", "tag").await;
+        let d = dispose_failed(inventory.clone(), &cfg, JobId(3), &dir, &dest, "job", "tag").await;
         assert_eq!(d.note, "kept");
         assert_eq!(d.files_at.as_deref(), Some(dir.as_path()));
         assert!(dir.join("payload.bin").exists());
@@ -2549,6 +2497,10 @@ mod decision_tests {
         let tmp = tempfile::tempdir().unwrap();
         let dest = tmp.path().join("dest");
         let dir = dest.join("job");
+        std::fs::create_dir_all(&dest).unwrap();
+        let inventory =
+            Arc::new(nzbd_state::artifacts::Inventory::open(&tmp.path().join("state")).unwrap());
+        inventory.allocate(3, &dest, &dir).unwrap();
         std::fs::create_dir_all(dir.join("Subs")).unwrap();
         std::fs::write(dir.join("Subs/en.srt"), b"subs").unwrap();
 
@@ -2556,7 +2508,7 @@ mod decision_tests {
             failure_action: FailureAction::Delete,
             ..PostConfig::default()
         };
-        let d = dispose_failed(&cfg, JobId(3), &dir, &dest, "job", "tag").await;
+        let d = dispose_failed(inventory.clone(), &cfg, JobId(3), &dir, &dest, "job", "tag").await;
         assert_eq!(d.note, "deleted");
         assert_eq!(
             d.files_at, None,
@@ -2566,8 +2518,9 @@ mod decision_tests {
 
         // Re-running the same disposition is the failover case: it must be
         // idempotent, not a second error.
-        let again = dispose_failed(&cfg, JobId(3), &dir, &dest, "job", "tag").await;
-        assert_eq!(again.note, "already gone");
+        let again =
+            dispose_failed(inventory.clone(), &cfg, JobId(3), &dir, &dest, "job", "tag").await;
+        assert_eq!(again.note, "deleted");
         assert_eq!(again.files_at, None);
     }
 
@@ -2579,6 +2532,10 @@ mod decision_tests {
         let tmp = tempfile::tempdir().unwrap();
         let dest = tmp.path().join("dest");
         let dir = dest.join("job");
+        std::fs::create_dir_all(&dest).unwrap();
+        let inventory =
+            Arc::new(nzbd_state::artifacts::Inventory::open(&tmp.path().join("state")).unwrap());
+        inventory.allocate(3, &dest, &dir).unwrap();
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("payload.bin"), b"bytes").unwrap();
 
@@ -2587,7 +2544,7 @@ mod decision_tests {
             ..PostConfig::default()
         };
         let parked = dest.join(".failed/job");
-        let d = dispose_failed(&cfg, JobId(3), &dir, &dest, "job", "tag").await;
+        let d = dispose_failed(inventory.clone(), &cfg, JobId(3), &dir, &dest, "job", "tag").await;
         assert_eq!(d.note, format!("parked at {}", parked.display()));
         assert_eq!(d.files_at.as_deref(), Some(parked.as_path()));
         assert_eq!(std::fs::read(parked.join("payload.bin")).unwrap(), b"bytes");
@@ -2596,15 +2553,17 @@ mod decision_tests {
         // A prior attempt completed the move and then lost its fence. The
         // successor sees no source and must recognise the existing target
         // as the witness rather than reporting the files gone.
-        let successor = dispose_failed(&cfg, JobId(3), &dir, &dest, "job", "tag").await;
+        let successor =
+            dispose_failed(inventory.clone(), &cfg, JobId(3), &dir, &dest, "job", "tag").await;
         assert_eq!(successor.note, d.note);
         assert_eq!(successor.files_at, d.files_at);
 
         // With neither source nor target, the files really are gone.
         std::fs::remove_dir_all(&parked).unwrap();
-        let gone = dispose_failed(&cfg, JobId(3), &dir, &dest, "job", "tag").await;
-        assert_eq!(gone.note, "already gone");
-        assert_eq!(gone.files_at, None);
+        let gone =
+            dispose_failed(inventory.clone(), &cfg, JobId(3), &dir, &dest, "job", "tag").await;
+        assert!(gone.note.starts_with("checked move pending:"));
+        assert!(gone.files_at.is_some());
     }
 
     /// An explicit `failed_dir` overrides the default location.
@@ -2613,6 +2572,10 @@ mod decision_tests {
         let tmp = tempfile::tempdir().unwrap();
         let dest = tmp.path().join("dest");
         let dir = dest.join("job");
+        std::fs::create_dir_all(&dest).unwrap();
+        let inventory =
+            Arc::new(nzbd_state::artifacts::Inventory::open(&tmp.path().join("state")).unwrap());
+        inventory.allocate(3, &dest, &dir).unwrap();
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("payload.bin"), b"bytes").unwrap();
         let quarantine = tmp.path().join("quarantine");
@@ -2622,7 +2585,7 @@ mod decision_tests {
             failed_dir: Some(quarantine.clone()),
             ..PostConfig::default()
         };
-        let d = dispose_failed(&cfg, JobId(3), &dir, &dest, "job", "tag").await;
+        let d = dispose_failed(inventory.clone(), &cfg, JobId(3), &dir, &dest, "job", "tag").await;
         assert_eq!(
             d.files_at.as_deref(),
             Some(quarantine.join("job").as_path())
@@ -2642,6 +2605,10 @@ mod decision_tests {
         let tmp = tempfile::tempdir().unwrap();
         let dest = tmp.path().join("dest");
         let dir = dest.join("job");
+        std::fs::create_dir_all(&dest).unwrap();
+        let inventory =
+            Arc::new(nzbd_state::artifacts::Inventory::open(&tmp.path().join("state")).unwrap());
+        inventory.allocate(3, &dest, &dir).unwrap();
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("payload.bin"), b"bytes").unwrap();
 
@@ -2658,11 +2625,11 @@ mod decision_tests {
             failure_action: FailureAction::Delete,
             ..PostConfig::default()
         };
-        let d = dispose_failed(&cfg, JobId(3), &dir, &dest, "job", "tag").await;
+        let d = dispose_failed(inventory.clone(), &cfg, JobId(3), &dir, &dest, "job", "tag").await;
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         assert!(
-            d.note.starts_with("delete failed: "),
+            d.note.starts_with("checked deletion pending:"),
             "the note must carry the reason, was {:?}",
             d.note
         );
