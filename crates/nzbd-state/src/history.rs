@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 
 mod sync;
 pub use sync::{HistoryMode, HistorySyncStatus, HistoryWorker};
-use sync::{MutationGuard, SyncControl};
+use sync::{MutationGuard, ReplayFence, SyncControl};
 
 /// Every column a [`HistoryEntry`] is read from, in the order the row
 /// mapper expects. `id` (the cursor `seq`) is appended last so adding it
@@ -449,10 +449,7 @@ impl HistoryDb {
     /// tombstone survives this compaction even after the covered entry does
     /// not.
     pub fn prune(&self, now: i64) -> Result<usize, StateError> {
-        let _mutation = self.sync.mutation.lock().unwrap();
-        self.sync
-            .generation
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let _fence = ReplayFence::new(self);
         let r = self.retention();
         if r.is_unlimited() {
             return Ok(0);

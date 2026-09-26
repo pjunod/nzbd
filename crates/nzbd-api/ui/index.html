@@ -3582,6 +3582,9 @@ function renderHistorySync(status) {
   const mode = status.mode === "local_only" ? "Local history" : "Shared history";
   $("history-sync-info").textContent = mode + " · " + status.state +
     " · last pass " + status.last_duration_ms + " ms / " + fmtBytes(status.last_bytes_read) +
+    (status.last_scan ? " · " + status.last_scan + " scan / " + status.last_entries_reconciled + " entries / " + status.last_files_rebuilt + " files rebuilt" : "") +
+    (status.last_incomplete_tails ? " · " + status.last_incomplete_tails + " unfinished log tails" : "") +
+    (status.last_malformed_lines ? " · " + status.last_malformed_lines + " unrecognized log lines" : "") +
     " · last reconciliation " + age + " · storage: " + status.placement +
     " · index: " + status.index_path +
     (status.repair_pending ? " · repair pending" : "") +

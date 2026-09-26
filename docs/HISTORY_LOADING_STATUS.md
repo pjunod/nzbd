@@ -1,6 +1,6 @@
 # History loading implementation status
 
-**Status:** review complete; live validation and merge status in PR #237 ·
+**Status:** first release merged; M6 implemented and reviewed, final CI in PR #238 ·
 **Updated:** 2026-09-25
 
 The [reviewed plan](HISTORY_LOADING_PLAN.md) records the diagnosis, nuc3
@@ -38,9 +38,8 @@ not HTTP latency or post-fix production evidence. The nuc3 baseline remains
 
 - Performance fixes are always active. Dev settings can pause or enable
   synchronization immediately; readiness never blocks enablement.
-- M6 incremental per-file contributions remain outside this first release,
-  as the reviewed plan requires separate proof of equivalent merge semantics.
-  Shared history still performs a bounded-transaction full replay when changed.
+- M6 is implemented and reviewed in [HISTORY_INCREMENTAL.md](HISTORY_INCREMENTAL.md),
+  which tracks its implementation, equivalence review, final tests, and merge.
 - Retain the original index during relocation. Rejecting a stale destination
   or missing active index protects cursor state; it is not a feature gate.
 - No production configuration, data migration, or deployment has been done.
