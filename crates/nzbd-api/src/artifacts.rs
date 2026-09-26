@@ -81,7 +81,7 @@ struct Page {
 }
 async fn list(State(st): State<ApiState>, Query(p): Query<Page>) -> Response {
     let db = st.engine.artifacts();
-    work(move||{let mut rows=db.list_visible(p.offset,100,p.include_terminal)?;let now=nzbd_state::artifacts::now();let mut out=Vec::new();for a in &mut rows {let total=a.files.len();let bytes=a.files.iter().filter(|f|!f.identity.directory).map(|f|f.identity.bytes).sum::<u64>();a.files.clear();out.push(json!({"artifact":a,"files":total,"bytes":bytes,"earliest_expiry":a.earliest_expiry(now)}));}Ok(json!({"entries":out,"offset":p.offset,"limit":100}))}).await
+    work(move||{let mut rows=db.list_visible(p.offset,100,p.include_terminal)?;let now=nzbd_state::artifacts::now();let mut out=Vec::new();for a in &mut rows {let total=a.files.len();let bytes=a.files.iter().filter(|f|!f.identity.directory).map(|f|f.identity.bytes).sum::<u64>();a.files.clear();out.push(json!({"artifact":a,"files":total,"bytes":bytes,"earliest_expiry":a.earliest_expiry(now)}));}Ok(json!({"entries":out,"offset":p.offset,"limit":100,"discovery":db.discovery_status()?}))}).await
 }
 async fn detail(State(st): State<ApiState>, Path(id): Path<String>) -> Response {
     let db = st.engine.artifacts();
@@ -187,6 +187,7 @@ async fn delete(
     }
 }
 
+#[allow(clippy::result_large_err)] // Axum error responses are returned directly.
 fn validate_artifact_role(st: &ApiState, id: &str) -> Result<(), Response> {
     let artifact = st.engine.artifacts().get(id).map_err(failure)?;
     if let Some(cfg) = config(st) {
@@ -343,6 +344,7 @@ async fn recovery(State(st): State<ApiState>, Path(id): Path<String>) -> Respons
     let db = st.engine.artifacts();
     work(move || db.recovery(&id)).await
 }
+#[allow(clippy::result_large_err)] // Axum error responses are returned directly.
 fn consumer(db: &Arc<Inventory>, headers: &HeaderMap) -> Result<String, Response> {
     let s = db.settings().map_err(failure)?;
     let supplied = headers

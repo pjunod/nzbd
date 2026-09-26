@@ -19,7 +19,7 @@ impl Inventory {
         if days > 3650 {
             return Err(Error::Conflict("retention exceeds 3650 days".into()));
         }
-        let _guard = self.mutation.lock().unwrap();
+        let _guard = self.mutation_guard()?;
         let db = self.db.lock().unwrap();
         let mut stmt = db.prepare("SELECT data FROM artifacts WHERE state='parked_failed' AND json_extract(data,'$.owned')=1 AND json_extract(data,'$.keep')=0 AND json_extract(data,'$.hold') IS NULL AND json_extract(data,'$.retention_seconds')<>?1 ORDER BY updated_at,id LIMIT 1000")?;
         let rows = stmt.query_map([i64::from(days) * 86400], |r| r.get::<_, String>(0))?;
@@ -57,7 +57,7 @@ impl Inventory {
         Ok(preview)
     }
     pub fn apply_retention(&self, key: &str) -> Result<Operation> {
-        let _guard = self.mutation.lock().unwrap();
+        let _guard = self.mutation_guard()?;
         let mut db = self.db.lock().unwrap();
         let tx = db.transaction()?;
         let mut op: Operation = read(&tx, "operations", key)?;
@@ -121,7 +121,7 @@ impl Inventory {
     /// Offline snapshot: the inventory process lock excludes the daemon and
     /// VACUUM INTO snapshots WAL contents without copying live SQLite files.
     pub fn backup(&self, output: &Path) -> Result<()> {
-        let _guard = self.mutation.lock().unwrap();
+        let _guard = self.mutation_guard()?;
         fs::absolute(output)?;
         if output.starts_with(&self.state_dir) || self.state_dir.starts_with(output) {
             return Err(Error::Conflict(

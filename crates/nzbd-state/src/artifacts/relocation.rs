@@ -14,7 +14,7 @@ impl Inventory {
     /// Journal before moving. A cross-volume move publishes a verified copy,
     /// then retires only the exact source entries captured by this operation.
     pub fn relocate(&self, job: u32, destination: &Path) -> Result<()> {
-        let guard = self.mutation.lock().unwrap();
+        let guard = self.mutation_guard()?;
         let mut source = self.for_job(job)?.ok_or(Error::NotFound)?;
         if source.path == destination {
             self.verify(&source)?;
@@ -147,10 +147,10 @@ impl Inventory {
                 }
                 Err(e) => return Err(e),
             }
-            let _guard = self.mutation.lock().unwrap();
+            let _guard = self.mutation_guard()?;
             self.commit_relocation(&mut op, &relocation)
         })();
-        let guard = self.mutation.lock().unwrap();
+        let guard = self.mutation_guard()?;
         if let Err(e) = &result {
             op.state = "review".into();
             op.error = Some(e.to_string());
@@ -162,7 +162,7 @@ impl Inventory {
             }
             // Keep the source identity at its known location when publication
             // did not happen, allowing PP to report retained files accurately.
-            if let Ok(_) = self.verify(&relocation.source) {
+            if self.verify(&relocation.source).is_ok() {
                 let mut retained = self.get(&relocation.source.id)?;
                 retained.state = "active".into();
                 retained.error = Some(e.to_string());
@@ -271,7 +271,7 @@ impl Inventory {
         Ok(())
     }
     pub fn reconcile_relocations(&self) -> Result<()> {
-        let guard = self.mutation.lock().unwrap();
+        let guard = self.mutation_guard()?;
         let raws = {
             let db = self.db.lock().unwrap();
             let mut stmt = db.prepare("SELECT data FROM operations WHERE state='running' AND json_extract(data,'$.kind')='relocate' LIMIT 25")?;

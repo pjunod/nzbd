@@ -131,6 +131,7 @@ impl Default for Settings {
 pub struct Inventory {
     db: Mutex<Connection>,
     _process_lock: File,
+    closed: std::sync::atomic::AtomicBool,
     state_dir: PathBuf,
     pub installation: String,
     // Serialized mutation coordinator. Reads never wait for filesystem work.
@@ -228,12 +229,29 @@ impl Inventory {
         Ok(Self {
             db: Mutex::new(db),
             _process_lock: process_lock,
+            closed: std::sync::atomic::AtomicBool::new(false),
             state_dir: state_dir.into(),
             installation,
             mutation: Mutex::new(()),
             clocks: Mutex::new(std::collections::HashMap::new()),
             reconcile_cursor: Mutex::new(String::new()),
         })
+    }
+    fn mutation_guard(&self) -> Result<std::sync::MutexGuard<'_, ()>> {
+        let guard = self.mutation.lock().unwrap();
+        if self.closed.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(Error::Conflict("inventory has stopped".into()));
+        }
+        Ok(guard)
+    }
+    /// Called only after the engine's writers and maintenance tasks finish.
+    /// Old API handles retain read access but cannot mutate a restarted daemon.
+    pub fn close(&self) -> Result<()> {
+        let _guard = self.mutation.lock().unwrap();
+        if !self.closed.swap(true, std::sync::atomic::Ordering::AcqRel) {
+            self._process_lock.unlock()?;
+        }
+        Ok(())
     }
     pub fn settings(&self) -> Result<Settings> {
         let db = self.db.lock().unwrap();
@@ -249,6 +267,7 @@ impl Inventory {
     }
     /// Advisory prerequisites never prevent accepting the enable switch.
     pub fn set_settings(&self, s: &Settings) -> Result<()> {
+        let _guard = self.mutation_guard()?;
         if s.failed_retention_days > 3650 {
             return Err(Error::Conflict(
                 "retention must be at most 3650 days".into(),
@@ -343,7 +362,7 @@ impl Inventory {
     /// Commit allocation intent before the directory exists or a writer opens
     /// a file. A directory already on disk must be explicitly adopted instead.
     pub fn allocate(&self, job: u32, root: &Path, path: &Path) -> Result<Artifact> {
-        let _guard = self.mutation.lock().unwrap();
+        let _guard = self.mutation_guard()?;
         if let Some(a) = self.for_job(job)? {
             if a.path == path && a.state == "active" {
                 self.verify(&a)?;
@@ -401,11 +420,28 @@ impl Inventory {
     /// Upgrade a live queue record without claiming its pre-existing bytes.
     /// It may resume writing; destructive actions still need operator adoption.
     pub fn register_legacy_active(&self, job: u32, root: &Path, path: &Path) -> Result<()> {
-        if self.for_job(job)?.is_some() || !path.exists() {
+        if !path.exists() {
             return Ok(());
         }
+        if let Some(mut previous) = self.for_job(job)? {
+            if previous.path == path && self.verify(&previous).is_ok() {
+                return Ok(());
+            }
+            let _guard = self.mutation_guard()?;
+            previous.job = None;
+            previous.state = if previous.path == path {
+                "source_gone"
+            } else {
+                "retained"
+            }
+            .into();
+            previous.keep = true;
+            previous.hold = Some("review: previous external job generation".into());
+            previous.revision += 1;
+            save_artifact(&self.db.lock().unwrap(), &previous)?;
+        }
         let mut a = self.discover(root, path, true)?;
-        let _guard = self.mutation.lock().unwrap();
+        let _guard = self.mutation_guard()?;
         a.job = Some(job);
         a.state = "active".into();
         save_artifact(&self.db.lock().unwrap(), &a)
@@ -414,7 +450,7 @@ impl Inventory {
     /// Called once before queue writers start, never from the periodic worker.
     pub fn reconcile_startup(&self, live_jobs: &[u32]) -> Result<()> {
         self.reconcile_relocations()?;
-        let _guard = self.mutation.lock().unwrap();
+        let _guard = self.mutation_guard()?;
         let rows = {
             let db = self.db.lock().unwrap();
             let mut stmt = db.prepare(
@@ -468,7 +504,7 @@ impl Inventory {
     }
 
     pub fn prepare_forget(&self, job: u32) -> Result<Option<Artifact>> {
-        let _guard = self.mutation.lock().unwrap();
+        let _guard = self.mutation_guard()?;
         let Some(mut a) = self.for_job(job)? else {
             return Ok(None);
         };
@@ -487,7 +523,7 @@ impl Inventory {
     }
 
     pub fn reconcile_missing(&self) -> Result<()> {
-        let _guard = self.mutation.lock().unwrap();
+        let _guard = self.mutation_guard()?;
         let raws = {
             let db = self.db.lock().unwrap();
             let mut stmt = db.prepare("SELECT data FROM artifacts WHERE state IN ('completed','retained','unknown','retiring') AND id>?1 ORDER BY id LIMIT 1000")?;
@@ -518,6 +554,7 @@ impl Inventory {
     }
 
     pub fn protect_roots(&self, roots: &[PathBuf]) -> Result<()> {
+        let _guard = self.mutation_guard()?;
         self.db.lock().unwrap().execute("INSERT INTO meta VALUES('protected_roots',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",[serde_json::to_string(roots)?])?;
         Ok(())
     }
@@ -589,8 +626,17 @@ impl Inventory {
     }
     /// Called at a writer/PP quiescence boundary, before publishing History.
     pub fn finish(&self, job: u32, path: &Path, root: &Path, state: &str) -> Result<Artifact> {
-        let _guard = self.mutation.lock().unwrap();
+        let _guard = self.mutation_guard()?;
         let mut a = self.for_job(job)?.ok_or(Error::NotFound)?;
+        // History may record a bounded PP failure while its independent
+        // deletion journal keeps retrying. Do not erase that pending authority.
+        if matches!(a.state.as_str(), "deleting" | "delete_failed")
+            && state == "retained"
+            && a.path == path
+            && a.root == root
+        {
+            return Ok(a);
+        }
         if a.path == path && a.state == state {
             self.verify(&a)?;
             return Ok(a);
@@ -634,7 +680,7 @@ impl Inventory {
     }
     /// Capture an unknown directory without granting deletion authority.
     pub fn discover(&self, root: &Path, path: &Path, active: bool) -> Result<Artifact> {
-        let _guard = self.mutation.lock().unwrap();
+        let _guard = self.mutation_guard()?;
         self.discover_record(root, path, active)
     }
     fn discover_unlocked(&self, root: &Path, path: &Path) -> Result<Artifact> {
@@ -684,7 +730,7 @@ impl Inventory {
         Ok(a)
     }
     pub fn inspect(&self, key: &str) -> Result<Artifact> {
-        let _guard = self.mutation.lock().unwrap();
+        let _guard = self.mutation_guard()?;
         let mut a = self.get(key)?;
         let dir = self.verify(&a)?;
         if matches!(
@@ -714,7 +760,7 @@ impl Inventory {
                     .into(),
             ));
         }
-        let _guard = self.mutation.lock().unwrap();
+        let _guard = self.mutation_guard()?;
         let mut a = self.get(key)?;
         if a.revision != revision
             || a.owned
@@ -754,7 +800,7 @@ impl Inventory {
         keep: bool,
         seconds: Option<u64>,
     ) -> Result<Artifact> {
-        let _guard = self.mutation.lock().unwrap();
+        let _guard = self.mutation_guard()?;
         let mut a = self.get(key)?;
         if a.revision != revision || matches!(a.state.as_str(), "deleting" | "deleted") {
             return Err(Error::Conflict(
@@ -802,7 +848,7 @@ impl Inventory {
         Ok(a)
     }
     pub fn release_review(&self, key: &str, revision: u64) -> Result<Artifact> {
-        let _guard = self.mutation.lock().unwrap();
+        let _guard = self.mutation_guard()?;
         let mut a = self.get(key)?;
         if a.revision != revision
             || !a
@@ -854,7 +900,7 @@ impl Inventory {
         undo_seconds: u64,
         automatic: bool,
     ) -> Result<Operation> {
-        let _guard = self.mutation.lock().unwrap();
+        let _guard = self.mutation_guard()?;
         if request_id.is_empty() || request_id.len() > 128 || undo_seconds > 60 {
             return Err(Error::Conflict(
                 "valid idempotency key and undo of 0–60 seconds required".into(),
@@ -916,7 +962,7 @@ impl Inventory {
         Ok(op)
     }
     pub fn cancel_delete(&self, key: &str) -> Result<Operation> {
-        let _guard = self.mutation.lock().unwrap();
+        let _guard = self.mutation_guard()?;
         let mut op = self.operation(key)?;
         if op.state != "queued" || !matches!(op.kind.as_str(), "delete" | "prune") {
             return Err(Error::Conflict(
@@ -928,7 +974,7 @@ impl Inventory {
         Ok(op)
     }
     pub fn execute_delete(&self, key: &str) -> Result<Operation> {
-        let _guard = self.mutation.lock().unwrap();
+        let _guard = self.mutation_guard()?;
         let mut op = self.operation(key)?;
         if op.kind != "delete" {
             return Err(Error::Conflict("not a deletion operation".into()));
@@ -1062,7 +1108,7 @@ impl Inventory {
         let enabled = self.settings()?.enabled;
         let mut due = Vec::new();
         {
-            let _guard = self.mutation.lock().unwrap();
+            let _guard = self.mutation_guard()?;
             let mut db = self.db.lock().unwrap();
             let tx = db.transaction()?;
             let raws = {
@@ -1141,7 +1187,7 @@ impl Inventory {
         Ok(())
     }
     pub fn compact(&self) -> Result<usize> {
-        let _guard = self.mutation.lock().unwrap();
+        let _guard = self.mutation_guard()?;
         let mut db = self.db.lock().unwrap();
         let tx = db.transaction()?;
         let rows = {
@@ -1221,7 +1267,7 @@ impl Inventory {
     /// Explicit restore quarantine; run before serving requests from a restored
     /// backup. Old retention and deletion intents cannot become active again.
     pub fn quarantine_restore(&self) -> Result<()> {
-        let _guard = self.mutation.lock().unwrap();
+        let _guard = self.mutation_guard()?;
         let mut db = self.db.lock().unwrap();
         let tx = db.transaction()?;
         let raws = {

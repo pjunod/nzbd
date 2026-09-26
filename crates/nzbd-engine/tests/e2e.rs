@@ -1228,9 +1228,9 @@ fn resume_after_unclean_restart_refetches_nothing_done() {
             "no progress before the crash"
         );
         std::mem::forget(ns); // avoid Drop-side effects during the hard kill
-        std::mem::forget(engine);
+        drop(engine); // runtime abortion drops the remaining owners, like process exit
     });
-    rt1.shutdown_background(); // kill -9 equivalent: no flush, no marker clear
+    rt1.shutdown_timeout(Duration::from_secs(5)); // abort tasks and release process resources without a graceful snapshot
 
     let done_before = journaled_segments(&journal);
     assert!(done_before.len() >= 3);

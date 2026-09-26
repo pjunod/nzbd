@@ -2,6 +2,7 @@ use super::*;
 
 impl Inventory {
     pub fn configure_scan(&self, request: serde_json::Value) -> Result<()> {
+        let _guard = self.mutation_guard()?;
         self.db.lock().unwrap().execute("INSERT INTO meta VALUES('scan_request',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value", [serde_json::to_string(&request)?])?;
         Ok(())
     }
@@ -50,7 +51,7 @@ impl Inventory {
         if !matches!(kind, "inspect" | "scan" | "stage" | "prune") {
             return Err(Error::Conflict("unknown task kind".into()));
         }
-        let _guard = self.mutation.lock().unwrap();
+        let _guard = self.mutation_guard()?;
         let db = self.db.lock().unwrap();
         let key = if request_id.is_empty() {
             id(&db)?

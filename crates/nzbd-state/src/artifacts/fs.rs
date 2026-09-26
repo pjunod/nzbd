@@ -364,6 +364,7 @@ pub fn remove_entry(root: &File, entry: &FileEntry) -> Result<()> {
 }
 
 #[cfg(unix)]
+#[allow(clippy::unnecessary_cast)] // statvfs field widths differ across Unix targets.
 pub fn available_bytes(dir: &File) -> Result<u64> {
     use std::os::fd::AsRawFd;
     let mut stat = std::mem::MaybeUninit::<libc::statvfs>::uninit();

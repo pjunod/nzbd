@@ -1058,7 +1058,7 @@ try {
     <p>Owned payloads survive History cleanup. Unknown folders stay on review hold until you inspect and adopt them.</p>
     <button onclick="scanFiles()">Scan configured folders</button>
     <button onclick="refreshFiles()">Refresh inventory</button>
-    <span id="files-message" role="status"></span>
+    <span id="files-message" role="status"></span><p id="files-discovery"></p>
     <label><input type="checkbox" id="files-show-terminal" onchange="filesOffset=0;refreshFiles()"> Show cleared payload records</label>
     <div id="files-list"></div>
     <button onclick="filesOffset=Math.max(0,filesOffset-100);refreshFiles()">Previous</button>
@@ -4507,6 +4507,7 @@ async function refreshFiles() {
     const response = await jfetch("/api/v1/artifacts?offset=" + filesOffset + "&include_terminal=" + $("files-show-terminal").checked);
     if (!response.ok) throw new Error("Inventory unavailable (" + response.status + ")");
     const data = await response.json();
+    $("files-discovery").textContent=data.discovery?"Last discovery: "+data.discovery.state+" · "+new Date(data.discovery.created_at*1000).toLocaleString()+(data.discovery.error?" · "+data.discovery.error:""):"Discovery has not run yet.";
     reconcileInventoryRows($("files-list"),data.entries.map(({artifact:a,files,bytes,earliest_expiry})=>({id:a.id,title:a.path,detail:a.state+" · "+files+" entries · "+fmtBytes(bytes)+" · "+(a.owned?"owned":"needs adoption")+" · "+(a.keep?"Keep":a.hold|| (earliest_expiry?"earliest expiry "+new Date(earliest_expiry*1000).toLocaleString():"no automatic expiry"))+(a.error?" · "+a.error:""),action:()=>openArtifact(a.id),label:"Inspect"})));
     const recoveries=await fileRequest("recoveries?include_terminal=true&offset="+filesRecoveryOffset,null,"GET");
     reconcileInventoryRows($("files-recoveries"),recoveries.map(r=>({id:r.id,title:r.id,detail:r.state+" · "+r.files.length+" files"+(r.error?" · "+r.error:""),label:"Delete receipted source files (8-second Undo)",action:["imported","partial"].includes(r.state)?async()=>{try{filesOperation=(await fileRequest("recoveries/"+r.id+"/delete-receipted-source")).id;await refreshFiles();}catch(e){filesError(e);}}:null})));

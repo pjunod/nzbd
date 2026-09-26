@@ -34,6 +34,55 @@ async fn spawn_engine(dir: &Path) -> EngineHandle {
     .expect("engine spawn")
 }
 
+// Synthetic completed jobs stand in for engine-created downloads. Explicitly
+// adopt their fixture bytes before import so destructive disposition tests
+// exercise owned payloads rather than silently granting ownership in production.
+trait FixtureImport {
+    async fn import_fixture_job(
+        &self,
+        base: &Path,
+        job: Job,
+        fold: bool,
+        emit: bool,
+    ) -> Result<(), nzbd_engine::EngineError>;
+}
+impl FixtureImport for EngineHandle {
+    async fn import_fixture_job(
+        &self,
+        base: &Path,
+        job: Job,
+        fold: bool,
+        emit: bool,
+    ) -> Result<(), nzbd_engine::EngineError> {
+        let name = nzbd_engine::queue::job_dir_name(&job);
+        let mut path = base.join("dest").join(&name);
+        if !path.is_dir() {
+            for entry in std::fs::read_dir(base).unwrap().flatten() {
+                let candidate = entry.path().join(&name);
+                if candidate.is_dir() {
+                    path = candidate;
+                    break;
+                }
+            }
+        }
+        let inventory = self.artifacts();
+        if path.is_dir() && inventory.for_job(job.id.0).unwrap().is_none() {
+            let a = inventory
+                .discover(path.parent().unwrap(), &path, false)
+                .unwrap();
+            let a = inventory.inspect(&a.id).unwrap();
+            let a = inventory.adopt(&a.id, a.revision).unwrap();
+            inventory
+                .retention(&a.id, a.revision, false, Some(0))
+                .unwrap();
+            inventory
+                .register_legacy_active(job.id.0, path.parent().unwrap(), &path)
+                .unwrap();
+        }
+        self.import_job(job, fold, emit).await
+    }
+}
+
 fn file_entry(id: u32, name: &str, crc32: Option<u32>, is_par2: bool) -> FileEntry {
     FileEntry {
         id: FileId(id),
@@ -165,6 +214,7 @@ async fn intact_quick_path_then_script() {
          [ \"$NZBPP_PARSTATUS\" = 1 ] || exit 94\n\
          [ \"$NZBPP_TOTALSTATUS\" = SUCCESS ] || exit 94\n\
          [ \"$NZBPR_mykey\" = myval ] || exit 94\n\
+         mkdir -p \"$NZBPP_DIRECTORY/final\"\n\
          echo \"[NZB] FINALDIR=$NZBPP_DIRECTORY/final\"\n\
          exit 93\n",
     )
@@ -178,7 +228,7 @@ async fn intact_quick_path_then_script() {
     let mut files = vec![file_entry(1, "payload.bin", Some(crc(&data)), false)];
     files.extend(par2_entries(&dir, 2));
     engine
-        .import_job(completed_job(1, "myjob", files), false, false)
+        .import_fixture_job(tmp.path(), completed_job(1, "myjob", files), false, false)
         .await
         .unwrap();
 
@@ -233,7 +283,7 @@ async fn corrupt_payload_gets_repaired() {
     let mut files = vec![file_entry(1, "payload.bin", Some(crc(&bad)), false)];
     files.extend(par2_entries(&dir, 2));
     engine
-        .import_job(completed_job(2, "damaged", files), false, false)
+        .import_fixture_job(tmp.path(), completed_job(2, "damaged", files), false, false)
         .await
         .unwrap();
 
@@ -278,7 +328,12 @@ async fn unrepairable_is_par_failure() {
     let mut files = vec![file_entry(1, "payload.bin", Some(crc(&bad)), false)];
     files.extend(par2_entries(&dir, 2));
     engine
-        .import_job(completed_job(3, "hopeless", files), false, false)
+        .import_fixture_job(
+            tmp.path(),
+            completed_job(3, "hopeless", files),
+            false,
+            false,
+        )
         .await
         .unwrap();
 
@@ -342,7 +397,12 @@ async fn par_failure_parks_or_keeps_per_config() {
         let mut files = vec![file_entry(1, "payload.bin", Some(crc(&bad)), false)];
         files.extend(par2_entries(&dir, 2));
         engine
-            .import_job(completed_job(job_id, "hopeless", files), false, false)
+            .import_fixture_job(
+                tmp.path(),
+                completed_job(job_id, "hopeless", files),
+                false,
+                false,
+            )
             .await
             .unwrap();
 
@@ -405,7 +465,7 @@ async fn unpack_then_cleanup() {
     let zip_bytes = std::fs::read(dir.join("release.zip")).unwrap();
     let files = vec![file_entry(1, "release.zip", Some(crc(&zip_bytes)), false)];
     engine
-        .import_job(completed_job(4, "packed", files), false, false)
+        .import_fixture_job(tmp.path(), completed_job(4, "packed", files), false, false)
         .await
         .unwrap();
 
@@ -459,7 +519,12 @@ async fn script_error_is_script_failure() {
         false,
     )];
     engine
-        .import_job(completed_job(5, "scripted", files), false, false)
+        .import_fixture_job(
+            tmp.path(),
+            completed_job(5, "scripted", files),
+            false,
+            false,
+        )
         .await
         .unwrap();
 
@@ -509,7 +574,7 @@ async fn manager_event_driven_and_restart_safe() {
 
     let files = vec![file_entry(1, "payload.bin", Some(crc(&data)), false)];
     engine
-        .import_job(completed_job(6, "watched", files), false, true)
+        .import_fixture_job(tmp.path(), completed_job(6, "watched", files), false, true)
         .await
         .unwrap();
 
@@ -611,7 +676,8 @@ async fn manager_restarts_a_hung_stage_in_place() {
     );
     tokio::time::sleep(Duration::from_millis(50)).await;
     engine
-        .import_job(
+        .import_fixture_job(
+            tmp.path(),
             completed_job(
                 60,
                 "recover-me",
@@ -693,7 +759,7 @@ async fn obfuscated_names_recovered_then_quick_verified() {
     let mut files = vec![file_entry(1, "d41d8cd9", Some(crc(&data)), false)];
     files.extend(par2_entries(&dir, 2));
     engine
-        .import_job(completed_job(7, "obfus", files), false, false)
+        .import_fixture_job(tmp.path(), completed_job(7, "obfus", files), false, false)
         .await
         .unwrap();
 
@@ -736,7 +802,8 @@ async fn deobfuscate_final_renames_to_job_name() {
         false,
     )];
     engine
-        .import_job(
+        .import_fixture_job(
+            tmp.path(),
             completed_job(11, "Great.Show.S02.1080p.WEB", files),
             false,
             false,
@@ -801,7 +868,12 @@ async fn deobfuscate_final_numbers_season_pack() {
         ));
     }
     engine
-        .import_job(completed_job(12, "Show.S03.1080p.WEB", files), false, false)
+        .import_fixture_job(
+            tmp.path(),
+            completed_job(12, "Show.S03.1080p.WEB", files),
+            false,
+            false,
+        )
         .await
         .unwrap();
 
@@ -854,7 +926,10 @@ async fn per_job_password_unlocks_archive() {
     let mut job = completed_job(8, "locked", files);
     job.params
         .push(("*Unpack:Password".into(), "hunter2".into()));
-    engine.import_job(job, false, false).await.unwrap();
+    engine
+        .import_fixture_job(tmp.path(), job, false, false)
+        .await
+        .unwrap();
 
     let hist = history(tmp.path());
     // deobfuscate off: the password path is under test, not final naming.
@@ -900,7 +975,10 @@ async fn health_action_delete_removes_files() {
     let files = vec![file_entry(1, "partial.bin", None, false)];
     let mut job = completed_job(9, "sick", files);
     job.status = JobStatus::Failed;
-    engine.import_job(job, false, true).await.unwrap();
+    engine
+        .import_fixture_job(tmp.path(), job, false, true)
+        .await
+        .unwrap();
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
@@ -965,7 +1043,10 @@ async fn permanently_undeletable_failed_job_retires_after_durable_retry_bound() 
         vec![file_entry(1, "partial.bin", None, false)],
     );
     job.status = JobStatus::Failed;
-    engine.import_job(job, false, true).await.unwrap();
+    engine
+        .import_fixture_job(tmp.path(), job, false, true)
+        .await
+        .unwrap();
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {
@@ -1085,10 +1166,9 @@ async fn permanently_undeletable_failed_job_retires_after_durable_retry_bound() 
         Some(dir.to_string_lossy().as_ref()),
         "history must name the leftover files that require operator cleanup"
     );
-    assert!(row
-        .params
-        .iter()
-        .any(|(key, value)| { key == "Failure:Files" && value.starts_with("delete failed:") }));
+    assert!(row.params.iter().any(|(key, value)| {
+        key == "Failure:Files" && value.starts_with("checked deletion pending:")
+    }));
     assert!(dir.join("partial.bin").is_file());
 
     // A finish event models another rescan finding the same queue row. The
@@ -1172,7 +1252,10 @@ async fn one_failed_row_seen_by_both_scan_and_event_spends_one_attempt() {
         vec![file_entry(1, "partial.bin", None, false)],
     );
     job.status = JobStatus::Failed;
-    engine.import_job(job, false, false).await.unwrap();
+    engine
+        .import_fixture_job(tmp.path(), job, false, false)
+        .await
+        .unwrap();
 
     let cancel = CancellationToken::new();
     let tracker = TaskTracker::new();
@@ -1209,7 +1292,10 @@ async fn one_failed_row_seen_by_both_scan_and_event_spends_one_attempt() {
         vec![file_entry(2, "partial.bin", None, false)],
     );
     barrier.status = JobStatus::Failed;
-    engine.import_job(barrier, false, false).await.unwrap();
+    engine
+        .import_fixture_job(tmp.path(), barrier, false, false)
+        .await
+        .unwrap();
 
     // The duplicate observation of job 95, then the barrier.
     engine.emit(nzbd_engine::Event::JobFinished {
@@ -1308,7 +1394,10 @@ async fn an_uncommitted_attempt_does_not_debounce_the_next_observation() {
         let mut job = completed_job(id, name, vec![file_entry(id, "partial.bin", None, false)]);
         job.status = JobStatus::Failed;
         job.params.push((FAILURE_AT_PARAM.into(), "1000".into()));
-        engine.import_job(job, false, false).await.unwrap();
+        engine
+            .import_fixture_job(tmp.path(), job, false, false)
+            .await
+            .unwrap();
     }
 
     // The state volume stops accepting writes. `save_snapshot` reports the
@@ -1436,7 +1525,10 @@ async fn failed_park_losing_admission_after_move_is_fenced_and_retried() {
         vec![file_entry(1, "partial.bin", None, false)],
     );
     job.status = JobStatus::Failed;
-    engine.import_job(job, false, true).await.unwrap();
+    engine
+        .import_fixture_job(tmp.path(), job, false, true)
+        .await
+        .unwrap();
     // Wait for the fence to be *reached* rather than assuming a fixed budget
     // covers reaching it (#107). Getting there means a cross-filesystem park
     // move plus a durable history write — real filesystem work — and a 200ms
@@ -1560,7 +1652,10 @@ async fn failed_job_is_not_stamped_when_durable_history_write_fails() {
     tokio::time::sleep(Duration::from_millis(50)).await;
     let mut job = completed_job(92, "history-full", Vec::new());
     job.status = JobStatus::Failed;
-    engine.import_job(job, false, true).await.unwrap();
+    engine
+        .import_fixture_job(tmp.path(), job, false, true)
+        .await
+        .unwrap();
     tokio::time::sleep(Duration::from_millis(200)).await;
     let retained = engine.export_job(JobId(92)).await.unwrap().unwrap();
     assert!(!retained.params.iter().any(|(key, _)| key == PP_DONE_PARAM));
@@ -1632,7 +1727,10 @@ async fn failed_job_waits_for_failure_key_snapshot_commit_before_side_effects() 
     let hist = history(&tmp.path().join("history"));
     let mut job = completed_job(93, "snapshot-full", Vec::new());
     job.status = JobStatus::Failed;
-    engine.import_job(job, false, true).await.unwrap();
+    engine
+        .import_fixture_job(tmp.path(), job, false, true)
+        .await
+        .unwrap();
     let durable_before = std::fs::read(state.join("queue.json")).unwrap();
 
     std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o555)).unwrap();
@@ -1746,7 +1844,10 @@ async fn failed_final_stamp_commit_rolls_back_live_state_and_retries_once() {
     tokio::time::sleep(Duration::from_millis(50)).await;
     let mut job = completed_job(94, "final-stamp-full", Vec::new());
     job.status = JobStatus::Failed;
-    engine.import_job(job, false, true).await.unwrap();
+    engine
+        .import_fixture_job(tmp.path(), job, false, true)
+        .await
+        .unwrap();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
     while hist.list(10).unwrap().is_empty() {
         assert!(tokio::time::Instant::now() < deadline);
@@ -1828,7 +1929,10 @@ async fn category_dest_dir_is_where_the_files_actually_land() {
     let library = tmp.path().join("library/tv");
     let mut job = completed_job(1, "catjob", vec![file_entry(1, "payload.bin", None, false)]);
     job.category = Some("TV".into()); // matched case-insensitively
-    engine.import_job(job, false, false).await.unwrap();
+    engine
+        .import_fixture_job(tmp.path(), job, false, false)
+        .await
+        .unwrap();
 
     let hist = history(tmp.path());
     let cfg = PostConfig {
@@ -1893,7 +1997,10 @@ async fn category_unpack_false_leaves_the_archive_alone() {
 
     let mut job = completed_job(1, "nounpack", vec![file_entry(1, "bundle.7z", None, false)]);
     job.category = Some("raw".into());
-    engine.import_job(job, false, false).await.unwrap();
+    engine
+        .import_fixture_job(tmp.path(), job, false, false)
+        .await
+        .unwrap();
 
     let hist = history(tmp.path());
     let cfg = PostConfig {
@@ -1959,7 +2066,10 @@ async fn category_extensions_select_which_scripts_run() {
         vec![file_entry(1, "payload.bin", None, false)],
     );
     job.category = Some("tv".into());
-    engine.import_job(job, false, false).await.unwrap();
+    engine
+        .import_fixture_job(tmp.path(), job, false, false)
+        .await
+        .unwrap();
 
     let hist = history(tmp.path());
     let cfg = PostConfig {
@@ -1996,7 +2106,10 @@ async fn a_job_without_a_category_rule_is_untouched_by_any_of_this() {
 
     let mut job = completed_job(1, "plain", vec![file_entry(1, "payload.bin", None, false)]);
     job.category = Some("movies".into()); // configured category is "tv"
-    engine.import_job(job, false, false).await.unwrap();
+    engine
+        .import_fixture_job(tmp.path(), job, false, false)
+        .await
+        .unwrap();
 
     let hist = history(tmp.path());
     let cfg = PostConfig {
@@ -2043,7 +2156,10 @@ async fn post_processing_resumes_after_a_crash_between_move_and_stamp() {
         vec![file_entry(1, "payload.bin", None, false)],
     );
     job.category = Some("tv".into());
-    engine.import_job(job, false, false).await.unwrap();
+    engine
+        .import_fixture_job(tmp.path(), job, false, false)
+        .await
+        .unwrap();
 
     let hist = history(tmp.path());
     let cfg = PostConfig {
@@ -2083,7 +2199,7 @@ async fn post_processing_resumes_after_a_crash_between_move_and_stamp() {
 /// would happily import from and that every later `rename` would then
 /// fail against with ENOTEMPTY.
 #[tokio::test]
-async fn an_interrupted_move_leaves_no_half_copied_folder_behind() {
+async fn legacy_move_scratch_is_kept_until_its_ownership_is_reviewed() {
     let tmp = tempfile::tempdir().unwrap();
     let engine = spawn_engine(tmp.path()).await;
     let dir = tmp.path().join("dest/atomic");
@@ -2098,7 +2214,10 @@ async fn an_interrupted_move_leaves_no_half_copied_folder_behind() {
 
     let mut job = completed_job(1, "atomic", vec![file_entry(1, "payload.bin", None, false)]);
     job.category = Some("tv".into());
-    engine.import_job(job, false, false).await.unwrap();
+    engine
+        .import_fixture_job(tmp.path(), job, false, false)
+        .await
+        .unwrap();
 
     let hist = history(tmp.path());
     let cfg = PostConfig {
@@ -2119,9 +2238,14 @@ async fn an_interrupted_move_leaves_no_half_copied_folder_behind() {
         b"content"
     );
     assert!(
-        !library.join("atomic.pp-move.local").exists(),
-        "a dead attempt's scratch dir must not accumulate in the library"
+        library.join("atomic.pp-move.local").exists(),
+        "an unjournaled legacy scratch directory must not be deleted by name"
     );
+    let unknown = engine
+        .artifacts()
+        .discover(&library, &library.join("atomic.pp-move.local"), false)
+        .unwrap();
+    assert!(!unknown.owned && unknown.keep);
     engine.shutdown().await;
 }
 
@@ -2207,7 +2331,7 @@ async fn a_multi_volume_archive_extracts_whole_or_fails() {
             .collect();
         let job_id = if drop_a_volume { 61 } else { 60 };
         engine
-            .import_job(completed_job(job_id, case, files), false, false)
+            .import_fixture_job(tmp.path(), completed_job(job_id, case, files), false, false)
             .await
             .unwrap();
 
@@ -2284,7 +2408,7 @@ async fn the_stage_timeline_reaches_history() {
     let mut files = vec![file_entry(1, "payload.bin", Some(crc(&data)), false)];
     files.extend(par2_entries(&dir, 2));
     engine
-        .import_job(completed_job(1, "timed", files), false, false)
+        .import_fixture_job(tmp.path(), completed_job(1, "timed", files), false, false)
         .await
         .unwrap();
 

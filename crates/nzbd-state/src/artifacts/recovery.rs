@@ -139,7 +139,7 @@ impl Inventory {
         paths: &[String],
         root: &Path,
     ) -> Result<Recovery> {
-        let _guard = self.mutation.lock().unwrap();
+        let _guard = self.mutation_guard()?;
         if paths.is_empty() || paths.len() > 1000 || request_id.is_empty() || request_id.len() > 128
         {
             return Err(Error::Conflict(
@@ -330,7 +330,7 @@ impl Inventory {
             File::open(&staging)?.sync_all()?;
             // Journal the complete manifest before publication. Crash recovery
             // may validate it and finish the acknowledgement without recopying.
-            let _publication_guard = self.mutation.lock().unwrap();
+            let _publication_guard = self.mutation_guard()?;
             if self.recovery(&r.id)?.state == "cancel_pending" {
                 return Err(Error::Conflict("staging cancelled".into()));
             }
@@ -347,7 +347,7 @@ impl Inventory {
             self.register_publication(&r)?;
             Ok(())
         })();
-        let _guard = self.mutation.lock().unwrap();
+        let _guard = self.mutation_guard()?;
         let cancelled = self.recovery(&r.id)?.state == "cancel_pending";
         match result {
             Ok(()) => r.state = "published".into(),
@@ -468,7 +468,7 @@ impl Inventory {
         Ok(r)
     }
     pub fn reconcile_recoveries(&self) -> Result<()> {
-        let _guard = self.mutation.lock().unwrap();
+        let _guard = self.mutation_guard()?;
         let pending = {
             let db = self.db.lock().unwrap();
             let mut stmt = db.prepare(
@@ -489,7 +489,7 @@ impl Inventory {
         import_id: &str,
         manifest: &str,
     ) -> Result<Recovery> {
-        let _guard = self.mutation.lock().unwrap();
+        let _guard = self.mutation_guard()?;
         let mut r = self.recovery(key)?;
         if r.manifest_digest != manifest || import_id.is_empty() {
             return Err(Error::Conflict(
@@ -522,7 +522,7 @@ impl Inventory {
         consumer: &str,
         receipt: Receipt,
     ) -> Result<Recovery> {
-        let _guard = self.mutation.lock().unwrap();
+        let _guard = self.mutation_guard()?;
         let mut r = self.recovery(key)?;
         if r.consumer.as_deref() != Some(consumer)
             || r.import_id.as_deref() != Some(&receipt.import_id)
@@ -601,7 +601,7 @@ impl Inventory {
         consumer: Option<&str>,
         ack: bool,
     ) -> Result<Recovery> {
-        let _guard = self.mutation.lock().unwrap();
+        let _guard = self.mutation_guard()?;
         let mut r = self.recovery(key)?;
         if matches!(r.state.as_str(), "staging" | "publishing")
             || (r.state == "cancel_pending" && r.consumer.is_none())
@@ -647,7 +647,7 @@ impl Inventory {
     /// Explicit, receipt-scoped source cleanup. Other source files and partial
     /// failures remain held; a receipt never authorizes deleting a whole tree.
     pub fn prune_receipted_source(&self, key: &str) -> Result<()> {
-        let _guard = self.mutation.lock().unwrap();
+        let _guard = self.mutation_guard()?;
         let r = self.recovery(key)?;
         if !matches!(r.state.as_str(), "imported" | "partial") {
             return Err(Error::Conflict(

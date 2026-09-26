@@ -363,7 +363,7 @@ fn protected_role_change_refuses_an_already_queued_deletion() {
     let op = db
         .request_delete(&a.id, a.revision, "root-role", 0)
         .unwrap();
-    db.protect_roots(&[a.path.clone()]).unwrap();
+    db.protect_roots(std::slice::from_ref(&a.path)).unwrap();
     assert_eq!(db.execute_delete(&op.id).unwrap().state, "review");
     assert!(a.path.exists());
 }
@@ -528,4 +528,17 @@ fn enabled_discovery_coalesces_and_scans_explicit_nested_category_roots() {
     assert_eq!(db.discovery_status().unwrap().unwrap().id, scan.id);
     let rows = db.list(0, 100).unwrap();
     assert!(rows.iter().any(|a| a.path == orphan && a.keep));
+}
+
+#[test]
+fn stopped_inventory_releases_lock_but_old_handles_cannot_mutate() {
+    let (tmp, db, root) = fixture();
+    let a = parked(&db, &root);
+    db.close().unwrap();
+    let restarted = Inventory::open(&tmp.path().join("state")).unwrap();
+    assert!(db
+        .request_delete(&a.id, a.revision, "stale-handle", 0)
+        .is_err());
+    assert!(db.set_settings(&Settings::default()).is_err());
+    assert_eq!(restarted.get(&a.id).unwrap().path, a.path);
 }

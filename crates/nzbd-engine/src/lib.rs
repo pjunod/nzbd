@@ -1176,6 +1176,9 @@ impl EngineHandle {
     pub async fn shutdown(&self) {
         self.cancel.cancel();
         self.tracker.wait().await;
+        if let Err(error) = self.artifacts.close() {
+            tracing::error!(%error,"inventory shutdown failed");
+        }
     }
 
     async fn send(&self, cmd: QueueCommand) -> Result<(), EngineError> {

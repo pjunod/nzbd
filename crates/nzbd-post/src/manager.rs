@@ -1329,7 +1329,15 @@ async fn process_job_ctx_from(
     ctx: &PpCtx,
     from: RestartPoint,
 ) -> Result<PpFinal, PostError> {
-    let _ = engine.set_job_status(job_id, JobStatus::PostQueued).await;
+    if !engine
+        .set_job_status(job_id, JobStatus::PostQueued)
+        .await
+        .map_err(|e| PostError::Subprocess(e.to_string()))?
+    {
+        return Err(PostError::Subprocess(
+            "job vanished or payload retirement started".into(),
+        ));
+    }
     let Some(job) = engine
         .export_job(job_id)
         .await
@@ -1810,8 +1818,22 @@ async fn process_job_ctx_from(
             } else {
                 "retained"
             };
-            let artifact = engine
-                .artifacts()
+            // Script-selected or legacy moved output is visible, but never
+            // inherits deletion authority solely from a returned path.
+            let inventory = engine.artifacts();
+            if inventory
+                .for_job(job_id.0)
+                .ok()
+                .flatten()
+                .is_none_or(|a| a.path != path)
+            {
+                inventory
+                    .register_legacy_active(job_id.0, path.parent().unwrap_or(dest_dir), path)
+                    .map_err(|e| {
+                        PostError::Subprocess(format!("external result inventory: {e}"))
+                    })?;
+            }
+            let artifact = inventory
                 .finish(job_id.0, path, path.parent().unwrap_or(dest_dir), state)
                 .map_err(|e| PostError::Subprocess(format!("file lifecycle finalization: {e}")))?;
             fin.params.retain(|(k, _)| k != "Artifact:Id");

@@ -1536,7 +1536,7 @@ impl Owner {
                     if record.torrent.is_some()
                         || matches!(
                             record.status,
-                            JobStatus::Post { .. } | JobStatus::PostQueued | JobStatus::Completed
+                            JobStatus::Post { .. } | JobStatus::PostQueued
                         )
                     {
                         return Err(
@@ -1926,6 +1926,10 @@ impl Owner {
                 let _ = reply.send(());
             }
             QueueCommand::SetJobStatus { job, status, reply } => {
+                if self.retiring_writers.contains_key(&job) {
+                    let _ = reply.send(false);
+                    return;
+                }
                 let ok = match self.state.job_mut(job) {
                     Some(j) => {
                         j.status = status;
@@ -2031,14 +2035,45 @@ impl Owner {
         if matches!(job.status, JobStatus::Downloading) {
             job.status = JobStatus::Queued;
         }
-        if job.torrent.is_none() {
-            if let Err(error) = self.artifacts.register_legacy_active(
-                job.id.0,
-                &self.dest_dir,
-                &self.dest_dir.join(job_dir_name(&job)),
-            ) {
+        if job.torrent.is_none()
+            && !matches!(
+                job.status,
+                JobStatus::Completed | JobStatus::Failed | JobStatus::Deleted
+            )
+        {
+            let relative = std::path::PathBuf::from(job_dir_name(&job));
+            if relative
+                .components()
+                .any(|c| !matches!(c, std::path::Component::Normal(_)))
+            {
+                return false;
+            }
+            let path = self.dest_dir.join(relative);
+            // Cluster grants may use nested, fenced generation directories.
+            // Register their bytes without local deletion authority.
+            if let Err(error) = std::fs::create_dir_all(&path) {
+                tracing::error!(job=job.id.0,%error,"cannot create granted payload directory");
+                return false;
+            }
+            self.allocated_jobs.remove(&job.id);
+            if let Err(error) =
+                self.artifacts
+                    .register_legacy_active(job.id.0, path.parent().unwrap(), &path)
+            {
                 tracing::error!(job=job.id.0, %error, "cluster payload inventory unavailable");
                 return false;
+            }
+        }
+        if job.torrent.is_none() && self.artifacts.for_job(job.id.0).ok().flatten().is_none() {
+            let path = self.dest_dir.join(job_dir_name(&job));
+            if path.is_dir() {
+                if let Err(error) =
+                    self.artifacts
+                        .register_legacy_active(job.id.0, path.parent().unwrap(), &path)
+                {
+                    tracing::error!(%error,"cannot inventory legacy completed payload");
+                    return false;
+                }
             }
         }
         let job_id = job.id;
