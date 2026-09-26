@@ -420,6 +420,12 @@ POST /api/v1/history-sync/pause
 POST /api/v1/history-sync/resume
 ```
 
+History status also reports the last scan kind, affected entry count, rebuilt
+file count, incomplete tails, and unrecognized complete lines. Normal shared
+appends use incremental ingestion automatically; startup and periodic full
+verification remain recovery safeguards. See
+[HISTORY_INCREMENTAL.md](HISTORY_INCREMENTAL.md) for interpretation and limits.
+
 History responses also include `sync`. Shared history can lag peer changes by
 one worker interval plus reconciliation/storage visibility time; there is no
 hard five-second freshness guarantee. Consumer observations enqueue without request-time storage writes and are

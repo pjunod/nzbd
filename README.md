@@ -136,6 +136,7 @@ NZBGet configuration and prints a mapping report.
 | [docs/STARTUP_RECOVERY_REVIEW.md](docs/STARTUP_RECOVERY_REVIEW.md) | Review of the 2026-09-25 startup delay: pending magnet retries held the API offline, plus fix and rollout checks |
 | [docs/HISTORY_LOADING_PLAN.md](docs/HISTORY_LOADING_PLAN.md) | History loading: measured root cause, implemented first release, operator controls, and remaining deployment validation |
 | [docs/HISTORY_LOADING_STATUS.md](docs/HISTORY_LOADING_STATUS.md) | History performance delivery status, review, final checks, and merge evidence |
+| [docs/HISTORY_INCREMENTAL.md](docs/HISTORY_INCREMENTAL.md) | Incremental history ingestion: delivery status, merge equivalence, recovery, and resource checks |
 | [docs/CLUSTERING.md](docs/CLUSTERING.md) | Cluster design (ADR-13…16), failure matrix, operations |
 | [docs/CLUSTERING_COMPLETION_PLAN.md](docs/CLUSTERING_COMPLETION_PLAN.md) | Current plurx comparison, recommended authority changes, and the finite C3 implementation/CI plan |
 | [docs/CLUSTERING_STATUS.md](docs/CLUSTERING_STATUS.md) | Cluster completion progress, review, validation, and remaining external evidence |

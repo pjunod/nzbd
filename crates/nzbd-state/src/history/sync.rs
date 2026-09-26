@@ -1,6 +1,9 @@
 //! Reconciliation is owned background work; HTTP reads use the local WAL view.
 use super::*;
+
+mod incremental;
 use std::collections::HashSet;
+#[cfg(test)]
 use std::io::{Read, Seek, SeekFrom};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, MutexGuard, Weak};
@@ -25,6 +28,11 @@ pub struct HistorySyncStatus {
     pub passes: u64,
     pub skipped_unchanged: u64,
     pub max_batch_ms: u64,
+    pub last_scan: &'static str,
+    pub last_entries_reconciled: u64,
+    pub last_files_rebuilt: u64,
+    pub last_incomplete_tails: u64,
+    pub last_malformed_lines: u64,
     pub index_path: PathBuf,
     pub placement: &'static str,
 }
@@ -64,6 +72,8 @@ pub(super) struct SyncControl {
     max_batch_ms: AtomicU64,
     pub(super) pending_seen: Mutex<std::collections::BTreeMap<u32, Seen>>,
     progress: Mutex<Progress>,
+    incremental: Mutex<incremental::Cache>,
+    last_scan: Mutex<incremental::ScanStats>,
     index_path: PathBuf,
     placement: &'static str,
 }
@@ -96,6 +106,8 @@ impl SyncControl {
                 skipped_unchanged: 0,
                 fingerprints: vec![],
             }),
+            incremental: Mutex::new(Default::default()),
+            last_scan: Mutex::new(Default::default()),
             index_path: path.to_owned(),
             placement: placement(path),
         }
@@ -109,22 +121,41 @@ impl SyncControl {
     }
 }
 
+/// Fence both edges of a mutation. A scanner can start while a writer is
+/// already inside its critical section; that scanner must fail after the
+/// writer finishes, even if it captured the writer's starting generation.
+pub(super) struct ReplayFence<'a> {
+    db: &'a HistoryDb,
+    _lock: MutexGuard<'a, ()>,
+}
+impl<'a> ReplayFence<'a> {
+    pub(super) fn new(db: &'a HistoryDb) -> Self {
+        let lock = db.sync.mutation.lock().unwrap();
+        db.sync.generation.fetch_add(1, Ordering::SeqCst);
+        Self { db, _lock: lock }
+    }
+}
+impl Drop for ReplayFence<'_> {
+    fn drop(&mut self) {
+        self.db.sync.generation.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
 /// Every local publication starts dirty. Only complete success clears that
 /// operation's repair requirement; an earlier failure remains dirty.
 pub(super) struct MutationGuard<'a> {
     db: &'a HistoryDb,
     previous_dirty: bool,
-    _lock: MutexGuard<'a, ()>,
+    _fence: ReplayFence<'a>,
 }
 impl<'a> MutationGuard<'a> {
     pub(super) fn new(db: &'a HistoryDb) -> Self {
-        let lock = db.sync.mutation.lock().unwrap();
-        db.sync.generation.fetch_add(1, Ordering::SeqCst);
+        let fence = ReplayFence::new(db);
         let previous_dirty = db.sync.dirty.swap(true, Ordering::SeqCst);
         Self {
             db,
             previous_dirty,
-            _lock: lock,
+            _fence: fence,
         }
     }
     pub(super) fn commit(self) {
@@ -226,6 +257,7 @@ impl HistoryDb {
 
     pub fn sync_status(&self) -> HistorySyncStatus {
         let p = self.sync.progress.lock().unwrap();
+        let scan = self.sync.last_scan.lock().unwrap();
         let paused = self.sync.paused.load(Ordering::SeqCst);
         let running = self.sync.running.load(Ordering::SeqCst);
         let stopping = self.sync.stopping.load(Ordering::SeqCst);
@@ -253,6 +285,11 @@ impl HistoryDb {
             passes: p.passes,
             skipped_unchanged: p.skipped_unchanged,
             max_batch_ms: self.sync.max_batch_ms.load(Ordering::Relaxed),
+            last_scan: scan.kind,
+            last_entries_reconciled: scan.entries,
+            last_files_rebuilt: scan.rebuilt,
+            last_incomplete_tails: scan.incomplete,
+            last_malformed_lines: scan.malformed,
             index_path: self.sync.index_path.clone(),
             placement: self.sync.placement,
         }
@@ -300,7 +337,8 @@ impl HistoryDb {
         Ok(())
     }
 
-    pub(super) fn replay_logs(&self, quiet: bool) -> Result<(), StateError> {
+    #[cfg(test)]
+    fn full_replay_logs(&self, quiet: bool) -> Result<(), StateError> {
         let Some(dir) = self.jsonl.as_ref().and_then(|p| p.parent()) else {
             return Ok(());
         };
@@ -748,7 +786,7 @@ pub(super) fn record_index_path(
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn entry(job: u32, at: i64) -> HistoryEntry {
+    pub(super) fn entry(job: u32, at: i64) -> HistoryEntry {
         HistoryEntry {
             job: crate::JobId(job),
             name: format!("job-{job}"),
