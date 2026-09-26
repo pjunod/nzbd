@@ -465,3 +465,67 @@ fn lifecycle_scale_one_million_tombstones() {
         "cached first-page latency exceeded design target"
     );
 }
+
+#[test]
+fn queued_expiry_is_invalidated_by_a_fresh_policy_or_disabled_automation() {
+    for disable in [false, true] {
+        let (_tmp, db, root) = fixture();
+        let mut a = parked(&db, &root);
+        db.set_settings(&Settings {
+            enabled: true,
+            ..Default::default()
+        })
+        .unwrap();
+        a.deadline = Some(now() - 1);
+        a.eligible_seconds = a.retention_seconds;
+        save_artifact(&db.db.lock().unwrap(), &a).unwrap();
+        let op = db
+            .request_delete_authorized(&a.id, a.revision, "expiry", 0, true)
+            .unwrap();
+        if disable {
+            db.set_settings(&Settings::default()).unwrap();
+        } else {
+            db.retention(&a.id, a.revision, false, Some(86400 * 30))
+                .unwrap();
+        }
+        assert_eq!(db.execute_delete(&op.id).unwrap().state, "cancelled");
+        assert!(a.path.join("episode.mkv").exists());
+    }
+}
+#[test]
+fn startup_orphaned_active_allocation_is_reviewable_and_detached_from_job_id() {
+    let (_tmp, db, root) = fixture();
+    let a = db.allocate(42, &root, &root.join("orphan")).unwrap();
+    std::fs::write(a.path.join("media.mkv"), b"keep").unwrap();
+    db.reconcile_startup(&[]).unwrap();
+    let orphan = db.get(&a.id).unwrap();
+    assert_eq!(orphan.state, "retained");
+    assert!(orphan.keep && orphan.hold.is_some());
+    assert!(db.for_job(42).unwrap().is_none());
+    assert!(db.inspect(&a.id).is_ok());
+    assert!(db.allocate(42, &root, &root.join("new-job")).is_ok());
+}
+#[test]
+fn enabled_discovery_coalesces_and_scans_explicit_nested_category_roots() {
+    let (_tmp, db, root) = fixture();
+    let category = root.join("tv");
+    std::fs::create_dir(&category).unwrap();
+    let orphan = category.join("old-media");
+    std::fs::create_dir(&orphan).unwrap();
+    db.configure_scan(
+        serde_json::json!({"roots":[root,category],"excluded":[category],"active":[]}),
+    )
+    .unwrap();
+    db.set_settings(&Settings {
+        enabled: true,
+        ..Default::default()
+    })
+    .unwrap();
+    db.tick().unwrap();
+    let scan = db.discovery_status().unwrap().unwrap();
+    assert_eq!(scan.state, "succeeded");
+    db.tick().unwrap();
+    assert_eq!(db.discovery_status().unwrap().unwrap().id, scan.id);
+    let rows = db.list(0, 100).unwrap();
+    assert!(rows.iter().any(|a| a.path == orphan && a.keep));
+}

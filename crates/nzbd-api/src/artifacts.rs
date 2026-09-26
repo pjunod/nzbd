@@ -209,7 +209,7 @@ fn config(st: &ApiState) -> Option<nzbd_config::Config> {
 async fn settings(State(st): State<ApiState>) -> Response {
     let db = st.engine.artifacts();
     let cfg = config(&st);
-    work(move||{let mut s=db.settings()?;let credential=!s.consumer_token.is_empty();s.consumer_token.clear();let mut advisory=Vec::new();advisory.push(json!({"requirement":"Consumer credential for claims and receipts","met":credential}));advisory.push(json!({"requirement":"Dedicated published recovery directory mounted read-only in Curator","met":null,"detail":"Configure /recovery separately from completed downloads; verify on the Curator host."}));if let Some(cfg)=cfg{advisory.push(json!({"requirement":"Single authoritative lifecycle writer","met":!cfg.cluster.enabled}));if s.recovery_root.as_os_str().is_empty(){s.recovery_root=nzbd_config::expand_home(&cfg.paths.main_dir).join("recovery");}}Ok(json!({"settings":s,"advisory":advisory,"installation":db.installation}))}).await
+    work(move||{let mut s=db.settings()?;let credential=!s.consumer_token.is_empty();s.consumer_token.clear();let mut advisory=Vec::new();advisory.push(json!({"requirement":"Consumer credential for claims and receipts","met":credential}));advisory.push(json!({"requirement":"Dedicated published recovery directory mounted read-only in Curator","met":null,"detail":"Configure /recovery separately from completed downloads; verify on the Curator host."}));if let Some(cfg)=cfg{advisory.push(json!({"requirement":"Single authoritative lifecycle writer","met":!cfg.cluster.enabled}));if s.recovery_root.as_os_str().is_empty(){s.recovery_root=nzbd_config::expand_home(&cfg.paths.main_dir).join("recovery");}}Ok(json!({"settings":s,"advisory":advisory,"installation":db.installation,"discovery":db.discovery_status()?}))}).await
 }
 #[derive(Deserialize)]
 struct SettingsUpdate {
@@ -236,6 +236,39 @@ async fn put_settings(State(st): State<ApiState>, Json(body): Json<SettingsUpdat
     })
     .await
 }
+pub(crate) fn scan_request(
+    cfg: &nzbd_config::Config,
+    db: &Inventory,
+    active: Vec<PathBuf>,
+) -> serde_json::Value {
+    let mut roots = vec![
+        nzbd_config::expand_home(&cfg.paths.main_dir),
+        cfg.dest_dir(),
+        cfg.post
+            .failed_dir
+            .as_ref()
+            .map(|p| nzbd_config::expand_home(p))
+            .unwrap_or_else(|| nzbd_config::expand_home(&cfg.paths.main_dir).join("failed")),
+    ];
+    if let Some(p) = &cfg.paths.inter_dir {
+        roots.push(nzbd_config::expand_home(p));
+    }
+    for category in &cfg.categories {
+        if let Some(p) = &category.dest_dir {
+            roots.push(nzbd_config::expand_home(p));
+        }
+    }
+    roots.sort();
+    roots.dedup();
+    let mut excluded: Vec<_> = cfg.storage_roots().into_iter().map(|r| r.path).collect();
+    excluded.push(nzbd_config::expand_home(&cfg.paths.main_dir).join("recovery"));
+    if let Ok(settings) = db.settings() {
+        if !settings.recovery_root.as_os_str().is_empty() {
+            excluded.push(settings.recovery_root);
+        }
+    }
+    json!({"roots":roots,"excluded":excluded,"active":active})
+}
 async fn scan(State(st): State<ApiState>) -> Response {
     let Some(cfg) = config(&st) else {
         return error(StatusCode::SERVICE_UNAVAILABLE, "configuration unavailable");
@@ -247,32 +280,8 @@ async fn scan(State(st): State<ApiState>) -> Response {
             active.push(cfg.dest_dir().join(nzbd_engine::queue::job_dir_name(&job)));
         }
     }
-    let mut roots = vec![
-        nzbd_config::expand_home(&cfg.paths.main_dir),
-        cfg.dest_dir(),
-        cfg.post
-            .failed_dir
-            .clone()
-            .unwrap_or_else(|| nzbd_config::expand_home(&cfg.paths.main_dir).join("failed")),
-    ];
-    if let Some(p) = &cfg.paths.inter_dir {
-        roots.push(nzbd_config::expand_home(p));
-    }
-    roots.sort();
-    roots.dedup();
-    let mut excluded: Vec<_> = cfg.storage_roots().into_iter().map(|r| r.path).collect();
-    excluded.push(nzbd_config::expand_home(&cfg.paths.main_dir).join("recovery"));
-    if let Ok(settings) = db.settings() {
-        if !settings.recovery_root.as_os_str().is_empty() {
-            excluded.push(settings.recovery_root);
-        }
-    }
-    match db.submit_task(
-        "scan",
-        "installation",
-        "",
-        json!({"roots":roots,"excluded":excluded,"active":active}),
-    ) {
+    let request = scan_request(&cfg, &db, active);
+    match db.submit_task("scan", "installation", "", request) {
         Ok(op) => (StatusCode::ACCEPTED, Json(op)).into_response(),
         Err(e) => failure(e),
     }
@@ -328,7 +337,7 @@ async fn stage(
 }
 async fn recoveries(State(st): State<ApiState>, Query(p): Query<Page>) -> Response {
     let db = st.engine.artifacts();
-    work(move || db.recoveries(p.offset)).await
+    work(move || db.recoveries_visible(p.offset, p.include_terminal)).await
 }
 async fn recovery(State(st): State<ApiState>, Path(id): Path<String>) -> Response {
     let db = st.engine.artifacts();

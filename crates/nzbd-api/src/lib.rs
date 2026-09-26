@@ -2733,6 +2733,13 @@ pub fn router_with(state: ApiState) -> Router {
         if let Err(error) = state.engine.artifacts().protect_roots(&roots) {
             tracing::error!(%error,"could not persist protected directory roles");
         }
+        let cfg = setup.current.lock().unwrap().clone();
+        let inventory = state.engine.artifacts();
+        if let Err(error) =
+            inventory.configure_scan(artifacts::scan_request(&cfg, &inventory, Vec::new()))
+        {
+            tracing::error!(%error,"could not persist discovery scopes");
+        }
     }
     let state = ApiState {
         events: state

@@ -229,6 +229,24 @@ impl Inventory {
             old.deadline = None;
             self.sidecar(&old)?;
             save_artifact(&tx, &old)?;
+            if old.owned && !old.keep && old.hold.is_none() {
+                // Publication and retirement admission share one transaction.
+                save_operation(
+                    &tx,
+                    &Operation {
+                        id: format!("retire-{}", op.id),
+                        artifact: old.id.clone(),
+                        kind: "delete".into(),
+                        state: "queued".into(),
+                        request: serde_json::to_string(&(&old.id, old.revision, 0u64, false))?,
+                        created_at: now(),
+                        not_before: now(),
+                        attempts: 0,
+                        next_retry: 0,
+                        error: None,
+                    },
+                )?;
+            }
         }
         save_artifact(&tx, &current)?;
         op.state = "succeeded".into();

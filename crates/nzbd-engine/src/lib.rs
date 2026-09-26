@@ -726,12 +726,18 @@ impl EngineHandle {
                 };
             };
             if artifact.state != "deleted" {
-                if !artifact.owned || artifact.keep || artifact.hold.is_some() {
+                if !artifact.owned
+                    || artifact.keep
+                    || artifact
+                        .hold
+                        .as_deref()
+                        .is_some_and(|h| h != "waiting for writer stop")
+                {
                     return Err(EngineError::Lifecycle(
                         "payload has Keep, recovery, or ownership review hold".into(),
                     ));
                 }
-                if artifact.state == "active" {
+                if matches!(artifact.state.as_str(), "active" | "retiring") {
                     let (tx, rx) = oneshot::channel();
                     self.send(QueueCommand::QuiescePayload { job, reply: tx })
                         .await?;

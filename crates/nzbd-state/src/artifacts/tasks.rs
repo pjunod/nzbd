@@ -1,6 +1,43 @@
 use super::*;
 
 impl Inventory {
+    pub fn configure_scan(&self, request: serde_json::Value) -> Result<()> {
+        self.db.lock().unwrap().execute("INSERT INTO meta VALUES('scan_request',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value", [serde_json::to_string(&request)?])?;
+        Ok(())
+    }
+    pub fn discovery_status(&self) -> Result<Option<Operation>> {
+        let raw: Option<String> = self.db.lock().unwrap().query_row("SELECT data FROM operations WHERE json_extract(data,'$.kind')='scan' ORDER BY json_extract(data,'$.created_at') DESC LIMIT 1", [], |r| r.get(0)).optional()?;
+        raw.map(|r| serde_json::from_str(&r).map_err(Error::from))
+            .transpose()
+    }
+    pub(super) fn schedule_discovery(&self) -> Result<()> {
+        if !self.settings()?.enabled {
+            return Ok(());
+        }
+        if self.discovery_status()?.is_some_and(|o| {
+            matches!(o.state.as_str(), "queued" | "running") || o.created_at > now() - 900
+        }) {
+            return Ok(());
+        }
+        let request: Option<String> = self
+            .db
+            .lock()
+            .unwrap()
+            .query_row("SELECT value FROM meta WHERE key='scan_request'", [], |r| {
+                r.get(0)
+            })
+            .optional()?;
+        if let Some(raw) = request {
+            self.submit_task(
+                "scan",
+                "installation",
+                &format!("periodic-scan-{}", now() / 900),
+                serde_json::from_str(&raw)?,
+            )?;
+        }
+        Ok(())
+    }
+
     /// Durable admission for filesystem inspection and recovery copying. A
     /// 202 response always names a persisted task, including before a restart.
     pub fn submit_task(

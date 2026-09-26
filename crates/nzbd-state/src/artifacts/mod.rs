@@ -417,14 +417,18 @@ impl Inventory {
         let _guard = self.mutation.lock().unwrap();
         let rows = {
             let db = self.db.lock().unwrap();
-            let mut stmt =
-                db.prepare("SELECT data FROM artifacts WHERE state IN ('allocating','retiring')")?;
+            let mut stmt = db.prepare(
+                "SELECT data FROM artifacts WHERE state IN ('allocating','retiring','active')",
+            )?;
             let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
             rows.collect::<std::result::Result<Vec<_>, _>>()?
         };
         for raw in rows {
             let mut a: Artifact = serde_json::from_str(&raw)?;
             let live = a.job.is_some_and(|job| live_jobs.contains(&job));
+            if a.state == "active" && live {
+                continue;
+            }
             if self.verify_root(&a).is_err() {
                 continue;
             }
@@ -444,15 +448,17 @@ impl Inventory {
                     a.hold = Some("review".into());
                     a.state = if live { "active" } else { "retained" }.into();
                 }
-            } else if live {
-                a.state = "active".into();
-                a.hold = if a.owned { None } else { Some("review".into()) };
             } else if let Ok(dir) = self.verify(&a) {
                 a.files = fs::manifest(&dir, 100_000)?;
                 a.state = "retained".into();
                 a.hold = if a.owned { None } else { Some("review".into()) };
             } else {
                 a.hold = Some("review: interrupted writer retirement".into());
+            }
+            if !live {
+                a.job = None;
+                a.keep = true;
+                a.hold = Some("review: allocation has no recovered job".into());
             }
             a.revision += 1;
             a.updated_at = now();
@@ -466,6 +472,9 @@ impl Inventory {
         let Some(mut a) = self.for_job(job)? else {
             return Ok(None);
         };
+        if a.state == "retiring" {
+            return Ok(Some(a));
+        }
         if a.state != "active" {
             return Ok(None);
         }
@@ -835,13 +844,23 @@ impl Inventory {
         request_id: &str,
         undo_seconds: u64,
     ) -> Result<Operation> {
+        self.request_delete_authorized(key, revision, request_id, undo_seconds, false)
+    }
+    fn request_delete_authorized(
+        &self,
+        key: &str,
+        revision: u64,
+        request_id: &str,
+        undo_seconds: u64,
+        automatic: bool,
+    ) -> Result<Operation> {
         let _guard = self.mutation.lock().unwrap();
         if request_id.is_empty() || request_id.len() > 128 || undo_seconds > 60 {
             return Err(Error::Conflict(
                 "valid idempotency key and undo of 0–60 seconds required".into(),
             ));
         }
-        let request = serde_json::to_string(&(key, revision, undo_seconds))?;
+        let request = serde_json::to_string(&(key, revision, undo_seconds, automatic))?;
         match self.operation(request_id) {
             Ok(op) => {
                 return if op.request == request {
@@ -921,6 +940,21 @@ impl Inventory {
             return Ok(op);
         }
         let mut a = self.get(&op.artifact)?;
+        let (_, revision, _, automatic): (String, u64, u64, bool) =
+            serde_json::from_str(&op.request)?;
+        if op.attempts == 0
+            && (a.revision != revision
+                || (automatic
+                    && (!self.settings()?.enabled
+                        || !a.eligible()
+                        || a.eligible_seconds < a.retention_seconds
+                        || !a.deadline.is_some_and(|d| d <= now()))))
+        {
+            op.state = "cancelled".into();
+            op.error = Some("deletion authorization changed; a fresh request is required".into());
+            save_operation(&self.db.lock().unwrap(), &op)?;
+            return Ok(op);
+        }
         if a.keep || a.hold.is_some() || !a.owned {
             return Err(Error::Conflict("payload acquired a hold".into()));
         }
@@ -1076,7 +1110,15 @@ impl Inventory {
             tx.commit()?;
         }
         for (key, revision) in due {
-            self.request_delete(&key, revision, &format!("retention-{key}-{revision}"), 0)?;
+            if let Err(e) = self.request_delete_authorized(
+                &key,
+                revision,
+                &format!("retention-{key}-{revision}"),
+                0,
+                true,
+            ) {
+                tracing::warn!(artifact=%key,error=%e,"expiry changed before admission");
+            }
         }
         let pending = {
             let db = self.db.lock().unwrap();
@@ -1092,6 +1134,7 @@ impl Inventory {
             }
         }
         self.reconcile_recoveries()?;
+        self.schedule_discovery()?;
         self.run_tasks()?;
         self.reconcile_missing()?;
         self.compact()?;
@@ -1197,6 +1240,7 @@ impl Inventory {
             a.revision += 1;
             save_artifact(&tx, &a)?;
         }
+        tx.execute("UPDATE recoveries SET state='review', data=json_set(data,'$.state','review','$.error','Restored backup: reconcile consumer and create a fresh handoff') WHERE state NOT IN ('imported','cancelled')", [])?;
         let ops = {
             let mut stmt = tx.prepare(
                 "SELECT data FROM operations WHERE state IN ('queued','running','retry')",

@@ -112,3 +112,24 @@ inventory performance fixture is reserved for the final verification phase.
 Compilation/type checks are the only validation performed so far. Unit tests,
 repository gates, the performance fixture, PR creation and merge are next, after
 review findings are addressed. No deployment or live-media cleanup is planned.
+
+## 8. Adversarial review corrections and verification
+
+Three reviewers completed read-only implementation reviews. Corrections retain
+writer-stop acknowledgements across retries, fence retiring jobs, invalidate
+stale expiry authorization, cache active writer allocation, reconcile abandoned
+allocations, and atomically journal cross-volume source retirement. Discovery
+now runs every 15 minutes when enabled and includes category roots; handoff
+listing is paginated.
+
+Curator rejects colliding destinations/episode assignments, imports complete
+staged handoffs, verifies surviving publications before receipts, repeats fsync
+when reconciling publication, and rolls back uncommitted publication before
+acknowledging cancellation. Ordinary reimports get a fresh placement generation;
+ebook replacement cleanup is journaled. Recognized obfuscated media uses its
+content-derived destination extension without changing the original filename.
+
+Decision: select the recovery subset in Runner before staging. Curator imports
+that immutable handoff together; it does not claim a subset and strand the rest.
+Enable controls remain advisory and unrestricted. Final test pass is starting;
+PRs and merges are still pending.

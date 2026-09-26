@@ -70,6 +70,19 @@ impl Inventory {
         let rows = stmt.query_map([offset as i64], |r| r.get::<_, String>(0))?;
         rows.map(|r| Ok(serde_json::from_str(&r?)?)).collect()
     }
+    pub fn recoveries_visible(
+        &self,
+        offset: usize,
+        include_terminal: bool,
+    ) -> Result<Vec<Recovery>> {
+        if include_terminal {
+            return self.recoveries(offset);
+        }
+        let db = self.db.lock().unwrap();
+        let mut stmt = db.prepare("SELECT data FROM recoveries WHERE state NOT IN ('imported','cancelled') ORDER BY id LIMIT 100 OFFSET ?1")?;
+        let rows = stmt.query_map([offset as i64], |r| r.get::<_, String>(0))?;
+        rows.map(|r| Ok(serde_json::from_str(&r?)?)).collect()
+    }
     /// Copies are independent inodes. Originals are held before scratch is
     /// allocated, and remain held through ambiguous claims or partial receipts.
     pub fn preview_recovery(

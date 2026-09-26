@@ -464,6 +464,8 @@ pub(crate) struct Owner {
     attempts: HashMap<SegRef, SegmentAttempt>,
     blocked: HashMap<ServerId, Instant>,
     writers: HashMap<FileId, WriterHandle>,
+    retiring_writers: HashMap<JobId, Vec<WriterHandle>>,
+    allocated_jobs: HashSet<JobId>,
     finalize_sent: HashSet<FileId>,
     pending_finalize: Vec<(JobId, FileId)>,
     /// Background par2-name inspections already started for each job.
@@ -823,12 +825,37 @@ impl Owner {
             );
         }
 
+        let mut allocated_jobs = HashSet::new();
+        let mut retiring_writers = HashMap::new();
+        // Validate recovered allocations before the actor starts. Segment
+        // scheduling subsequently consults only actor-owned admission state.
+        for job in &mut state.jobs {
+            if job.torrent.is_some() {
+                continue;
+            }
+            if let Some(a) = artifacts
+                .for_job(job.id.0)
+                .map_err(|e| nzbd_state::StateError::Corrupt(e.to_string()))?
+            {
+                if a.state == "active" {
+                    artifacts
+                        .allocate(job.id.0, &a.root, &a.path)
+                        .map_err(|e| nzbd_state::StateError::Corrupt(e.to_string()))?;
+                    allocated_jobs.insert(job.id);
+                } else if a.state == "retained" {
+                    job.status = JobStatus::Paused;
+                    retiring_writers.insert(job.id, Vec::new());
+                }
+            }
+        }
         let initial_disk_hold = tuning.min_free_disk_bytes > 0;
         Ok(Owner {
             state,
             attempts: HashMap::new(),
             blocked: HashMap::new(),
             writers: HashMap::new(),
+            retiring_writers,
+            allocated_jobs,
             finalize_sent: HashSet::new(),
             pending_finalize: Vec::new(),
             pending_name_inspections: HashMap::new(),
@@ -1175,6 +1202,22 @@ impl Owner {
                 // Nothing has been written yet, so a better name may take
                 // the directory with it.
                 let name = self.name_from_requestor(id, true).unwrap_or(name);
+                if let Some(job) = self.state.job_mut(id) {
+                    let base = job_dir_name(job);
+                    // Requeue creates a new allocation, never implicitly adopts
+                    // bytes retained by the previous job incarnation.
+                    if self.dest_dir.join(&base).exists() {
+                        let mut suffix = 0u32;
+                        loop {
+                            let candidate = format!("{base}.job-{}-{suffix}", id.0);
+                            if !self.dest_dir.join(&candidate).exists() {
+                                job.dir_name = candidate;
+                                break;
+                            }
+                            suffix += 1;
+                        }
+                    }
+                }
                 let allocation = self.ensure_allocation(id);
                 if let Err(e) = allocation {
                     self.state.jobs.retain(|j| j.id != id);
@@ -1414,6 +1457,10 @@ impl Owner {
                 let _ = reply.send(ok);
             }
             QueueCommand::Resume { job, reply } => {
+                if self.retiring_writers.contains_key(&job) {
+                    let _ = reply.send(false);
+                    return;
+                }
                 if self
                     .state
                     .job(job)
@@ -1497,14 +1544,19 @@ impl Owner {
                                 .to_string(),
                         );
                     }
+                    self.artifacts
+                        .prepare_forget(job.0)
+                        .map_err(|e| e.to_string())?;
                     record.status = JobStatus::Paused;
-                    let mut writers = Vec::new();
+                    self.allocated_jobs.remove(&job);
+                    let writers = self.retiring_writers.entry(job).or_default();
                     for file in &record.files {
                         if let Some(writer) = self.writers.remove(&file.id) {
                             writer.stop.cancel();
                             writers.push(writer);
                         }
                     }
+                    let writers = writers.clone();
                     self.attempts.retain(|r, _| r.job != job);
                     self.pending_finalize.retain(|(j, _)| *j != job);
                     self.save_snapshot();
@@ -2818,13 +2870,22 @@ impl Owner {
 
     // -- writers -------------------------------------------------------------
 
-    fn ensure_allocation(&self, job: JobId) -> Result<(), nzbd_state::artifacts::Error> {
+    fn ensure_allocation(&mut self, job: JobId) -> Result<(), nzbd_state::artifacts::Error> {
+        if self.retiring_writers.contains_key(&job) {
+            return Err(nzbd_state::artifacts::Error::Conflict(
+                "writer retirement in progress".into(),
+            ));
+        }
+        if self.allocated_jobs.contains(&job) {
+            return Ok(());
+        }
         let record = self
             .state
             .job(job)
             .ok_or(nzbd_state::artifacts::Error::NotFound)?;
         let dir = self.dest_dir.join(job_dir_name(record));
         self.artifacts.allocate(job.0, &self.dest_dir, &dir)?;
+        self.allocated_jobs.insert(job);
         Ok(())
     }
 
@@ -2989,7 +3050,8 @@ impl Owner {
                 return false;
             }
         };
-        let mut stopping = Vec::new();
+        let mut stopping = self.retiring_writers.remove(&job_id).unwrap_or_default();
+        self.allocated_jobs.remove(&job_id);
         let job = self.state.jobs.remove(idx);
         for f in &job.files {
             if let Some(writer) = self.writers.remove(&f.id) {
@@ -4422,6 +4484,56 @@ mod tests {
         )
         .unwrap();
         (tmp, owner, adapter)
+    }
+
+    #[tokio::test]
+    async fn payload_retirement_retries_keep_original_acknowledgements_and_fence_resume() {
+        let (_tmp, mut owner, _adapter) = control_test_owner();
+        std::fs::create_dir_all(&owner.dest_dir).unwrap();
+        let job = pending_job(1);
+        let file = job.files[0].id;
+        owner.state.jobs.push(job);
+        owner.ensure_allocation(JobId(1)).unwrap();
+        let (tx, _rx) = mpsc::channel(1);
+        let (done, stopped) = watch::channel(false);
+        owner.writers.insert(
+            file,
+            WriterHandle {
+                tx,
+                stop: CancellationToken::new(),
+                stopped,
+            },
+        );
+        let (reply, rx) = oneshot::channel();
+        owner.on_command(QueueCommand::QuiescePayload {
+            job: JobId(1),
+            reply,
+        });
+        let first = rx.await.unwrap().unwrap();
+        assert_eq!(first.len(), 1);
+        assert!(!*first[0].stopped.borrow());
+        drop(first); // the timed-out HTTP request loses its receivers
+        let (reply, rx) = oneshot::channel();
+        owner.on_command(QueueCommand::Resume {
+            job: JobId(1),
+            reply,
+        });
+        assert!(!rx.await.unwrap());
+        assert!(owner.ensure_allocation(JobId(1)).is_err());
+        let (reply, rx) = oneshot::channel();
+        owner.on_command(QueueCommand::QuiescePayload {
+            job: JobId(1),
+            reply,
+        });
+        let mut retry = rx.await.unwrap().unwrap();
+        assert_eq!(retry.len(), 1);
+        assert!(!*retry[0].stopped.borrow());
+        done.send(true).unwrap();
+        retry[0].stopped.wait_for(|v| *v).await.unwrap();
+        assert_eq!(
+            owner.artifacts.for_job(1).unwrap().unwrap().state,
+            "retiring"
+        );
     }
 
     fn control_torrent_job() -> Job {
