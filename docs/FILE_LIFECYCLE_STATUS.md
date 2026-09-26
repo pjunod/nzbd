@@ -23,7 +23,7 @@ one PR per repository. No deployment or live-media cleanup is included.
 | F5: Curator recovery import | Implemented and locally verified |
 | F6: settings, cleanup and operations | Implemented and locally verified |
 | Final adversarial review | Three reviewers completed; findings addressed |
-| PRs and merge | Curator [#41](https://github.com/pjunod/curator/pull/41) in CI; Runner PR next |
+| PRs and merge | Runner [#239](https://github.com/pjunod/runner/pull/239) and Curator [#41](https://github.com/pjunod/curator/pull/41) in CI |
 
 ## 2. Decisions
 
@@ -74,8 +74,9 @@ Curator local verification completed:
   tests; zero lint issues; generated sources consistent; production build passed.
 - CI browser, mobile, Docker, lint and fake-consumer contracts pass. Linux CI
   unit assertions pass, but aggregate coverage is 85.6% against the 86.0% floor;
-  additional failure-path coverage is being added before merge.
+  additional passing failure-path coverage raises the combined local measurement to 86.4%; Linux CI is running again.
 
 Remaining acceptance: green CI on final PR heads and merge. Real two-process
-recovery and 100,000-entry filesystem load checks have not yet been recorded.
+recovery and 100,000-entry filesystem load checks are currently running against
+disposable fixtures.
 No deployment has been performed.
