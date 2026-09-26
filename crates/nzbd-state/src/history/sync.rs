@@ -435,21 +435,10 @@ impl HistoryDb {
         if tombstones.is_empty() {
             return Ok(());
         }
-        // One indexed snapshot avoids rescanning the growing tombstone table
-        // for every batch. The live delete path keeps its atomic transaction.
-        let existing = {
-            let conn = self.reader.lock().unwrap();
-            let mut statement = conn
-                .prepare("SELECT job_id, completed_at FROM history_tombstones")
-                .map_err(sql_error)?;
-            let keys = statement
-                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
-                .map_err(sql_error)?
-                .collect::<Result<HashSet<HistoryKey>, _>>()
-                .map_err(sql_error)?;
-            keys
-        };
-        let pending: Vec<_> = tombstones.difference(&existing).copied().collect();
+        // Probe only incoming keys in bounded writer transactions. Reading the
+        // lifetime tombstone table here would make one appended deletion O(all
+        // prior deletions) and contend with history pages' reader connection.
+        let pending: Vec<_> = tombstones.iter().copied().collect();
         for batch in pending.chunks(16) {
             self.replay_tombstone_batch(batch, quiet, generation)?;
         }
@@ -469,16 +458,19 @@ impl HistoryDb {
         let tx = conn.transaction().map_err(sql_error)?;
         for (job, at) in keys {
             self.replay_checkpoint(quiet, generation)?;
-            tx.prepare_cached(
-                "INSERT OR IGNORE INTO history_tombstones(job_id,completed_at) VALUES(?1,?2)",
-            )
-            .map_err(sql_error)?
-            .execute(rusqlite::params![job, at])
-            .map_err(sql_error)?;
-            tx.prepare_cached("DELETE FROM history WHERE job_id=?1 AND completed_at=?2")
+            let inserted = tx
+                .prepare_cached(
+                    "INSERT OR IGNORE INTO history_tombstones(job_id,completed_at) VALUES(?1,?2)",
+                )
                 .map_err(sql_error)?
                 .execute(rusqlite::params![job, at])
                 .map_err(sql_error)?;
+            if inserted != 0 {
+                tx.prepare_cached("DELETE FROM history WHERE job_id=?1 AND completed_at=?2")
+                    .map_err(sql_error)?
+                    .execute(rusqlite::params![job, at])
+                    .map_err(sql_error)?;
+            }
         }
         tx.commit().map_err(sql_error)?;
         self.sync

@@ -1,6 +1,6 @@
 # Incremental history ingestion
 
-**Status:** implementation complete; preparing adversarial review ·
+**Status:** review addressed; 73 state tests passed; final CI tracked in PR #238 ·
 **Updated:** 2026-09-25 · **Branch:** `codex/history-incremental`
 
 This completes M6 from [HISTORY_LOADING_PLAN.md](HISTORY_LOADING_PLAN.md).
@@ -8,6 +8,8 @@ The first PR removed reconciliation from history requests. This change makes
 normal shared-log catch-up read new bytes and reconcile affected completion
 keys. The JSONL format, cursor contract, and merge precedence stay intact.
 Work uses the independent clone at `/private/tmp/nzbd-history-loading`.
+[PR #238](https://github.com/pjunod/runner/pull/238) is the live delivery status
+page for final review, checks, and merge.
 
 ## 1. Delivery status
 
@@ -17,8 +19,9 @@ Work uses the independent clone at `/private/tmp/nzbd-history-loading`.
 | Merge and recovery behavior | Implemented | Sorted-file precedence, first immutable payload, last effective mutable values, monotone tombstones, retention, stable cursors. |
 | Concurrency and failure handling | Implemented | Publish cache only after successful database batches; fence both edges of local mutations. |
 | Operator visibility | Implemented | History shows scan kind, affected entry count, rebuilt files, incomplete tails, and unrecognized lines. |
-| Adversarial review | Pending | One review of the complete candidate before unit tests. |
-| Final tests and PR merge | Pending | Fix review findings, run final affected tests and required CI, then merge. |
+| Adversarial review | Addressed | One P2: appended tombstones scanned the lifetime set using the page-reader connection. Now indexed writer-only work. |
+| Final tests | Local affected suite passed | 73 state tests passed; one opt-in benchmark ignored. [Live CI checks](https://github.com/pjunod/runner/pull/238/checks). |
+| Merge | Tracked live | [PR #238](https://github.com/pjunod/runner/pull/238) records final checks and merge. |
 
 ## 2. Contract
 
@@ -131,7 +134,18 @@ Run unit tests only after the combined adversarial review and remediation:
 cargo test --locked -p nzbd-state --lib
 ```
 
-Final evidence will be linked from this status page and the combined PR.
+The single adversarial review found one P2 performance defect: the reused
+replay helper scanned all historical tombstones while holding the page reader.
+It now checks incoming keys through the unique index in bounded writer
+transactions and skips deletes for already-known tombstones. A regression
+adds new and duplicate tombstones against 5,000 existing tombstones while
+holding the page-reader connection; ingestion must complete independently.
+
+After the review fix, all 73 state unit tests passed (one opt-in benchmark
+ignored). This includes all 11 new incremental-ingestion regressions. The
+state crate also passed clippy with warnings denied. Required CI and the
+final merge are tracked on [PR #238](https://github.com/pjunod/runner/pull/238),
+so recording results does not retrigger the unit suites.
 
 ## 6. Limits
 

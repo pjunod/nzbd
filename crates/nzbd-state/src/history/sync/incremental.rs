@@ -483,7 +483,7 @@ mod tests {
         let mut b = a.clone();
         b.hidden = true;
         b.removed_at_unix = Some(20);
-        p.append("history.a.jsonl", &[a.clone()]);
+        p.append("history.a.jsonl", std::slice::from_ref(&a));
         p.append("history.b.jsonl", &[b]);
         p.step();
         p.replace("history.b.jsonl", &[entry(2, 200)]);
@@ -732,6 +732,62 @@ mod tests {
         p.append("history.a.jsonl", &[entry(1, 100)]);
         p.step();
         assert_eq!(p.fast.count_filtered(true).unwrap(), 1);
+    }
+
+    #[test]
+    fn deletion_suffix_uses_indexed_writer_work_without_the_page_reader() {
+        let t = tempfile::tempdir().unwrap();
+        let logs = t.path().join("logs");
+        let db = Arc::new(HistoryDb::open(&t.path().join("db.sqlite"), Some(&logs)).unwrap());
+        db.record(&entry(1, 100)).unwrap();
+        db.record(&entry(2, 200)).unwrap();
+        db.replay_logs(false).unwrap();
+        {
+            let mut conn = db.conn.lock().unwrap();
+            let tx = conn.transaction().unwrap();
+            for id in 100..5100 {
+                tx.execute(
+                    "INSERT INTO history_tombstones(job_id,completed_at) VALUES(?1,100)",
+                    [id],
+                )
+                .unwrap();
+            }
+            tx.commit().unwrap();
+        }
+        let mut f = std::fs::File::create(logs.join("history.peer.jsonl")).unwrap();
+        for id in [1, 100] {
+            writeln!(
+                f,
+                "{}",
+                serde_json::to_string(&HistoryMutation::Tombstone {
+                    job: crate::JobId(id),
+                    completed_at_unix: 100,
+                })
+                .unwrap()
+            )
+            .unwrap();
+        }
+        let reader = db.reader.lock().unwrap();
+        let (send, receive) = std::sync::mpsc::channel();
+        let other = db.clone();
+        let worker = std::thread::spawn(move || send.send(other.replay_logs(true)).unwrap());
+        let result = receive.recv_timeout(Duration::from_secs(3));
+        drop(reader); // Release even on failure so the test cannot strand a worker.
+        worker.join().unwrap();
+        result
+            .expect("deletion ingestion must not acquire the page reader")
+            .unwrap();
+        assert_eq!(db.list_filtered(10, true).unwrap()[0].job.0, 2);
+        assert_eq!(db.count_filtered(true).unwrap(), 1);
+        assert_eq!(
+            db.conn
+                .lock()
+                .unwrap()
+                .query_row("SELECT COUNT(*) FROM history_tombstones", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            5001
+        );
     }
 
     #[test]
