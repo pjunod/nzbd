@@ -39,11 +39,12 @@ record. The implemented behavior is:
 - Ordering index, latest-request browser rendering, same-page request
   coalescing, and loading/error/synchronization controls.
 
-The optional incremental per-file contribution schema in §5/M6 is deliberately
-not included: that milestone requires its own merge-equivalence review. Shared
-logs still undergo full replay when changed or during periodic verification.
-Startup is still a recovery cost. No nuc3 deployment, index migration, or
-post-fix production timing has been performed.
+The first release shipped in PR #237. M6 is now implemented on the follow-up
+branch, with merge-equivalence review and final verification tracked in
+[HISTORY_INCREMENTAL.md](HISTORY_INCREMENTAL.md). It retains full recovery and
+periodic verification, while ordinary shared-log appends consume only suffixes.
+No production deployment, index migration, or post-fix production timing has
+been performed.
 
 A repeatable local debug-build probe uses 1,000 synthetic entries containing
 16 KiB records and alternates 20-row pages at offsets 0, 500, and 980 during
@@ -566,8 +567,9 @@ restart. Never persist an offset ahead of its applied data.
 | Local record/hide/restore/delete during ingestion | Serialize or version publication so stale work cannot undo an acknowledged local mutation; compare later convergence with the full-replay reference. |
 | Compaction removes earlier versions | Preserve the existing `COALESCE` behavior and node-local retained values; do not clear fields solely because the compacted contribution lacks them. |
 
-This is a design direction requiring its own schema and concurrency review,
-not permission to invent a new conflict-resolution protocol. Keep full replay
+The implementation and its concurrency review are tracked in
+[HISTORY_INCREMENTAL.md](HISTORY_INCREMENTAL.md). It preserves the existing
+conflict-resolution protocol and uses ephemeral offsets and contributions. Keep full replay
 as the recovery path and test oracle. Cross-file conflicts, disappearing files,
 and local mutation races must pass equivalence tests before rollout. A future
 versioned log format could simplify ordering, but that is outside this fix.

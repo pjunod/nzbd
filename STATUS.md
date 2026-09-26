@@ -1,5 +1,14 @@
 # nzbd — Project Status
 
+## Incremental history ingestion — 2026-09-25
+
+**Status:** M6 implemented and adversarial review addressed; 73 state tests
+passed. [PR #238](https://github.com/pjunod/runner/pull/238) tracks final CI and
+merge. [Delivery status](docs/HISTORY_INCREMENTAL.md)
+tracks the remaining history work through merge. Ordinary shared-log appends
+read only complete suffix lines, preserving sorted-file merge semantics.
+
+
 ## History loading performance — 2026-09-25
 
 **Status:** adversarial review findings addressed; local affected checks passed.

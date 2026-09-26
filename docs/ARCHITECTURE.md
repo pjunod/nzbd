@@ -275,8 +275,10 @@ SQLite WAL snapshot; native page rows and total share one read transaction.
 Standalone stores explicitly opt into one-writer ownership and skip routine
 post-startup replay, retaining repair after failed local publication. Shared
 stores have one runtime-owned worker, a whole-pass synchronization gate,
-completion-based throttling, conservative file fingerprints with periodic
-verification, and bounded replay transactions. Readers use a separate SQLite
+completion-based throttling, per-file incremental contributions and complete-line
+offsets, conservative fingerprints with periodic full verification, and bounded
+replay transactions. Offsets publish only after associated commits; restart
+reconstructs the cache. See [HISTORY_INCREMENTAL.md](HISTORY_INCREMENTAL.md). Readers use a separate SQLite
 connection, and consumer observations defer when replay owns the writer.
 Pause/resume and worker I/O/freshness/placement are visible in the History tab.
 `history.index_dir` permits an index copy to persistent local storage without
